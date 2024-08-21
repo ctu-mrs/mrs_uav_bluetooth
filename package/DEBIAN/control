@@ -1,0 +1,6 @@
+Package: mrs-uav-bluetooth
+Version: 1.0.0
+Architecture: all
+Maintainer: Vojtech Vrba <vojtech.vrba@fel.cvut.cz>
+Description: Bluetooth server utility for MRS UAV system.
+Depends: bluez (>=5.50), python3 (>=3.8)

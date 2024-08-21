@@ -1,0 +1,26 @@
+#!/bin/bash
+#remove pre-existing version of the systemctl service
+systemctl stop uav_bluetooth
+systemctl disable uav_bluetooth
+rm /etc/systemd/system/uav_bluetooth.service
+systemctl daemon-reload
+systemctl reset-failed
+
+#setup new systemctl service
+chmod +x /etc/ctu-mrs/uav-bluetooth/service_exec.sh
+touch /etc/systemd/system/uav_bluetooth.service
+> /etc/systemd/system/uav_bluetooth.service
+echo "[Unit]
+Description=MRS UAV Bluetooth service
+After=network.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+Restart=always
+ExecStart=/etc/ctu-mrs/uav-bluetooth/service_exec.sh
+[Install]
+WantedBy=multi-user.target" >> /etc/systemd/system/uav_bluetooth.service
+systemctl daemon-reload
+systemctl enable uav_bluetooth
+systemctl start uav_bluetooth
+

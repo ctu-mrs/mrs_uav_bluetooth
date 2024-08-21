@@ -1,0 +1,23 @@
+name: generic_package_build
+
+on:
+
+  push:
+    branches: [ master ]
+
+    paths-ignore:
+      - '**/README.md'
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  build:
+    uses: ctu-mrs/ci_scripts/.github/workflows/generic_package_build.yml@master
+    secrets:
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+

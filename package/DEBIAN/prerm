@@ -1,0 +1,7 @@
+#!/bin/bash
+systemctl stop uav_bluetooth
+systemctl disable uav_bluetooth
+rm /etc/systemd/system/uav_bluetooth.service
+systemctl daemon-reload
+systemctl reset-failed
+
