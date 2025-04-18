@@ -57,7 +57,7 @@ checkinstall -D \
     --fstrans=yes \
     --pkgversion=$BLUEZ_VERSION \
     --pkgname=bluez \
-    --arch=amd64 \
+    --arch=all \
     --requires=kmod,udev,dbus-system-bus \
     --replaces=bluez,bluez-cups,bluez-obexd \
     --maintainer="Vojtech Vrba \<vrba.vojtech\@fel.cvut.cz\>" \
