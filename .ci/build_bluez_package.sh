@@ -36,6 +36,7 @@ cd bluez ;
     --mandir=/usr/share/man \
     --sysconfdir=/etc \
     --localstatedir=/var \
+    --disable-cups \
     --enable-library \
     --enable-testing \
     --enable-experimental \
