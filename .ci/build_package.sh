@@ -5,7 +5,11 @@ set -e
 trap 'last_command=$current_command; current_command=$BASH_COMMAND' DEBUG
 trap 'echo "$0: \"${last_command}\" command failed with exit code $?"' ERR
 
-echo "$0: building the package"
+echo "$0: building the package bluez with meshing support"
+
+sudo ./build_bluez_package.sh
+
+echo "$0: building the package mrs_uav_bluetooth"
 
 ARTIFACTS_FOLDER=$1
 BASE_IMAGE=$2
