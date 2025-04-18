@@ -7,7 +7,7 @@ trap 'echo "$0: \"${last_command}\" command failed with exit code $?"' ERR
 
 echo "$0: building the package bluez with meshing support"
 
-sudo ./build_bluez_package.sh
+sudo ./.ci/build_bluez_package.sh
 
 echo "$0: building the package mrs_uav_bluetooth"
 
