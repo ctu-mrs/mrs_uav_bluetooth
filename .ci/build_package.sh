@@ -7,8 +7,6 @@ trap 'echo "$0: \"${last_command}\" command failed with exit code $?"' ERR
 
 echo "$0: building the package bluez with meshing support"
 
-sudo sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list"
-sudo apt-get -y update
 sudo ./.ci/build_bluez_package.sh
 
 echo "$0: building the package mrs_uav_bluetooth"

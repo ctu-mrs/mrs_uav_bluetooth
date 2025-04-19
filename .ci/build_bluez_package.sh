@@ -16,8 +16,10 @@ fi
 # clean before running the script
 rm -rf bluez* ell* ;
 
-# install pre-requisites
-apt-get -y install git checkinstall libcups2-dev libasound2-dev ;
+# install pre-requisites (with sources)
+sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ;
+apt-get -y update ;
+apt-get -y install git checkinstall libasound2-dev ;
 apt-get -y build-dep bluez bluez-cups ;
 
 # clone the bluez and ell repositories
@@ -59,6 +61,7 @@ checkinstall -D \
     --pkgname=bluez \
     --arch=all \
     --requires=kmod,udev,dbus-system-bus \
+    --provides="bluez \(= $BLUEZ_VERSION\)" \
     --replaces=bluez,bluez-cups,bluez-obexd \
     --maintainer="Vojtech Vrba \<vrba.vojtech\@fel.cvut.cz\>" \
     --nodoc	\
