@@ -20,7 +20,7 @@ rm -rf bluez* ell* ;
 sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ;
 apt-get -y update ;
 apt-get -y install git checkinstall libasound2-dev ;
-apt-get -y build-dep bluez bluez-cups ;
+apt-get -y build-dep bluez ;
 
 # clone the bluez and ell repositories
 git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
@@ -59,7 +59,7 @@ checkinstall -D \
     --fstrans=yes \
     --pkgversion=$BLUEZ_VERSION \
     --pkgname=bluez \
-    --arch=all \
+    --arch=$(dpkg-architecture -qDEB_HOST_ARCH) \
     --requires=kmod,udev,dbus-system-bus \
     --provides="bluez \(= $BLUEZ_VERSION\)" \
     --replaces=bluez,bluez-cups,bluez-obexd \
