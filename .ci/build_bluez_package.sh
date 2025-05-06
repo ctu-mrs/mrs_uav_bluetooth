@@ -17,10 +17,12 @@ fi
 rm -rf bluez* ell* ;
 
 # install pre-requisites (with sources)
-sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ;
+# sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ; # this enables deb-src for apt
 apt-get -y update ;
 apt-get -y install git checkinstall libasound2-dev ;
-apt-get -y build-dep bluez ;
+# apt-get -y build-dep bluez ; # this installs packages obtained by: apt-cache showsrc bluez | grep ^Build-Depends
+apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, dh-systemd (>= 1.5), libebook1.2-dev (>= 3.12)" ;
+
 
 # clone the bluez and ell repositories
 git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
@@ -62,7 +64,7 @@ checkinstall -D \
     --pkgversion=$BLUEZ_VERSION \
     --pkgname=bluez \
     --arch=$ARCH \
-    --requires=kmod,udev,dbus-system-bus \
+    --requires="libc6, libdbus-1-3, libglib2.0-0, libreadline8, libudev1, kmod, udev, lsb-base, dbus" \
     --provides="bluez \(= $BLUEZ_VERSION\)" \
     --replaces=bluez,bluez-cups,bluez-obexd \
     --maintainer="Vojtech Vrba \<vrba.vojtech\@fel.cvut.cz\>" \
@@ -113,7 +115,7 @@ case "$1" in
     ;;
 
     *)
-        echo "postinst called with unknown argument: $1" >&2
+        echo "postinst called with unknown argument: '$1'" >&2
         exit 0
     ;;
 esac
@@ -144,7 +146,9 @@ dpkg -b ./bluez_package $PACKAGE_NAME ;
 chmod 777 ./$PACKAGE_NAME ;
 cp ./$PACKAGE_NAME .. ;
 
-# here you can check the package with: dpkg-deb --info ./bluez_*.deb
+echo "###### FINISHED PACKAGE BUILD ######"
+dpkg-deb --info ./$PACKAGE_NAME
+echo "###### FINISHED PACKAGE BUILD ######"
 
 # terminate successfully
 exit 0
