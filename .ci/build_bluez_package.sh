@@ -19,8 +19,8 @@ rm -rf bluez* ell* ;
 # install pre-requisites (with sources)
 sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ;
 apt-get -y update ;
-#apt-get -y install git checkinstall libasound2-dev ;
-#apt-get -y build-dep bluez ;
+apt-get -y install git checkinstall libasound2-dev ;
+apt-get -y build-dep bluez ;
 
 # clone the bluez and ell repositories
 git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
