@@ -54,14 +54,12 @@ cd bluez ;
 make ;
 
 # create the deb package by capturing "make install" effects
-ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
-
 checkinstall -D \
     --install=no \
     --fstrans=yes \
     --pkgversion=$BLUEZ_VERSION \
     --pkgname=bluez \
-    --arch=$ARCH \
+    --arch=$(dpkg-architecture -qDEB_HOST_ARCH) \
     --requires=kmod,udev,dbus-system-bus \
     --provides="bluez \(= $BLUEZ_VERSION\)" \
     --replaces=bluez,bluez-cups,bluez-obexd \
@@ -69,80 +67,9 @@ checkinstall -D \
     --nodoc	\
     --default ;
 
-# modify the deb package
-PACKAGE_NAME="bluez_"$BLUEZ_VERSION"_"$ARCH".deb" ;
-
-dpkg-deb -x ./bluez_*.deb ./bluez_package ;
-dpkg-deb --control ./bluez_*.deb ./bluez_package/DEBIAN ;
-
-sed -i "s/Description:.*/Description: Custom bluez build for MRS UAV system/g" ./bluez_package/DEBIAN/control ;
-sed -i "s/Version:.*/Version: $BLUEZ_VERSION/g" ./bluez_package/DEBIAN/control ;
-
-cat > ./bluez_package/DEBIAN/preinst <<EOT
-#!/bin/sh
-set -e
-
-case "$1" in
-  upgrade|install)
-	install -m 700 -d /var/lib/bluetooth
-  ;;
-esac
-
-exit 0
-EOT
-chmod +x ./bluez_package/DEBIAN/preinst ;
-
-cat > ./bluez_package/DEBIAN/postinst <<EOT
-#!/bin/sh
-set -e
-
-case "$1" in
-    configure)
-        # create bluetooth group if not already present
-        if ! getent group bluetooth > /dev/null; then
-            addgroup --quiet --system bluetooth
-        fi
-
-        # reload dbus config file
-        if [ -x /etc/init.d/dbus ]; then
-            invoke-rc.d dbus force-reload || true
-        fi
-
-        ;;
-    abort-upgrade|abort-remove|abort-deconfigure)
-    ;;
-
-    *)
-        echo "postinst called with unknown argument: $1" >&2
-        exit 0
-    ;;
-esac
-
-exit 0
-EOT
-chmod +x ./bluez_package/DEBIAN/postinst ;
-
-cat > ./bluez_package/DEBIAN/prerm <<EOT
-#!/bin/sh
-set -e
-
-case "$1" in
-    remove)
-	if [ -d /var/lib/bluetooth ] ; then
-	    rm -rf /var/lib/bluetooth
-	fi
-    ;;
-esac
-
-exit 0
-EOT
-chmod +x ./bluez_package/DEBIAN/prerm ;
-
-dpkg -b ./bluez_package $PACKAGE_NAME ;
-
 # move the deb package to the parent directory
-chmod 777 ./$PACKAGE_NAME ;
-cp ./$PACKAGE_NAME .. ;
+chmod 777 bluez_*.deb ;
+cp bluez_*.deb .. ;
 
 # here you can check the package with: dpkg-deb --info ./bluez_*.deb
 
