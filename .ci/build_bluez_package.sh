@@ -146,9 +146,12 @@ dpkg -b ./bluez_package $PACKAGE_NAME ;
 chmod 777 ./$PACKAGE_NAME ;
 cp ./$PACKAGE_NAME .. ;
 
-echo "###### FINISHED PACKAGE BUILD ######"
-dpkg-deb --info ./$PACKAGE_NAME
-echo "###### FINISHED PACKAGE BUILD ######"
+echo "" ;
+echo "###### FINISHED PACKAGE INFO START ######" ;
+stat ./$PACKAGE_NAME ;
+dpkg-deb --info ./$PACKAGE_NAME ;
+echo "###### FINISHED PACKAGE INFO END ######" ;
+echo "" ;
 
 # terminate successfully
 exit 0
