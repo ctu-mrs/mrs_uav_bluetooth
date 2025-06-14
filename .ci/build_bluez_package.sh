@@ -1,17 +1,29 @@
 #!/bin/bash
-
-# selection of BlueZ and ELL versions
-export BLUEZ_VERSION=5.82 ;
-export ELL_VERSION=0.76 ;
-
-# terminate the script if any command fails
-set -e ;
+set -e ; # terminate the script if any command fails
 
 # check if the script is run as root
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root. Please use sudo." ;
     exit 1
 fi
+
+# load the architecture string ("amd64" or "arm64" is expected)
+ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
+
+###################################
+### CONFIGURATION SECTION START ###
+###################################
+
+# selection of BlueZ and ELL versions
+BLUEZ_VERSION=5.83 ;
+ELL_VERSION=0.78 ;
+
+# the final package name
+PACKAGE_NAME="bluez_"$BLUEZ_VERSION"_"$ARCH".deb" ;
+
+###################################
+###  CONFIGURATION SECTION END  ###
+###################################
 
 # clean before running the script
 rm -rf bluez* ell* ;
@@ -21,8 +33,7 @@ rm -rf bluez* ell* ;
 apt-get -y update ;
 apt-get -y install git checkinstall libasound2-dev ;
 # apt-get -y build-dep bluez ; # this installs packages obtained by: apt-cache showsrc bluez | grep ^Build-Depends
-apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, dh-systemd (>= 1.5), libebook1.2-dev (>= 3.12)" ;
-
+apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, dh-systemd (>= 1.5), libebook1.2-dev (>= 3.12)" ;
 
 # clone the bluez and ell repositories
 git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
@@ -56,8 +67,6 @@ cd bluez ;
 make ;
 
 # create the deb package by capturing "make install" effects
-ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
-
 checkinstall -D \
     --install=no \
     --fstrans=yes \
@@ -71,15 +80,16 @@ checkinstall -D \
     --nodoc	\
     --default ;
 
-# modify the deb package
-PACKAGE_NAME="bluez_"$BLUEZ_VERSION"_"$ARCH".deb" ;
-
+# extract the created deb package and remove it
 dpkg-deb -x ./bluez_*.deb ./bluez_package ;
 dpkg-deb --control ./bluez_*.deb ./bluez_package/DEBIAN ;
+rm -f ./bluez_*.deb ;
 
+# modify package control file
 sed -i "s/Description:.*/Description: Custom bluez build for MRS UAV system/g" ./bluez_package/DEBIAN/control ;
 sed -i "s/Version:.*/Version: $BLUEZ_VERSION/g" ./bluez_package/DEBIAN/control ;
 
+# create pre-installation package script
 cat > ./bluez_package/DEBIAN/preinst <<EOT
 #!/bin/sh
 set -e
@@ -94,6 +104,7 @@ exit 0
 EOT
 chmod +x ./bluez_package/DEBIAN/preinst ;
 
+# create post-installation package script
 cat > ./bluez_package/DEBIAN/postinst <<EOT
 #!/bin/sh
 set -e
@@ -124,6 +135,7 @@ exit 0
 EOT
 chmod +x ./bluez_package/DEBIAN/postinst ;
 
+# create pre-removal package script
 cat > ./bluez_package/DEBIAN/prerm <<EOT
 #!/bin/sh
 set -e
@@ -140,16 +152,17 @@ exit 0
 EOT
 chmod +x ./bluez_package/DEBIAN/prerm ;
 
+# create the new deb package
 dpkg -b ./bluez_package $PACKAGE_NAME ;
 
 # move the deb package to the parent directory
 chmod 777 ./$PACKAGE_NAME ;
-cp ./$PACKAGE_NAME .. ;
+mv ./$PACKAGE_NAME ../$PACKAGE_NAME ;
 
 echo "" ;
 echo "###### FINISHED PACKAGE INFO START ######" ;
-stat ./$PACKAGE_NAME ;
-dpkg-deb --info ./$PACKAGE_NAME ;
+stat ../$PACKAGE_NAME ;
+dpkg-deb --info ../$PACKAGE_NAME ;
 echo "###### FINISHED PACKAGE INFO END ######" ;
 echo "" ;
 
