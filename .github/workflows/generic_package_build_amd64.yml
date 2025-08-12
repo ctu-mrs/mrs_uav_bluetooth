@@ -1,4 +1,4 @@
-name: generic_package_build
+name: generic_package_build_amd64
 
 on:
 
@@ -17,7 +17,6 @@ concurrency:
 jobs:
 
   build:
-    uses: ctu-mrs/ci_scripts/.github/workflows/generic_package_build.yml@ros2
+    uses: ctu-mrs/ci_scripts/.github/workflows/generic_package_build_amd64.yml@ros2
     secrets:
       PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
-
