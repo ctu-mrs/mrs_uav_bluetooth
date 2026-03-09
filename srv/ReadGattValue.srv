@@ -1,0 +1,6 @@
+string path
+bool descriptor
+---
+bool success
+string message
+uint8[] value

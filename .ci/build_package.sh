@@ -12,23 +12,26 @@ sudo ./.ci/build_bluez_package.sh
 echo "$0: building the package mrs_uav_bluetooth"
 
 ARTIFACTS_FOLDER=$1
-BASE_IMAGE=$2
+#BASE_IMAGE=$2
 
-sudo apt-get -y install dpkg-dev
+#sudo apt-get -y install dpkg-dev
 
 echo "$0: building the package into '$ARTIFACTS_FOLDER'"
 
-mkdir -p $ARTIFACTS_FOLDER
+xmkdir -p $ARTIFACTS_FOLDER
 
-epoch=1
+#epoch=1
 # SHA=$(git rev-parse --short HEAD)
-build_flag=$(date +%Y%m%d.%H%M%S)
+#build_flag=$(date +%Y%m%d.%H%M%S)
 
-sed -i "s/(/($epoch:/" ./package/DEBIAN/changelog
-sed -i "s/)/.${build_flag})/" ./package/DEBIAN/changelog
+#sed -i "s/(/($epoch:/" ./package/DEBIAN/changelog
+#sed -i "s/)/.${build_flag})/" ./package/DEBIAN/changelog
 
-dpkg-deb --build --root-owner-group package
+#dpkg-deb --build --root-owner-group package
 
-dpkg-name package.deb
+#dpkg-name package.deb
+
+echo "$0: -> handled by ROS 2 package workflow"
 
 mv *.deb $ARTIFACTS_FOLDER
+

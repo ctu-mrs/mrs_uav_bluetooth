@@ -1,0 +1,8 @@
+string mac
+float32 timeout
+bool wait_for_services
+---
+bool success
+string message
+string resolved_mac
+string device_path

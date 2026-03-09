@@ -1,0 +1,19 @@
+string direction
+string mac
+string characteristic
+string topic_name
+string message_type
+string[] member_paths
+float32 rate_hz
+string transport_endpoint
+bool enable
+---
+bool success
+string message
+string resolved_uuid
+string resolved_path
+string resolved_topic
+string resolved_message_type
+string[] resolved_member_paths
+float32 resolved_rate_hz
+string resolved_transport_endpoint
