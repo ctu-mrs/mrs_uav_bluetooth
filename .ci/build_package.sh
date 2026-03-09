@@ -1,4 +1,4 @@
-#!/bin/bash
+Ahoj #!/bin/bash
 
 set -e
 
@@ -18,7 +18,7 @@ ARTIFACTS_FOLDER=$1
 
 echo "$0: building the package into '$ARTIFACTS_FOLDER'"
 
-xmkdir -p $ARTIFACTS_FOLDER
+mkdir -p $ARTIFACTS_FOLDER
 
 #epoch=1
 # SHA=$(git rev-parse --short HEAD)
