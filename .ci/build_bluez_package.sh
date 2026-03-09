@@ -187,7 +187,7 @@ chmod +x "$PACKAGE_ROOT/DEBIAN/prerm" ;
 dpkg-deb --build "$PACKAGE_ROOT" "$PACKAGE_FILENAME" ;
 
 # move the deb package to the parent directory
-#chmod 644 ./$PACKAGE_FILENAME ;
+chmod 777 ./$PACKAGE_FILENAME ;
 mv ./$PACKAGE_FILENAME ../$PACKAGE_FILENAME ;
 
 # create a world-readable copy outside private home directories for apt validation
