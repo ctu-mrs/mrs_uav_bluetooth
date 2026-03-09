@@ -38,6 +38,10 @@ class GlibMainLoopThread:
 
 
 class BluetoothDbusRuntime:
+    _LEGACY_ADV_MAX_BYTES = 31
+    _ADV_FLAGS_BYTES = 3
+    _ADV_TX_POWER_BYTES = 3
+
     def __init__(
         self,
         local_name: str,
@@ -170,15 +174,13 @@ class BluetoothDbusRuntime:
         advertisement.local_name = self._local_name
 
         service_uuids = []
-        if self._wifi_service is not None:
-            service_uuids.append(WIFI_SERVICE_UUID)
         if self._time_service is not None:
             service_uuids.append(TIME_SERVICE_UUID)
+        if self._wifi_service is not None:
+            service_uuids.append(WIFI_SERVICE_UUID)
         for state in topic_exports.values():
             if state.service is not None:
                 service_uuids.append(state.service.uuid)
-        advertisement.service_uuids = service_uuids
-        advertisement.include_tx_power = True
 
         self.set_adapter_props(
             alias=self._local_name,
@@ -202,16 +204,9 @@ class BluetoothDbusRuntime:
             self._app = app
             self._logger.info(f"GATT application registered ({service_index} services)")
 
-            self._logger.info(f"Registering BLE advertisement (name={self._local_name}, uuids={len(service_uuids)})")
-            self._call_dbus_method_async(
-                ad_mgr.RegisterAdvertisement,
-                "register the BLE advertisement",
-                advertisement.get_path(),
-                {},
-            )
-            advertisement_registered = True
-            self._advertisement = advertisement
-            self._logger.info(f"BLE advertisement registered (name={self._local_name}, uuids={len(service_uuids)})")
+            advertisement_registered = self._register_advertisement(ad_mgr, advertisement, service_uuids)
+            if advertisement_registered:
+                self._advertisement = advertisement
         except Exception:
             if advertisement_registered:
                 try:
@@ -280,15 +275,99 @@ class BluetoothDbusRuntime:
         props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), DBUS_PROP_IFACE)
         iface = "org.bluez.Adapter1"
         if powered is not None:
-            props.Set(iface, "Powered", dbus.Boolean(powered))
+            props.Set(iface, "Powered", dbus.Boolean(powered, variant_level=1))
         if alias is not None:
-            props.Set(iface, "Alias", dbus.String(alias))
+            props.Set(iface, "Alias", dbus.String(alias, variant_level=1))
         if discoverable_timeout is not None:
-            props.Set(iface, "DiscoverableTimeout", dbus.UInt32(discoverable_timeout))
+            props.Set(iface, "DiscoverableTimeout", dbus.UInt32(discoverable_timeout, variant_level=1))
         if discoverable is not None:
-            props.Set(iface, "Discoverable", dbus.Boolean(discoverable))
+            props.Set(iface, "Discoverable", dbus.Boolean(discoverable, variant_level=1))
         if pairable is not None:
-            props.Set(iface, "Pairable", dbus.Boolean(pairable))
+            props.Set(iface, "Pairable", dbus.Boolean(pairable, variant_level=1))
+
+    def _register_advertisement(self, ad_mgr, advertisement: Advertisement, service_uuids) -> bool:
+        last_error = None
+        attempts = []
+        for include_tx_power in (True, False):
+            attempts.append(
+                (
+                    include_tx_power,
+                    self._select_advertised_service_uuids(service_uuids, include_tx_power=include_tx_power),
+                )
+            )
+        attempts.append((False, []))
+
+        attempted_configs = set()
+        for include_tx_power, advertised_uuids in attempts:
+            config_key = (include_tx_power, tuple(advertised_uuids))
+            if config_key in attempted_configs:
+                continue
+            attempted_configs.add(config_key)
+
+            advertisement.include_tx_power = include_tx_power
+            advertisement.service_uuids = list(advertised_uuids)
+
+            if len(advertised_uuids) != len(service_uuids):
+                self._logger.warning(
+                    "BLE advertisement trimmed from "
+                    f"{len(service_uuids)} to {len(advertised_uuids)} service UUIDs to fit controller limits"
+                )
+
+            try:
+                self._logger.info(
+                    f"Registering BLE advertisement (name={self._local_name}, uuids={len(advertised_uuids)}, "
+                    f"tx_power={'ON' if include_tx_power else 'OFF'})"
+                )
+                self._call_dbus_method_async(
+                    ad_mgr.RegisterAdvertisement,
+                    "register the BLE advertisement",
+                    advertisement.get_path(),
+                    {},
+                )
+                self._logger.info(
+                    f"BLE advertisement registered (name={self._local_name}, uuids={len(advertised_uuids)}, "
+                    f"tx_power={'ON' if include_tx_power else 'OFF'})"
+                )
+                return True
+            except Exception as exc:
+                last_error = exc
+                self._logger.warning(
+                    f"BLE advertisement registration attempt failed (uuids={len(advertised_uuids)}, "
+                    f"tx_power={'ON' if include_tx_power else 'OFF'}): {exc}"
+                )
+
+        self._logger.error(f"BLE advertisement unavailable; continuing without advertising: {last_error}")
+        advertisement.destroy()
+        return False
+
+    def _select_advertised_service_uuids(self, service_uuids, *, include_tx_power: bool):
+        # Legacy LE advertising payload is limited to 31 bytes including flags.
+        remaining_bytes = self._LEGACY_ADV_MAX_BYTES - self._ADV_FLAGS_BYTES
+        local_name = self._local_name or ""
+        if local_name:
+            remaining_bytes -= 2 + len(local_name.encode("utf-8"))
+        if include_tx_power:
+            remaining_bytes -= self._ADV_TX_POWER_BYTES
+        if remaining_bytes <= 2:
+            return []
+
+        advertised = []
+        used_bytes = 2
+        for uuid in service_uuids:
+            uuid_size = self._uuid_advertising_size(uuid)
+            if used_bytes + uuid_size > remaining_bytes:
+                break
+            advertised.append(uuid)
+            used_bytes += uuid_size
+        return advertised
+
+    def _uuid_advertising_size(self, uuid: str) -> int:
+        compact = str(uuid).replace("-", "")
+        if len(compact) == 4:
+            return 2
+        if len(compact) == 8:
+            return 4
+        return 16
 
     def start_scan(self, transport: str) -> bool:
         if self._client is None:
