@@ -1,0 +1,6 @@
+string mac
+string characteristic_path
+---
+bool success
+string message
+BleGattDescriptor[] descriptors

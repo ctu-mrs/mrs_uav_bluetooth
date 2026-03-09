@@ -1,0 +1,7 @@
+string path
+bool descriptor
+uint8[] value
+bool with_response
+---
+bool success
+string message

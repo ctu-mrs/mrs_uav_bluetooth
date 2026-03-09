@@ -1,0 +1,5 @@
+bool connected_only
+---
+bool success
+string message
+BleDevice[] devices

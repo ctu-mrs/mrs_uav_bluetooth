@@ -1,0 +1,26 @@
+{
+  "mrs_uav_bluetooth": {
+    "ros__parameters": {
+      "scan_publish_period": 2.0,
+      "time_update_period": 1.0,
+      "wifi_refresh_period": 2.0,
+      "auto_connect_period": 3.0,
+
+      "discoverable_timeout": 0,
+      "auto_accept_pairing": true,
+      "auto_trust": true,
+
+      "enable_time_service": true,
+      "enable_wifi_service": true,
+
+      "auto_connect_names": [],
+      "auto_connect_macs": [],
+      "auto_connect_uav_peers": false,
+      "uav_name_pattern": "^uav[0-9]{2}$",
+
+      "peer_time_topic_prefix": "/ble/peers",
+
+      "allowed_wifi_networks": ["mrs_ctu", "mrs_ctu_1", "mrs_ctu_2", "mrs_ctu_3", "mrs_ctu_4", "mrs_ctu_5", "mrs_ctu_6", "mrs_ctu_7", "mrs_ctu_8", "mrs_ctu_9"]
+    }
+  }
+}

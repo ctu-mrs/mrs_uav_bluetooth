@@ -1,0 +1,5 @@
+string mac
+bool trusted
+---
+bool success
+string message

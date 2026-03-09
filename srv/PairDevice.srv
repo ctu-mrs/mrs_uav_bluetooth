@@ -1,0 +1,6 @@
+string mac
+float32 timeout
+bool trust_after_pair
+---
+bool success
+string message

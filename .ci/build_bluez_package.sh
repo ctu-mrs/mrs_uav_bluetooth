@@ -15,11 +15,22 @@ ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
 ###################################
 
 # selection of BlueZ and ELL versions
-BLUEZ_VERSION=5.83 ;
-ELL_VERSION=0.78 ;
+BLUEZ_VERSION=5.86 ;
+ELL_VERSION=0.82 ;
+
+# custom package name; it replaces distro BlueZ when explicitly installed,
+# but it is not the same package so normal system updates do not require it.
+PACKAGE_NAME="mrs-bluez" ; # better than bluez-mrs
 
 # the final package name
-PACKAGE_NAME="bluez_"$BLUEZ_VERSION"_"$ARCH".deb" ;
+PACKAGE_FILENAME=$PACKAGE_NAME"_"$BLUEZ_VERSION"_"$ARCH".deb" ;
+
+# package metadata
+PACKAGE_MAINTAINER="Vojtech Vrba <vrba.vojtech@fel.cvut.cz>" ;
+PACKAGE_DEPENDS="libc6, libdbus-1-3, libglib2.0-0, libreadline8, libudev1, kmod, udev, dbus" ;
+PACKAGE_PROVIDES="bluez (= $BLUEZ_VERSION), bluez-obexd (= $BLUEZ_VERSION), bluez-hcidump (= $BLUEZ_VERSION), bluez-meshd (= $BLUEZ_VERSION)" ;
+PACKAGE_CONFLICTS="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-tools" ;
+PACKAGE_REPLACES="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-tools" ;
 
 ###################################
 ###  CONFIGURATION SECTION END  ###
@@ -31,9 +42,9 @@ rm -rf bluez* ell* ;
 # install pre-requisites (with sources)
 # sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ; # this enables deb-src for apt
 apt-get -y update ;
-apt-get -y install git checkinstall libasound2-dev ;
+apt-get -y install git libasound2-dev ;
 # apt-get -y build-dep bluez ; # this installs packages obtained by: apt-cache showsrc bluez | grep ^Build-Depends
-apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, dh-systemd (>= 1.5), libebook1.2-dev (>= 3.12)" ;
+apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, libebook1.2-dev (>= 3.12)" ;
 
 # clone the bluez and ell repositories
 git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
@@ -58,39 +69,45 @@ cd bluez ;
     --enable-deprecated \
     --enable-external-plugins \
     --enable-nfc \
-    --enable-sap \
-    --enable-health \
     --enable-midi \
     --enable-mesh ;
 
 # compile everything
 make ;
 
-# create the deb package by capturing "make install" effects
-checkinstall -D \
-    --install=no \
-    --fstrans=yes \
-    --pkgversion=$BLUEZ_VERSION \
-    --pkgname=bluez \
-    --arch=$ARCH \
-    --requires="libc6, libdbus-1-3, libglib2.0-0, libreadline8, libudev1, kmod, udev, lsb-base, dbus" \
-    --provides="bluez \(= $BLUEZ_VERSION\)" \
-    --replaces=bluez,bluez-cups,bluez-obexd \
-    --maintainer="Vojtech Vrba \<vrba.vojtech\@fel.cvut.cz\>" \
-    --nodoc	\
-    --default ;
+# stage installation into a package root
+PACKAGE_ROOT="$(pwd)/bluez_package" ;
+mkdir -p "$PACKAGE_ROOT/DEBIAN" ;
+make DESTDIR="$PACKAGE_ROOT" install ;
 
-# extract the created deb package and remove it
-dpkg-deb -x ./bluez_*.deb ./bluez_package ;
-dpkg-deb --control ./bluez_*.deb ./bluez_package/DEBIAN ;
-rm -f ./bluez_*.deb ;
+# create package control file
+cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOT
+Package: $PACKAGE_NAME
+Version: $BLUEZ_VERSION
+Section: admin
+Priority: optional
+Architecture: $ARCH
+Maintainer: $PACKAGE_MAINTAINER
+Depends: $PACKAGE_DEPENDS
+Provides: $PACKAGE_PROVIDES
+Conflicts: $PACKAGE_CONFLICTS
+Replaces: $PACKAGE_REPLACES
+Description: Custom bluez build for MRS UAV system
+EOT
 
-# modify package control file
-sed -i "s/Description:.*/Description: Custom bluez build for MRS UAV system/g" ./bluez_package/DEBIAN/control ;
-sed -i "s/Version:.*/Version: $BLUEZ_VERSION/g" ./bluez_package/DEBIAN/control ;
+# mark files under /etc as configuration so upgrades preserve local edits
+if [ -d "$PACKAGE_ROOT/etc" ] ; then
+    find "$PACKAGE_ROOT/etc" -type f | sed "s#^$PACKAGE_ROOT##" | sort > "$PACKAGE_ROOT/DEBIAN/conffiles" ;
+fi
+
+# generate md5sums for package contents
+(
+    cd "$PACKAGE_ROOT" ;
+    find . -type f ! -path './DEBIAN/*' -print0 | xargs -0 md5sum > ./DEBIAN/md5sums ;
+) ;
 
 # create pre-installation package script
-cat > ./bluez_package/DEBIAN/preinst <<EOT
+cat > "$PACKAGE_ROOT/DEBIAN/preinst" <<'EOT'
 #!/bin/sh
 set -e
 
@@ -102,10 +119,10 @@ esac
 
 exit 0
 EOT
-chmod +x ./bluez_package/DEBIAN/preinst ;
+chmod +x "$PACKAGE_ROOT/DEBIAN/preinst" ;
 
 # create post-installation package script
-cat > ./bluez_package/DEBIAN/postinst <<EOT
+cat > "$PACKAGE_ROOT/DEBIAN/postinst" <<'EOT'
 #!/bin/sh
 set -e
 
@@ -121,27 +138,41 @@ case "$1" in
             invoke-rc.d dbus force-reload || true
         fi
 
+        # refresh systemd unit files and start bluetoothd so bluetoothctl works immediately
+        if command -v systemctl >/dev/null 2>&1 ; then
+            systemctl daemon-reload || true
+            systemctl enable bluetooth.service >/dev/null 2>&1 || true
+            systemctl restart bluetooth.service || systemctl start bluetooth.service || true
+        elif [ -x /etc/init.d/bluetooth ] ; then
+            invoke-rc.d bluetooth restart || invoke-rc.d bluetooth start || true
+        fi
+
         ;;
-    abort-upgrade|abort-remove|abort-deconfigure)
+    abort-upgrade|abort-remove|abort-deconfigure|triggered)
     ;;
 
     *)
-        echo "postinst called with unknown argument: '$1'" >&2
         exit 0
     ;;
 esac
 
 exit 0
 EOT
-chmod +x ./bluez_package/DEBIAN/postinst ;
+chmod +x "$PACKAGE_ROOT/DEBIAN/postinst" ;
 
 # create pre-removal package script
-cat > ./bluez_package/DEBIAN/prerm <<EOT
+cat > "$PACKAGE_ROOT/DEBIAN/prerm" <<'EOT'
 #!/bin/sh
 set -e
 
 case "$1" in
     remove)
+	if command -v systemctl >/dev/null 2>&1 ; then
+	    systemctl stop bluetooth.service || true
+	elif [ -x /etc/init.d/bluetooth ] ; then
+	    invoke-rc.d bluetooth stop || true
+	fi
+
 	if [ -d /var/lib/bluetooth ] ; then
 	    rm -rf /var/lib/bluetooth
 	fi
@@ -150,19 +181,28 @@ esac
 
 exit 0
 EOT
-chmod +x ./bluez_package/DEBIAN/prerm ;
+chmod +x "$PACKAGE_ROOT/DEBIAN/prerm" ;
 
 # create the new deb package
-dpkg -b ./bluez_package $PACKAGE_NAME ;
+dpkg-deb --build "$PACKAGE_ROOT" "$PACKAGE_FILENAME" ;
 
 # move the deb package to the parent directory
-chmod 777 ./$PACKAGE_NAME ;
-mv ./$PACKAGE_NAME ../$PACKAGE_NAME ;
+#chmod 644 ./$PACKAGE_FILENAME ;
+mv ./$PACKAGE_FILENAME ../$PACKAGE_FILENAME ;
+
+# create a world-readable copy outside private home directories for apt validation
+if [ -d /var/tmp ] ; then
+    cp ../$PACKAGE_FILENAME /var/tmp/$PACKAGE_FILENAME ;
+    chmod 644 /var/tmp/$PACKAGE_FILENAME ;
+fi
 
 echo "" ;
 echo "###### FINISHED PACKAGE INFO START ######" ;
-stat ../$PACKAGE_NAME ;
-dpkg-deb --info ../$PACKAGE_NAME ;
+stat ../$PACKAGE_FILENAME ;
+dpkg-deb --info ../$PACKAGE_FILENAME ;
+if [ -f /var/tmp/$PACKAGE_FILENAME ] ; then
+    echo "APT validation copy: /var/tmp/$PACKAGE_FILENAME" ;
+fi
 echo "###### FINISHED PACKAGE INFO END ######" ;
 echo "" ;
 
