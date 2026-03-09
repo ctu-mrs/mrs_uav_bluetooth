@@ -15,7 +15,7 @@
 
       "auto_connect_names": [],
       "auto_connect_macs": [],
-      "auto_connect_uav_peers": false,
+      "auto_connect_uav_peers": true,
       "uav_name_pattern": "^uav[0-9]{2}$",
 
       "peer_time_topic_prefix": "/ble/peers",

@@ -69,6 +69,7 @@ class BluetoothNode(Node):
         self._local_name = system_hostname() or "mrs-uav"
         self._pending_wifi_password = ""
         self._auto_connect_attempts: Dict[str, float] = {}
+        self._peer_security_attempts: Dict[str, float] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._scan_transport = self.get_parameter("scan_mode").get_parameter_value().string_value
         self._topic_exports: Dict[str, TopicExportBridgeState] = {}
@@ -251,9 +252,19 @@ class BluetoothNode(Node):
         if self._client is not None:
             with self._lock:
                 all_devs = self._client.get_devices()
-            connected = {mac: d for mac, d in all_devs.items() if d.connected}
+            pattern = str(self.get_parameter("uav_name_pattern").value)
+            peers = {mac: d for mac, d in all_devs.items() if d.connected and self._is_uav_peer_candidate(d, pattern)}
+            connected = {mac: d for mac, d in all_devs.items() if d.connected and mac not in peers}
             paired = {mac: d for mac, d in all_devs.items() if d.paired}
             lines.append(f"  discovered: {len(all_devs)} devices")
+            if peers:
+                for mac, d in sorted(peers.items()):
+                    name = d.alias or d.name or "?"
+                    lines.append(
+                        f"    peer:      {mac}  {name}  RSSI={d.rssi}  paired={d.paired} trusted={d.trusted} bonded={d.bonded}"
+                    )
+            else:
+                lines.append(f"    peers:     (none)")
             if connected:
                 for mac, d in sorted(connected.items()):
                     name = d.alias or d.name or "?"
@@ -470,6 +481,7 @@ class BluetoothNode(Node):
             self._stop_notify_if_unused(state.characteristic_path)
         for mac in stale_macs:
             self._peer_time_bridges.pop(mac, None)
+            self._peer_security_attempts.pop(mac, None)
 
     def _reconcile_import_bridges(self, snapshot: Dict[str, DeviceInfo]):
         for state in self._notification_bridges.values():
@@ -520,12 +532,15 @@ class BluetoothNode(Node):
         self._auto_connect_attempts = {
             mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot
         }
+        self._peer_security_attempts = {
+            mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot
+        }
         for mac, device in snapshot.items():
             peer_candidate = connect_uav_peers and self._is_uav_peer_candidate(device, pattern)
             if device.connected:
                 self._auto_connect_attempts.pop(mac, None)
                 if peer_candidate:
-                    self._ensure_peer_time_bridge(mac, device)
+                    self._maintain_peer_connection(mac, device, retry_period)
                 continue
             last_attempt = self._auto_connect_attempts.get(mac, 0.0)
             if now - last_attempt < retry_period:
@@ -540,7 +555,7 @@ class BluetoothNode(Node):
                 continue
             self._client.wait_services_resolved(mac, timeout=10.0)
             current = self._client.get_device(mac, refresh=True) or device
-            if peer_candidate and not self._ensure_peer_time_bridge(mac, current) and not (matches_name or matches_mac):
+            if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period) and not (matches_name or matches_mac):
                 self.get_logger().info(f"Disconnecting {mac}: uavXX peer candidate without BLE time characteristic")
                 self._client.disconnect(mac, timeout=5.0)
             else:
@@ -566,7 +581,9 @@ class BluetoothNode(Node):
         topic_name = f"{topic_prefix}/{sanitize_topic_suffix(hostname)}/time_ns"
         existing = self._peer_time_bridges.get(mac)
         if existing is not None and existing.characteristic_path == path and existing.topic_name == topic_name:
-            return True
+            if self._is_characteristic_notifying(mac, path):
+                return True
+            return bool(self._client.start_notify(path))
         if existing is not None:
             old_path = existing.characteristic_path
             self.destroy_publisher(existing.publisher)
@@ -583,6 +600,46 @@ class BluetoothNode(Node):
             publisher=publisher,
         )
         return True
+
+    def _maintain_peer_connection(self, mac: str, device: DeviceInfo, retry_period: float) -> bool:
+        time_bridge_ready = self._ensure_peer_time_bridge(mac, device)
+        self._ensure_peer_security(mac, device, retry_period)
+        return time_bridge_ready
+
+    def _ensure_peer_security(self, mac: str, device: DeviceInfo, retry_period: float):
+        current = self._client.get_device(mac, refresh=True) or device
+        if current.paired and current.trusted and current.bonded:
+            self._peer_security_attempts.pop(mac, None)
+            return
+
+        now = time.monotonic()
+        last_attempt = self._peer_security_attempts.get(mac, 0.0)
+        if now - last_attempt < retry_period:
+            return
+        self._peer_security_attempts[mac] = now
+
+        if not current.paired or not current.bonded:
+            if self._client.pair(mac, timeout=30.0):
+                self.get_logger().info(f"Paired BLE peer {mac}")
+            else:
+                self.get_logger().warning(f"Failed to pair BLE peer {mac}")
+            current = self._client.get_device(mac, refresh=True) or current
+
+        if current.paired and not current.trusted:
+            if self._client.trust(mac):
+                self.get_logger().info(f"Trusted BLE peer {mac}")
+            else:
+                self.get_logger().warning(f"Failed to trust BLE peer {mac}")
+            current = self._client.get_device(mac, refresh=True) or current
+
+        if current.paired and current.trusted and current.bonded:
+            self._peer_security_attempts.pop(mac, None)
+
+    def _is_characteristic_notifying(self, mac: str, path: str) -> bool:
+        for characteristic in self._client.list_characteristics(mac):
+            if characteristic["path"] == path:
+                return bool(characteristic.get("notifying", False))
+        return False
 
     def _stop_notify_if_unused(self, path: str):
         if any(state.transport_endpoint == "characteristic" and state.path == path for state in self._notification_bridges.values()):
