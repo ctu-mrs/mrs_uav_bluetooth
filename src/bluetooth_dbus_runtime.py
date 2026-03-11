@@ -134,6 +134,7 @@ class BluetoothDbusRuntime:
         wifi_apply_cb: Callable[[str], None],
         wifi_password_write_cb: Callable[[str], None],
         wifi_password_read_cb: Callable[[], str],
+        time_writeback_cb: Optional[Callable[[bytes, dict, int], None]] = None,
     ):
         self._require_setup()
         self.unregister_server_objects(topic_exports)
@@ -152,7 +153,7 @@ class BluetoothDbusRuntime:
             app.add_service(self._wifi_service)
             service_index += 1
         if enable_time_service:
-            self._time_service = TimeService(self._bus, service_index)
+            self._time_service = TimeService(self._bus, service_index, writeback_cb=time_writeback_cb)
             app.add_service(self._time_service)
             service_index += 1
         for state in topic_exports.values():
