@@ -1,29 +1,20 @@
-# mrs_uav_bluetooth
+# MRS UAV Bluetooth
 
-This repository now contains a ROS 2 reimplementation of the original MRS UAV Bluetooth service.
+This repository contains the MRS UAV Bluetooth tool. It consists of a ROS 2 node running in background as a system service. The node manages Bluetooth Low Energy (BLE) server and client for an automatic discovery and connection management among peer UAVs in a swarm.
 
-## Packages
-
-- `mrs_uav_bluetooth`: Python ROS 2 package that runs the BLE node and also defines the custom ROS 2 messages and services used for scan results, GATT discovery, device control, reads, writes, notifications, and topic bridging.
-
-## Running the node
-
-Start the node directly:
+## Installation
 
 ```bash
-ros2 run mrs_uav_bluetooth bluetooth_node
+sudo apt update
+sudo apt install mrs-bluez # optional (replaces distro's bluez)
+sudo apt install ros-jazzy-mrs-uav-bluetooth mrs-uav-bluetooth-service
 ```
 
-Example with common runtime options:
-
+Then verify the service status:
 ```bash
-ros2 run mrs_uav_bluetooth bluetooth_node --ros-args \
-  -p enable_server:=true \
-  -p enable_scan:=true \
-  -p auto_connect_uav_peers:=true \
-  -p scan_mode:=le \
-  -p verbose_log_file:=/tmp/mrs_uav_bluetooth.log
+service mrs-uav-bluetooth status
 ```
+
 
 ## Default BLE services
 
@@ -34,32 +25,24 @@ The local GATT server always exposes:
 	- The Wi-Fi characteristic is writable, so generic BLE clients can change SSID by writing the target name directly to the characteristic.
 	- The writable SSID descriptor still supports the same write flow for clients that prefer descriptor writes.
 	- The writable password descriptor provides credentials for unknown networks when a direct connection attempt is needed.
-	- The backend now prefers `nmcli` for reading the current SSID and performing live Wi-Fi connection changes. If that is not available or cannot be used, the node falls back to site scripts and then to direct netplan updates.
+	- The backend prefers `nmcli` for reading the current SSID and performing live Wi-Fi connection changes. If that is not available or cannot be used, the node falls back to site scripts and then to direct netplan updates.
 2. Time service
-	- Characteristic and descriptor expose current system time as little-endian `uint64` nanoseconds.
+	- .
 
 All BLE UUIDs are generated from md5 hashes of symbolic names, so service calls can resolve human-readable names into the same stable UUIDs used on-air.
-
-## ROS 2 behavior
-
-- Publishes periodic BLE discovery snapshots with MACs, names, aliases, hostnames, RSSI, UUIDs, and connection state.
-- Publishes remote GATT notification payloads on a dedicated ROS 2 topic.
-- Automatically enables and republishes peer time notifications to `/ble/peers/<hostname>/time_ns` for connected UAV peers when enabled in launch.
-- Provides ROS 2 services for connect, disconnect, pair, trust, remove, GATT enumeration, path lookup, read, write, notify, scan control, and BLE topic bridging.
-- Supports launch-file driven auto-connect lists for BLE names and MAC addresses, plus optional `uavXX` peer auto-connect verification through the default time characteristic.
 
 ## Published topics
 
 - `/ble/devices` (`mrs_uav_bluetooth/msg/BleDeviceArray`): periodic snapshot of discovered devices.
 - `/ble/notifications` (`mrs_uav_bluetooth/msg/BleNotification`): raw remote GATT notifications received by the client side.
-- `/ble/peers/<hostname>/time_ns` (`std_msgs/msg/UInt64`): republished peer time notifications for auto-connected UAV peers.
+- `/ble/peers/<hostname>/time_status` 
 
 Examples:
 
 ```bash
 ros2 topic echo /ble/devices
 ros2 topic echo /ble/notifications
-ros2 topic echo /ble/peers/uav37/time_ns
+ros2 topic echo /ble/peers/uav37/time_status
 ```
 
 ## Wi-Fi over BLE
