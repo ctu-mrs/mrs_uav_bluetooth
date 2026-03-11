@@ -16,6 +16,7 @@ WIFI_PASSWORD_DESCRIPTOR_NAME = "mrs_uav_bluetooth/wifi/password/config"
 TIME_SERVICE_NAME = "mrs_uav_bluetooth/time"
 TIME_CHARACTERISTIC_NAME = "mrs_uav_bluetooth/time/ns"
 TIME_DESCRIPTOR_NAME = "mrs_uav_bluetooth/time/ns/value"
+TIME_WRITEBACK_DESCRIPTOR_NAME = "mrs_uav_bluetooth/time/ns/writeback"
 
 WIFI_SERVICE_UUID = named_service_uuid(WIFI_SERVICE_NAME)
 WIFI_CHARACTERISTIC_UUID = named_characteristic_uuid(WIFI_SSID_NAME)
@@ -24,6 +25,7 @@ WIFI_PASSWORD_DESCRIPTOR_UUID = named_descriptor_uuid(WIFI_PASSWORD_DESCRIPTOR_N
 TIME_SERVICE_UUID = named_service_uuid(TIME_SERVICE_NAME)
 TIME_CHARACTERISTIC_UUID = named_characteristic_uuid(TIME_CHARACTERISTIC_NAME)
 TIME_DESCRIPTOR_UUID = named_descriptor_uuid(TIME_DESCRIPTOR_NAME)
+TIME_WRITEBACK_DESCRIPTOR_UUID = named_descriptor_uuid(TIME_WRITEBACK_DESCRIPTOR_NAME)
 
 
 def topic_bridge_characteristic_uuid(bridge_name: str) -> str:
@@ -90,6 +92,7 @@ class WifiService(Service):
 class TimeService(Service):
     def __init__(self, bus, index):
         super().__init__(bus, index, TIME_SERVICE_UUID, primary=True)
+        self._last_writeback = b"\x00" * 8
         self._characteristic = NotifyingCharacteristic(
             bus,
             0,
@@ -99,19 +102,31 @@ class TimeService(Service):
             read_cb=self._read_time,
             initial_value=self._read_time(),
         )
-        self._descriptor = WritableDescriptor(
+        self._descriptor = ReadOnlyDescriptor(
             bus,
             0,
             TIME_DESCRIPTOR_UUID,
-            ["read"],
             self._characteristic,
             read_cb=self._read_time,
         )
+        self._writeback_descriptor = WritableDescriptor(
+            bus,
+            1,
+            TIME_WRITEBACK_DESCRIPTOR_UUID,
+            ["read", "write"],
+            self._characteristic,
+            read_cb=lambda: self._last_writeback,
+            write_cb=self._write_writeback,
+        )
         self._characteristic.add_descriptor(self._descriptor)
+        self._characteristic.add_descriptor(self._writeback_descriptor)
         self.add_characteristic(self._characteristic)
 
     def _read_time(self):
         return struct.pack("<Q", time.time_ns())
+
+    def _write_writeback(self, payload: bytes):
+        self._last_writeback = bytes(payload)
 
     def update(self):
         payload = self._read_time()
