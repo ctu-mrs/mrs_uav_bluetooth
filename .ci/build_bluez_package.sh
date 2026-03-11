@@ -18,13 +18,6 @@ ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
 BLUEZ_VERSION=5.86 ;
 ELL_VERSION=0.82 ;
 
-# arm64 hosts may require older core packages so ROS 2 and BlueZ build-deps stay solvable.
-# Allow overriding these from the environment when the distro mirror changes.
-ARM64_ENABLE_COMPAT_DOWNGRADE=${ARM64_ENABLE_COMPAT_DOWNGRADE:-1} ;
-ARM64_SYSTEMD_VERSION=${ARM64_SYSTEMD_VERSION:-255.4-1ubuntu8.8} ;
-ARM64_GPG_ERROR_VERSION=${ARM64_GPG_ERROR_VERSION:-1.47-3build2} ;
-ARM64_NGHTTP2_VERSION=${ARM64_NGHTTP2_VERSION:-1.59.0-1ubuntu0.1} ;
-
 # custom package name; it replaces distro BlueZ when explicitly installed,
 # but it is not the same package so normal system updates do not require it.
 PACKAGE_NAME="mrs-bluez" ; # better than bluez-mrs
@@ -43,35 +36,12 @@ PACKAGE_REPLACES="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-too
 ###  CONFIGURATION SECTION END  ###
 ###################################
 
-install_arm64_compat_packages() {
-    if [ "$ARCH" != "arm64" ] || [ "$ARM64_ENABLE_COMPAT_DOWNGRADE" != "1" ] ; then
-        return 0 ;
-    fi
-
-    echo "Installing arm64 compatibility package versions required by ROS 2 build environment..." ;
-
-    apt-get -y --allow-downgrades install \
-        "libsystemd0=$ARM64_SYSTEMD_VERSION" \
-        "systemd=$ARM64_SYSTEMD_VERSION" \
-        "systemd-sysv=$ARM64_SYSTEMD_VERSION" \
-        "libpam-systemd=$ARM64_SYSTEMD_VERSION" \
-        "libsystemd-shared=$ARM64_SYSTEMD_VERSION" \
-        "udev=$ARM64_SYSTEMD_VERSION" \
-        "libudev1=$ARM64_SYSTEMD_VERSION" \
-        "libgpg-error0=$ARM64_GPG_ERROR_VERSION" \
-        "libnghttp2-14=$ARM64_NGHTTP2_VERSION" \
-        libgpg-error-dev \
-        libnghttp2-dev \
-        libsystemd-dev ;
-}
-
 # clean before running the script
 rm -rf bluez* ell* ;
 
 # install pre-requisites (with sources)
 # sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ; # this enables deb-src for apt
 apt-get -y update ;
-install_arm64_compat_packages ;
 apt-get -y install git libasound2-dev ;
 # apt-get -y build-dep bluez ; # this installs packages obtained by: apt-cache showsrc bluez | grep ^Build-Depends
 apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, libebook1.2-dev (>= 3.12)" ;
