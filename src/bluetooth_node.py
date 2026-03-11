@@ -322,11 +322,11 @@ class BluetoothNode(Node):
                     )
                     last_rtt_s = bridge_state.last_rtt_s if bridge_state is not None else 0
                     lines.append(
-                        f"    connected peer: {mac}  {name}  RSSI={d.rssi}  fully_paired={d.paired and d.trusted and d.bonded} "
+                        f"    peer: {mac}  {name}  RSSI={d.rssi}  paired={d.paired and d.trusted and d.bonded} "
                         f"  inactive_s={inactivity:.1f}  rtt_s={last_rtt_s}"
                     )
             else:
-                lines.append("    connected peers: (none)")
+                lines.append("    peers: (none)")
             if other_connected:
                 lines.append("    other:")
                 for mac, d in sorted(other_connected.items()):
@@ -336,7 +336,7 @@ class BluetoothNode(Node):
                 lines.append("    other: (none)")
             if paired:
                 paired_strs = [f"{mac}({d.alias or d.name or '?'})" for mac, d in sorted(paired.items())]
-                lines.append(f"    paired:    {', '.join(paired_strs)}")
+                lines.append(f"  paired:    {', '.join(paired_strs)}")
 
         # Topic bridges
         if self._topic_exports:
@@ -360,7 +360,7 @@ class BluetoothNode(Node):
         per_peer = {}
         for mac, state in self._peer_time_bridges.items():
             per_peer.setdefault(mac, []).append(
-                f"{state.status_topic_name} @ {state.current_hz:.2f} Hz rtt_s={state.last_rtt_s:.6f}"
+                f"{state.status_topic_name} @ {state.current_hz:.2f} Hz"
             )
         for state in self._notification_bridges.values():
             per_peer.setdefault(state.mac, []).append(f"{state.resolved_topic_name} @ {state.current_hz:.2f} Hz")
