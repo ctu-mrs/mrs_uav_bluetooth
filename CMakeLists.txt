@@ -15,6 +15,7 @@ set(msg_files
   "msg/BleGattCharacteristic.msg"
   "msg/BleGattDescriptor.msg"
   "msg/BleNotification.msg"
+  "msg/BlePeerTimeStatus.msg"
 )
 
 set(srv_files
