@@ -60,4 +60,4 @@ class PeerTimeBridgeState:
     last_publish_monotonic: float = 0.0
     current_hz: float = 0.0
     last_time_value_ns: int = 0
-    last_writeback_latency_ns: int = 0
+    last_rtt_s: float = 0.0

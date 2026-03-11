@@ -320,10 +320,10 @@ class BluetoothNode(Node):
                         if bridge_state is not None
                         else -1.0
                     )
-                    latency_ns = bridge_state.last_writeback_latency_ns if bridge_state is not None else 0
+                    last_rtt_s = bridge_state.last_rtt_s if bridge_state is not None else 0
                     lines.append(
-                        f"    connected peer: {mac}  {name}  RSSI={d.rssi}  paired={d.paired} trusted={d.trusted} bonded={d.bonded}"
-                        f"  inactive_s={inactivity:.1f}  latency_ns={latency_ns}"
+                        f"    connected peer: {mac}  {name}  RSSI={d.rssi}  fully_paired={d.paired and d.trusted and d.bonded} "
+                        f"  inactive_s={inactivity:.1f}  rtt_s={last_rtt_s}"
                     )
             else:
                 lines.append("    connected peers: (none)")
@@ -360,7 +360,7 @@ class BluetoothNode(Node):
         per_peer = {}
         for mac, state in self._peer_time_bridges.items():
             per_peer.setdefault(mac, []).append(
-                f"{state.status_topic_name} @ {state.current_hz:.2f} Hz latency_ns={state.last_writeback_latency_ns}"
+                f"{state.status_topic_name} @ {state.current_hz:.2f} Hz rtt_s={state.last_rtt_s:.6f}"
             )
         for state in self._notification_bridges.values():
             per_peer.setdefault(state.mac, []).append(f"{state.resolved_topic_name} @ {state.current_hz:.2f} Hz")
@@ -957,8 +957,9 @@ class BluetoothNode(Node):
         message.header = self._header()
         message.mac = state.mac
         message.peer_name = state.peer_name
-        message.time_ns = max(0, int(state.last_time_value_ns))
-        message.writeback_latency_ns = max(0, int(state.last_writeback_latency_ns))
+        ns = max(0, int(state.last_time_value_ns))
+        message.peer_stamp = TimeMsg(sec=int(ns // 1_000_000_000), nanosec=int(ns % 1_000_000_000))
+        message.last_rtt_s = max(0.0, state.last_rtt_s)
         state.publisher.publish(message)
 
     def _handle_time_writeback(self, payload: bytes, options: dict, received_time_ns: int):
@@ -977,10 +978,10 @@ class BluetoothNode(Node):
         if echoed_time_ns <= 0:
             return
         state.last_activity_monotonic = time.monotonic()
-        state.last_writeback_latency_ns = max(0, int(received_time_ns - echoed_time_ns))
+        state.last_rtt_s = max(0.0, (received_time_ns - echoed_time_ns) / 1e9)
         self._log_verbose(
             f"Peer writeback received mac={mac} path={device_path} echoed_time_ns={echoed_time_ns} "
-            f"latency_ns={state.last_writeback_latency_ns}"
+            f"rtt_s={state.last_rtt_s}"
         )
         self._publish_peer_time_status(state)
 
