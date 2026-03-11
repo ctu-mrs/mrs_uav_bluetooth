@@ -20,10 +20,9 @@ class WritableDescriptor(Descriptor):
         return dbus_byte_array(self.value or b"")
 
     def WriteValue(self, value, options):
-        del options
         data = bytes(value)
         if self._write_cb is not None:
-            self._write_cb(data)
+            self._write_cb(data, options)
         self.set_value(data, emit=True)
 
 

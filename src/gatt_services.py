@@ -3,7 +3,7 @@
 import json
 import struct
 import time
-from typing import Callable, Sequence
+from typing import Callable, Optional, Sequence
 
 from .dbus_gatt import Service
 from .gatt_server import NotifyingCharacteristic, ReadOnlyDescriptor, WritableDescriptor
@@ -68,7 +68,7 @@ class WifiService(Service):
             ["read", "write"],
             self._characteristic,
             read_cb=lambda: wifi_name_cb().encode("utf-8"),
-            write_cb=lambda data: wifi_apply_cb(data.decode("utf-8").strip()),
+            write_cb=lambda data, options: wifi_apply_cb(data.decode("utf-8").strip()),
         )
         self._password_descriptor = WritableDescriptor(
             bus,
@@ -77,7 +77,7 @@ class WifiService(Service):
             ["read", "write"],
             self._characteristic,
             read_cb=lambda: wifi_password_read_cb().encode("utf-8"),
-            write_cb=lambda data: wifi_password_write_cb(data.decode("utf-8")),
+            write_cb=lambda data, options: wifi_password_write_cb(data.decode("utf-8")),
         )
         self._characteristic.add_descriptor(self._descriptor)
         self._characteristic.add_descriptor(self._password_descriptor)
@@ -90,9 +90,10 @@ class WifiService(Service):
 
 
 class TimeService(Service):
-    def __init__(self, bus, index):
+    def __init__(self, bus, index, *, writeback_cb: Optional[Callable[[bytes, dict, int], None]] = None):
         super().__init__(bus, index, TIME_SERVICE_UUID, primary=True)
         self._last_writeback = b"\x00" * 8
+        self._writeback_cb = writeback_cb
         self._characteristic = NotifyingCharacteristic(
             bus,
             0,
@@ -125,8 +126,10 @@ class TimeService(Service):
     def _read_time(self):
         return struct.pack("<Q", time.time_ns())
 
-    def _write_writeback(self, payload: bytes):
+    def _write_writeback(self, payload: bytes, options: dict):
         self._last_writeback = bytes(payload)
+        if self._writeback_cb is not None:
+            self._writeback_cb(self._last_writeback, options, time.time_ns())
 
     def update(self):
         payload = self._read_time()

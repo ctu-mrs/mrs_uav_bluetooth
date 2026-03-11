@@ -75,6 +75,7 @@ class BluetoothNode(Node):
         self._peer_security_attempts: Dict[str, float] = {}
         self._peer_inactive_since: Dict[str, float] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
+        self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
         self._scan_transport = self.get_parameter("scan_mode").get_parameter_value().string_value
         self._topic_exports: Dict[str, TopicExportBridgeState] = {}
         self._notification_bridges: Dict[str, TopicImportBridgeState] = {}
@@ -491,6 +492,7 @@ class BluetoothNode(Node):
                 wifi_apply_cb=self._set_wifi_name,
                 wifi_password_write_cb=self._set_wifi_password,
                 wifi_password_read_cb=lambda: "",
+                time_writeback_cb=self._handle_time_writeback,
             )
 
     def _start_scan(self, transport: str):
@@ -871,24 +873,34 @@ class BluetoothNode(Node):
         state.last_time_value_ns = time_value_ns
         state.last_publish_monotonic, state.current_hz = self._update_publish_rate(state.last_publish_monotonic)
 
-        message = BlePeerTimeStatus()
-        message.header = self._header()
-        message.mac = state.mac
-        message.peer_name = state.peer_name
-        message.time_ns = time_value_ns
-        message.writeback_latency_ns = max(0, int(state.last_writeback_latency_ns))
-        state.publisher.publish(message)
+        self._publish_peer_time_status(state)
 
         if state.writeback_descriptor_path:
             self._update_peer_writeback_latency(state, data)
 
     def _update_peer_writeback_latency(self, state: PeerTimeBridgeState, payload: bytes):
-        if not self._client.write_descriptor(state.writeback_descriptor_path, payload):
+        if not state.writeback_descriptor_path:
             return
-        state.last_writeback_latency_ns = max(0, time.time_ns() - state.last_time_value_ns)
+        if self._client.write_descriptor(state.writeback_descriptor_path, payload):
+            return
+        refreshed_path = self._client.find_descriptor(
+            state.mac,
+            TIME_WRITEBACK_DESCRIPTOR_UUID,
+            chrc_path=state.characteristic_path,
+        ) or ""
+        if not refreshed_path or refreshed_path == state.writeback_descriptor_path:
+            self.get_logger().warning(
+                f"Failed to write peer time writeback descriptor for {state.mac} at {state.writeback_descriptor_path}"
+            )
+            return
         self._log_verbose(
-            f"Peer writeback mac={state.mac} path={state.writeback_descriptor_path} latency_ns={state.last_writeback_latency_ns}"
+            f"Refreshing writeback descriptor path for {state.mac}: {state.writeback_descriptor_path} -> {refreshed_path}"
         )
+        state.writeback_descriptor_path = refreshed_path
+        if not self._client.write_descriptor(refreshed_path, payload):
+            self.get_logger().warning(
+                f"Failed to write refreshed peer time writeback descriptor for {state.mac} at {refreshed_path}"
+            )
 
     def _buffer_import_topic_bridge(self, mac: str, chrc_path: str, data: bytes):
         for state in self._notification_bridges.values():
@@ -904,6 +916,15 @@ class BluetoothNode(Node):
     def _on_client_gatt_event(self, event_type: str, info: dict):
         self._log_verbose(f"GATT event {event_type}: {info}")
         if event_type.endswith("failed"):
+            if event_type == "client_descriptor_write_failed":
+                desc_path = str(info.get("desc_path", ""))
+                if any(state.writeback_descriptor_path == desc_path for state in self._peer_time_bridges.values()):
+                    key = (event_type, desc_path)
+                    now = time.monotonic()
+                    last = self._last_gatt_warning_at.get(key, 0.0)
+                    if now - last < 30.0:
+                        return
+                    self._last_gatt_warning_at[key] = now
             self.get_logger().warning(f"BLE GATT event {event_type}: {info}")
 
     def _on_pairing_event(self, event_type, device_path, **kw):
@@ -916,6 +937,52 @@ class BluetoothNode(Node):
         if device.name:
             return device.name
         return ""
+
+    def _mac_from_device_path(self, device_path: str) -> str:
+        candidate = str(device_path or "").strip()
+        if not candidate:
+            return ""
+        match = re.search(r"/dev_((?:[0-9A-Fa-f]{2}_){5}[0-9A-Fa-f]{2})(?:/|$)", candidate)
+        if match:
+            return match.group(1).replace("_", ":").upper()
+        if self._client is None:
+            return ""
+        for mac, device in self._client.get_devices().items():
+            if device.path == candidate:
+                return mac
+        return ""
+
+    def _publish_peer_time_status(self, state: PeerTimeBridgeState):
+        message = BlePeerTimeStatus()
+        message.header = self._header()
+        message.mac = state.mac
+        message.peer_name = state.peer_name
+        message.time_ns = max(0, int(state.last_time_value_ns))
+        message.writeback_latency_ns = max(0, int(state.last_writeback_latency_ns))
+        state.publisher.publish(message)
+
+    def _handle_time_writeback(self, payload: bytes, options: dict, received_time_ns: int):
+        if len(payload) < 8:
+            return
+        device_path = str(options.get("device", ""))
+        mac = self._mac_from_device_path(device_path)
+        if not mac:
+            self._log_verbose(f"Time writeback from unknown device path={device_path} len={len(payload)}")
+            return
+        state = self._peer_time_bridges.get(mac)
+        if state is None:
+            self._log_verbose(f"Time writeback for unmanaged peer mac={mac} path={device_path}")
+            return
+        echoed_time_ns = struct.unpack("<Q", payload[:8])[0]
+        if echoed_time_ns <= 0:
+            return
+        state.last_activity_monotonic = time.monotonic()
+        state.last_writeback_latency_ns = max(0, int(received_time_ns - echoed_time_ns))
+        self._log_verbose(
+            f"Peer writeback received mac={mac} path={device_path} echoed_time_ns={echoed_time_ns} "
+            f"latency_ns={state.last_writeback_latency_ns}"
+        )
+        self._publish_peer_time_status(state)
 
     def _resolve_message_type(self, topic_name: str, explicit_message_type: str, prefer_publishers: bool) -> Tuple[str, type]:
         explicit = explicit_message_type.strip()
