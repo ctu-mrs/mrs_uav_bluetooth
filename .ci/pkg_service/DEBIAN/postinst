@@ -24,7 +24,11 @@ else
 fi
 
 if [ -z "$SERVICE_USER" ] || ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  echo "$0: failed to determine the installing user" >&2
+  SERVICE_USER="mrs"
+fi
+
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "$0: failed to determine the installing user and fallback user '$SERVICE_USER' does not exist" >&2
   exit 1
 fi
 
@@ -54,6 +58,7 @@ WorkingDirectory=$SERVICE_HOME
 Environment=HOME=$SERVICE_HOME
 Environment=USER=$SERVICE_USER
 Environment=LOGNAME=$SERVICE_USER
+Environment=SERVICE_USER=$SERVICE_USER
 Environment=ROS_HOME=$SERVICE_HOME/.ros
 Environment=ROS_LOG_DIR=$SERVICE_HOME/.ros/log
 ExecStart=/etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
