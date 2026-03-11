@@ -1,10 +1,16 @@
 #!/bin/bash
 #remove pre-existing version of the systemctl service
-systemctl stop mrs-uav-bluetooth
-systemctl disable mrs-uav-bluetooth
-rm /etc/systemd/system/mrs-uav-bluetooth.service
+if systemctl is-active --quiet mrs-uav-bluetooth 2>/dev/null; then
+  systemctl stop mrs-uav-bluetooth
+fi
+if systemctl is-enabled --quiet mrs-uav-bluetooth 2>/dev/null; then
+  systemctl disable mrs-uav-bluetooth
+fi
+if [ -f /etc/systemd/system/mrs-uav-bluetooth.service ]; then
+  rm /etc/systemd/system/mrs-uav-bluetooth.service
+fi
 systemctl daemon-reload
-systemctl reset-failed
+systemctl reset-failed 2>/dev/null || true
 
 #setup new systemctl service
 chmod +x /etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
@@ -17,7 +23,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Restart=always
-ExecStart=ros2 launch mrs_uav_bluetooth bluetooth_node.launch.py
+ExecStart=/etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
 [Install]
 WantedBy=multi-user.target" >> /etc/systemd/system/mrs-uav-bluetooth.service
 systemctl daemon-reload

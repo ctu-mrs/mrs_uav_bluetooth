@@ -1,6 +1,12 @@
 #!/bin/bash
-systemctl stop mrs-uav-bluetooth
-systemctl disable mrs-uav-bluetooth
-rm /etc/systemd/system/mrs-uav-bluetooth.service
+if systemctl is-active --quiet mrs-uav-bluetooth 2>/dev/null; then
+  systemctl stop mrs-uav-bluetooth
+fi
+if systemctl is-enabled --quiet mrs-uav-bluetooth 2>/dev/null; then
+  systemctl disable mrs-uav-bluetooth
+fi
+if [ -f /etc/systemd/system/mrs-uav-bluetooth.service ]; then
+  rm /etc/systemd/system/mrs-uav-bluetooth.service
+fi
 systemctl daemon-reload
-systemctl reset-failed
+systemctl reset-failed 2>/dev/null || true
