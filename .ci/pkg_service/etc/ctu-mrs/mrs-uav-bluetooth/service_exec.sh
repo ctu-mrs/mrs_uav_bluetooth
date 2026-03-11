@@ -1,10 +1,14 @@
 #!/bin/bash
 set -e
 
-export HOME=${HOME:-/root}
-export USER=${USER:-root}
-export LOGNAME=${LOGNAME:-root}
-export ROS_LOG_DIR=${ROS_LOG_DIR:-/var/log/mrs-uav-bluetooth}
+export USER=${USER:-$(id -un)}
+if [ -z "${HOME:-}" ]; then
+	HOME=$(getent passwd "$USER" | cut -d: -f6)
+fi
+export HOME=${HOME:-/tmp}
+export LOGNAME=${LOGNAME:-$USER}
+export ROS_HOME=${ROS_HOME:-$HOME/.ros}
+export ROS_LOG_DIR=${ROS_LOG_DIR:-$ROS_HOME/log}
 
 mkdir -p "$ROS_LOG_DIR"
 
