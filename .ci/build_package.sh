@@ -17,7 +17,13 @@ sudo ./.ci/build_bluez_package.sh
 
 echo "$0: building the package mrs-uav-bluetooth-service"
 
-dpkg-deb --build --root-owner-group .ci/pkg_service .
+ARCH=$(dpkg-architecture -qDEB_HOST_ARCH)
+
+if [ "$ARCH" = "amd64" ]; then
+  dpkg-deb --build --root-owner-group .ci/pkg_service .
+else
+  echo "$0: skipping mrs-uav-bluetooth-service build on architecture $ARCH"
+fi
 
 
 mv ./*.deb "$ARTIFACTS_FOLDER"
