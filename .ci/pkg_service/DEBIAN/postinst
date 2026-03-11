@@ -1,0 +1,25 @@
+#!/bin/bash
+#remove pre-existing version of the systemctl service
+systemctl stop mrs-uav-bluetooth
+systemctl disable mrs-uav-bluetooth
+rm /etc/systemd/system/mrs-uav-bluetooth.service
+systemctl daemon-reload
+systemctl reset-failed
+
+#setup new systemctl service
+chmod +x /etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
+touch /etc/systemd/system/mrs-uav-bluetooth.service
+> /etc/systemd/system/mrs-uav-bluetooth.service
+echo "[Unit]
+Description=ROS 2 MRS UAV Bluetooth node service
+After=network.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+Restart=always
+ExecStart=ros2 launch mrs_uav_bluetooth bluetooth_node.launch.py
+[Install]
+WantedBy=multi-user.target" >> /etc/systemd/system/mrs-uav-bluetooth.service
+systemctl daemon-reload
+systemctl enable mrs-uav-bluetooth
+systemctl start mrs-uav-bluetooth
