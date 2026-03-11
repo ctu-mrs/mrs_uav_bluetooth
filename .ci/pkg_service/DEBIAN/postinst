@@ -23,6 +23,10 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Restart=always
+Environment=HOME=/root
+Environment=USER=root
+Environment=LOGNAME=root
+Environment=ROS_LOG_DIR=/var/log/mrs-uav-bluetooth
 ExecStart=/etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
 [Install]
 WantedBy=multi-user.target" >> /etc/systemd/system/mrs-uav-bluetooth.service
