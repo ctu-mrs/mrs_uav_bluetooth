@@ -19,7 +19,7 @@ from builtin_interfaces.msg import Time as TimeMsg
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rosidl_runtime_py.utilities import get_message
-from std_msgs.msg import Header, String
+from std_msgs.msg import Empty, Header, String
 from std_srvs.srv import Trigger
 
 from mrs_uav_bluetooth.msg import (
@@ -92,7 +92,6 @@ class SharedTopicConfig:
 
 
 class BluetoothNode(Node):
-    _MIN_OVERLAY_HOLD_SECONDS = 15.0
 
     _CONFIG_PARAM_NAMES = [
         "advertise_mode",
@@ -120,6 +119,9 @@ class BluetoothNode(Node):
         "log_topic_enable",
         "expire_connections_with_overlay",
         "verbose_log_file",
+        "min_overlay_hold_seconds",
+        "overlay_keepalive_timeout",
+        "overlay_keepalive_topic_suffix",
     ]
 
     def __init__(self):
@@ -133,6 +135,7 @@ class BluetoothNode(Node):
         self._peer_inactive_since: Dict[str, float] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
+        self._last_dbus_warning_at: Dict[str, float] = {}
         self._scan_transport = self.get_parameter("scan_mode").get_parameter_value().string_value
         self._topic_exports: Dict[str, TopicExportBridgeState] = {}
         self._notification_bridges: Dict[str, TopicImportBridgeState] = {}
@@ -140,7 +143,10 @@ class BluetoothNode(Node):
         self._shared_topic_configs: Dict[str, SharedTopicConfig] = {}
         self._active_overlay_path = ""
         self._active_overlay_deadline = 0.0
+        self._active_overlay_hold_seconds = 0.0
         self._overlay_connected_baseline: Set[str] = set()
+        self._overlay_keepalive_last_seen = 0.0
+        self._overlay_keepalive_sub = None
         self._default_config_path = self._resolve_default_config_path()
         self._active_config_source = self._default_config_path
         self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
@@ -234,6 +240,9 @@ class BluetoothNode(Node):
         self.declare_parameter("log_topic_enable", False)
         self.declare_parameter("expire_connections_with_overlay", True)
         self.declare_parameter("verbose_log_file", "")
+        self.declare_parameter("min_overlay_hold_seconds", 15.0)
+        self.declare_parameter("overlay_keepalive_timeout", 4.0)
+        self.declare_parameter("overlay_keepalive_topic_suffix", "overlay_keepalive")
 
     def _resolve_default_config_path(self) -> str:
         configured = str(self.get_parameter("default_config_path").value or "").strip()
@@ -597,6 +606,10 @@ class BluetoothNode(Node):
         return lines
 
     def _setup_ros_interfaces(self):
+        keepalive_suffix = str(self.get_parameter("overlay_keepalive_topic_suffix").value or "overlay_keepalive").strip().strip("/")
+        if keepalive_suffix:
+            keepalive_topic = self._node_topic(keepalive_suffix)
+            self._overlay_keepalive_sub = self.create_subscription(Empty, keepalive_topic, self._on_overlay_keepalive, 10)
         self.create_service(ListDevices, "ble/list_devices", self._handle_list_devices)
         self.create_service(GetDevice, "ble/get_device", self._handle_get_device)
         self.create_service(ConnectDevice, "ble/connect_device", self._handle_connect_device)
@@ -751,29 +764,41 @@ class BluetoothNode(Node):
         if self._time_service is not None:
             self._time_service.update()
 
+    def _dbus_warning(self, key: str, message: str, interval_s: float = 5.0):
+        now = time.monotonic()
+        last = self._last_dbus_warning_at.get(key, 0.0)
+        if now - last < interval_s:
+            return
+        self._last_dbus_warning_at[key] = now
+        self.get_logger().warning(message)
+        self._log_verbose(message)
+
     def _publish_scan_results(self):
         if self._client is None:
             return
-        snapshot = self._client.get_devices(refresh=True)
-        self._sync_auto_import_bridges(snapshot)
-        self._reconcile_import_bridges(snapshot)
-        msg = BleDeviceArray()
-        msg.header = self._header(frame_id=self._local_frame_id())
-        msg.devices = [self._device_to_msg(device) for device in snapshot.values()]
-        self.devices_pub.publish(msg)
-        self._refresh_notification_mapping(snapshot)
-        self._cleanup_peer_time_bridges(snapshot)
-        if snapshot:
-            lines = [f"Scan results: {len(snapshot)} device(s)"]
-            for mac, dev in sorted(snapshot.items()):
-                lines.append(
-                    f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
-                    f"  rssi={dev.rssi}  connected={dev.connected}"
-                    f"  paired={dev.paired}  trusted={dev.trusted}"
-                )
-            self._log_verbose("\n".join(lines))
-        else:
-            self._log_verbose("Scan results: no devices found")
+        try:
+            snapshot = self._client.get_devices(refresh=True)
+            self._sync_auto_import_bridges(snapshot)
+            self._reconcile_import_bridges(snapshot)
+            msg = BleDeviceArray()
+            msg.header = self._header(frame_id=self._local_frame_id())
+            msg.devices = [self._device_to_msg(device) for device in snapshot.values()]
+            self.devices_pub.publish(msg)
+            self._refresh_notification_mapping(snapshot)
+            self._cleanup_peer_time_bridges(snapshot)
+            if snapshot:
+                lines = [f"Scan results: {len(snapshot)} device(s)"]
+                for mac, dev in sorted(snapshot.items()):
+                    lines.append(
+                        f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
+                        f"  rssi={dev.rssi}  connected={dev.connected}"
+                        f"  paired={dev.paired}  trusted={dev.trusted}"
+                    )
+                self._log_verbose("\n".join(lines))
+            else:
+                self._log_verbose("Scan results: no devices found")
+        except dbus.exceptions.DBusException as exc:
+            self._dbus_warning("scan_results", f"Skipping BLE scan publish tick due to DBus error: {exc}")
 
     def _sync_auto_import_bridges(self, snapshot: Dict[str, DeviceInfo]):
         desired_keys = set()
@@ -873,7 +898,12 @@ class BluetoothNode(Node):
     def _refresh_notification_mapping(self, snapshot: Dict[str, DeviceInfo]):
         path_to_mac = {}
         for mac in snapshot:
-            for characteristic in self._client.list_characteristics(mac):
+            try:
+                characteristics = self._client.list_characteristics(mac)
+            except dbus.exceptions.DBusException as exc:
+                self._dbus_warning("refresh_notification_mapping", f"Failed to refresh notification mapping for {mac}: {exc}")
+                continue
+            for characteristic in characteristics:
                 path_to_mac[characteristic["path"]] = mac
         self._notification_path_to_mac = path_to_mac
 
@@ -957,61 +987,64 @@ class BluetoothNode(Node):
     def _auto_connect_devices(self):
         if self._client is None or not bool(self.get_parameter("auto_connect_enable").value):
             return
-        now = time.monotonic()
-        retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
-        whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
-        whitelist_enabled = bool(whitelist_names or whitelist_macs)
-        pattern = str(self.get_parameter("auto_connect_pattern").value)
-        snapshot = self._client.get_devices(refresh=True)
-        self._auto_connect_attempts = {mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot}
-        self._peer_security_attempts = {mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot}
-        self._peer_inactive_since = {mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot}
-        lines = [
-            f"Auto-connect tick: {len(snapshot)} device(s), "
-            f"whitelist={sorted(whitelist_names) or '(none)'}, pattern={pattern}, "
-            f"enable={bool(self.get_parameter('auto_connect_enable').value)}"
-        ]
-        for mac, dev in sorted(snapshot.items()):
-            lines.append(
-                f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
-                f"  connected={dev.connected}  candidate={self._is_uav_peer_candidate(dev, pattern)}"
-            )
-        self._log_verbose("\n".join(lines))
-        for mac, device in snapshot.items():
-            peer_candidate = self._is_uav_peer_candidate(device, pattern)
-            explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
-            should_connect = explicit_target or (peer_candidate and not whitelist_enabled)
-            device_label = f"{mac} ({device.alias or device.name or '?'})"
-            if whitelist_enabled and peer_candidate and not explicit_target:
-                self._log_verbose(f"Dropping non-whitelisted peer: {device_label}")
-                self._drop_non_whitelisted_peer(mac, device)
-                continue
-            if device.connected:
-                self._auto_connect_attempts.pop(mac, None)
-                if should_connect:
-                    self._maintain_peer_connection(mac, device, retry_period, explicit_target=explicit_target)
-                continue
-            if not should_connect:
-                continue
-            last_attempt = self._auto_connect_attempts.get(mac, 0.0)
-            if now - last_attempt < retry_period:
-                continue
-            self._auto_connect_attempts[mac] = now
-            self._log_verbose(f"Auto-connect attempt: {device_label}")
-            if not self._client.connect(mac, timeout=10.0):
-                self.get_logger().warning(f"Auto-connect failed: {device_label}")
-                self._log_verbose(f"Auto-connect failed: {device_label}")
-                continue
-            self._client.wait_services_resolved(mac, timeout=10.0)
-            current = self._client.get_device(mac, refresh=True) or device
-            if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
-                self.get_logger().info(f"Disconnecting {mac}: UAV peer candidate without BLE time characteristic")
-                self._log_verbose(f"Disconnecting {device_label}: no time characteristic found")
-                self._client.disconnect(mac, timeout=5.0)
-            else:
-                self._auto_connect_attempts.pop(mac, None)
-                self.get_logger().info(f"Auto-connected BLE device {mac}")
-                self._log_verbose(f"Auto-connected: {device_label}")
+        try:
+            now = time.monotonic()
+            retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
+            whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
+            whitelist_enabled = bool(whitelist_names or whitelist_macs)
+            pattern = str(self.get_parameter("auto_connect_pattern").value)
+            snapshot = self._client.get_devices(refresh=True)
+            self._auto_connect_attempts = {mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot}
+            self._peer_security_attempts = {mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot}
+            self._peer_inactive_since = {mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot}
+            lines = [
+                f"Auto-connect tick: {len(snapshot)} device(s), "
+                f"whitelist={sorted(whitelist_names) or '(none)'}, pattern={pattern}, "
+                f"enable={bool(self.get_parameter('auto_connect_enable').value)}"
+            ]
+            for mac, dev in sorted(snapshot.items()):
+                lines.append(
+                    f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
+                    f"  connected={dev.connected}  candidate={self._is_uav_peer_candidate(dev, pattern)}"
+                )
+            self._log_verbose("\n".join(lines))
+            for mac, device in snapshot.items():
+                peer_candidate = self._is_uav_peer_candidate(device, pattern)
+                explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
+                should_connect = explicit_target or (peer_candidate and not whitelist_enabled)
+                device_label = f"{mac} ({device.alias or device.name or '?'})"
+                if whitelist_enabled and peer_candidate and not explicit_target:
+                    self._log_verbose(f"Dropping non-whitelisted peer: {device_label}")
+                    self._drop_non_whitelisted_peer(mac, device)
+                    continue
+                if device.connected:
+                    self._auto_connect_attempts.pop(mac, None)
+                    if should_connect:
+                        self._maintain_peer_connection(mac, device, retry_period, explicit_target=explicit_target)
+                    continue
+                if not should_connect:
+                    continue
+                last_attempt = self._auto_connect_attempts.get(mac, 0.0)
+                if now - last_attempt < retry_period:
+                    continue
+                self._auto_connect_attempts[mac] = now
+                self._log_verbose(f"Auto-connect attempt: {device_label}")
+                if not self._client.connect(mac, timeout=10.0):
+                    self.get_logger().warning(f"Auto-connect failed: {device_label}")
+                    self._log_verbose(f"Auto-connect failed: {device_label}")
+                    continue
+                self._client.wait_services_resolved(mac, timeout=10.0)
+                current = self._client.get_device(mac, refresh=True) or device
+                if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
+                    self.get_logger().info(f"Disconnecting {mac}: UAV peer candidate without BLE time characteristic")
+                    self._log_verbose(f"Disconnecting {device_label}: no time characteristic found")
+                    self._client.disconnect(mac, timeout=5.0)
+                else:
+                    self._auto_connect_attempts.pop(mac, None)
+                    self.get_logger().info(f"Auto-connected BLE device {mac}")
+                    self._log_verbose(f"Auto-connected: {device_label}")
+        except dbus.exceptions.DBusException as exc:
+            self._dbus_warning("auto_connect", f"Skipping auto-connect tick due to DBus error: {exc}")
 
     def _drop_non_whitelisted_peer(self, mac: str, device: DeviceInfo):
         if device.connected:
@@ -1177,7 +1210,10 @@ class BluetoothNode(Node):
             return
         if any(state.characteristic_path == path for state in self._peer_time_bridges.values()):
             return
-        self._client.stop_notify(path)
+        try:
+            self._client.stop_notify(path)
+        except dbus.exceptions.DBusException as exc:
+            self._dbus_warning("stop_notify_if_unused", f"Ignoring StopNotify failure for {path}: {exc}")
 
     def _header(self, frame_id: Optional[str] = None) -> Header:
         header = Header()
@@ -1879,7 +1915,11 @@ class BluetoothNode(Node):
     def _get_connected_peer_macs(self) -> Set[str]:
         if self._client is None:
             return set()
-        return {mac for mac, device in self._client.get_devices(refresh=True).items() if device.connected}
+        try:
+            return {mac for mac, device in self._client.get_devices(refresh=True).items() if device.connected}
+        except dbus.exceptions.DBusException as exc:
+            self._dbus_warning("get_connected_peer_macs", f"Unable to list connected peers due to DBus error: {exc}")
+            return set()
 
     def _capture_overlay_connection_baseline(self):
         if self._overlay_connected_baseline:
@@ -1954,9 +1994,14 @@ class BluetoothNode(Node):
         return response
 
     def _effective_overlay_hold_seconds(self, requested_hold_seconds: float) -> float:
-        requested = max(0.5, float(requested_hold_seconds or 3.0))
-        # Keep overlays alive across caller scheduling jitter to avoid rapid config flips.
-        return max(requested, self._MIN_OVERLAY_HOLD_SECONDS)
+        min_hold = max(0.0, float(self.get_parameter("min_overlay_hold_seconds").value or 0.0))
+        requested = max(0.0, float(requested_hold_seconds or 0.0))
+        return max(requested, min_hold)
+
+    def _on_overlay_keepalive(self, _msg: Empty):
+        if not self._active_overlay_path:
+            return
+        self._overlay_keepalive_last_seen = time.monotonic()
 
     def _handle_set_active_config(self, request, response):
         path = str(request.config_path or "").strip()
@@ -1968,6 +2013,8 @@ class BluetoothNode(Node):
                     self._expire_overlay_connections("explicit revert")
                     self._active_overlay_path = ""
                     self._active_overlay_deadline = 0.0
+                    self._active_overlay_hold_seconds = 0.0
+                    self._overlay_keepalive_last_seen = 0.0
                     self._reload_active_config()
                 response.success = True
                 response.message = "Reverted to default config"
@@ -1982,16 +2029,19 @@ class BluetoothNode(Node):
                 )
             new_deadline = time.monotonic() + hold_seconds
             if path == self._active_overlay_path:
-                # Only extend the lease deadline — do not reload the full config
-                self._active_overlay_deadline = new_deadline
+                # Keep one-shot config activation semantics: no config reapply on keepalive refresh requests.
+                self._active_overlay_deadline = max(self._active_overlay_deadline, new_deadline)
+                self._active_overlay_hold_seconds = hold_seconds
                 response.success = True
-                response.message = f"Lease extended for overlay config {path}"
+                response.message = f"Overlay config already active: {path}"
                 response.active_config_path = self._active_config_source
                 response.overlay_active = True
                 return response
             self._capture_overlay_connection_baseline()
             self._active_overlay_path = path
             self._active_overlay_deadline = new_deadline
+            self._active_overlay_hold_seconds = hold_seconds
+            self._overlay_keepalive_last_seen = time.monotonic()
             self._reload_active_config()
             response.success = True
             response.message = f"Activated overlay config {path}"
@@ -2008,12 +2058,21 @@ class BluetoothNode(Node):
     def _check_overlay_config_lease(self):
         if not self._active_overlay_path:
             return
+        now = time.monotonic()
+        keepalive_timeout = max(0.0, float(self.get_parameter("overlay_keepalive_timeout").value or 0.0))
+        if keepalive_timeout > 0.0 and self._overlay_keepalive_last_seen > 0.0:
+            if now - self._overlay_keepalive_last_seen <= keepalive_timeout:
+                refreshed_deadline = self._overlay_keepalive_last_seen + max(0.0, self._active_overlay_hold_seconds)
+                if refreshed_deadline > self._active_overlay_deadline:
+                    self._active_overlay_deadline = refreshed_deadline
         if time.monotonic() <= self._active_overlay_deadline:
             return
         expired_path = self._active_overlay_path
         self._expire_overlay_connections("lease timeout")
         self._active_overlay_path = ""
         self._active_overlay_deadline = 0.0
+        self._active_overlay_hold_seconds = 0.0
+        self._overlay_keepalive_last_seen = 0.0
         self._reload_active_config()
         self.get_logger().info(f"Overlay config lease expired, reverted to default after {expired_path}")
 
@@ -2043,9 +2102,17 @@ class BluetoothNode(Node):
                     self._client.stop_notify(path)
                 except Exception:
                     pass
-            if self._client.scanning:
-                self._client.stop_scan()
-            for device in self._client.get_devices(refresh=True).values():
+            try:
+                if self._client.scanning:
+                    self._client.stop_scan()
+            except Exception:
+                pass
+            try:
+                devices = self._client.get_devices(refresh=True).values()
+            except dbus.exceptions.DBusException as exc:
+                self._dbus_warning("shutdown_get_devices", f"Skipping peer disconnects during shutdown due to DBus error: {exc}")
+                devices = []
+            for device in devices:
                 if not device.connected:
                     continue
                 try:
