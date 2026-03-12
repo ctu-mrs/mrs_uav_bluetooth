@@ -728,6 +728,17 @@ class BluetoothNode(Node):
         self.devices_pub.publish(msg)
         self._refresh_notification_mapping(snapshot)
         self._cleanup_peer_time_bridges(snapshot)
+        if snapshot:
+            lines = [f"Scan results: {len(snapshot)} device(s)"]
+            for mac, dev in sorted(snapshot.items()):
+                lines.append(
+                    f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
+                    f"  rssi={dev.rssi}  connected={dev.connected}"
+                    f"  paired={dev.paired}  trusted={dev.trusted}"
+                )
+            self._log_verbose("\n".join(lines))
+        else:
+            self._log_verbose("Scan results: no devices found")
 
     def _sync_auto_import_bridges(self, snapshot: Dict[str, DeviceInfo]):
         desired_keys = set()
@@ -900,9 +911,17 @@ class BluetoothNode(Node):
         self._auto_connect_attempts = {mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot}
         self._peer_security_attempts = {mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot}
         self._peer_inactive_since = {mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot}
-        self._log_verbose(
-            f"Auto-connect tick: {len(snapshot)} devices, whitelist={whitelist_names or '(none)'}, pattern={pattern}"
-        )
+        lines = [
+            f"Auto-connect tick: {len(snapshot)} device(s), "
+            f"whitelist={sorted(whitelist_names) or '(none)'}, pattern={pattern}, "
+            f"enable={bool(self.get_parameter('auto_connect_enable').value)}"
+        ]
+        for mac, dev in sorted(snapshot.items()):
+            lines.append(
+                f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
+                f"  connected={dev.connected}  candidate={self._is_uav_peer_candidate(dev, pattern)}"
+            )
+        self._log_verbose("\n".join(lines))
         for mac, device in snapshot.items():
             peer_candidate = self._is_uav_peer_candidate(device, pattern)
             explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
@@ -925,12 +944,14 @@ class BluetoothNode(Node):
             self._auto_connect_attempts[mac] = now
             self._log_verbose(f"Auto-connect attempt: {device_label}")
             if not self._client.connect(mac, timeout=10.0):
+                self.get_logger().warning(f"Auto-connect failed: {device_label}")
                 self._log_verbose(f"Auto-connect failed: {device_label}")
                 continue
             self._client.wait_services_resolved(mac, timeout=10.0)
             current = self._client.get_device(mac, refresh=True) or device
             if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
                 self.get_logger().info(f"Disconnecting {mac}: UAV peer candidate without BLE time characteristic")
+                self._log_verbose(f"Disconnecting {device_label}: no time characteristic found")
                 self._client.disconnect(mac, timeout=5.0)
             else:
                 self._auto_connect_attempts.pop(mac, None)
@@ -962,8 +983,10 @@ class BluetoothNode(Node):
 
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> bool:
         path = self._client.find_characteristic(mac, TIME_CHARACTERISTIC_UUID)
+        device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
         if not path:
             self._peer_inactive_since.setdefault(mac, time.monotonic())
+            self._log_verbose(f"Peer {device_label}: time characteristic {TIME_CHARACTERISTIC_UUID} not found")
             return False
         writeback_descriptor_path = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=path) or ""
         peer_name = self._hostname_from_device(device) or mac.lower().replace(":", "_")
@@ -989,8 +1012,15 @@ class BluetoothNode(Node):
             self._stop_notify_if_unused(old_path)
         publisher = self.create_publisher(BlePeerTimeStatus, status_topic_name, 10)
         if not self._client.start_notify(path):
+            self.get_logger().warning(f"Failed to start time notify for peer {device_label}")
+            self._log_verbose(f"Failed to start_notify on time characteristic {path} for {device_label}")
             self.destroy_publisher(publisher)
             return False
+        self.get_logger().info(f"Established time bridge with peer {device_label} -> {status_topic_name}")
+        self._log_verbose(
+            f"Time bridge: {device_label} chrc={path} writeback={writeback_descriptor_path or 'none'}"
+            f" topic={status_topic_name}"
+        )
         self._peer_time_bridges[mac] = PeerTimeBridgeState(
             mac=mac,
             peer_name=peer_name,
@@ -1023,17 +1053,25 @@ class BluetoothNode(Node):
         if now - last_attempt < retry_period:
             return
         self._peer_security_attempts[mac] = now
+        device_label = f"{mac} ({self._hostname_from_device(current) or '?'})"
+        self._log_verbose(
+            f"Security state for {device_label}: paired={current.paired} trusted={current.trusted} bonded={current.bonded}"
+        )
         if not current.paired or not current.bonded:
             if self._client.pair(mac, timeout=30.0):
                 self.get_logger().info(f"Paired BLE peer {mac}")
+                self._log_verbose(f"Paired: {device_label}")
             else:
                 self.get_logger().warning(f"Failed to pair BLE peer {mac}")
+                self._log_verbose(f"Pairing failed: {device_label}")
             current = self._client.get_device(mac, refresh=True) or current
         if current.paired and not current.trusted:
             if self._client.trust(mac):
                 self.get_logger().info(f"Trusted BLE peer {mac}")
+                self._log_verbose(f"Trusted: {device_label}")
             else:
                 self.get_logger().warning(f"Failed to trust BLE peer {mac}")
+                self._log_verbose(f"Trust failed: {device_label}")
             current = self._client.get_device(mac, refresh=True) or current
         if current.paired and current.trusted and current.bonded:
             self._peer_security_attempts.pop(mac, None)
@@ -1785,9 +1823,10 @@ class BluetoothNode(Node):
         hold_seconds = max(0.5, float(request.hold_seconds or 3.0))
         try:
             if not path:
-                self._active_overlay_path = ""
-                self._active_overlay_deadline = 0.0
-                self._reload_active_config()
+                if self._active_overlay_path:
+                    self._active_overlay_path = ""
+                    self._active_overlay_deadline = 0.0
+                    self._reload_active_config()
                 response.success = True
                 response.message = "Reverted to default config"
                 response.active_config_path = self._active_config_source
@@ -1795,8 +1834,17 @@ class BluetoothNode(Node):
                 return response
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
+            new_deadline = time.monotonic() + hold_seconds
+            if path == self._active_overlay_path:
+                # Only extend the lease deadline — do not reload the full config
+                self._active_overlay_deadline = new_deadline
+                response.success = True
+                response.message = f"Lease extended for overlay config {path}"
+                response.active_config_path = self._active_config_source
+                response.overlay_active = True
+                return response
             self._active_overlay_path = path
-            self._active_overlay_deadline = time.monotonic() + hold_seconds
+            self._active_overlay_deadline = new_deadline
             self._reload_active_config()
             response.success = True
             response.message = f"Activated overlay config {path}"
