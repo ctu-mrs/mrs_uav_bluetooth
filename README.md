@@ -66,6 +66,8 @@ Typical experiment workflow is putting the following line into the tmux script (
 ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
 ```
 
+The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing of a topic with `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members.
+
 While `user_node` is running, it keeps renewing the overlay lease and prints either the bluetooth status stream (default) or log stream from `/{hostname}/ble/status` or `/{hostname}/ble/log`.
 
 Core published topics:
@@ -76,6 +78,7 @@ Core published topics:
 | `/{hostname}/ble/notifications` | `mrs_uav_bluetooth/msg/BleNotification` | Raw notifications received from peer GATT characteristics. |
 | `/{hostname}/ble/status` | `std_msgs/msg/String` | Human-readable periodic status report. |
 | `/{hostname}/ble/log` | `std_msgs/msg/String` | Optional verbose log stream when `log_topic_enable` is enabled. |
+| `/{hostname}/ble/overlay_keepalive` | `std_msgs/msg/Empty` | Keep-alive heartbeat for the user node configuration overlay. |
 | `/{hostname}/ble/peers/<peer>/time_status` | `mrs_uav_bluetooth/msg/BlePeerTimeStatus` | Per-peer time sharing status including the latest peer timestamp and RTT estimate. |
 | Derived imported topics | configured ROS message type | Auto-created publishers for bridges declared in `shared_topics`. |
 
@@ -108,8 +111,6 @@ Topic sharing is configured declaratively in `shared_topics`. Each bridge packs 
 - `transport_endpoint: descriptor` uses a descriptor as the data endpoint when that layout is more convenient.
 
 By default, imported topics are published under the peer namespace rooted at `/{hostname}/ble/peers/<peer>/...`. The rest of the topic name remains the same as on the origin device unless `import_topic_suffix` overrides it.
-
-The file `config/example_sharing_odometry.yaml` shows a complete bidirectional bridge for `nav_msgs/msg/Odometry`, including a fixed packet layout with timestamp, position, orientation, and twist members.
 
 Useful service calls while testing topic bridges:
 

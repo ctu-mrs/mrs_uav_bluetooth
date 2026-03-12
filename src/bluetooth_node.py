@@ -19,7 +19,7 @@ from builtin_interfaces.msg import Time as TimeMsg
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rosidl_runtime_py.utilities import get_message
-from std_msgs.msg import Empty, Header, String
+from std_msgs.msg import Header, String
 from std_srvs.srv import Trigger
 
 from mrs_uav_bluetooth.msg import (
@@ -119,8 +119,6 @@ class BluetoothNode(Node):
         "log_topic_enable",
         "expire_connections_with_overlay",
         "verbose_log_file",
-        "min_overlay_hold_seconds",
-        "overlay_keepalive_timeout",
         "overlay_keepalive_topic_suffix",
     ]
 
@@ -142,11 +140,8 @@ class BluetoothNode(Node):
         self._peer_time_bridges: Dict[str, PeerTimeBridgeState] = {}
         self._shared_topic_configs: Dict[str, SharedTopicConfig] = {}
         self._active_overlay_path = ""
-        self._active_overlay_deadline = 0.0
-        self._active_overlay_hold_seconds = 0.0
         self._overlay_connected_baseline: Set[str] = set()
-        self._overlay_keepalive_last_seen = 0.0
-        self._overlay_keepalive_sub = None
+        self._overlay_keepalive_topic = ""
         self._default_config_path = self._resolve_default_config_path()
         self._active_config_source = self._default_config_path
         self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
@@ -163,7 +158,6 @@ class BluetoothNode(Node):
         self._wifi_service_timer = None
         self._auto_connect_timer = None
         self._status_timer = None
-        self._config_lease_timer = None
 
         self._apply_config_document(self._load_effective_config(), source_path=self._default_config_path, initial=True)
         self._ensure_core_publishers()
@@ -240,8 +234,6 @@ class BluetoothNode(Node):
         self.declare_parameter("log_topic_enable", False)
         self.declare_parameter("expire_connections_with_overlay", True)
         self.declare_parameter("verbose_log_file", "")
-        self.declare_parameter("min_overlay_hold_seconds", 15.0)
-        self.declare_parameter("overlay_keepalive_timeout", 4.0)
         self.declare_parameter("overlay_keepalive_topic_suffix", "overlay_keepalive")
 
     def _resolve_default_config_path(self) -> str:
@@ -511,7 +503,6 @@ class BluetoothNode(Node):
             self._recreate_timer("_status_timer", max(1.0, status_period), self._publish_status_report)
         else:
             self._destroy_timer_attr("_status_timer")
-        self._recreate_timer("_config_lease_timer", 1.0, self._check_overlay_config_lease)
 
     def _recreate_timer(self, attr_name: str, period: float, callback):
         self._destroy_timer_attr(attr_name)
@@ -608,8 +599,7 @@ class BluetoothNode(Node):
     def _setup_ros_interfaces(self):
         keepalive_suffix = str(self.get_parameter("overlay_keepalive_topic_suffix").value or "overlay_keepalive").strip().strip("/")
         if keepalive_suffix:
-            keepalive_topic = self._node_topic(keepalive_suffix)
-            self._overlay_keepalive_sub = self.create_subscription(Empty, keepalive_topic, self._on_overlay_keepalive, 10)
+            self._overlay_keepalive_topic = self._node_topic(keepalive_suffix)
         self.create_service(ListDevices, "ble/list_devices", self._handle_list_devices)
         self.create_service(GetDevice, "ble/get_device", self._handle_get_device)
         self.create_service(ConnectDevice, "ble/connect_device", self._handle_connect_device)
@@ -777,6 +767,7 @@ class BluetoothNode(Node):
         if self._client is None:
             return
         try:
+            self._check_overlay_config_lease()
             snapshot = self._client.get_devices(refresh=True)
             self._sync_auto_import_bridges(snapshot)
             self._reconcile_import_bridges(snapshot)
@@ -930,12 +921,6 @@ class BluetoothNode(Node):
             if mac in self._peer_time_bridges:
                 continue
             self._peer_inactive_since.setdefault(mac, now)
-            if timeout > 0 and now - self._peer_inactive_since[mac] >= timeout:
-                self.get_logger().warning(
-                    f"Disconnecting {mac}: no active peer time bridge for {now - self._peer_inactive_since[mac]:.1f}s"
-                )
-                self._client.disconnect(mac, timeout=5.0)
-                self._peer_inactive_since.pop(mac, None)
         for mac in stale_macs:
             state = self._peer_time_bridges.pop(mac, None)
             if state is not None:
@@ -1993,28 +1978,22 @@ class BluetoothNode(Node):
             response.message = str(exc)
         return response
 
-    def _effective_overlay_hold_seconds(self, requested_hold_seconds: float) -> float:
-        min_hold = max(0.0, float(self.get_parameter("min_overlay_hold_seconds").value or 0.0))
-        requested = max(0.0, float(requested_hold_seconds or 0.0))
-        return max(requested, min_hold)
-
-    def _on_overlay_keepalive(self, _msg: Empty):
-        if not self._active_overlay_path:
-            return
-        self._overlay_keepalive_last_seen = time.monotonic()
+    def _overlay_keepalive_active(self) -> bool:
+        if not self._overlay_keepalive_topic:
+            return False
+        try:
+            return bool(self.get_publishers_info_by_topic(self._overlay_keepalive_topic))
+        except Exception as exc:
+            self._dbus_warning("overlay_keepalive_graph", f"Failed to inspect overlay keepalive topic publishers: {exc}")
+            return False
 
     def _handle_set_active_config(self, request, response):
         path = str(request.config_path or "").strip()
-        requested_hold_seconds = float(request.hold_seconds or 3.0)
-        hold_seconds = self._effective_overlay_hold_seconds(requested_hold_seconds)
         try:
             if not path:
                 if self._active_overlay_path:
                     self._expire_overlay_connections("explicit revert")
                     self._active_overlay_path = ""
-                    self._active_overlay_deadline = 0.0
-                    self._active_overlay_hold_seconds = 0.0
-                    self._overlay_keepalive_last_seen = 0.0
                     self._reload_active_config()
                 response.success = True
                 response.message = "Reverted to default config"
@@ -2023,15 +2002,8 @@ class BluetoothNode(Node):
                 return response
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
-            if hold_seconds > requested_hold_seconds:
-                self.get_logger().info(
-                    f"Clamped overlay lease from {requested_hold_seconds:.1f}s to {hold_seconds:.1f}s for stability"
-                )
-            new_deadline = time.monotonic() + hold_seconds
             if path == self._active_overlay_path:
-                # Keep one-shot config activation semantics: no config reapply on keepalive refresh requests.
-                self._active_overlay_deadline = max(self._active_overlay_deadline, new_deadline)
-                self._active_overlay_hold_seconds = hold_seconds
+                # Keep one-shot config activation semantics: no config reapply for same active overlay path.
                 response.success = True
                 response.message = f"Overlay config already active: {path}"
                 response.active_config_path = self._active_config_source
@@ -2039,9 +2011,6 @@ class BluetoothNode(Node):
                 return response
             self._capture_overlay_connection_baseline()
             self._active_overlay_path = path
-            self._active_overlay_deadline = new_deadline
-            self._active_overlay_hold_seconds = hold_seconds
-            self._overlay_keepalive_last_seen = time.monotonic()
             self._reload_active_config()
             response.success = True
             response.message = f"Activated overlay config {path}"
@@ -2058,23 +2027,13 @@ class BluetoothNode(Node):
     def _check_overlay_config_lease(self):
         if not self._active_overlay_path:
             return
-        now = time.monotonic()
-        keepalive_timeout = max(0.0, float(self.get_parameter("overlay_keepalive_timeout").value or 0.0))
-        if keepalive_timeout > 0.0 and self._overlay_keepalive_last_seen > 0.0:
-            if now - self._overlay_keepalive_last_seen <= keepalive_timeout:
-                refreshed_deadline = self._overlay_keepalive_last_seen + max(0.0, self._active_overlay_hold_seconds)
-                if refreshed_deadline > self._active_overlay_deadline:
-                    self._active_overlay_deadline = refreshed_deadline
-        if time.monotonic() <= self._active_overlay_deadline:
+        if self._overlay_keepalive_active():
             return
         expired_path = self._active_overlay_path
-        self._expire_overlay_connections("lease timeout")
+        self._expire_overlay_connections("keepalive sentinel missing")
         self._active_overlay_path = ""
-        self._active_overlay_deadline = 0.0
-        self._active_overlay_hold_seconds = 0.0
-        self._overlay_keepalive_last_seen = 0.0
         self._reload_active_config()
-        self.get_logger().info(f"Overlay config lease expired, reverted to default after {expired_path}")
+        self.get_logger().info(f"Overlay keepalive missing, reverted to default after {expired_path}")
 
     def _reload_active_config(self):
         config = self._load_effective_config(self._active_overlay_path)

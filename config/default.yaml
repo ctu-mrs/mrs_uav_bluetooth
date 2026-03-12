@@ -67,9 +67,14 @@ status_report_period: 10.0
 # Must be enabled for user node reports using "log" as "print_source".
 log_topic_enable: false
 
-# If true, peers that connected during an overlay lease are disconnected when
-# the overlay expires or is explicitly reverted.
+# If true, peers that connected while an overlay is active are disconnected
+# when the overlay is reverted because keepalive sentinel publishers disappear
+# or when it is explicitly reverted.
 expire_connections_with_overlay: true
+
+# Sentinel topic suffix used by experiment user nodes. Overlay mode stays active
+# while at least one publisher exists on /{hostname}/ble/<overlay_keepalive_topic_suffix>.
+overlay_keepalive_topic_suffix: overlay_keepalive
 
 # Optional extra file sink for verbose log lines.
 verbose_log_file: ""
