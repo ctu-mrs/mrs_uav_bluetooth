@@ -42,11 +42,16 @@ class BluetoothUserNode(Node):
         self.get_logger().info(f"Tailing bluetooth service log topic: {self._log_topic}")
 
     def deactivate(self):
-        if not self._client.service_is_ready() and not self._client.wait_for_service(timeout_sec=2.0):
-            return
-        response = self._call_config_service("", 0.0)
-        if response is not None and response.success:
-            self.get_logger().info("Reverted bluetooth service to default config")
+        try:
+            if not self.context.ok():
+                return
+            if not self._client.service_is_ready() and not self._client.wait_for_service(timeout_sec=2.0):
+                return
+            response = self._call_config_service("", 0.0)
+            if response is not None and response.success:
+                self.get_logger().info("Reverted bluetooth service to default config")
+        except Exception:
+            pass
 
     def _refresh_lease(self):
         if self._pending_future is not None and not self._pending_future.done():

@@ -615,14 +615,23 @@ class BluetoothNode(Node):
         desired_scan = bool(self.get_parameter("enable_scan").value)
         desired_transport = str(self.get_parameter("scan_mode").value)
         if desired_scan:
-            self._start_scan(desired_transport)
+            if self._client is not None and self._client.scanning and self._scan_transport == desired_transport:
+                pass  # Already scanning with same transport
+            else:
+                self._start_scan(desired_transport)
         else:
             self._stop_scan()
         if not initial:
             self.get_logger().info(f"Applied config from {self._active_config_source}")
+            self._log_verbose(f"Applied config from {self._active_config_source}")
 
     def _rebuild_server(self):
         with self._lock:
+            self._log_verbose(
+                f"Rebuilding GATT server: wifi={bool(self.get_parameter('enable_wifi_service').value)}, "
+                f"time={bool(self.get_parameter('enable_time_service').value)}, "
+                f"exports={len(self._topic_exports)}"
+            )
             self._dbus.rebuild_server(
                 self._topic_exports,
                 enable_wifi_service=bool(self.get_parameter("enable_wifi_service").value),
@@ -647,6 +656,7 @@ class BluetoothNode(Node):
             if shared.mode not in {"export", "both"}:
                 continue
             key = f"config-export::{shared.bridge_key}"
+            self._log_verbose(f"Creating export bridge: {shared.export_topic} -> {shared.bridge_key[:8]}...")
             subscription = self.create_subscription(
                 shared.message_class,
                 shared.export_topic,
@@ -734,15 +744,19 @@ class BluetoothNode(Node):
                 )
                 key = f"config-import::{shared.bridge_key}::{mac}"
                 state = self._notification_bridges.get(key)
+                device_label = f"{mac} ({device.alias or device.name or '?'})"
                 if not path:
                     if state is not None:
+                        self._log_verbose(f"Removing import bridge (no path): {device_label}")
                         self._remove_import_bridge(key, state)
                     continue
                 desired_keys.add(key)
                 resolved_topic_name = self._resolve_peer_topic_name(mac, shared.import_topic_suffix, device=device)
                 if state is None:
                     if transport_endpoint == "characteristic" and not self._client.start_notify(path):
+                        self._log_verbose(f"Failed to start notify for import bridge: {device_label}")
                         continue
+                    self._log_verbose(f"Creating import bridge: {device_label} -> {resolved_topic_name}")
                     publisher = self.create_publisher(shared.message_class, resolved_topic_name, 10)
                     self._notification_bridges[key] = TopicImportBridgeState(
                         mac=mac,
@@ -886,11 +900,16 @@ class BluetoothNode(Node):
         self._auto_connect_attempts = {mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot}
         self._peer_security_attempts = {mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot}
         self._peer_inactive_since = {mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot}
+        self._log_verbose(
+            f"Auto-connect tick: {len(snapshot)} devices, whitelist={whitelist_names or '(none)'}, pattern={pattern}"
+        )
         for mac, device in snapshot.items():
             peer_candidate = self._is_uav_peer_candidate(device, pattern)
             explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
             should_connect = explicit_target or (peer_candidate and not whitelist_enabled)
+            device_label = f"{mac} ({device.alias or device.name or '?'})"
             if whitelist_enabled and peer_candidate and not explicit_target:
+                self._log_verbose(f"Dropping non-whitelisted peer: {device_label}")
                 self._drop_non_whitelisted_peer(mac, device)
                 continue
             if device.connected:
@@ -904,7 +923,9 @@ class BluetoothNode(Node):
             if now - last_attempt < retry_period:
                 continue
             self._auto_connect_attempts[mac] = now
+            self._log_verbose(f"Auto-connect attempt: {device_label}")
             if not self._client.connect(mac, timeout=10.0):
+                self._log_verbose(f"Auto-connect failed: {device_label}")
                 continue
             self._client.wait_services_resolved(mac, timeout=10.0)
             current = self._client.get_device(mac, refresh=True) or device
@@ -914,6 +935,7 @@ class BluetoothNode(Node):
             else:
                 self._auto_connect_attempts.pop(mac, None)
                 self.get_logger().info(f"Auto-connected BLE device {mac}")
+                self._log_verbose(f"Auto-connected: {device_label}")
 
     def _drop_non_whitelisted_peer(self, mac: str, device: DeviceInfo):
         if device.connected:
