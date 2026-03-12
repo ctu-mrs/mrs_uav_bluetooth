@@ -16,8 +16,6 @@ class BluetoothUserNode(Node):
     def __init__(self):
         super().__init__("mrs_uav_bluetooth_user")
         self.declare_parameter("config_path", "")
-        self.declare_parameter("hold_seconds", 3.0)
-        self.declare_parameter("min_hold_seconds", 0.5)
         self.declare_parameter("print_source", "status")
         self.declare_parameter("service_wait_timeout_sec", 10.0)
         self.declare_parameter("service_call_timeout_sec", 5.0)
@@ -27,8 +25,6 @@ class BluetoothUserNode(Node):
         self.declare_parameter("min_sentinel_publish_period_sec", 0.2)
 
         self._config_path = str(self.get_parameter("config_path").value or "").strip()
-        self._min_hold_seconds = max(0.0, float(self.get_parameter("min_hold_seconds").value or 0.0))
-        self._hold_seconds = max(self._min_hold_seconds, float(self.get_parameter("hold_seconds").value or 0.0))
         self._service_wait_timeout_sec = max(0.0, float(self.get_parameter("service_wait_timeout_sec").value or 0.0))
         self._service_call_timeout_sec = max(0.0, float(self.get_parameter("service_call_timeout_sec").value or 0.0))
         self._deactivate_service_wait_timeout_sec = max(
@@ -63,7 +59,7 @@ class BluetoothUserNode(Node):
     def activate(self):
         if not self._client.wait_for_service(timeout_sec=self._service_wait_timeout_sec):
             raise RuntimeError("ble/set_active_config service is not available")
-        response = self._call_config_service(self._config_path, self._hold_seconds)
+        response = self._call_config_service(self._config_path)
         if response is None or not response.success:
             raise RuntimeError(response.message if response is not None else "No response from ble/set_active_config")
         self.get_logger().info(f"Activated BLE overlay config: {response.active_config_path}")
@@ -78,7 +74,7 @@ class BluetoothUserNode(Node):
                 timeout_sec=self._deactivate_service_wait_timeout_sec
             ):
                 return
-            response = self._call_config_service("", 0.0)
+            response = self._call_config_service("")
             if response is not None and response.success:
                 self.get_logger().info("Reverted bluetooth service to default config")
         except Exception:
@@ -88,10 +84,10 @@ class BluetoothUserNode(Node):
         msg = Empty()
         self._sentinel_pub.publish(msg)
 
-    def _call_config_service(self, config_path: str, hold_seconds: float):
+    def _call_config_service(self, config_path: str):
         request = SetActiveConfig.Request()
         request.config_path = config_path
-        request.hold_seconds = float(hold_seconds)
+        request.hold_seconds = 0.0
         future = self._client.call_async(request)
         rclpy.spin_until_future_complete(self, future, timeout_sec=self._service_call_timeout_sec)
         if not future.done():
