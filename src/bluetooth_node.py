@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Set, Tuple
 
 import dbus
 import rclpy
@@ -115,6 +115,8 @@ class BluetoothNode(Node):
         "enable_wifi_service",
         "discoverable_timeout",
         "status_report_period",
+        "log_topic_enable",
+        "expire_connections_with_overlay",
         "verbose_log_file",
     ]
 
@@ -136,6 +138,7 @@ class BluetoothNode(Node):
         self._shared_topic_configs: Dict[str, SharedTopicConfig] = {}
         self._active_overlay_path = ""
         self._active_overlay_deadline = 0.0
+        self._overlay_connected_baseline: Set[str] = set()
         self._default_config_path = self._resolve_default_config_path()
         self._active_config_source = self._default_config_path
         self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
@@ -143,6 +146,7 @@ class BluetoothNode(Node):
 
         self.devices_pub = None
         self.notifications_pub = None
+        self.status_pub = None
         self.log_pub = None
         self._verbose_logger = None  # type: Optional[logging.Logger]
         self._netplan = None
@@ -225,6 +229,8 @@ class BluetoothNode(Node):
         self.declare_parameter("enable_time_service", True)
         self.declare_parameter("enable_wifi_service", True)
         self.declare_parameter("status_report_period", 10.0)
+        self.declare_parameter("log_topic_enable", False)
+        self.declare_parameter("expire_connections_with_overlay", True)
         self.declare_parameter("verbose_log_file", "")
 
     def _resolve_default_config_path(self) -> str:
@@ -238,7 +244,23 @@ class BluetoothNode(Node):
             return
         self.devices_pub = self.create_publisher(BleDeviceArray, self._node_topic("devices"), 10)
         self.notifications_pub = self.create_publisher(BleNotification, self._node_topic("notifications"), 50)
+        self.status_pub = self.create_publisher(String, self._node_topic("status"), 50)
         self.log_pub = self.create_publisher(String, self._node_topic("log"), 200)
+
+    def _local_frame_id(self) -> str:
+        return sanitize_topic_suffix(self._local_name or "mrs-uav")
+
+    def _peer_frame_id(self, mac: str) -> str:
+        state = self._peer_time_bridges.get(mac)
+        if state is not None and state.peer_name:
+            return sanitize_topic_suffix(state.peer_name)
+        if self._client is not None:
+            device = self._client.get_device(mac)
+            if device is not None:
+                peer_name = self._hostname_from_device(device)
+                if peer_name:
+                    return sanitize_topic_suffix(peer_name)
+        return sanitize_topic_suffix(mac.lower().replace(":", "_"))
 
     def _node_topic(self, suffix: str) -> str:
         normalized = str(suffix or "").strip().lstrip("/")
@@ -447,6 +469,9 @@ class BluetoothNode(Node):
         if verbose_logger is not None:
             verbose_logger.debug(message)
 
+        if not bool(self.get_parameter("log_topic_enable").value):
+            return
+
         if self.log_pub is None or self._shutting_down or not self._ros_context_ok():
             return
 
@@ -495,6 +520,14 @@ class BluetoothNode(Node):
             return
         report = "\n".join(lines)
         self.get_logger().info(f"[STATUS]\n{report}")
+        if self.status_pub is not None and not self._shutting_down and self._ros_context_ok():
+            status_msg = String()
+            status_msg.data = report
+            try:
+                self.status_pub.publish(status_msg)
+            except Exception:
+                if not self._shutting_down and self._ros_context_ok():
+                    raise
         self._log_verbose(f"[STATUS]\n{report}")
 
     def _build_status_lines(self):
@@ -723,7 +756,7 @@ class BluetoothNode(Node):
         self._sync_auto_import_bridges(snapshot)
         self._reconcile_import_bridges(snapshot)
         msg = BleDeviceArray()
-        msg.header = self._header()
+        msg.header = self._header(frame_id=self._local_frame_id())
         msg.devices = [self._device_to_msg(device) for device in snapshot.values()]
         self.devices_pub.publish(msg)
         self._refresh_notification_mapping(snapshot)
@@ -1089,10 +1122,10 @@ class BluetoothNode(Node):
             return
         self._client.stop_notify(path)
 
-    def _header(self) -> Header:
+    def _header(self, frame_id: Optional[str] = None) -> Header:
         header = Header()
         header.stamp = self.get_clock().now().to_msg()
-        header.frame_id = "bluetooth"
+        header.frame_id = sanitize_topic_suffix(frame_id or self._local_frame_id())
         return header
 
     def _time_msg(self, stamp: float) -> TimeMsg:
@@ -1157,7 +1190,7 @@ class BluetoothNode(Node):
         mac = self._notification_path_to_mac.get(chrc_path, "")
         self._log_verbose(f"Notification mac={mac} uuid={uuid} path={chrc_path} len={len(data)}")
         msg = BleNotification()
-        msg.header = self._header()
+        msg.header = self._header(frame_id=self._peer_frame_id(mac) if mac else self._local_frame_id())
         msg.mac = mac
         msg.path = chrc_path
         msg.uuid = uuid
@@ -1251,7 +1284,7 @@ class BluetoothNode(Node):
 
     def _publish_peer_time_status(self, state: PeerTimeBridgeState):
         message = BlePeerTimeStatus()
-        message.header = self._header()
+        message.header = self._header(frame_id=self._local_frame_id())
         message.mac = state.mac
         message.peer_name = state.peer_name
         ns = max(0, int(state.last_time_value_ns))
@@ -1764,9 +1797,40 @@ class BluetoothNode(Node):
         except Exception as exc:
             self.get_logger().warning(f"Failed to decode BLE payload for topic bridge {state.resolved_topic_name}: {exc}")
             return
+        # Imported payloads originate from the peer UAV, so stamp header frame_id accordingly when present.
+        header = getattr(message, "header", None)
+        if header is not None and hasattr(header, "frame_id"):
+            header.frame_id = self._peer_frame_id(state.mac)
         state.last_payload = bytes(payload)
         state.last_publish_monotonic, state.current_hz = self._update_publish_rate(state.last_publish_monotonic)
         state.publisher.publish(message)
+
+    def _get_connected_peer_macs(self) -> Set[str]:
+        if self._client is None:
+            return set()
+        return {mac for mac, device in self._client.get_devices(refresh=True).items() if device.connected}
+
+    def _capture_overlay_connection_baseline(self):
+        if self._overlay_connected_baseline:
+            return
+        self._overlay_connected_baseline = self._get_connected_peer_macs()
+
+    def _expire_overlay_connections(self, reason: str):
+        if not bool(self.get_parameter("expire_connections_with_overlay").value):
+            self._overlay_connected_baseline.clear()
+            return
+        if self._client is None:
+            self._overlay_connected_baseline.clear()
+            return
+        current_connected = self._get_connected_peer_macs()
+        if not current_connected:
+            self._overlay_connected_baseline.clear()
+            return
+        to_disconnect = current_connected - self._overlay_connected_baseline
+        for mac in sorted(to_disconnect):
+            self.get_logger().info(f"Disconnecting {mac}: overlay lease expired ({reason})")
+            self._client.disconnect(mac, timeout=5.0)
+        self._overlay_connected_baseline.clear()
 
     def _read_remote_bridge_metadata(self, mac: str, bridge_name: str, *, message_class: type):
         member_specs = ()
@@ -1824,6 +1888,7 @@ class BluetoothNode(Node):
         try:
             if not path:
                 if self._active_overlay_path:
+                    self._expire_overlay_connections("explicit revert")
                     self._active_overlay_path = ""
                     self._active_overlay_deadline = 0.0
                     self._reload_active_config()
@@ -1843,6 +1908,7 @@ class BluetoothNode(Node):
                 response.active_config_path = self._active_config_source
                 response.overlay_active = True
                 return response
+            self._capture_overlay_connection_baseline()
             self._active_overlay_path = path
             self._active_overlay_deadline = new_deadline
             self._reload_active_config()
@@ -1864,6 +1930,7 @@ class BluetoothNode(Node):
         if time.monotonic() <= self._active_overlay_deadline:
             return
         expired_path = self._active_overlay_path
+        self._expire_overlay_connections("lease timeout")
         self._active_overlay_path = ""
         self._active_overlay_deadline = 0.0
         self._reload_active_config()

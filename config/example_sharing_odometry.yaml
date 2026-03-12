@@ -1,15 +1,13 @@
 # Example experiment overlay loaded by the user_node.
 #
 # Usage example:
-#   ros2 launch mrs_uav_bluetooth user_node.launch.py \
-#     config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
+#   ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
 #
-# This file is intentionally standalone and may live anywhere on disk. The
-# system bluetooth service merges it on top of config/default.yaml while the
-# user node keeps the lease alive.
+# Make a copy of this file and adjust it as needed for your experiment. 
+# On launch, the system bluetooth service merges it on top of config/default.yaml 
+# while the user node keeps the lease alive.
 
-# Enable automatic peer connection only for the swarm members involved in the
-# experiment.
+# Enable automatic peer connection only for the swarm members involved in the experiment.
 auto_connect_enable: true
 auto_connect_whitelist:
   - uav42

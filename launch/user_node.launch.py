@@ -10,6 +10,11 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("config_path", description="Path to the user BLE overlay YAML file."),
         DeclareLaunchArgument("hold_seconds", default_value="3.0", description="Overlay lease refresh period in seconds."),
+        DeclareLaunchArgument(
+            "print_source",
+            default_value="status",
+            description="Service text source topic suffix to print: status or log.",
+        ),
         Node(
             package="mrs_uav_bluetooth",
             executable="user_node",
@@ -19,6 +24,7 @@ def generate_launch_description():
                 {
                     "config_path": LaunchConfiguration("config_path"),
                     "hold_seconds": LaunchConfiguration("hold_seconds"),
+                    "print_source": LaunchConfiguration("print_source"),
                 },
             ],
         ),
