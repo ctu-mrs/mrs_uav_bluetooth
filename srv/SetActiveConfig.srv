@@ -1,0 +1,7 @@
+string config_path
+float32 hold_seconds
+---
+bool success
+string message
+string active_config_path
+bool overlay_active

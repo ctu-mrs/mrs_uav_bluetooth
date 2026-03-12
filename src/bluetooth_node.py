@@ -1,23 +1,25 @@
 """ROS 2 BLE node providing MRS UAV Bluetooth server and client control."""
 
+import hashlib
 import logging
 import os
 import re
 import struct
 import threading
 import time
+from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
-
-import json
 
 import dbus
 import rclpy
 import rclpy.exceptions
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from builtin_interfaces.msg import Time as TimeMsg
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rosidl_runtime_py.utilities import get_message
-from std_msgs.msg import Header
+from std_msgs.msg import Header, String
 from std_srvs.srv import Trigger
 
 from mrs_uav_bluetooth.msg import (
@@ -42,13 +44,22 @@ from mrs_uav_bluetooth.srv import (
     PairDevice,
     ReadGattValue,
     RemoveDevice,
+    SetActiveConfig,
     SetDeviceTrust,
     SetNotify,
     SetScanEnabled,
     WriteGattValue,
 )
 
-from .bridge_payload import decode_message_payload, encode_message_payload, normalize_member_paths, payload_format_for_member_paths
+from .bridge_payload import (
+    BridgeMemberSpec,
+    bytes_to_serializable,
+    decode_message_payload,
+    encode_message_payload,
+    member_specs_from_serializable,
+    normalize_member_specs,
+    payload_format_for_member_specs,
+)
 from .bluetooth_bridge_state import PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
 from .bluetooth_dbus_runtime import BluetoothDbusRuntime
 from .dbus_client import BleClient, DeviceInfo
@@ -64,7 +75,49 @@ from .netplan import NetplanConfiguration
 from .uuid_utils import is_uav_hostname, resolve_uuid, sanitize_topic_suffix, system_hostname
 
 
+@dataclass(frozen=True)
+class SharedTopicConfig:
+    name: str
+    mode: str
+    bridge_key: str
+    bridge_name: str
+    export_topic: str
+    import_topic_suffix: str
+    message_type: str
+    message_class: type
+    rate_hz: float
+    transport_endpoint: str
+    payload_format: str
+    member_specs: Tuple[BridgeMemberSpec, ...]
+
+
 class BluetoothNode(Node):
+    _CONFIG_PARAM_NAMES = [
+        "advertise_mode",
+        "pairing_agent",
+        "auto_accept_pairing",
+        "auto_trust",
+        "enable_scan",
+        "scan_mode",
+        "scan_publish_period",
+        "time_update_period",
+        "wifi_refresh_period",
+        "auto_connect_period",
+        "auto_connect_whitelist",
+        "auto_connect_enable",
+        "auto_connect_pattern",
+        "peer_connection_timeout",
+        "netplan_config_file",
+        "netplan_scripts_dir",
+        "allowed_wifi_networks",
+        "enable_server",
+        "enable_time_service",
+        "enable_wifi_service",
+        "discoverable_timeout",
+        "status_report_period",
+        "verbose_log_file",
+    ]
+
     def __init__(self):
         super().__init__("mrs_uav_bluetooth")
         self._declare_parameters()
@@ -80,45 +133,40 @@ class BluetoothNode(Node):
         self._topic_exports: Dict[str, TopicExportBridgeState] = {}
         self._notification_bridges: Dict[str, TopicImportBridgeState] = {}
         self._peer_time_bridges: Dict[str, PeerTimeBridgeState] = {}
+        self._shared_topic_configs: Dict[str, SharedTopicConfig] = {}
+        self._active_overlay_path = ""
+        self._active_overlay_deadline = 0.0
+        self._default_config_path = self._resolve_default_config_path()
+        self._active_config_source = self._default_config_path
+        self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
+        self._shutting_down = False
 
+        self.devices_pub = None
+        self.notifications_pub = None
+        self.log_pub = None
         self._verbose_logger = None  # type: Optional[logging.Logger]
+        self._netplan = None
+        self._scan_results_timer = None
+        self._time_service_timer = None
+        self._wifi_service_timer = None
+        self._auto_connect_timer = None
+        self._status_timer = None
+        self._config_lease_timer = None
+
+        self._apply_config_document(self._load_effective_config(), source_path=self._default_config_path, initial=True)
+        self._ensure_core_publishers()
         self._setup_verbose_logger()
         self._dbus = BluetoothDbusRuntime(self._local_name, self.get_logger(), self._log_verbose, self._on_pairing_event)
 
-        self.devices_pub = self.create_publisher(BleDeviceArray, "ble/devices", 10)
-        self.notifications_pub = self.create_publisher(BleNotification, "ble/notifications", 50)
-
-        self._config_file = ""  # resolved later from share directory
-        try:
-            from ament_index_python.packages import get_package_share_directory
-            self._config_file = os.path.join(
-                get_package_share_directory("mrs_uav_bluetooth"), "config", "bluetooth_node.json"
-            )
-        except Exception:
-            pass
-
         self._setup_ros_interfaces()
         self._setup_bluetooth()
-
-        publish_period = float(self.get_parameter("scan_publish_period").value)
-        time_period = float(self.get_parameter("time_update_period").value)
-        wifi_period = float(self.get_parameter("wifi_refresh_period").value)
-        autoconnect_period = float(self.get_parameter("auto_connect_period").value)
-
-        status_period = float(self.get_parameter("status_report_period").value)
-
-        self.create_timer(max(0.2, publish_period), self._publish_scan_results)
-        self.create_timer(max(0.2, time_period), self._update_time_service)
-        self.create_timer(max(0.5, wifi_period), self._refresh_wifi_service)
-        self.create_timer(max(0.5, autoconnect_period), self._auto_connect_devices)
-        if status_period > 0:
-            self.create_timer(max(1.0, status_period), self._publish_status_report)
+        self._reconfigure_timers()
 
         self.get_logger().info(
-            f"BluetoothNode started — adapter={self._adapter_path}, "
+            f"BluetoothNode started: adapter={self._adapter_path}, "
             f"server={'ON' if bool(self.get_parameter('enable_server').value) else 'OFF'}, "
             f"scan={'ON' if bool(self.get_parameter('enable_scan').value) else 'OFF'}, "
-            f"hostname={self._local_name}"
+            f"hostname={self._local_name}, prefix={self._node_topics_prefix}"
         )
 
     @property
@@ -150,6 +198,7 @@ class BluetoothNode(Node):
         return self._dbus.wifi_service
 
     def _declare_parameters(self):
+        self.declare_parameter("default_config_path", "")
         self.declare_parameter("discoverable_timeout", 0)
         self.declare_parameter("advertise_mode", "peripheral")
         self.declare_parameter("pairing_agent", "NoInputNoOutput")
@@ -161,32 +210,163 @@ class BluetoothNode(Node):
         self.declare_parameter("time_update_period", 1.0)
         self.declare_parameter("wifi_refresh_period", 2.0)
         self.declare_parameter("auto_connect_period", 3.0)
-        self.declare_parameter("auto_connect_whitelist", rclpy.Parameter.Type.STRING_ARRAY)
-
+        self.declare_parameter("auto_connect_whitelist", [])
         self.declare_parameter(
-            "auto_connect_uav_peers",
+            "auto_connect_enable",
             False,
-            ParameterDescriptor(description="Auto-connect discovered uavXX peers that expose the default BLE time characteristic."),
+            ParameterDescriptor(description="Global switch for automatic peer connect/pair/trust handling."),
         )
+        self.declare_parameter("auto_connect_pattern", r"^uav[0-9]{2}$")
         self.declare_parameter("peer_connection_timeout", 30.0)
-        self.declare_parameter("uav_name_pattern", r"^uav[0-9]{2}$")
-        self.declare_parameter("peer_topics_prefix", "/ble/peers")
         self.declare_parameter("netplan_config_file", "/etc/netplan/01-netcfg.yaml")
         self.declare_parameter("netplan_scripts_dir", "/etc/ctu-mrs/uav-bluetooth/netplan-scripts")
-        self.declare_parameter("allowed_wifi_networks", rclpy.Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("allowed_wifi_networks", [])
         self.declare_parameter("enable_server", True)
-
         self.declare_parameter("enable_time_service", True)
         self.declare_parameter("enable_wifi_service", True)
-
         self.declare_parameter("status_report_period", 10.0)
         self.declare_parameter("verbose_log_file", "")
 
+    def _resolve_default_config_path(self) -> str:
+        configured = str(self.get_parameter("default_config_path").value or "").strip()
+        if configured:
+            return configured
+        return os.path.join(get_package_share_directory("mrs_uav_bluetooth"), "config", "default.yaml")
+
+    def _ensure_core_publishers(self):
+        if self.devices_pub is not None:
+            return
+        self.devices_pub = self.create_publisher(BleDeviceArray, self._node_topic("devices"), 10)
+        self.notifications_pub = self.create_publisher(BleNotification, self._node_topic("notifications"), 50)
+        self.log_pub = self.create_publisher(String, self._node_topic("log"), 200)
+
+    def _node_topic(self, suffix: str) -> str:
+        normalized = str(suffix or "").strip().lstrip("/")
+        return self._node_topics_prefix if not normalized else f"{self._node_topics_prefix}/{normalized}"
+
+    def _format_node_topics_prefix(self, value: str) -> str:
+        candidate = str(value or "").strip() or "/{hostname}/ble"
+        candidate = candidate.replace("{hostname}", sanitize_topic_suffix(self._local_name))
+        if not candidate.startswith("/"):
+            candidate = f"/{candidate}"
+        return candidate.rstrip("/") or "/"
+
+    def _normalize_ros_topic(self, value: str) -> str:
+        candidate = re.sub(r"/+", "/", str(value or "").strip())
+        if not candidate:
+            return "/"
+        if not candidate.startswith("/"):
+            candidate = f"/{candidate}"
+        candidate = candidate.rstrip("/")
+        return candidate or "/"
+
+    def _canonical_shared_topic(self, export_topic: str) -> str:
+        normalized = self._normalize_ros_topic(export_topic)
+        segments = [segment for segment in normalized.split("/") if segment]
+        if not segments:
+            return normalized
+        pattern = str(self.get_parameter("auto_connect_pattern").value)
+        if is_uav_hostname(segments[0], pattern=pattern):
+            if len(segments) == 1:
+                return "/"
+            return "/" + "/".join(segments[1:])
+        return normalized
+
+    def _load_yaml_mapping(self, path: str) -> dict:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"Config {path} must contain a YAML mapping at the top level")
+        return data
+
+    def _deep_merge(self, base, override):
+        if isinstance(base, dict) and isinstance(override, dict):
+            merged = dict(base)
+            for key, value in override.items():
+                merged[key] = self._deep_merge(merged.get(key), value)
+            return merged
+        return override
+
+    def _load_effective_config(self, overlay_path: str = "") -> dict:
+        config = self._load_yaml_mapping(self._default_config_path)
+        if overlay_path:
+            config = self._deep_merge(config, self._load_yaml_mapping(overlay_path))
+        return config
+
+    def _make_parameter(self, name: str, value):
+        return rclpy.parameter.Parameter(name, rclpy.parameter.Parameter.Type.from_parameter_value(value), value)
+
+    def _apply_config_document(self, config: dict, *, source_path: str, initial: bool = False):
+        params = []
+        for name in self._CONFIG_PARAM_NAMES:
+            if name in config:
+                params.append(self._make_parameter(name, config[name]))
+        if params:
+            self.set_parameters(params)
+        self._scan_transport = str(self.get_parameter("scan_mode").value)
+
+        requested_prefix = self._format_node_topics_prefix(config.get("node_topics_prefix", self._node_topics_prefix))
+        if initial:
+            self._node_topics_prefix = requested_prefix
+        elif requested_prefix != self._node_topics_prefix:
+            self.get_logger().warning(
+                f"Ignoring runtime node_topics_prefix change ({requested_prefix}); keeping {self._node_topics_prefix}"
+            )
+
+        self._shared_topic_configs = self._parse_shared_topics(config.get("shared_topics", []))
+        self._active_config_source = source_path
+
+    def _parse_shared_topics(self, raw_items) -> Dict[str, SharedTopicConfig]:
+        configs = {}
+        for index, raw in enumerate(raw_items or []):
+            if not isinstance(raw, dict):
+                raise ValueError(f"shared_topics[{index}] must be a mapping")
+            mode = str(raw.get("mode", "both")).strip().lower() or "both"
+            if mode not in {"export", "import", "both"}:
+                raise ValueError(f"shared_topics[{index}].mode must be export, import, or both")
+            export_topic = self._normalize_ros_topic(raw.get("export_topic", ""))
+            if export_topic == "/":
+                raise ValueError(f"shared_topics[{index}] requires export_topic")
+            canonical_topic = self._canonical_shared_topic(export_topic)
+            key_source = str(raw.get("key", canonical_topic)).strip()
+            if not key_source:
+                raise ValueError(f"shared_topics[{index}] produced an empty bridge key")
+            bridge_key = hashlib.md5(key_source.encode("utf-8")).hexdigest()
+            bridge_name = bridge_key
+            message_type = str(raw.get("message_type", "")).strip()
+            if not message_type:
+                raise ValueError(f"shared_topics[{index}] requires message_type")
+            message_class = get_message(message_type)
+            member_specs = normalize_member_specs(raw.get("members", []), message_class=message_class)
+            if not member_specs:
+                raise ValueError(f"shared_topics[{index}] requires at least one compact member definition")
+            payload_format = payload_format_for_member_specs(member_specs)
+            import_topic_suffix = self._normalize_ros_topic(raw.get("import_topic_suffix", canonical_topic))
+            transport_endpoint = self._normalize_transport_endpoint(str(raw.get("transport_endpoint", "characteristic")))
+            rate_hz = max(0.0, float(raw.get("rate_hz", 0.0)))
+            name = str(raw.get("name", canonical_topic)).strip() or canonical_topic
+            if bridge_key in configs:
+                raise ValueError(f"shared_topics[{index}] duplicates bridge key for {canonical_topic}")
+            configs[bridge_key] = SharedTopicConfig(
+                name=name,
+                mode=mode,
+                bridge_key=bridge_key,
+                bridge_name=bridge_name,
+                export_topic=export_topic,
+                import_topic_suffix=import_topic_suffix.lstrip("/"),
+                message_type=message_type,
+                message_class=message_class,
+                rate_hz=rate_hz,
+                transport_endpoint=transport_endpoint,
+                payload_format=payload_format,
+                member_specs=member_specs,
+            )
+        return configs
+
     def _get_string_list(self, name: str):
-        """Safely get a STRING_ARRAY parameter, returning [] if uninitialized."""
         try:
-            val = self.get_parameter(name).value
-            return list(val) if val else []
+            value = self.get_parameter(name).value
+            return list(value) if value else []
         except rclpy.exceptions.ParameterUninitializedException:
             return []
 
@@ -210,13 +390,11 @@ class BluetoothNode(Node):
         return any(field.strip().lower() in target_names for field in name_fields if field.strip())
 
     def _resolve_peer_topic_name(self, mac: str, topic_name: str, device: Optional[DeviceInfo] = None) -> str:
-        prefix = str(self.get_parameter("peer_topics_prefix").value).strip() or "/ble/peers"
-        prefix = prefix.rstrip("/")
         current_device = device or (self._client.get_device(mac, refresh=True) if self._client is not None else None)
         peer_name = self._hostname_from_device(current_device) if current_device is not None else ""
         peer_segment = sanitize_topic_suffix(peer_name or mac.lower().replace(":", "_"))
-        scoped_prefix = f"{prefix}/{peer_segment}"
-        normalized_topic = topic_name.strip() or "/"
+        scoped_prefix = self._node_topic(f"peers/{peer_segment}")
+        normalized_topic = str(topic_name or "").strip() or "/"
         if not normalized_topic.startswith("/"):
             normalized_topic = f"/{normalized_topic}"
         if normalized_topic == scoped_prefix or normalized_topic.startswith(scoped_prefix + "/"):
@@ -238,44 +416,79 @@ class BluetoothNode(Node):
             return now, 1.0 / (now - last_publish_monotonic)
         return now, 0.0
 
-    # -- Thread-safe verbose file logger ------------------------------------------
-
     def _setup_verbose_logger(self):
-        """Create a Python file logger if the verbose_log_file parameter is set."""
         log_path = str(self.get_parameter("verbose_log_file").value or "").strip()
+        logger = logging.getLogger("mrs_uav_bluetooth.verbose")
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
         if not log_path:
+            self._verbose_logger = None
             return
         try:
-            logger = logging.getLogger("mrs_uav_bluetooth.verbose")
-            logger.setLevel(logging.DEBUG)
-            logger.propagate = False
-            # Remove stale handlers from a previous incarnation
-            for handler in list(logger.handlers):
-                logger.removeHandler(handler)
             os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-            fh = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-            logger.addHandler(fh)
+            file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+            logger.addHandler(file_handler)
             self._verbose_logger = logger
             self._verbose_logger.info("Verbose file logger started")
         except Exception as exc:
-            self.get_logger().warn(f"Failed to open verbose log file {log_path}: {exc}")
+            self._verbose_logger = None
+            self.get_logger().warning(f"Failed to open verbose log file {log_path}: {exc}")
 
     def _log_verbose(self, message: str):
-        """Write *message* to the verbose file logger (thread-safe, no-op if disabled)."""
-        vl = self._verbose_logger
-        if vl is not None:
-            vl.debug(message)
+        verbose_logger = self._verbose_logger
+        if verbose_logger is not None:
+            verbose_logger.debug(message)
 
-    # -- Periodic status report ---------------------------------------------------
+        if self.log_pub is None or self._shutting_down or not self._ros_context_ok():
+            return
+
+        log_msg = String()
+        log_msg.data = message
+        try:
+            self.log_pub.publish(log_msg)
+        except Exception:
+            if self._shutting_down or not self._ros_context_ok():
+                return
+            raise
+
+    def _ros_context_ok(self) -> bool:
+        try:
+            return bool(self.context.ok())
+        except Exception:
+            return False
+
+    def _reconfigure_timers(self):
+        self._recreate_timer("_scan_results_timer", max(0.2, float(self.get_parameter("scan_publish_period").value)), self._publish_scan_results)
+        self._recreate_timer("_time_service_timer", max(0.2, float(self.get_parameter("time_update_period").value)), self._update_time_service)
+        self._recreate_timer("_wifi_service_timer", max(0.5, float(self.get_parameter("wifi_refresh_period").value)), self._refresh_wifi_service)
+        self._recreate_timer("_auto_connect_timer", max(0.5, float(self.get_parameter("auto_connect_period").value)), self._auto_connect_devices)
+        status_period = float(self.get_parameter("status_report_period").value)
+        if status_period > 0:
+            self._recreate_timer("_status_timer", max(1.0, status_period), self._publish_status_report)
+        else:
+            self._destroy_timer_attr("_status_timer")
+        self._recreate_timer("_config_lease_timer", 1.0, self._check_overlay_config_lease)
+
+    def _recreate_timer(self, attr_name: str, period: float, callback):
+        self._destroy_timer_attr(attr_name)
+        setattr(self, attr_name, self.create_timer(period, callback))
+
+    def _destroy_timer_attr(self, attr_name: str):
+        timer = getattr(self, attr_name, None)
+        if timer is not None:
+            self.destroy_timer(timer)
+            setattr(self, attr_name, None)
 
     def _publish_status_report(self):
-        """Log a human-readable summary of the node state (inspired by test_run.py)."""
         try:
             lines = self._build_status_lines()
         except Exception as exc:
-            self.get_logger().warn(f"Status report failed: {exc}")
+            self.get_logger().warning(f"Status report failed: {exc}")
             return
         report = "\n".join(lines)
         self.get_logger().info(f"[STATUS]\n{report}")
@@ -285,83 +498,59 @@ class BluetoothNode(Node):
         lines = []
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         lines.append(f"--- Bluetooth Node Status @ {ts} ---")
-
-        # Adapter
         lines.append(f"  adapter:    {self._adapter_path}")
         lines.append(f"  hostname:   {self._local_name}")
-        scanning = self._client.scanning if self._client else False
-        lines.append(f"  scanning:   {scanning}")
-
-        # Server state
-        server_on = self._app is not None
-        lines.append(f"  server:     {'ACTIVE' if server_on else 'OFF'}")
+        lines.append(f"  prefix:     {self._node_topics_prefix}")
+        lines.append(f"  config:     {self._active_config_source}")
+        lines.append(f"  scanning:   {self._client.scanning if self._client else False}")
+        lines.append(f"  server:     {'ACTIVE' if self._app is not None else 'OFF'}")
         lines.append(f"  advertise:  {'ACTIVE' if self._advertisement is not None else 'OFF'}")
         if self._wifi_service is not None:
-            lines.append(f"  wifi-svc:   enabled")
+            lines.append("  wifi-svc:   enabled")
         if self._time_service is not None:
-            lines.append(f"  time-svc:   enabled")
-
-        # Devices
+            lines.append("  time-svc:   enabled")
         if self._client is not None:
             with self._lock:
-                all_devs = self._client.get_devices()
-            pattern = str(self.get_parameter("uav_name_pattern").value)
-            peers = {mac: d for mac, d in all_devs.items() if d.connected and self._is_uav_peer_candidate(d, pattern)}
-            other_connected = {mac: d for mac, d in all_devs.items() if d.connected and mac not in peers}
-            paired = {mac: d for mac, d in all_devs.items() if d.paired}
-            lines.append(f"  discovered: {len(all_devs)} devices")
+                all_devices = self._client.get_devices()
+            pattern = str(self.get_parameter("auto_connect_pattern").value)
+            peers = {mac: dev for mac, dev in all_devices.items() if dev.connected and self._is_uav_peer_candidate(dev, pattern)}
+            other_connected = {mac: dev for mac, dev in all_devices.items() if dev.connected and mac not in peers}
+            lines.append(f"  discovered: {len(all_devices)} devices")
             lines.append(f"  connected:  {len(peers) + len(other_connected)} devices")
-            if peers:
-                for mac, d in sorted(peers.items()):
-                    name = d.alias or d.name or "?"
-                    bridge_state = self._peer_time_bridges.get(mac)
-                    inactivity = (
-                        max(0.0, time.monotonic() - bridge_state.last_activity_monotonic)
-                        if bridge_state is not None
-                        else -1.0
-                    )
-                    last_rtt_s = bridge_state.last_rtt_s if bridge_state is not None else 0
-                    lines.append(
-                        f"    peer: {mac}  {name}  RSSI={d.rssi}  paired={d.paired and d.trusted and d.bonded} "
-                        f"  inactive_s={inactivity:.1f}  rtt_s={last_rtt_s}"
-                    )
-            else:
+            for mac, dev in sorted(peers.items()):
+                bridge_state = self._peer_time_bridges.get(mac)
+                inactivity = max(0.0, time.monotonic() - bridge_state.last_activity_monotonic) if bridge_state is not None else -1.0
+                lines.append(
+                    f"    peer: {mac} {dev.alias or dev.name or '?'} RSSI={dev.rssi} paired={dev.paired and dev.trusted and dev.bonded} inactive_s={inactivity:.1f}"
+                )
+            if not peers:
                 lines.append("    peers: (none)")
             if other_connected:
                 lines.append("    other:")
-                for mac, d in sorted(other_connected.items()):
-                    name = d.alias or d.name or "?"
-                    lines.append(f"      {mac}  {name}  RSSI={d.rssi}")
+                for mac, dev in sorted(other_connected.items()):
+                    lines.append(f"      {mac} {dev.alias or dev.name or '?'} RSSI={dev.rssi}")
             else:
                 lines.append("    other: (none)")
-            if paired:
-                paired_strs = [f"{mac}({d.alias or d.name or '?'})" for mac, d in sorted(paired.items())]
-                lines.append(f"  paired:    {', '.join(paired_strs)}")
-
-        # Topic bridges
         if self._topic_exports:
             lines.append(f"  export bridges ({len(self._topic_exports)}):")
-            for key, state in self._topic_exports.items():
+            for state in self._topic_exports.values():
                 bridge_path = state.service.transport_path(state.transport_endpoint) if state.service is not None else "?"
-                lines.append(f"    {state.topic_name} -> {state.bridge_uuid}  [{bridge_path}]")
+                lines.append(f"    {state.topic_name} -> {state.bridge_key} [{bridge_path}]")
         if self._notification_bridges:
             lines.append(f"  import bridges ({len(self._notification_bridges)}):")
-            for key, state in self._notification_bridges.items():
-                lines.append(f"    {state.mac} {state.path} -> {state.resolved_topic_name}")
+            for state in self._notification_bridges.values():
+                lines.append(f"    {state.mac} {state.bridge_key} -> {state.resolved_topic_name}")
         peer_topic_lines = self._build_peer_topic_status_lines()
         if peer_topic_lines:
             lines.append("  peer topics:")
             lines.extend(peer_topic_lines)
-
         lines.append("---")
         return lines
 
     def _build_peer_topic_status_lines(self):
         per_peer = {}
         for mac, state in self._peer_time_bridges.items():
-            per_peer.setdefault(mac, []).append(
-                f"{state.status_topic_name} @ {state.current_hz:.2f} Hz"
-            )
+            per_peer.setdefault(mac, []).append(f"{state.status_topic_name} @ {state.current_hz:.2f} Hz")
         for state in self._notification_bridges.values():
             per_peer.setdefault(state.mac, []).append(f"{state.resolved_topic_name} @ {state.current_hz:.2f} Hz")
         lines = []
@@ -385,100 +574,49 @@ class BluetoothNode(Node):
         self.create_service(WriteGattValue, "ble/write_gatt_value", self._handle_write_gatt_value)
         self.create_service(SetNotify, "ble/set_notify", self._handle_set_notify)
         self.create_service(SetScanEnabled, "ble/set_scan_enabled", self._handle_set_scan_enabled)
-        self.create_service(
-            ConfigureNotificationBridge,
-            "ble/configure_notification_bridge",
-            self._handle_configure_notification_bridge,
-        )
+        self.create_service(ConfigureNotificationBridge, "ble/configure_notification_bridge", self._handle_configure_notification_bridge)
         self.create_service(Trigger, "ble/reload_config", self._handle_reload_config)
-
-    # -- Reloadable parameters (names must match config/bluetooth_node.json) --
-    _RELOADABLE_PARAMS = [
-        "scan_publish_period",
-        "time_update_period",
-        "wifi_refresh_period",
-        "auto_connect_period",
-        "discoverable_timeout",
-        "auto_accept_pairing",
-        "auto_trust",
-        "enable_time_service",
-        "enable_wifi_service",
-        "auto_connect_whitelist",
-        "auto_connect_uav_peers",
-        "peer_connection_timeout",
-        "uav_name_pattern",
-        "peer_topics_prefix",
-        "allowed_wifi_networks",
-        "status_report_period",
-    ]
-
-    def _handle_reload_config(self, request, response):
-        path = self._config_file
-        if not path or not os.path.isfile(path):
-            response.success = False
-            response.message = f"Config file not found: {path}"
-            return response
-        try:
-            with open(path, "r") as fh:
-                raw = json.load(fh)
-            # Navigate into the nested ros__parameters dict
-            ns = raw.get("mrs_uav_bluetooth", raw)
-            params = ns.get("ros__parameters", ns)
-            updated = []
-            for name in self._RELOADABLE_PARAMS:
-                if name not in params:
-                    continue
-                value = params[name]
-                param = rclpy.parameter.Parameter(
-                    name,
-                    rclpy.parameter.Parameter.Type.from_parameter_value(value),
-                    value,
-                )
-                self.set_parameters([param])
-                updated.append(name)
-            # Apply side-effects for params that affect runtime objects
-            self._apply_reloaded_params()
-            response.success = True
-            response.message = f"Reloaded {len(updated)} params: {', '.join(updated)}"
-        except Exception as exc:
-            response.success = False
-            response.message = str(exc)
-        return response
-
-    def _apply_reloaded_params(self):
-        """Apply side-effects after reloading runtime parameters."""
-        # Update netplan allowed networks
-        self._netplan.allowed_networks = self._get_string_list("allowed_wifi_networks")
-        # Update adapter discoverable timeout
-        try:
-            self._dbus.set_adapter_props(
-                discoverable_timeout=int(self.get_parameter("discoverable_timeout").value),
-            )
-        except Exception:
-            pass
+        self.create_service(SetActiveConfig, "ble/set_active_config", self._handle_set_active_config)
 
     def _setup_bluetooth(self):
         self._dbus.setup()
         self._client.add_notification_handler(self._on_notification)
         self._client.add_gatt_event_handler(self._on_client_gatt_event)
+        self._rebuild_netplan()
+        self._dbus.ensure_pairing_agent(
+            auto_accept=bool(self.get_parameter("auto_accept_pairing").value),
+            auto_trust=bool(self.get_parameter("auto_trust").value),
+            capability=self.get_parameter("pairing_agent").value,
+        )
+        self._apply_runtime_side_effects(initial=True)
 
+    def _rebuild_netplan(self):
         self._netplan = NetplanConfiguration(
             self.get_parameter("netplan_config_file").value,
             self.get_parameter("netplan_scripts_dir").value,
             self._get_string_list("allowed_wifi_networks"),
         )
 
-        self._dbus.ensure_pairing_agent(
-            auto_accept=bool(self.get_parameter("auto_accept_pairing").value),
-            auto_trust=bool(self.get_parameter("auto_trust").value),
-            capability=self.get_parameter("pairing_agent").value,
-        )
+    def _apply_runtime_side_effects(self, *, initial: bool = False):
+        self._setup_verbose_logger()
+        self._rebuild_netplan()
+        try:
+            self._dbus.set_adapter_props(discoverable_timeout=int(self.get_parameter("discoverable_timeout").value))
+        except Exception:
+            pass
+        self._sync_configured_exports()
         if bool(self.get_parameter("enable_server").value):
-            self.get_logger().info("Initializing BLE GATT server...")
             self._rebuild_server()
-        if bool(self.get_parameter("enable_scan").value):
-            self.get_logger().info(f"Starting BLE scan (transport={self._scan_transport})")
-            self._start_scan(self._scan_transport)
+        else:
+            self._dbus.unregister_server_objects(self._topic_exports)
+        desired_scan = bool(self.get_parameter("enable_scan").value)
+        desired_transport = str(self.get_parameter("scan_mode").value)
+        if desired_scan:
+            self._start_scan(desired_transport)
+        else:
+            self._stop_scan()
+        if not initial:
+            self.get_logger().info(f"Applied config from {self._active_config_source}")
 
     def _rebuild_server(self):
         with self._lock:
@@ -494,6 +632,43 @@ class BluetoothNode(Node):
                 wifi_password_read_cb=lambda: "",
                 time_writeback_cb=self._handle_time_writeback,
             )
+
+    def _sync_configured_exports(self):
+        removed = False
+        for key in [item for item, state in self._topic_exports.items() if state.auto_managed]:
+            state = self._topic_exports.pop(key)
+            self._destroy_export_bridge(state)
+            self.destroy_subscription(state.subscription)
+            removed = True
+        for shared in self._shared_topic_configs.values():
+            if shared.mode not in {"export", "both"}:
+                continue
+            key = f"config-export::{shared.bridge_key}"
+            subscription = self.create_subscription(
+                shared.message_class,
+                shared.export_topic,
+                lambda msg, bridge_key=key: self._on_export_topic_message(bridge_key, msg),
+                10,
+            )
+            self._topic_exports[key] = TopicExportBridgeState(
+                topic_name=shared.export_topic,
+                message_type=shared.message_type,
+                message_class=shared.message_class,
+                bridge_name=shared.bridge_name,
+                bridge_key=shared.bridge_key,
+                bridge_uuid=topic_bridge_data_descriptor_uuid(shared.bridge_name)
+                if shared.transport_endpoint == "descriptor"
+                else topic_bridge_characteristic_uuid(shared.bridge_name),
+                member_specs=shared.member_specs,
+                rate_hz=shared.rate_hz,
+                transport_endpoint=shared.transport_endpoint,
+                payload_format=shared.payload_format,
+                subscription=subscription,
+                auto_managed=True,
+            )
+            self._configure_export_bridge_timer(self._topic_exports[key], key)
+        if removed and not self._topic_exports:
+            self._log_verbose("Removed all auto-managed export bridges")
 
     def _start_scan(self, transport: str):
         ok = self._dbus.start_scan(transport)
@@ -532,6 +707,7 @@ class BluetoothNode(Node):
         if self._client is None:
             return
         snapshot = self._client.get_devices(refresh=True)
+        self._sync_auto_import_bridges(snapshot)
         self._reconcile_import_bridges(snapshot)
         msg = BleDeviceArray()
         msg.header = self._header()
@@ -539,6 +715,84 @@ class BluetoothNode(Node):
         self.devices_pub.publish(msg)
         self._refresh_notification_mapping(snapshot)
         self._cleanup_peer_time_bridges(snapshot)
+
+    def _sync_auto_import_bridges(self, snapshot: Dict[str, DeviceInfo]):
+        desired_keys = set()
+        for shared in self._shared_topic_configs.values():
+            if shared.mode not in {"import", "both"}:
+                continue
+            for mac, device in snapshot.items():
+                if not device.connected:
+                    continue
+                if (device.alias or device.name or "").strip().lower() == self._local_name.strip().lower():
+                    continue
+                path, bridge_uuid, transport_endpoint = self._resolve_remote_characteristic(
+                    mac, shared.bridge_name, shared.transport_endpoint
+                )
+                key = f"config-import::{shared.bridge_key}::{mac}"
+                state = self._notification_bridges.get(key)
+                if not path:
+                    if state is not None:
+                        self._remove_import_bridge(key, state)
+                    continue
+                desired_keys.add(key)
+                resolved_topic_name = self._resolve_peer_topic_name(mac, shared.import_topic_suffix, device=device)
+                if state is None:
+                    if transport_endpoint == "characteristic" and not self._client.start_notify(path):
+                        continue
+                    publisher = self.create_publisher(shared.message_class, resolved_topic_name, 10)
+                    self._notification_bridges[key] = TopicImportBridgeState(
+                        mac=mac,
+                        requested_topic_name=shared.import_topic_suffix,
+                        resolved_topic_name=resolved_topic_name,
+                        message_type=shared.message_type,
+                        message_class=shared.message_class,
+                        bridge_name=shared.bridge_name,
+                        bridge_key=shared.bridge_key,
+                        bridge_uuid=bridge_uuid,
+                        member_specs=shared.member_specs,
+                        rate_hz=shared.rate_hz,
+                        transport_endpoint=transport_endpoint,
+                        payload_format=shared.payload_format,
+                        path=path,
+                        publisher=publisher,
+                        auto_managed=True,
+                    )
+                    self._configure_import_bridge_timer(self._notification_bridges[key], key)
+                    continue
+                old_path = state.path
+                old_transport = state.transport_endpoint
+                if transport_endpoint == "characteristic" and (old_transport != "characteristic" or old_path != path):
+                    if not self._client.start_notify(path):
+                        continue
+                if state.resolved_topic_name != resolved_topic_name or state.message_type != shared.message_type:
+                    replacement = self.create_publisher(shared.message_class, resolved_topic_name, 10)
+                    self.destroy_publisher(state.publisher)
+                    state.publisher = replacement
+                state.requested_topic_name = shared.import_topic_suffix
+                state.resolved_topic_name = resolved_topic_name
+                state.message_type = shared.message_type
+                state.message_class = shared.message_class
+                state.bridge_name = shared.bridge_name
+                state.bridge_key = shared.bridge_key
+                state.bridge_uuid = bridge_uuid
+                state.member_specs = shared.member_specs
+                state.rate_hz = shared.rate_hz
+                state.transport_endpoint = transport_endpoint
+                state.payload_format = shared.payload_format
+                state.path = path
+                self._configure_import_bridge_timer(state, key)
+                if old_transport == "characteristic" and (transport_endpoint != "characteristic" or old_path != path):
+                    self._stop_notify_if_unused(old_path)
+        for key in [item for item, state in self._notification_bridges.items() if state.auto_managed and item not in desired_keys]:
+            self._remove_import_bridge(key, self._notification_bridges[key])
+
+    def _remove_import_bridge(self, key: str, state: TopicImportBridgeState):
+        self._notification_bridges.pop(key, None)
+        self._destroy_import_bridge(state)
+        self.destroy_publisher(state.publisher)
+        if state.transport_endpoint == "characteristic":
+            self._stop_notify_if_unused(state.path)
 
     def _refresh_notification_mapping(self, snapshot: Dict[str, DeviceInfo]):
         path_to_mac = {}
@@ -562,7 +816,7 @@ class BluetoothNode(Node):
                     stale_macs.append(mac)
                 continue
             stale_macs.append(mac)
-        pattern = str(self.get_parameter("uav_name_pattern").value)
+        pattern = str(self.get_parameter("auto_connect_pattern").value)
         for mac, device in snapshot.items():
             if not device.connected or not self._is_uav_peer_candidate(device, pattern):
                 self._peer_inactive_since.pop(mac, None)
@@ -589,7 +843,6 @@ class BluetoothNode(Node):
             device = snapshot.get(state.mac)
             if device is None or not device.connected:
                 continue
-
             if state.bridge_uuid:
                 current_path, notifying = self._find_remote_bridge_path(state.mac, state.bridge_uuid, state.transport_endpoint)
                 if not current_path:
@@ -619,30 +872,21 @@ class BluetoothNode(Node):
         return "", False
 
     def _auto_connect_devices(self):
-        if self._client is None:
+        if self._client is None or not bool(self.get_parameter("auto_connect_enable").value):
             return
         now = time.monotonic()
         retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
         whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
         whitelist_enabled = bool(whitelist_names or whitelist_macs)
-        connect_uav_peers = bool(self.get_parameter("auto_connect_uav_peers").value) and not whitelist_enabled
-        pattern = str(self.get_parameter("uav_name_pattern").value)
-        if not whitelist_enabled and not connect_uav_peers:
-            return
+        pattern = str(self.get_parameter("auto_connect_pattern").value)
         snapshot = self._client.get_devices(refresh=True)
-        self._auto_connect_attempts = {
-            mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot
-        }
-        self._peer_security_attempts = {
-            mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot
-        }
-        self._peer_inactive_since = {
-            mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot
-        }
+        self._auto_connect_attempts = {mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot}
+        self._peer_security_attempts = {mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot}
+        self._peer_inactive_since = {mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot}
         for mac, device in snapshot.items():
             peer_candidate = self._is_uav_peer_candidate(device, pattern)
             explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
-            should_connect = explicit_target or (connect_uav_peers and peer_candidate)
+            should_connect = explicit_target or (peer_candidate and not whitelist_enabled)
             if whitelist_enabled and peer_candidate and not explicit_target:
                 self._drop_non_whitelisted_peer(mac, device)
                 continue
@@ -651,10 +895,10 @@ class BluetoothNode(Node):
                 if should_connect:
                     self._maintain_peer_connection(mac, device, retry_period, explicit_target=explicit_target)
                 continue
+            if not should_connect:
+                continue
             last_attempt = self._auto_connect_attempts.get(mac, 0.0)
             if now - last_attempt < retry_period:
-                continue
-            if not should_connect:
                 continue
             self._auto_connect_attempts[mac] = now
             if not self._client.connect(mac, timeout=10.0):
@@ -662,7 +906,7 @@ class BluetoothNode(Node):
             self._client.wait_services_resolved(mac, timeout=10.0)
             current = self._client.get_device(mac, refresh=True) or device
             if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
-                self.get_logger().info(f"Disconnecting {mac}: uavXX peer candidate without BLE time characteristic")
+                self.get_logger().info(f"Disconnecting {mac}: UAV peer candidate without BLE time characteristic")
                 self._client.disconnect(mac, timeout=5.0)
             else:
                 self._auto_connect_attempts.pop(mac, None)
@@ -740,7 +984,7 @@ class BluetoothNode(Node):
             self._process_peer_time_payload(state.mac, state.characteristic_path, payload)
 
     def _maintain_peer_connection(self, mac: str, device: DeviceInfo, retry_period: float, explicit_target: bool = False) -> bool:
-        time_bridge_ready = self._ensure_peer_time_bridge(mac, device) if self._is_uav_peer_candidate(device, str(self.get_parameter("uav_name_pattern").value)) else False
+        time_bridge_ready = self._ensure_peer_time_bridge(mac, device) if self._is_uav_peer_candidate(device, str(self.get_parameter("auto_connect_pattern").value)) else False
         self._ensure_peer_security(mac, device, retry_period)
         return time_bridge_ready or explicit_target
 
@@ -749,27 +993,23 @@ class BluetoothNode(Node):
         if current.paired and current.trusted and current.bonded:
             self._peer_security_attempts.pop(mac, None)
             return
-
         now = time.monotonic()
         last_attempt = self._peer_security_attempts.get(mac, 0.0)
         if now - last_attempt < retry_period:
             return
         self._peer_security_attempts[mac] = now
-
         if not current.paired or not current.bonded:
             if self._client.pair(mac, timeout=30.0):
                 self.get_logger().info(f"Paired BLE peer {mac}")
             else:
                 self.get_logger().warning(f"Failed to pair BLE peer {mac}")
             current = self._client.get_device(mac, refresh=True) or current
-
         if current.paired and not current.trusted:
             if self._client.trust(mac):
                 self.get_logger().info(f"Trusted BLE peer {mac}")
             else:
                 self.get_logger().warning(f"Failed to trust BLE peer {mac}")
             current = self._client.get_device(mac, refresh=True) or current
-
         if current.paired and current.trusted and current.bonded:
             self._peer_security_attempts.pop(mac, None)
 
@@ -872,9 +1112,7 @@ class BluetoothNode(Node):
         state.last_activity_monotonic = time.monotonic()
         state.last_time_value_ns = time_value_ns
         state.last_publish_monotonic, state.current_hz = self._update_publish_rate(state.last_publish_monotonic)
-
         self._publish_peer_time_status(state)
-
         if state.writeback_descriptor_path:
             self._update_peer_writeback_latency(state, data)
 
@@ -883,11 +1121,7 @@ class BluetoothNode(Node):
             return
         if self._client.write_descriptor(state.writeback_descriptor_path, payload):
             return
-        refreshed_path = self._client.find_descriptor(
-            state.mac,
-            TIME_WRITEBACK_DESCRIPTOR_UUID,
-            chrc_path=state.characteristic_path,
-        ) or ""
+        refreshed_path = self._client.find_descriptor(state.mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=state.characteristic_path) or ""
         if not refreshed_path or refreshed_path == state.writeback_descriptor_path:
             self.get_logger().warning(
                 f"Failed to write peer time writeback descriptor for {state.mac} at {state.writeback_descriptor_path}"
@@ -927,9 +1161,9 @@ class BluetoothNode(Node):
                     self._last_gatt_warning_at[key] = now
             self.get_logger().warning(f"BLE GATT event {event_type}: {info}")
 
-    def _on_pairing_event(self, event_type, device_path, **kw):
-        self.get_logger().info(f"Pairing event {event_type} for {device_path}: {kw}")
-        self._log_verbose(f"Pairing event {event_type} device={device_path} {kw}")
+    def _on_pairing_event(self, event_type, device_path, **kwargs):
+        self.get_logger().info(f"Pairing event {event_type} for {device_path}: {kwargs}")
+        self._log_verbose(f"Pairing event {event_type} device={device_path} {kwargs}")
 
     def _hostname_from_device(self, device: DeviceInfo) -> str:
         if device.alias:
@@ -980,8 +1214,7 @@ class BluetoothNode(Node):
         state.last_activity_monotonic = time.monotonic()
         state.last_rtt_s = max(0.0, (received_time_ns - echoed_time_ns) / 1e9)
         self._log_verbose(
-            f"Peer writeback received mac={mac} path={device_path} echoed_time_ns={echoed_time_ns} "
-            f"rtt_s={state.last_rtt_s}"
+            f"Peer writeback received mac={mac} path={device_path} echoed_time_ns={echoed_time_ns} rtt_s={state.last_rtt_s}"
         )
         self._publish_peer_time_status(state)
 
@@ -1015,8 +1248,8 @@ class BluetoothNode(Node):
     def _resolve_remote_characteristic(self, mac: str, identifier: str, transport_endpoint: str) -> Tuple[str, str, str]:
         candidate = identifier.strip()
         if candidate.startswith("/"):
+            props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, candidate), DBUS_PROP_IFACE)
             try:
-                props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, candidate), DBUS_PROP_IFACE)
                 uuid = str(props.Get(GATT_CHRC_IFACE, "UUID"))
                 return candidate, uuid, "characteristic"
             except Exception:
@@ -1183,14 +1416,16 @@ class BluetoothNode(Node):
             response.message = "topic_name is required"
             return response
         bridge_name = (request.characteristic or topic_name).strip()
-        member_paths = normalize_member_paths(request.member_paths)
         rate_hz = max(0.0, float(request.rate_hz))
         transport_endpoint = self._normalize_transport_endpoint(request.transport_endpoint)
-        payload_format = payload_format_for_member_paths(member_paths)
+        message_type, message_class = self._resolve_message_type(topic_name, request.message_type, prefer_publishers=True)
+        member_specs = normalize_member_specs(request.member_paths, message_class=message_class)
+        payload_format = payload_format_for_member_specs(member_specs)
+        bridge_key = hashlib.md5(bridge_name.encode("utf-8")).hexdigest()
         bridge_uuid = topic_bridge_data_descriptor_uuid(bridge_name) if transport_endpoint == "descriptor" else topic_bridge_characteristic_uuid(bridge_name)
         existing_key = None
         for key, state in self._topic_exports.items():
-            if state.topic_name == topic_name and state.bridge_name == bridge_name:
+            if state.topic_name == topic_name and state.bridge_name == bridge_name and not state.auto_managed:
                 existing_key = key
                 break
 
@@ -1214,9 +1449,8 @@ class BluetoothNode(Node):
             response.resolved_transport_endpoint = state.transport_endpoint
             return response
 
-        message_type, message_class = self._resolve_message_type(topic_name, request.message_type, prefer_publishers=True)
         if existing_key is None:
-            key = f"export::{topic_name}::{bridge_name}"
+            key = f"manual-export::{topic_name}::{bridge_name}"
             subscription = self.create_subscription(
                 message_class,
                 topic_name,
@@ -1228,8 +1462,9 @@ class BluetoothNode(Node):
                 message_type=message_type,
                 message_class=message_class,
                 bridge_name=bridge_name,
+                bridge_key=bridge_key,
                 bridge_uuid=bridge_uuid,
-                member_paths=member_paths,
+                member_specs=member_specs,
                 rate_hz=rate_hz,
                 transport_endpoint=transport_endpoint,
                 payload_format=payload_format,
@@ -1249,8 +1484,9 @@ class BluetoothNode(Node):
                 )
                 state.message_type = message_type
                 state.message_class = message_class
+            state.bridge_key = bridge_key
             state.bridge_uuid = bridge_uuid
-            state.member_paths = member_paths
+            state.member_specs = member_specs
             state.rate_hz = rate_hz
             state.transport_endpoint = transport_endpoint
             state.payload_format = payload_format
@@ -1273,7 +1509,7 @@ class BluetoothNode(Node):
         if state is None or state.service is None:
             return
         try:
-            payload = encode_message_payload(message, state.member_paths, state.payload_format)
+            payload = encode_message_payload(message, state.member_specs, state.payload_format)
         except Exception as exc:
             self.get_logger().warning(f"Failed to serialize message for BLE topic bridge {state.topic_name}: {exc}")
             return
@@ -1315,33 +1551,28 @@ class BluetoothNode(Node):
             response.message = "mac is required for import bridges"
             return response
         bridge_name = (request.characteristic or topic_name).strip()
-        remote_member_paths, remote_payload_format, remote_rate_hz = self._read_remote_bridge_metadata(mac, bridge_name)
-        member_paths = normalize_member_paths(request.member_paths) or remote_member_paths
-        rate_hz = max(0.0, float(request.rate_hz or remote_rate_hz or 0.0))
         transport_endpoint = self._normalize_transport_endpoint(request.transport_endpoint)
-        payload_format = remote_payload_format or payload_format_for_member_paths(member_paths)
+        message_type, message_class = self._resolve_message_type(topic_name, request.message_type, prefer_publishers=False)
+        remote_member_specs, remote_payload_format, remote_rate_hz, remote_bridge_key = self._read_remote_bridge_metadata(mac, bridge_name, message_class=message_class)
+        member_specs = normalize_member_specs(request.member_paths, message_class=message_class) or remote_member_specs
+        rate_hz = max(0.0, float(request.rate_hz or remote_rate_hz or 0.0))
+        payload_format = remote_payload_format or payload_format_for_member_specs(member_specs)
         path, bridge_uuid, transport_endpoint = self._resolve_remote_characteristic(mac, bridge_name, transport_endpoint)
+        bridge_key = remote_bridge_key or hashlib.md5(bridge_name.encode("utf-8")).hexdigest()
 
         if not request.enable:
             removed = None
             removed_key = None
             for key, state in self._notification_bridges.items():
-                if state.mac != mac or state.requested_topic_name != topic_name:
-                    continue
-                if bridge_uuid and state.bridge_uuid != bridge_uuid:
-                    continue
-                removed = state
-                removed_key = key
-                break
+                if state.mac == mac and state.requested_topic_name == topic_name and state.bridge_name == bridge_name and not state.auto_managed:
+                    removed = state
+                    removed_key = key
+                    break
             if removed is None:
                 response.success = False
                 response.message = "notification bridge not found"
                 return response
-            self._notification_bridges.pop(removed_key)
-            self._destroy_import_bridge(removed)
-            self.destroy_publisher(removed.publisher)
-            if removed.transport_endpoint == "characteristic":
-                self._stop_notify_if_unused(removed.path)
+            self._remove_import_bridge(removed_key, removed)
             response.success = True
             response.message = "removed"
             response.resolved_uuid = removed.bridge_uuid
@@ -1354,14 +1585,12 @@ class BluetoothNode(Node):
             return response
 
         if not path:
-            target_name = "descriptor" if transport_endpoint == "descriptor" else "characteristic"
             response.success = False
-            response.message = f"{target_name} {bridge_name} not found on {mac}"
+            response.message = f"remote bridge {bridge_name} not found on {mac}"
             return response
 
-        message_type, message_class = self._resolve_message_type(topic_name, request.message_type, prefer_publishers=False)
         resolved_topic_name = self._resolve_peer_topic_name(mac, topic_name)
-        key = f"import::{mac}::{transport_endpoint}::{bridge_name}::{topic_name}"
+        key = f"manual-import::{mac}::{transport_endpoint}::{bridge_name}::{topic_name}"
         state = self._notification_bridges.get(key)
         if state is None:
             if transport_endpoint == "characteristic" and not self._client.start_notify(path):
@@ -1376,8 +1605,9 @@ class BluetoothNode(Node):
                 message_type=message_type,
                 message_class=message_class,
                 bridge_name=bridge_name,
+                bridge_key=bridge_key,
                 bridge_uuid=bridge_uuid,
-                member_paths=member_paths,
+                member_specs=member_specs,
                 rate_hz=rate_hz,
                 transport_endpoint=transport_endpoint,
                 payload_format=payload_format,
@@ -1406,10 +1636,11 @@ class BluetoothNode(Node):
                 self.destroy_publisher(state.publisher)
                 state.publisher = replacement_publisher
             state.bridge_name = bridge_name
+            state.bridge_key = bridge_key
             state.bridge_uuid = bridge_uuid
             state.requested_topic_name = topic_name
             state.resolved_topic_name = resolved_topic_name
-            state.member_paths = member_paths
+            state.member_specs = member_specs
             state.rate_hz = rate_hz
             state.transport_endpoint = transport_endpoint
             state.payload_format = payload_format
@@ -1466,7 +1697,7 @@ class BluetoothNode(Node):
 
     def _publish_import_payload(self, state: TopicImportBridgeState, payload: bytes):
         try:
-            message = decode_message_payload(payload, state.message_class, state.member_paths, state.payload_format)
+            message = decode_message_payload(payload, state.message_class, state.member_specs, state.payload_format)
         except Exception as exc:
             self.get_logger().warning(f"Failed to decode BLE payload for topic bridge {state.resolved_topic_name}: {exc}")
             return
@@ -1474,14 +1705,16 @@ class BluetoothNode(Node):
         state.last_publish_monotonic, state.current_hz = self._update_publish_rate(state.last_publish_monotonic)
         state.publisher.publish(message)
 
-    def _read_remote_bridge_metadata(self, mac: str, bridge_name: str):
-        members = ()
+    def _read_remote_bridge_metadata(self, mac: str, bridge_name: str, *, message_class: type):
+        member_specs = ()
         payload_format = ""
         rate_hz = 0.0
+        bridge_key = ""
         metadata_specs = {
             "format": topic_bridge_metadata_descriptor_uuid(bridge_name, "format"),
             "members": topic_bridge_metadata_descriptor_uuid(bridge_name, "members"),
             "rate_hz": topic_bridge_metadata_descriptor_uuid(bridge_name, "rate_hz"),
+            "key": topic_bridge_metadata_descriptor_uuid(bridge_name, "key"),
         }
         raw_values = {}
         for key, descriptor_uuid in metadata_specs.items():
@@ -1496,10 +1729,10 @@ class BluetoothNode(Node):
             except Exception:
                 continue
         if raw_values.get("members"):
-            try:
-                members = normalize_member_paths(json.loads(raw_values["members"]))
-            except Exception:
-                members = ()
+            member_specs = member_specs_from_serializable(
+                bytes_to_serializable(raw_values["members"].encode("utf-8")),
+                message_class=message_class,
+            )
         if raw_values.get("format"):
             payload_format = raw_values["format"].strip().lower()
         if raw_values.get("rate_hz"):
@@ -1507,9 +1740,71 @@ class BluetoothNode(Node):
                 rate_hz = max(0.0, float(raw_values["rate_hz"]))
             except ValueError:
                 rate_hz = 0.0
-        return members, payload_format, rate_hz
+        if raw_values.get("key"):
+            bridge_key = raw_values["key"].strip()
+        return member_specs, payload_format, rate_hz, bridge_key
+
+    def _handle_reload_config(self, request, response):
+        del request
+        try:
+            self._reload_active_config()
+            response.success = True
+            response.message = f"Reloaded config from {self._active_config_source}"
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+        return response
+
+    def _handle_set_active_config(self, request, response):
+        path = str(request.config_path or "").strip()
+        hold_seconds = max(0.5, float(request.hold_seconds or 3.0))
+        try:
+            if not path:
+                self._active_overlay_path = ""
+                self._active_overlay_deadline = 0.0
+                self._reload_active_config()
+                response.success = True
+                response.message = "Reverted to default config"
+                response.active_config_path = self._active_config_source
+                response.overlay_active = False
+                return response
+            if not os.path.isfile(path):
+                raise FileNotFoundError(path)
+            self._active_overlay_path = path
+            self._active_overlay_deadline = time.monotonic() + hold_seconds
+            self._reload_active_config()
+            response.success = True
+            response.message = f"Activated overlay config {path}"
+            response.active_config_path = self._active_config_source
+            response.overlay_active = True
+            return response
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            response.active_config_path = self._active_config_source
+            response.overlay_active = bool(self._active_overlay_path)
+            return response
+
+    def _check_overlay_config_lease(self):
+        if not self._active_overlay_path:
+            return
+        if time.monotonic() <= self._active_overlay_deadline:
+            return
+        expired_path = self._active_overlay_path
+        self._active_overlay_path = ""
+        self._active_overlay_deadline = 0.0
+        self._reload_active_config()
+        self.get_logger().info(f"Overlay config lease expired, reverted to default after {expired_path}")
+
+    def _reload_active_config(self):
+        config = self._load_effective_config(self._active_overlay_path)
+        source_path = self._active_overlay_path or self._default_config_path
+        self._apply_config_document(config, source_path=source_path, initial=False)
+        self._reconfigure_timers()
+        self._apply_runtime_side_effects(initial=False)
 
     def destroy_node(self):
+        self._shutting_down = True
         try:
             self._shutdown_bluetooth()
         finally:
@@ -1539,9 +1834,8 @@ class BluetoothNode(Node):
         for state in self._topic_exports.values():
             self._destroy_export_bridge(state)
             self.destroy_subscription(state.subscription)
-        for state in self._notification_bridges.values():
-            self._destroy_import_bridge(state)
-            self.destroy_publisher(state.publisher)
+        for key, state in list(self._notification_bridges.items()):
+            self._remove_import_bridge(key, state)
         for state in self._peer_time_bridges.values():
             self.destroy_publisher(state.publisher)
         self._notification_bridges.clear()

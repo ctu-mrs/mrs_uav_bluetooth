@@ -1,0 +1,67 @@
+# Example experiment overlay loaded by the user_node.
+#
+# Usage:
+#   ros2 launch mrs_uav_bluetooth user_node.launch.py \
+#     config_path:=/absolute/path/to/your_experiment_ble.yaml
+#
+# This file is intentionally standalone and may live anywhere on disk. The
+# system bluetooth service merges it on top of config/default.yaml while the
+# user node keeps the lease alive.
+
+# Enable automatic peer connection only for the swarm members involved in the
+# experiment.
+auto_connect_enable: true
+auto_connect_whitelist:
+  - uav42
+  - uav99
+
+# Share one compact odometry packet in both directions.
+# Packet layout:
+#   uint64  timestamp_ns
+#   float32 position.x
+#   float32 position.y
+#   float32 position.z
+#   float32 orientation.x
+#   float32 orientation.y
+#   float32 orientation.z
+#   float32 orientation.w
+#   float32 linear.x
+#   float32 linear.y
+#   float32 linear.z
+#   float32 angular.x
+#   float32 angular.y
+#   float32 angular.z
+shared_topics:
+  - export_topic: /uav42/mavros/odometry/local
+    message_type: nav_msgs/msg/Odometry
+    rate_hz: 10.0
+    transport_endpoint: characteristic
+    members:
+      - path: header.stamp
+        type: time_ns
+      - path: pose.pose.position.x
+        type: float32
+      - path: pose.pose.position.y
+        type: float32
+      - path: pose.pose.position.z
+        type: float32
+      - path: pose.pose.orientation.x
+        type: float32
+      - path: pose.pose.orientation.y
+        type: float32
+      - path: pose.pose.orientation.z
+        type: float32
+      - path: pose.pose.orientation.w
+        type: float32
+      - path: twist.twist.linear.x
+        type: float32
+      - path: twist.twist.linear.y
+        type: float32
+      - path: twist.twist.linear.z
+        type: float32
+      - path: twist.twist.angular.x
+        type: float32
+      - path: twist.twist.angular.y
+        type: float32
+      - path: twist.twist.angular.z
+        type: float32
