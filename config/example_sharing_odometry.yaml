@@ -1,8 +1,8 @@
 # Example experiment overlay loaded by the user_node.
 #
-# Usage:
+# Usage example:
 #   ros2 launch mrs_uav_bluetooth user_node.launch.py \
-#     config_path:=/absolute/path/to/your_experiment_ble.yaml
+#     config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
 #
 # This file is intentionally standalone and may live anywhere on disk. The
 # system bluetooth service merges it on top of config/default.yaml while the
@@ -32,7 +32,7 @@ auto_connect_whitelist:
 #   float32 angular.y
 #   float32 angular.z
 shared_topics:
-  - export_topic: /uav42/mavros/odometry/local
+  - export_topic: /{hostname}/mavros/odometry/local
     message_type: nav_msgs/msg/Odometry
     rate_hz: 10.0
     transport_endpoint: characteristic

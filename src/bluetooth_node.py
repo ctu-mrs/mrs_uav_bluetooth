@@ -251,6 +251,9 @@ class BluetoothNode(Node):
             candidate = f"/{candidate}"
         return candidate.rstrip("/") or "/"
 
+    def _format_shared_topic_name(self, value: str) -> str:
+        return str(value or "").replace("{hostname}", sanitize_topic_suffix(self._local_name))
+
     def _normalize_ros_topic(self, value: str) -> str:
         candidate = re.sub(r"/+", "/", str(value or "").strip())
         if not candidate:
@@ -324,7 +327,7 @@ class BluetoothNode(Node):
             mode = str(raw.get("mode", "both")).strip().lower() or "both"
             if mode not in {"export", "import", "both"}:
                 raise ValueError(f"shared_topics[{index}].mode must be export, import, or both")
-            export_topic = self._normalize_ros_topic(raw.get("export_topic", ""))
+            export_topic = self._normalize_ros_topic(self._format_shared_topic_name(raw.get("export_topic", "")))
             if export_topic == "/":
                 raise ValueError(f"shared_topics[{index}] requires export_topic")
             canonical_topic = self._canonical_shared_topic(export_topic)
