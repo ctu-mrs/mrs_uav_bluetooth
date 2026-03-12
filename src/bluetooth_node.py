@@ -92,6 +92,8 @@ class SharedTopicConfig:
 
 
 class BluetoothNode(Node):
+    _MIN_OVERLAY_HOLD_SECONDS = 15.0
+
     _CONFIG_PARAM_NAMES = [
         "advertise_mode",
         "pairing_agent",
@@ -1951,9 +1953,15 @@ class BluetoothNode(Node):
             response.message = str(exc)
         return response
 
+    def _effective_overlay_hold_seconds(self, requested_hold_seconds: float) -> float:
+        requested = max(0.5, float(requested_hold_seconds or 3.0))
+        # Keep overlays alive across caller scheduling jitter to avoid rapid config flips.
+        return max(requested, self._MIN_OVERLAY_HOLD_SECONDS)
+
     def _handle_set_active_config(self, request, response):
         path = str(request.config_path or "").strip()
-        hold_seconds = max(0.5, float(request.hold_seconds or 3.0))
+        requested_hold_seconds = float(request.hold_seconds or 3.0)
+        hold_seconds = self._effective_overlay_hold_seconds(requested_hold_seconds)
         try:
             if not path:
                 if self._active_overlay_path:
@@ -1968,6 +1976,10 @@ class BluetoothNode(Node):
                 return response
             if not os.path.isfile(path):
                 raise FileNotFoundError(path)
+            if hold_seconds > requested_hold_seconds:
+                self.get_logger().info(
+                    f"Clamped overlay lease from {requested_hold_seconds:.1f}s to {hold_seconds:.1f}s for stability"
+                )
             new_deadline = time.monotonic() + hold_seconds
             if path == self._active_overlay_path:
                 # Only extend the lease deadline — do not reload the full config
