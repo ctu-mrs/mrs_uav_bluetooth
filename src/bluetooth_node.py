@@ -797,9 +797,16 @@ class BluetoothNode(Node):
                 desired_keys.add(key)
                 resolved_topic_name = self._resolve_peer_topic_name(mac, shared.import_topic_suffix, device=device)
                 if state is None:
-                    if transport_endpoint == "characteristic" and not self._client.start_notify(path):
-                        self._log_verbose(f"Failed to start notify for import bridge: {device_label}")
-                        continue
+                    if transport_endpoint == "characteristic":
+                        started, path = self._start_notify_with_refresh(
+                            mac,
+                            path,
+                            bridge_uuid,
+                            label=f"import bridge {shared.bridge_name}",
+                        )
+                        if not started:
+                            self._log_verbose(f"Failed to start notify for import bridge: {device_label}")
+                            continue
                     self._log_verbose(f"Creating import bridge: {device_label} -> {resolved_topic_name}")
                     publisher = self.create_publisher(shared.message_class, resolved_topic_name, 10)
                     self._notification_bridges[key] = TopicImportBridgeState(
@@ -824,7 +831,13 @@ class BluetoothNode(Node):
                 old_path = state.path
                 old_transport = state.transport_endpoint
                 if transport_endpoint == "characteristic" and (old_transport != "characteristic" or old_path != path):
-                    if not self._client.start_notify(path):
+                    started, path = self._start_notify_with_refresh(
+                        mac,
+                        path,
+                        bridge_uuid,
+                        label=f"import bridge {shared.bridge_name}",
+                    )
+                    if not started:
                         continue
                 if state.resolved_topic_name != resolved_topic_name or state.message_type != shared.message_type:
                     replacement = self.create_publisher(shared.message_class, resolved_topic_name, 10)
@@ -915,7 +928,14 @@ class BluetoothNode(Node):
                         self._stop_notify_if_unused(old_path)
                 if state.transport_endpoint != "characteristic" or notifying:
                     continue
-            if not self._client.start_notify(state.path):
+            started, refreshed_path = self._start_notify_with_refresh(
+                state.mac,
+                state.path,
+                state.bridge_uuid,
+                label=f"import bridge {state.bridge_name}",
+            )
+            state.path = refreshed_path
+            if not started:
                 self.get_logger().warning(
                     f"Failed to re-enable notifications for topic bridge {state.resolved_topic_name} on {state.mac}"
                 )
@@ -1014,13 +1034,32 @@ class BluetoothNode(Node):
                 return True
         return False
 
-    def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> bool:
+    def _start_notify_with_refresh(self, mac: str, path: str, characteristic_uuid: str, *, label: str) -> Tuple[bool, str]:
+        if self._client.start_notify(path):
+            return True, path
+
+        self._log_verbose(f"Retrying notify setup for {label} on {mac}: path={path}")
+        self._client.wait_services_resolved(mac, timeout=5.0)
+        refreshed_path = self._client.find_characteristic(mac, characteristic_uuid) or path
+        if refreshed_path != path:
+            self._log_verbose(f"Refreshed notify path for {label} on {mac}: {path} -> {refreshed_path}")
+        if self._client.start_notify(refreshed_path):
+            return True, refreshed_path
+        return False, refreshed_path
+
+    def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> Tuple[bool, bool]:
+        current = self._client.get_device(mac, refresh=True) or device
+        if not current.services_resolved and not self._client.wait_services_resolved(mac, timeout=5.0):
+            self._peer_inactive_since.setdefault(mac, time.monotonic())
+            self._log_verbose(f"Peer {mac}: services not resolved yet, delaying time bridge setup")
+            return False, True
+
         path = self._client.find_characteristic(mac, TIME_CHARACTERISTIC_UUID)
         device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
         if not path:
             self._peer_inactive_since.setdefault(mac, time.monotonic())
             self._log_verbose(f"Peer {device_label}: time characteristic {TIME_CHARACTERISTIC_UUID} not found")
-            return False
+            return False, False
         writeback_descriptor_path = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=path) or ""
         peer_name = self._hostname_from_device(device) or mac.lower().replace(":", "_")
         status_topic_name = self._resolve_peer_topic_name(mac, "/time_status", device=device)
@@ -1033,22 +1072,35 @@ class BluetoothNode(Node):
         ):
             self._peer_inactive_since.pop(mac, None)
             if self._is_characteristic_notifying(mac, path):
-                return True
-            started = bool(self._client.start_notify(path))
+                return True, True
+            started, path = self._start_notify_with_refresh(
+                mac,
+                path,
+                TIME_CHARACTERISTIC_UUID,
+                label="peer time characteristic",
+            )
+            existing.characteristic_path = path
             if started:
                 self._prime_peer_time_bridge(existing)
-            return started
+            return started, True
         if existing is not None:
             old_path = existing.characteristic_path
             self.destroy_publisher(existing.publisher)
             self._peer_time_bridges.pop(mac, None)
             self._stop_notify_if_unused(old_path)
         publisher = self.create_publisher(BlePeerTimeStatus, status_topic_name, 10)
-        if not self._client.start_notify(path):
+        started, path = self._start_notify_with_refresh(
+            mac,
+            path,
+            TIME_CHARACTERISTIC_UUID,
+            label="peer time characteristic",
+        )
+        if not started:
             self.get_logger().warning(f"Failed to start time notify for peer {device_label}")
             self._log_verbose(f"Failed to start_notify on time characteristic {path} for {device_label}")
             self.destroy_publisher(publisher)
-            return False
+            self._peer_inactive_since.setdefault(mac, time.monotonic())
+            return False, True
         self.get_logger().info(f"Established time bridge with peer {device_label} -> {status_topic_name}")
         self._log_verbose(
             f"Time bridge: {device_label} chrc={path} writeback={writeback_descriptor_path or 'none'}"
@@ -1064,7 +1116,7 @@ class BluetoothNode(Node):
         )
         self._peer_inactive_since.pop(mac, None)
         self._prime_peer_time_bridge(self._peer_time_bridges[mac])
-        return True
+        return True, True
 
     def _prime_peer_time_bridge(self, state: PeerTimeBridgeState):
         payload = self._client.read_characteristic(state.characteristic_path)
@@ -1072,9 +1124,12 @@ class BluetoothNode(Node):
             self._process_peer_time_payload(state.mac, state.characteristic_path, payload)
 
     def _maintain_peer_connection(self, mac: str, device: DeviceInfo, retry_period: float, explicit_target: bool = False) -> bool:
-        time_bridge_ready = self._ensure_peer_time_bridge(mac, device) if self._is_uav_peer_candidate(device, str(self.get_parameter("auto_connect_pattern").value)) else False
+        time_bridge_ready = False
+        time_bridge_available = False
+        if self._is_uav_peer_candidate(device, str(self.get_parameter("auto_connect_pattern").value)):
+            time_bridge_ready, time_bridge_available = self._ensure_peer_time_bridge(mac, device)
         self._ensure_peer_security(mac, device, retry_period)
-        return time_bridge_ready or explicit_target
+        return time_bridge_ready or time_bridge_available or explicit_target
 
     def _ensure_peer_security(self, mac: str, device: DeviceInfo, retry_period: float):
         current = self._client.get_device(mac, refresh=True) or device
@@ -1689,10 +1744,17 @@ class BluetoothNode(Node):
         key = f"manual-import::{mac}::{transport_endpoint}::{bridge_name}::{topic_name}"
         state = self._notification_bridges.get(key)
         if state is None:
-            if transport_endpoint == "characteristic" and not self._client.start_notify(path):
-                response.success = False
-                response.message = f"failed to enable notifications for {path}"
-                return response
+            if transport_endpoint == "characteristic":
+                started, path = self._start_notify_with_refresh(
+                    mac,
+                    path,
+                    bridge_uuid,
+                    label=f"manual import bridge {bridge_name}",
+                )
+                if not started:
+                    response.success = False
+                    response.message = f"failed to enable notifications for {path}"
+                    return response
             publisher = self.create_publisher(message_class, resolved_topic_name, 10)
             self._notification_bridges[key] = TopicImportBridgeState(
                 mac=mac,
@@ -1717,10 +1779,17 @@ class BluetoothNode(Node):
             old_transport_endpoint = state.transport_endpoint
             if transport_endpoint == "characteristic":
                 needs_notify = old_transport_endpoint != "characteristic" or old_path != path
-                if needs_notify and not self._client.start_notify(path):
-                    response.success = False
-                    response.message = f"failed to enable notifications for {path}"
-                    return response
+                if needs_notify:
+                    started, path = self._start_notify_with_refresh(
+                        mac,
+                        path,
+                        bridge_uuid,
+                        label=f"manual import bridge {bridge_name}",
+                    )
+                    if not started:
+                        response.success = False
+                        response.message = f"failed to enable notifications for {path}"
+                        return response
             if state.message_type != message_type:
                 replacement_publisher = self.create_publisher(message_class, resolved_topic_name, 10)
                 self.destroy_publisher(state.publisher)
