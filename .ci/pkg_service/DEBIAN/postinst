@@ -14,34 +14,7 @@ fi
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 
-SERVICE_USER=""
-if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
-  SERVICE_USER="$SUDO_USER"
-elif [ -n "$PKEXEC_UID" ]; then
-  SERVICE_USER=$(id -nu "$PKEXEC_UID" 2>/dev/null || true)
-else
-  SERVICE_USER=$(logname 2>/dev/null || true)
-fi
-
-if [ -z "$SERVICE_USER" ] || ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  SERVICE_USER="mrs"
-fi
-
-if ! id "$SERVICE_USER" >/dev/null 2>&1; then
-  echo "$0: failed to determine the installing user and fallback user '$SERVICE_USER' does not exist" >&2
-  exit 1
-fi
-
-SERVICE_GROUP=$(id -gn "$SERVICE_USER")
-SERVICE_HOME=$(getent passwd "$SERVICE_USER" | cut -d: -f6)
-
-if [ -z "$SERVICE_HOME" ]; then
-  echo "$0: failed to determine home directory for user $SERVICE_USER" >&2
-  exit 1
-fi
-
 #setup new systemctl service
-install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$SERVICE_HOME/.ros/log"
 chmod +x /etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
 touch /etc/systemd/system/mrs-uav-bluetooth.service
 > /etc/systemd/system/mrs-uav-bluetooth.service
@@ -52,15 +25,6 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Restart=always
-User=$SERVICE_USER
-Group=$SERVICE_GROUP
-WorkingDirectory=$SERVICE_HOME
-Environment=HOME=$SERVICE_HOME
-Environment=USER=$SERVICE_USER
-Environment=LOGNAME=$SERVICE_USER
-Environment=SERVICE_USER=$SERVICE_USER
-Environment=ROS_HOME=$SERVICE_HOME/.ros
-Environment=ROS_LOG_DIR=$SERVICE_HOME/.ros/log
 ExecStart=/etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
 [Install]
 WantedBy=multi-user.target" >> /etc/systemd/system/mrs-uav-bluetooth.service

@@ -1,10 +1,10 @@
 """Server-side BLE GATT services for the ROS 2 Bluetooth node."""
 
-import json
 import struct
 import time
 from typing import Callable, Optional, Sequence
 
+from .bridge_payload import BridgeMemberSpec, member_specs_to_serializable, serializable_to_bytes
 from .dbus_gatt import Service
 from .gatt_server import NotifyingCharacteristic, ReadOnlyDescriptor, WritableDescriptor
 from .uuid_utils import named_characteristic_uuid, named_descriptor_uuid, named_service_uuid
@@ -138,13 +138,14 @@ class TimeService(Service):
 
 
 class TopicBridgeService(Service):
-    def __init__(self, bus, index, topic_name: str, message_type: str, bridge_name: str, *, member_paths: Sequence[str], rate_hz: float, payload_format: str):
+    def __init__(self, bus, index, topic_name: str, message_type: str, bridge_name: str, bridge_key: str, *, member_specs: Sequence[BridgeMemberSpec], rate_hz: float, payload_format: str):
         service_uuid = named_service_uuid(f"bridge:{bridge_name}")
         super().__init__(bus, index, service_uuid, primary=True)
         self.topic_name = topic_name
         self.message_type = message_type
         self.bridge_name = bridge_name
-        self.member_paths = tuple(member_paths)
+        self.bridge_key = bridge_key
+        self.member_specs = tuple(member_specs)
         self.rate_hz = float(rate_hz)
         self.payload_format = payload_format
         self._payload = b""
@@ -189,13 +190,13 @@ class TopicBridgeService(Service):
             read_cb=lambda: self.payload_format.encode("utf-8"),
             initial_value=self.payload_format.encode("utf-8"),
         )
-        members_payload = json.dumps(list(self.member_paths), separators=(",", ":")).encode("utf-8")
+        members_payload = serializable_to_bytes(member_specs_to_serializable(self.member_specs))
         self._member_descriptor = ReadOnlyDescriptor(
             bus,
             4,
             topic_bridge_metadata_descriptor_uuid(bridge_name, "members"),
             self._characteristic,
-            read_cb=lambda: json.dumps(list(self.member_paths), separators=(",", ":")).encode("utf-8"),
+            read_cb=lambda: serializable_to_bytes(member_specs_to_serializable(self.member_specs)),
             initial_value=members_payload,
         )
         rate_payload = f"{self.rate_hz:.6f}".encode("utf-8")
@@ -207,12 +208,22 @@ class TopicBridgeService(Service):
             read_cb=lambda: f"{self.rate_hz:.6f}".encode("utf-8"),
             initial_value=rate_payload,
         )
+        key_payload = self.bridge_key.encode("utf-8")
+        self._key_descriptor = ReadOnlyDescriptor(
+            bus,
+            6,
+            topic_bridge_metadata_descriptor_uuid(bridge_name, "key"),
+            self._characteristic,
+            read_cb=lambda: self.bridge_key.encode("utf-8"),
+            initial_value=key_payload,
+        )
         self._characteristic.add_descriptor(self._data_descriptor)
         self._characteristic.add_descriptor(self._topic_descriptor)
         self._characteristic.add_descriptor(self._type_descriptor)
         self._characteristic.add_descriptor(self._format_descriptor)
         self._characteristic.add_descriptor(self._member_descriptor)
         self._characteristic.add_descriptor(self._rate_descriptor)
+        self._characteristic.add_descriptor(self._key_descriptor)
         self.add_characteristic(self._characteristic)
 
     @property

@@ -1,0 +1,99 @@
+# Default runtime configuration for the system bluetooth service node.
+# This file is loaded directly by the service node at startup.
+#
+# The system service always starts from this file. A separate experiment-side
+# user node can temporarily apply an overlay YAML file that overrides any of the
+# keys below while it remains alive.
+
+# Topic root used by all publishers created by the bluetooth service node.
+# The value supports {hostname}. On a host named uavXX this becomes /uavXX/ble.
+node_topics_prefix: "/{hostname}/ble"
+
+# BLE scan publishing period for the discovered device list topic.
+scan_publish_period: 2.0
+
+# Period of the built-in time service characteristic updates.
+time_update_period: 1.0
+
+# Period of refreshing the built-in Wi-Fi service characteristic.
+wifi_refresh_period: 2.0
+
+# Retry interval used by the automatic peer connector.
+auto_connect_period: 3.0
+
+# When non-zero, make the adapter discoverable for this many seconds.
+discoverable_timeout: 0
+
+# BlueZ pairing agent behaviour.
+auto_accept_pairing: true
+auto_trust: true
+
+# Enable the built-in services hosted by the system node.
+enable_time_service: true
+enable_wifi_service: true
+
+# Global gate for automatic peer discovery/connection logic.
+# When false, the node never auto-connects or auto-pairs peers.
+auto_connect_enable: false
+
+# Optional whitelist of peer hostnames or BLE MAC addresses.
+# If non-empty, only these peers are kept automatically connected.
+auto_connect_whitelist: []
+
+# Hostname pattern used to identify UAV peers.
+auto_connect_pattern: "^uav[0-9]{2}$"
+
+# Disconnect a peer if the time bridge stays inactive for too long.
+peer_connection_timeout: 30.0
+
+# Allowed Wi-Fi SSIDs that may be selected over BLE.
+allowed_wifi_networks:
+  - mrs_ctu
+  - mrs_ctu_1
+  - mrs_ctu_2
+  - mrs_ctu_3
+  - mrs_ctu_4
+  - mrs_ctu_5
+  - mrs_ctu_6
+  - mrs_ctu_7
+  - mrs_ctu_8
+  - mrs_ctu_9
+
+# Periodic human-readable status logging. Set to 0 to disable.
+status_report_period: 10.0
+
+# Optional extra file sink for verbose log lines.
+verbose_log_file: ""
+
+# Static runtime settings for the system service.
+advertise_mode: peripheral
+pairing_agent: NoInputNoOutput
+enable_server: true
+enable_scan: true
+scan_mode: le
+netplan_config_file: /etc/netplan/01-netcfg.yaml
+netplan_scripts_dir: /etc/ctu-mrs/uav-bluetooth/netplan-scripts
+
+# Declarative bridge setup.
+# Each entry defines one BLE bridge that the node may export, import, or both.
+#
+# Fields:
+# - mode: export | import | both.
+# - export_topic: Local ROS topic subscribed by this node. This is the only
+#   identity field that needs to be provided. If it starts with a UAV hostname
+#   segment such as /uavXX/..., that first segment is ignored when deriving the
+#   shared BLE key and the imported topic suffix.
+# - name: Optional human-readable label for logging only.
+# - key: Optional override for the derived logical key.
+# - import_topic_suffix: Optional override for the derived imported suffix.
+#   By default, a topic like /uavXX/mavros/odometry/local appears on a peer as
+#   /uavYY/ble/peers/uavXX/mavros/odometry/local.
+# - message_type: ROS interface type, for example nav_msgs/msg/Odometry.
+# - rate_hz: Publish/poll rate. 0 means send on every received sample.
+# - transport_endpoint: characteristic | descriptor.
+# - members: Ordered packet layout for the compact BLE payload. Each member is
+#   packed little-endian and must use a fixed-width scalar type.
+#
+# Supported member types: bool, int8, uint8, int16, uint16, int32, uint32,
+# int64, uint64, float32, float64, time_ns.
+shared_topics: []

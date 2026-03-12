@@ -35,6 +35,7 @@ set(srv_files
   "srv/ListDevices.srv"
   "srv/FindGattPath.srv"
   "srv/ConfigureNotificationBridge.srv"
+  "srv/SetActiveConfig.srv"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -48,7 +49,13 @@ ament_python_install_package(${PROJECT_NAME}_pkg PACKAGE_DIR src)
 install(PROGRAMS
   src/__init__.py
   DESTINATION lib/${PROJECT_NAME}
-  RENAME bluetooth_node
+  RENAME service_node
+)
+
+install(PROGRAMS
+  src/user_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME user_node
 )
 
 install(DIRECTORY

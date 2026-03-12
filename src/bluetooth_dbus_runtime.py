@@ -163,7 +163,8 @@ class BluetoothDbusRuntime:
                 topic_name=state.topic_name,
                 message_type=state.message_type,
                 bridge_name=state.bridge_name,
-                member_paths=state.member_paths,
+                bridge_key=state.bridge_key,
+                member_specs=state.member_specs,
                 rate_hz=state.rate_hz,
                 payload_format=state.payload_format,
             )
