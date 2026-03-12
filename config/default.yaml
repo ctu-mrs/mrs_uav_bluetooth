@@ -62,6 +62,15 @@ allowed_wifi_networks:
 # Periodic human-readable status logging. Set to 0 to disable.
 status_report_period: 10.0
 
+# Enable publishing verbose service logs on /{hostname}/ble/log.
+# Keep disabled by default to avoid high-rate chatter on ROS topics.
+# Must be enabled for user node reports using "log" as "print_source".
+log_topic_enable: false
+
+# If true, peers that connected during an overlay lease are disconnected when
+# the overlay expires or is explicitly reverted.
+expire_connections_with_overlay: true
+
 # Optional extra file sink for verbose log lines.
 verbose_log_file: ""
 
