@@ -33,6 +33,7 @@ class BluetoothNode(
         self._pending_wifi_password = ""
         self._auto_connect_attempts: Dict[str, float] = {}
         self._peer_security_attempts: Dict[str, float] = {}
+        self._peer_repair_attempts: Dict[str, float] = {}
         self._peer_inactive_since: Dict[str, float] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
