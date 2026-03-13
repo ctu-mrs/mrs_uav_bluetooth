@@ -473,15 +473,27 @@ class BluetoothNodeRuntimeMixin:
                     continue
                 self._auto_connect_attempts[mac] = now
                 self._log_verbose(f"Auto-connect attempt: {device_label}")
-                if not self._client.connect(mac, timeout=10.0):
+                connected = self._client.connect(mac, timeout=10.0)
+                if not connected:
+                    refreshed = self._client.get_device(mac, refresh=True)
+                    connected = bool(refreshed and refreshed.connected)
+                if not connected:
                     self.get_logger().warning(f"Auto-connect failed: {device_label}")
                     self._log_verbose(f"Auto-connect failed: {device_label}")
                     continue
                 self._client.wait_services_resolved(mac, timeout=10.0)
                 current = self._client.get_device(mac, refresh=True) or device
                 if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
+                    missing_since = self._peer_inactive_since.setdefault(mac, now)
+                    grace_s = max(10.0, retry_period * 3.0)
+                    if now - missing_since < grace_s:
+                        self._log_verbose(
+                            f"Keeping {device_label} connected while waiting for time characteristic "
+                            f"({now - missing_since:.1f}s/{grace_s:.1f}s)"
+                        )
+                        continue
                     self.get_logger().info(f"Disconnecting {mac}: UAV peer candidate without BLE time characteristic")
-                    self._log_verbose(f"Disconnecting {device_label}: no time characteristic found")
+                    self._log_verbose(f"Disconnecting {device_label}: no time characteristic found after grace period")
                     self._client.disconnect(mac, timeout=5.0)
                 else:
                     self._auto_connect_attempts.pop(mac, None)
@@ -635,7 +647,8 @@ class BluetoothNodeRuntimeMixin:
 
     def _ensure_peer_security(self, mac: str, device: DeviceInfo, retry_period: float):
         current = self._client.get_device(mac, refresh=True) or device
-        if current.paired and current.trusted and current.bonded:
+        security_ready = bool(current.trusted and (current.paired or current.bonded))
+        if security_ready:
             self._peer_security_attempts.pop(mac, None)
             return
         now = time.monotonic()
@@ -647,7 +660,7 @@ class BluetoothNodeRuntimeMixin:
         self._log_verbose(
             f"Security state for {device_label}: paired={current.paired} trusted={current.trusted} bonded={current.bonded}"
         )
-        if not current.paired or not current.bonded:
+        if not (current.paired or current.bonded):
             paired_ok = self._client.pair(mac, timeout=30.0)
             if not paired_ok and current.trusted:
                 # Recover from stale one-sided bonds (peer removed pairing but local side kept trust/bond state).
@@ -665,7 +678,7 @@ class BluetoothNodeRuntimeMixin:
                 self.get_logger().warning(f"Failed to pair BLE peer {mac}")
                 self._log_verbose(f"Pairing failed: {device_label}")
             current = self._client.get_device(mac, refresh=True) or current
-        if current.paired and not current.trusted:
+        if (current.paired or current.bonded) and not current.trusted:
             if self._client.trust(mac):
                 self.get_logger().info(f"Trusted BLE peer {mac}")
                 self._log_verbose(f"Trusted: {device_label}")
@@ -673,7 +686,7 @@ class BluetoothNodeRuntimeMixin:
                 self.get_logger().warning(f"Failed to trust BLE peer {mac}")
                 self._log_verbose(f"Trust failed: {device_label}")
             current = self._client.get_device(mac, refresh=True) or current
-        if current.paired and current.trusted and current.bonded:
+        if current.trusted and (current.paired or current.bonded):
             self._peer_security_attempts.pop(mac, None)
 
     def _is_characteristic_notifying(self, mac: str, path: str) -> bool:

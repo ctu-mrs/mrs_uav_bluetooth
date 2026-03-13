@@ -432,26 +432,33 @@ class BleClient:
             self._emit_gatt("client_descriptor_write_failed", desc_path=desc_path, error=str(exc))
             return False
 
+    def _ensure_notify_match(self, chrc_path: str):
+        if chrc_path in self._notify_matches:
+            return
+        chrc_obj = self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path)
+        props_iface = dbus.Interface(chrc_obj, DBUS_PROP_IFACE)
+        self._notify_matches[chrc_path] = props_iface.connect_to_signal(
+            "PropertiesChanged",
+            lambda iface, changed, invalidated: self._on_chrc_notify(chrc_path, iface, changed, invalidated),
+        )
+
     def start_notify(self, chrc_path: str) -> bool:
         try:
             chrc_obj = self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path)
             characteristic = dbus.Interface(chrc_obj, GATT_CHRC_IFACE)
             characteristic.StartNotify()
-            if chrc_path not in self._notify_matches:
-                props_iface = dbus.Interface(chrc_obj, DBUS_PROP_IFACE)
-                self._notify_matches[chrc_path] = props_iface.connect_to_signal(
-                    "PropertiesChanged",
-                    lambda iface, changed, invalidated: self._on_chrc_notify(chrc_path, iface, changed, invalidated),
-                )
+            self._ensure_notify_match(chrc_path)
             self._emit_gatt("client_notify_enabled", chrc_path=chrc_path)
             return True
         except dbus.DBusException as exc:
-            match = self._notify_matches.pop(chrc_path, None)
-            if match is not None:
+            message = str(exc)
+            if "InProgress" in message or "Already notifying" in message or "AlreadyNotifying" in message:
                 try:
-                    match.remove()
+                    self._ensure_notify_match(chrc_path)
                 except Exception:
                     pass
+                self._emit_gatt("client_notify_enabled", chrc_path=chrc_path, recovered_from=message)
+                return True
             self._emit_gatt("client_notify_failed", chrc_path=chrc_path, error=str(exc))
             return False
 
