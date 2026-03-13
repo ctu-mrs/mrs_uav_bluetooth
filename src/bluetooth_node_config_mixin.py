@@ -326,6 +326,11 @@ class BluetoothNodeConfigMixin:
             self.get_logger().warning(f"Failed to open verbose log file {log_path}: {exc}")
 
     def _log_verbose(self, message: str):
+        try:
+            self.get_logger().info(f"[VERBOSE] {message}")
+        except Exception:
+            pass
+
         verbose_logger = self._verbose_logger
         if verbose_logger is not None:
             verbose_logger.debug(message)
