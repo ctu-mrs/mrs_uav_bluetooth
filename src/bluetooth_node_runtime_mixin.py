@@ -386,6 +386,7 @@ class BluetoothNodeRuntimeMixin:
                 self.destroy_publisher(state.publisher)
                 self._stop_notify_if_unused(state.characteristic_path)
             self._peer_security_attempts.pop(mac, None)
+            self._peer_repair_attempts.pop(mac, None)
             self._peer_inactive_since.pop(mac, None)
 
     def _reconcile_import_bridges(self, snapshot: Dict[str, DeviceInfo]):
@@ -440,6 +441,7 @@ class BluetoothNodeRuntimeMixin:
             snapshot = self._client.get_devices(refresh=True)
             self._auto_connect_attempts = {mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot}
             self._peer_security_attempts = {mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot}
+            self._peer_repair_attempts = {mac: stamp for mac, stamp in self._peer_repair_attempts.items() if mac in snapshot}
             self._peer_inactive_since = {mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot}
             lines = [
                 f"Auto-connect tick: {len(snapshot)} device(s), "
@@ -484,12 +486,14 @@ class BluetoothNodeRuntimeMixin:
                 self._client.wait_services_resolved(mac, timeout=10.0)
                 current = self._client.get_device(mac, refresh=True) or device
                 if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
-                    missing_since = self._peer_inactive_since.setdefault(mac, now)
+                    now_mono = time.monotonic()
+                    missing_since = self._peer_inactive_since.setdefault(mac, now_mono)
                     grace_s = max(10.0, retry_period * 3.0)
-                    if now - missing_since < grace_s:
+                    waited_s = max(0.0, now_mono - missing_since)
+                    if waited_s < grace_s:
                         self._log_verbose(
                             f"Keeping {device_label} connected while waiting for time characteristic "
-                            f"({now - missing_since:.1f}s/{grace_s:.1f}s)"
+                            f"({waited_s:.1f}s/{grace_s:.1f}s)"
                         )
                         continue
                     self.get_logger().info(f"Disconnecting {mac}: UAV peer candidate without BLE time characteristic")
@@ -513,6 +517,7 @@ class BluetoothNodeRuntimeMixin:
             self.destroy_publisher(state.publisher)
             self._stop_notify_if_unused(state.characteristic_path)
         self._peer_security_attempts.pop(mac, None)
+        self._peer_repair_attempts.pop(mac, None)
         self._peer_inactive_since.pop(mac, None)
 
     def _is_uav_peer_candidate(self, device: DeviceInfo, pattern: str) -> bool:
@@ -558,17 +563,30 @@ class BluetoothNodeRuntimeMixin:
 
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> Tuple[bool, bool]:
         current = self._client.get_device(mac, refresh=True) or device
+        device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
         if not current.services_resolved and not self._client.wait_services_resolved(mac, timeout=5.0):
             self._peer_inactive_since.setdefault(mac, time.monotonic())
             self._log_verbose(f"Peer {mac}: services not resolved yet, delaying time bridge setup")
+            self._maybe_repair_peer_link(
+                mac,
+                device_label,
+                reason="services unresolved for too long",
+                min_wait_s=20.0,
+            )
             return False, True
 
         time_candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
         path = time_candidates[0] if time_candidates else ""
-        device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
         if not path:
             self._peer_inactive_since.setdefault(mac, time.monotonic())
             self._log_verbose(f"Peer {device_label}: time characteristic {TIME_CHARACTERISTIC_UUID} not found")
+            retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
+            self._maybe_repair_peer_link(
+                mac,
+                device_label,
+                reason=f"missing time characteristic {TIME_CHARACTERISTIC_UUID}",
+                min_wait_s=max(8.0, retry_period * 3.0),
+            )
             return False, False
         writeback_descriptor_path = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=path) or ""
         peer_name = self._hostname_from_device(device) or mac.lower().replace(":", "_")
@@ -627,9 +645,36 @@ class BluetoothNodeRuntimeMixin:
             writeback_descriptor_path=writeback_descriptor_path,
             publisher=publisher,
         )
+        self._peer_repair_attempts.pop(mac, None)
         self._peer_inactive_since.pop(mac, None)
         self._prime_peer_time_bridge(self._peer_time_bridges[mac])
         return True, True
+
+    def _maybe_repair_peer_link(self, mac: str, device_label: str, *, reason: str, min_wait_s: float) -> bool:
+        now_mono = time.monotonic()
+        missing_since = self._peer_inactive_since.setdefault(mac, now_mono)
+        waited_s = max(0.0, now_mono - missing_since)
+        if waited_s < max(0.0, float(min_wait_s)):
+            return False
+        retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
+        repair_cooldown_s = max(15.0, retry_period * 4.0)
+        last_attempt = self._peer_repair_attempts.get(mac, 0.0)
+        if now_mono - last_attempt < repair_cooldown_s:
+            return False
+        self._peer_repair_attempts[mac] = now_mono
+        self.get_logger().warning(f"Repairing peer {mac}: {reason}; clearing local bond/cache state")
+        self._log_verbose(f"Repairing peer {device_label}: {reason}")
+        bridge = self._peer_time_bridges.pop(mac, None)
+        if bridge is not None:
+            self.destroy_publisher(bridge.publisher)
+            self._stop_notify_if_unused(bridge.characteristic_path)
+        self._client.disconnect(mac, timeout=5.0)
+        self._client.untrust(mac)
+        self._client.remove(mac)
+        self._peer_security_attempts.pop(mac, None)
+        self._auto_connect_attempts.pop(mac, None)
+        self._peer_inactive_since.pop(mac, None)
+        return True
 
     def _prime_peer_time_bridge(self, state: PeerTimeBridgeState):
         payload = self._client.read_characteristic(state.characteristic_path)
@@ -677,6 +722,12 @@ class BluetoothNodeRuntimeMixin:
             else:
                 self.get_logger().warning(f"Failed to pair BLE peer {mac}")
                 self._log_verbose(f"Pairing failed: {device_label}")
+                self._maybe_repair_peer_link(
+                    mac,
+                    device_label,
+                    reason="pairing failed (possible one-sided stale bond)",
+                    min_wait_s=0.0,
+                )
             current = self._client.get_device(mac, refresh=True) or current
         if (current.paired or current.bonded) and not current.trusted:
             if self._client.trust(mac):

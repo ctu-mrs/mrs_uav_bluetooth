@@ -52,6 +52,23 @@ class BluetoothNodeStatusMixin:
             lines.append("  wifi-svc:   enabled")
         if self._time_service is not None:
             lines.append("  time-svc:   enabled")
+        if self._app is not None:
+            local_services = list(getattr(self._app, "services", []))
+            local_chrc_count = sum(len(service.get_characteristics()) for service in local_services)
+            local_desc_count = sum(
+                len(characteristic.get_descriptors())
+                for service in local_services
+                for characteristic in service.get_characteristics()
+            )
+            lines.append(
+                f"  local gatt: services={len(local_services)} characteristics={local_chrc_count} descriptors={local_desc_count}"
+            )
+            for service in local_services:
+                lines.append(f"    service {service.uuid} [{service.get_path()}]")
+                for characteristic in service.get_characteristics():
+                    lines.append(f"      chrc {characteristic.uuid} [{characteristic.get_path()}]")
+                    for descriptor in characteristic.get_descriptors():
+                        lines.append(f"        desc {descriptor.uuid} [{descriptor.get_path()}]")
         if self._client is not None:
             with self._lock:
                 all_devices = self._client.get_devices()
