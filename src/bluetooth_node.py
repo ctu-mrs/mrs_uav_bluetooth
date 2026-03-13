@@ -156,7 +156,7 @@ class BluetoothNode(
 def main(args: Optional[Sequence[str]] = None):
     rclpy.init(args=args)
     node = BluetoothNode()
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=16)
     executor.add_node(node)
     try:
         executor.spin()
