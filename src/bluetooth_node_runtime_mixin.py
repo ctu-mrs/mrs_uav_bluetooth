@@ -785,22 +785,35 @@ class BluetoothNodeRuntimeMixin:
     def _update_peer_writeback_latency(self, state: PeerTimeBridgeState, payload: bytes):
         if not state.writeback_descriptor_path:
             return
-        if self._client.write_descriptor(state.writeback_descriptor_path, payload):
+        desc_path = state.writeback_descriptor_path
+        payload_bytes = bytes(payload)
+        with self._peer_writeback_lock:
+            self._peer_writeback_pending[desc_path] = payload_bytes
+        self._kick_peer_writeback(desc_path)
+
+    def _kick_peer_writeback(self, desc_path: str):
+        if not desc_path:
             return
-        refreshed_path = self._client.find_descriptor(state.mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=state.characteristic_path) or ""
-        if not refreshed_path or refreshed_path == state.writeback_descriptor_path:
-            self.get_logger().warning(
-                f"Failed to write peer time writeback descriptor for {state.mac} at {state.writeback_descriptor_path}"
-            )
+        with self._peer_writeback_lock:
+            payload = self._peer_writeback_pending.get(desc_path)
+            if payload is None:
+                return
+            inflight = getattr(self, "_peer_writeback_inflight", set())
+            if desc_path in inflight:
+                return
+            last_sent = getattr(self, "_peer_writeback_last_sent", {}).get(desc_path)
+            if last_sent == payload:
+                return
+            inflight.add(desc_path)
+            self._peer_writeback_inflight = inflight
+            sent = getattr(self, "_peer_writeback_last_sent", {})
+            sent[desc_path] = payload
+            self._peer_writeback_last_sent = sent
+        if self._client.write_descriptor_async(desc_path, payload):
             return
-        self._log_verbose(
-            f"Refreshing writeback descriptor path for {state.mac}: {state.writeback_descriptor_path} -> {refreshed_path}"
-        )
-        state.writeback_descriptor_path = refreshed_path
-        if not self._client.write_descriptor(refreshed_path, payload):
-            self.get_logger().warning(
-                f"Failed to write refreshed peer time writeback descriptor for {state.mac} at {refreshed_path}"
-            )
+        with self._peer_writeback_lock:
+            self._peer_writeback_inflight.discard(desc_path)
+            self._peer_writeback_last_sent.pop(desc_path, None)
 
     def _buffer_import_topic_bridge(self, mac: str, chrc_path: str, data: bytes):
         for state in self._notification_bridges.values():
@@ -815,10 +828,22 @@ class BluetoothNodeRuntimeMixin:
 
     def _on_client_gatt_event(self, event_type: str, info: dict):
         self._log_verbose(f"GATT event {event_type}: {info}")
+        if event_type in {"client_descriptor_write", "client_descriptor_write_failed"}:
+            desc_path = str(info.get("desc_path", ""))
+            self._handle_peer_writeback_event(desc_path, event_type == "client_descriptor_write")
         if event_type.endswith("failed"):
             if event_type == "client_descriptor_write_failed":
                 desc_path = str(info.get("desc_path", ""))
                 if any(state.writeback_descriptor_path == desc_path for state in self._peer_time_bridges.values()):
+                    for state in self._peer_time_bridges.values():
+                        if state.writeback_descriptor_path != desc_path:
+                            continue
+                        self._run_background_once(
+                            f"writeback-recover::{state.mac}",
+                            self._recover_peer_writeback_path,
+                            state.mac,
+                            desc_path,
+                        )
                     key = (event_type, desc_path)
                     now = time.monotonic()
                     last = self._last_gatt_warning_at.get(key, 0.0)
@@ -827,9 +852,91 @@ class BluetoothNodeRuntimeMixin:
                     self._last_gatt_warning_at[key] = now
             self.get_logger().warning(f"BLE GATT event {event_type}: {info}")
 
+    def _handle_peer_writeback_event(self, desc_path: str, success: bool):
+        if not desc_path:
+            return
+        with self._peer_writeback_lock:
+            self._peer_writeback_inflight.discard(desc_path)
+            if not success:
+                self._peer_writeback_last_sent.pop(desc_path, None)
+                return
+            latest = self._peer_writeback_pending.get(desc_path)
+            sent = self._peer_writeback_last_sent.get(desc_path)
+            if latest is None:
+                self._peer_writeback_last_sent.pop(desc_path, None)
+                return
+            if latest == sent:
+                return
+        self._kick_peer_writeback(desc_path)
+
+    def _recover_peer_writeback_path(self, mac: str, failed_desc_path: str):
+        state = self._peer_time_bridges.get(mac)
+        if state is None:
+            return
+        refreshed = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=state.characteristic_path) or ""
+        if not refreshed:
+            return
+        if refreshed != state.writeback_descriptor_path:
+            self._log_verbose(
+                f"Refreshing writeback descriptor path for {mac}: {state.writeback_descriptor_path} -> {refreshed}"
+            )
+            state.writeback_descriptor_path = refreshed
+        with self._peer_writeback_lock:
+            pending = self._peer_writeback_pending.pop(failed_desc_path, None)
+            self._peer_writeback_inflight.discard(failed_desc_path)
+            self._peer_writeback_last_sent.pop(failed_desc_path, None)
+            if pending is not None:
+                self._peer_writeback_pending[refreshed] = pending
+                self._peer_writeback_last_sent.pop(refreshed, None)
+        self._kick_peer_writeback(refreshed)
+
     def _on_pairing_event(self, event_type, device_path, **kwargs):
         self.get_logger().info(f"Pairing event {event_type} for {device_path}: {kwargs}")
         self._log_verbose(f"Pairing event {event_type} device={device_path} {kwargs}")
+        if event_type not in {
+            "request_confirmation",
+            "request_pin",
+            "request_passkey",
+            "request_authorization",
+            "authorize_service",
+        }:
+            return
+        mac = self._mac_from_device_path(str(device_path or ""))
+        if not mac:
+            return
+        now = time.monotonic()
+        last = self._pairing_repair_attempts.get(mac, 0.0)
+        if now - last < 20.0:
+            return
+        device = self._client.get_device(mac, refresh=True) if self._client is not None else None
+        if device is None:
+            return
+        if not (device.paired or device.bonded or device.trusted):
+            return
+        self._pairing_repair_attempts[mac] = now
+        self._repair_incoming_pairing_state(mac)
+
+    def _repair_incoming_pairing_state(self, mac: str):
+        if self._client is None:
+            return
+        self.get_logger().warning(f"Incoming pairing for {mac}: clearing stale local bond/trust state")
+        # Keep this path fast because it runs during pairing-agent callbacks.
+        try:
+            self._client.disconnect(mac, timeout=1.0)
+        except Exception:
+            pass
+        try:
+            self._client.untrust(mac)
+        except Exception:
+            pass
+        try:
+            self._client.remove(mac)
+        except Exception:
+            pass
+        self._auto_connect_attempts.pop(mac, None)
+        self._peer_security_attempts.pop(mac, None)
+        self._peer_repair_attempts.pop(mac, None)
+        self._peer_inactive_since.pop(mac, None)
 
     def _hostname_from_device(self, device: DeviceInfo) -> str:
         if device.alias:
@@ -922,6 +1029,7 @@ class BluetoothNodeRuntimeMixin:
 
     def _shutdown_bluetooth(self):
         self._log_verbose("Shutting down Bluetooth node...")
+        self._shutdown_background_executor()
         if self._client is not None:
             notify_paths = {
                 state.path for state in self._notification_bridges.values() if state.transport_endpoint == "characteristic"
