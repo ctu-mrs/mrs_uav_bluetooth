@@ -361,6 +361,18 @@ class BleClient:
                 return characteristic["path"]
         return None
 
+    def find_characteristics(self, mac: str, uuid: str) -> List[str]:
+        uuid_lower = uuid.lower()
+        candidates = []
+        for characteristic in self.list_characteristics(mac):
+            if characteristic["uuid"].lower() != uuid_lower:
+                continue
+            path = characteristic["path"]
+            if path in candidates:
+                continue
+            candidates.append(path)
+        return candidates
+
     def find_descriptor(self, mac: str, uuid: str, chrc_path: Optional[str] = None) -> Optional[str]:
         uuid_lower = uuid.lower()
         for descriptor in self.list_descriptors(mac, chrc_path=chrc_path):

@@ -1055,16 +1055,34 @@ class BluetoothNode(Node):
         return False
 
     def _start_notify_with_refresh(self, mac: str, path: str, characteristic_uuid: str, *, label: str) -> Tuple[bool, str]:
-        if self._client.start_notify(path):
+        tried_paths = []
+
+        def _try_notify(candidate_path: str) -> bool:
+            candidate = str(candidate_path or "")
+            if not candidate or candidate in tried_paths:
+                return False
+            tried_paths.append(candidate)
+            if self._client.start_notify(candidate):
+                return True
+            return False
+
+        if _try_notify(path):
             return True, path
 
         self._log_verbose(f"Retrying notify setup for {label} on {mac}: path={path}")
         self._client.wait_services_resolved(mac, timeout=5.0)
-        refreshed_path = self._client.find_characteristic(mac, characteristic_uuid) or path
-        if refreshed_path != path:
-            self._log_verbose(f"Refreshed notify path for {label} on {mac}: {path} -> {refreshed_path}")
-        if self._client.start_notify(refreshed_path):
-            return True, refreshed_path
+
+        candidates = self._client.find_characteristics(mac, characteristic_uuid)
+        if path and path in candidates:
+            candidates = [path] + [item for item in candidates if item != path]
+
+        for candidate in candidates:
+            if _try_notify(candidate):
+                if candidate != path:
+                    self._log_verbose(f"Refreshed notify path for {label} on {mac}: {path} -> {candidate}")
+                return True, candidate
+
+        refreshed_path = candidates[0] if candidates else (path or "")
         return False, refreshed_path
 
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> Tuple[bool, bool]:
@@ -1074,13 +1092,13 @@ class BluetoothNode(Node):
             self._log_verbose(f"Peer {mac}: services not resolved yet, delaying time bridge setup")
             return False, True
 
-        path = self._client.find_characteristic(mac, TIME_CHARACTERISTIC_UUID)
+        time_candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
+        path = time_candidates[0] if time_candidates else ""
         device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
         if not path:
             self._peer_inactive_since.setdefault(mac, time.monotonic())
             self._log_verbose(f"Peer {device_label}: time characteristic {TIME_CHARACTERISTIC_UUID} not found")
             return False, False
-        writeback_descriptor_path = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=path) or ""
         peer_name = self._hostname_from_device(device) or mac.lower().replace(":", "_")
         status_topic_name = self._resolve_peer_topic_name(mac, "/time_status", device=device)
         existing = self._peer_time_bridges.get(mac)
@@ -1121,6 +1139,7 @@ class BluetoothNode(Node):
             self.destroy_publisher(publisher)
             self._peer_inactive_since.setdefault(mac, time.monotonic())
             return False, True
+        writeback_descriptor_path = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=path) or ""
         self.get_logger().info(f"Established time bridge with peer {device_label} -> {status_topic_name}")
         self._log_verbose(
             f"Time bridge: {device_label} chrc={path} writeback={writeback_descriptor_path or 'none'}"
