@@ -118,6 +118,7 @@ class BluetoothNodeRuntimeMixin:
                 self._start_scan(desired_transport)
         else:
             self._stop_scan()
+        self._enforce_peer_connection_policy(reason="config update")
         if not initial:
             self.get_logger().info(f"Applied config from {self._active_config_source}")
             self._log_verbose(f"Applied config from {self._active_config_source}")
@@ -228,6 +229,7 @@ class BluetoothNodeRuntimeMixin:
         try:
             self._check_overlay_config_lease()
             snapshot = self._client.get_devices(refresh=True)
+            snapshot = self._enforce_peer_connection_policy(snapshot=snapshot, reason="scan policy tick")
             self._sync_auto_import_bridges(snapshot)
             self._reconcile_import_bridges(snapshot)
             msg = BleDeviceArray()
@@ -249,6 +251,47 @@ class BluetoothNodeRuntimeMixin:
                 self._log_verbose("Scan results: no devices found")
         except dbus.exceptions.DBusException as exc:
             self._dbus_warning("scan_results", f"Skipping BLE scan publish tick due to DBus error: {exc}")
+
+    def _enforce_peer_connection_policy(self, snapshot: Dict[str, DeviceInfo] = None, *, reason: str = "policy"):
+        if self._client is None:
+            return snapshot or {}
+
+        if snapshot is None:
+            snapshot = self._client.get_devices(refresh=True)
+
+        auto_connect_enabled = bool(self.get_parameter("auto_connect_enable").value)
+        whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
+        pattern = str(self.get_parameter("auto_connect_pattern").value)
+        whitelist_enabled = bool(whitelist_names or whitelist_macs)
+        changed = False
+
+        for mac, device in snapshot.items():
+            if not device.connected:
+                continue
+            explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
+            peer_candidate = self._is_uav_peer_candidate(device, pattern)
+            if not peer_candidate:
+                continue
+            allowed = explicit_target or (auto_connect_enabled and not whitelist_enabled)
+            if allowed:
+                continue
+            device_label = f"{mac} ({device.alias or device.name or '?'})"
+            self.get_logger().info(f"Disconnecting {mac}: peer policy denies connection ({reason})")
+            self._log_verbose(f"Disconnecting disallowed peer {device_label}: {reason}")
+            self._client.disconnect(mac, timeout=5.0)
+            bridge = self._peer_time_bridges.pop(mac, None)
+            if bridge is not None:
+                self.destroy_publisher(bridge.publisher)
+                self._stop_notify_if_unused(bridge.characteristic_path)
+            self._peer_security_attempts.pop(mac, None)
+            self._peer_repair_attempts.pop(mac, None)
+            self._peer_inactive_since.pop(mac, None)
+            self._auto_connect_attempts.pop(mac, None)
+            changed = True
+
+        if changed:
+            return self._client.get_devices(refresh=True)
+        return snapshot
 
     def _sync_auto_import_bridges(self, snapshot: Dict[str, DeviceInfo]):
         desired_keys = set()

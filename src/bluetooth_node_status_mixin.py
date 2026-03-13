@@ -26,7 +26,6 @@ class BluetoothNodeStatusMixin:
             self.get_logger().warning(f"Status report failed: {exc}")
             return
         report = "\n".join(lines)
-        self.get_logger().info(f"[STATUS]\n{report}")
         if self.status_pub is not None and not self._shutting_down and self._ros_context_ok():
             status_msg = String()
             status_msg.data = report
@@ -35,7 +34,6 @@ class BluetoothNodeStatusMixin:
             except Exception:
                 if not self._shutting_down and self._ros_context_ok():
                     raise
-        self._log_verbose(f"[STATUS]\n{report}")
 
     def _build_status_lines(self):
         lines = []
