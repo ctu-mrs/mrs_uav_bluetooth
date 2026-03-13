@@ -60,7 +60,7 @@ allowed_wifi_networks:
   - mrs_ctu_9
 
 # Periodic human-readable status logging. Set to 0 to disable.
-status_report_period: 10.0
+status_report_period: 1.0
 
 # Enable publishing verbose service logs on /{hostname}/ble/log.
 # Keep disabled by default to avoid high-rate chatter on ROS topics.

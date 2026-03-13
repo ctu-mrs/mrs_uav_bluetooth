@@ -266,8 +266,6 @@ class BluetoothNodeRuntimeMixin:
         changed = False
 
         for mac, device in snapshot.items():
-            if not device.connected:
-                continue
             explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
             peer_candidate = self._is_uav_peer_candidate(device, pattern)
             if not peer_candidate:
@@ -275,18 +273,16 @@ class BluetoothNodeRuntimeMixin:
             allowed = explicit_target or (auto_connect_enabled and not whitelist_enabled)
             if allowed:
                 continue
+            if not device.connected and not (device.paired or device.bonded or device.trusted):
+                continue
             device_label = f"{mac} ({device.alias or device.name or '?'})"
-            self.get_logger().info(f"Disconnecting {mac}: peer policy denies connection ({reason})")
-            self._log_verbose(f"Disconnecting disallowed peer {device_label}: {reason}")
-            self._client.disconnect(mac, timeout=5.0)
-            bridge = self._peer_time_bridges.pop(mac, None)
-            if bridge is not None:
-                self.destroy_publisher(bridge.publisher)
-                self._stop_notify_if_unused(bridge.characteristic_path)
-            self._peer_security_attempts.pop(mac, None)
-            self._peer_repair_attempts.pop(mac, None)
-            self._peer_inactive_since.pop(mac, None)
-            self._auto_connect_attempts.pop(mac, None)
+            if device.connected:
+                self.get_logger().info(f"Disconnecting {mac}: peer policy denies connection ({reason})")
+                self._log_verbose(f"Disconnecting disallowed peer {device_label}: {reason}")
+            else:
+                self.get_logger().info(f"Clearing disallowed stale BLE bond for {mac} ({reason})")
+                self._log_verbose(f"Clearing stale disallowed peer {device_label}: {reason}")
+            self._clear_peer_local_state(mac, device=device, reason=f"policy denies connection ({reason})")
             changed = True
 
         if changed:
@@ -551,15 +547,25 @@ class BluetoothNodeRuntimeMixin:
             return False
         self.get_logger().info(f"Disconnecting {mac}: UAV peer candidate without healthy BLE time bridge")
         self._log_verbose(f"Disconnecting {device_label}: no healthy time bridge after grace period")
-        self._client.disconnect(mac, timeout=3.0)
+        self._clear_peer_local_state(mac, reason="missing healthy BLE time bridge")
         return True
 
     def _drop_non_whitelisted_peer(self, mac: str, device: DeviceInfo):
-        if device.connected:
-            self._client.disconnect(mac, timeout=5.0)
-        if device.paired or device.bonded or device.trusted or device.path:
-            if self._client.remove(mac):
-                self.get_logger().info(f"Removed non-whitelisted peer {mac}")
+        self._clear_peer_local_state(mac, device=device, reason="non-whitelisted peer")
+
+    def _clear_peer_local_state(self, mac: str, device: DeviceInfo = None, *, reason: str = ""):
+        current = device or self._client.get_device(mac, refresh=True)
+        self._client.disconnect(mac, timeout=5.0)
+        had_pairing_state = bool(current and (current.paired or current.bonded or current.trusted or current.path))
+        if had_pairing_state:
+            self._client.untrust(mac)
+            removed = self._client.remove(mac)
+            if removed:
+                detail = f": {reason}" if reason else ""
+                self.get_logger().info(f"Cleared local BLE bond/cache for {mac}{detail}")
+            else:
+                detail = f" ({reason})" if reason else ""
+                self.get_logger().warning(f"Failed to clear local BLE bond/cache for {mac}{detail}")
         if mac in self._peer_time_bridges:
             state = self._peer_time_bridges.pop(mac)
             self.destroy_publisher(state.publisher)
@@ -567,6 +573,7 @@ class BluetoothNodeRuntimeMixin:
         self._peer_security_attempts.pop(mac, None)
         self._peer_repair_attempts.pop(mac, None)
         self._peer_inactive_since.pop(mac, None)
+        self._auto_connect_attempts.pop(mac, None)
 
     def _is_uav_peer_candidate(self, device: DeviceInfo, pattern: str) -> bool:
         local_name = self._local_name.strip().lower()
