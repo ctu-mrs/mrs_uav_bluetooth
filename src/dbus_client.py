@@ -232,7 +232,12 @@ class BleClient:
         try:
             device.Connect()
         except dbus.DBusException as exc:
-            if "Already Connected" not in str(exc) and "AlreadyConnected" not in str(exc):
+            message = str(exc)
+            if (
+                "Already Connected" not in message
+                and "AlreadyConnected" not in message
+                and "InProgress" not in message
+            ):
                 return False
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -265,7 +270,13 @@ class BleClient:
         try:
             device.Pair()
         except dbus.DBusException as exc:
-            if "AlreadyExists" not in str(exc):
+            message = str(exc)
+            if (
+                "AlreadyExists" not in message
+                and "Already Paired" not in message
+                and "AlreadyPaired" not in message
+                and "InProgress" not in message
+            ):
                 return False
         deadline = time.time() + timeout
         while time.time() < deadline:

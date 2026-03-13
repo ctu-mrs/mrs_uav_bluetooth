@@ -12,7 +12,7 @@ def generate_launch_description():
         DeclareLaunchArgument("hold_seconds", default_value="3.0", description="Overlay lease refresh period in seconds."),
         DeclareLaunchArgument(
             "print_source",
-            default_value="status",
+            default_value="log",
             description="Service text source topic suffix to print: status or log.",
         ),
         Node(
