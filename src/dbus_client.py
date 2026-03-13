@@ -412,6 +412,29 @@ class BleClient:
             self._emit_gatt("client_write_failed", chrc_path=chrc_path, error=str(exc), with_response=with_response)
             return False
 
+    def write_characteristic_async(self, chrc_path: str, data: bytes, with_response=True, timeout: float = 6.0) -> bool:
+        try:
+            characteristic = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE)
+            options = {"type": dbus.String("request" if with_response else "command")}
+
+            def _reply_handler(*_):
+                self._emit_gatt("client_write", chrc_path=chrc_path, value=data, with_response=with_response)
+
+            def _error_handler(error):
+                self._emit_gatt("client_write_failed", chrc_path=chrc_path, error=str(error), with_response=with_response)
+
+            characteristic.WriteValue(
+                dbus_byte_array(data),
+                dbus_dict(options),
+                reply_handler=_reply_handler,
+                error_handler=_error_handler,
+                timeout=timeout,
+            )
+            return True
+        except dbus.DBusException as exc:
+            self._emit_gatt("client_write_failed", chrc_path=chrc_path, error=str(exc), with_response=with_response)
+            return False
+
     def read_descriptor(self, desc_path: str) -> Optional[bytes]:
         try:
             descriptor = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, desc_path), GATT_DESC_IFACE)
@@ -427,6 +450,28 @@ class BleClient:
             descriptor = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, desc_path), GATT_DESC_IFACE)
             descriptor.WriteValue(dbus_byte_array(data), dbus_dict({}))
             self._emit_gatt("client_descriptor_write", desc_path=desc_path, value=data)
+            return True
+        except dbus.DBusException as exc:
+            self._emit_gatt("client_descriptor_write_failed", desc_path=desc_path, error=str(exc))
+            return False
+
+    def write_descriptor_async(self, desc_path: str, data: bytes, timeout: float = 6.0) -> bool:
+        try:
+            descriptor = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, desc_path), GATT_DESC_IFACE)
+
+            def _reply_handler(*_):
+                self._emit_gatt("client_descriptor_write", desc_path=desc_path, value=data)
+
+            def _error_handler(error):
+                self._emit_gatt("client_descriptor_write_failed", desc_path=desc_path, error=str(error))
+
+            descriptor.WriteValue(
+                dbus_byte_array(data),
+                dbus_dict({}),
+                reply_handler=_reply_handler,
+                error_handler=_error_handler,
+                timeout=timeout,
+            )
             return True
         except dbus.DBusException as exc:
             self._emit_gatt("client_descriptor_write_failed", desc_path=desc_path, error=str(exc))

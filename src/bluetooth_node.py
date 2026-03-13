@@ -1,10 +1,13 @@
 """ROS 2 BLE node providing MRS UAV Bluetooth server and client control."""
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import threading
+import time
 from typing import Dict, Optional, Sequence, Set, Tuple
 
 import rclpy
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from .bluetooth_bridge_state import PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
@@ -50,6 +53,15 @@ class BluetoothNode(
         self._active_config_source = self._default_config_path
         self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
         self._shutting_down = False
+        self._background_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ble-bg")
+        self._background_lock = threading.RLock()
+        self._background_inflight: Set[str] = set()
+        self._background_error_at: Dict[str, float] = {}
+        self._peer_writeback_lock = threading.RLock()
+        self._peer_writeback_pending: Dict[str, bytes] = {}
+        self._peer_writeback_inflight: Set[str] = set()
+        self._peer_writeback_last_sent: Dict[str, bytes] = {}
+        self._pairing_repair_attempts: Dict[str, float] = {}
 
         self.devices_pub = None
         self.notifications_pub = None
@@ -78,6 +90,39 @@ class BluetoothNode(
             f"scan={'ON' if bool(self.get_parameter('enable_scan').value) else 'OFF'}, "
             f"hostname={self._local_name}, prefix={self._node_topics_prefix}"
         )
+
+    def _run_background_once(self, key: str, fn, *args, **kwargs) -> bool:
+        with self._background_lock:
+            if self._shutting_down or key in self._background_inflight:
+                return False
+            self._background_inflight.add(key)
+        future = self._background_executor.submit(fn, *args, **kwargs)
+        future.add_done_callback(lambda fut, task_key=key: self._on_background_done(task_key, fut))
+        return True
+
+    def _on_background_done(self, key: str, future):
+        with self._background_lock:
+            self._background_inflight.discard(key)
+        exc = future.exception()
+        if exc is None:
+            return
+        now = time.monotonic()
+        last = self._background_error_at.get(key, 0.0)
+        if now - last < 5.0:
+            return
+        self._background_error_at[key] = now
+        self.get_logger().warning(f"Background BLE task {key} failed: {exc}")
+        self._log_verbose(f"Background BLE task {key} failed: {exc}")
+
+    def _shutdown_background_executor(self):
+        with self._background_lock:
+            inflight = len(self._background_inflight)
+        if inflight:
+            self._log_verbose(f"Waiting for {inflight} background BLE task(s) to finish")
+        try:
+            self._background_executor.shutdown(wait=True, cancel_futures=False)
+        except Exception as exc:
+            self._log_verbose(f"Background executor shutdown warning: {exc}")
 
     @property
     def _adapter_path(self) -> str:
@@ -111,13 +156,20 @@ class BluetoothNode(
 def main(args: Optional[Sequence[str]] = None):
     rclpy.init(args=args)
     node = BluetoothNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     except rclpy.executors.ExternalShutdownException:
         pass
     finally:
+        try:
+            executor.remove_node(node)
+        except Exception:
+            pass
+        executor.shutdown(timeout_sec=2.0)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
