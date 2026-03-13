@@ -65,7 +65,7 @@ status_report_period: 10.0
 # Enable publishing verbose service logs on /{hostname}/ble/log.
 # Keep disabled by default to avoid high-rate chatter on ROS topics.
 # Must be enabled for user node reports using "log" as "print_source".
-log_topic_enable: false
+log_topic_enable: true
 
 # If true, peers that connected while an overlay is active are disconnected
 # when the overlay is reverted because keepalive sentinel publishers disappear
