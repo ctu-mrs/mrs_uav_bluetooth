@@ -52,7 +52,7 @@ class Application(dbus.service.Object):
 class Service(dbus.service.Object):
     PATH_BASE = BLUEZ_SERVICE_PATH + "/app/service"
 
-    def __init__(self, bus, index, uuid, primary=True, handle=0, includes=None):
+    def __init__(self, bus, index, uuid, primary=True, handle=0, includes=None, name="N/A"):
         self.path = self.PATH_BASE + str(index)
         self.bus = bus
         self.uuid = uuid
@@ -60,6 +60,7 @@ class Service(dbus.service.Object):
         self.handle = int(handle)
         self.includes = list(includes or [])
         self.characteristics = []
+        self.name = name
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_properties(self):
@@ -98,7 +99,7 @@ class Service(dbus.service.Object):
 
 
 class Characteristic(dbus.service.Object):
-    def __init__(self, bus, index, uuid, flags, service, *, handle=0, value=None, mtu=None):
+    def __init__(self, bus, index, uuid, flags, service, *, handle=0, value=None, mtu=None, name="N/A"):
         self.path = service.path + "/char" + str(index)
         self.bus = bus
         self.uuid = uuid
@@ -109,6 +110,7 @@ class Characteristic(dbus.service.Object):
         self.handle = int(handle)
         self.mtu = None if mtu is None else int(mtu)
         self.value = bytes(value or b"")
+        self.name = name
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_properties(self):
@@ -175,7 +177,7 @@ class Characteristic(dbus.service.Object):
 
 
 class Descriptor(dbus.service.Object):
-    def __init__(self, bus, index, uuid, flags, characteristic, *, handle=0, value=None):
+    def __init__(self, bus, index, uuid, flags, characteristic, *, handle=0, value=None, name="N/A"):
         self.path = characteristic.path + "/desc" + str(index)
         self.bus = bus
         self.uuid = uuid
@@ -183,6 +185,7 @@ class Descriptor(dbus.service.Object):
         self.chrc = characteristic
         self.handle = int(handle)
         self.value = None if value is None else bytes(value)
+        self.name = name
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_properties(self):

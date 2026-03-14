@@ -7,8 +7,8 @@ from .dbus_gatt import Characteristic, Descriptor
 
 
 class WritableDescriptor(Descriptor):
-    def __init__(self, bus, index, uuid, flags, characteristic, *, read_cb=None, write_cb=None):
-        super().__init__(bus, index, uuid, flags, characteristic)
+    def __init__(self, bus, index, uuid, flags, characteristic, *, read_cb=None, write_cb=None, name="N/A"):
+        super().__init__(bus, index, uuid, flags, characteristic, name=name)
         self._read_cb = read_cb
         self._write_cb = write_cb
 
@@ -27,8 +27,8 @@ class WritableDescriptor(Descriptor):
 
 
 class ReadOnlyDescriptor(Descriptor):
-    def __init__(self, bus, index, uuid, characteristic, *, read_cb=None, initial_value=b""):
-        super().__init__(bus, index, uuid, ["read"], characteristic, value=initial_value)
+    def __init__(self, bus, index, uuid, characteristic, *, read_cb=None, initial_value=b"", name="N/A"):
+        super().__init__(bus, index, uuid, ["read"], characteristic, value=initial_value, name=name)
         self._read_cb = read_cb
 
     def ReadValue(self, options):
@@ -39,8 +39,8 @@ class ReadOnlyDescriptor(Descriptor):
 
 
 class NotifyingCharacteristic(Characteristic):
-    def __init__(self, bus, index, uuid, flags, service, *, read_cb=None, write_cb=None, notify_cb=None, initial_value=b""):
-        super().__init__(bus, index, uuid, flags, service, value=initial_value)
+    def __init__(self, bus, index, uuid, flags, service, *, read_cb=None, write_cb=None, notify_cb=None, initial_value=b"", name="N/A"):
+        super().__init__(bus, index, uuid, flags, service, value=initial_value, name=name)
         self._read_cb = read_cb
         self._write_cb = write_cb
         self._notify_cb = notify_cb

@@ -585,7 +585,7 @@ class BluetoothNodeRuntimeMixin:
         if connected_since > missing_since:
             missing_since = connected_since
             self._peer_inactive_since[mac] = connected_since
-        grace_s = max(10.0, retry_period * 3.0)
+        grace_s = max(60.0, retry_period * 3.0)
         waited_s = max(0.0, now_mono - missing_since)
         if waited_s < grace_s:
             self._log_verbose(

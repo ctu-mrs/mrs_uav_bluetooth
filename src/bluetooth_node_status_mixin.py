@@ -62,11 +62,11 @@ class BluetoothNodeStatusMixin:
                 f"  local gatt: services={len(local_services)} characteristics={local_chrc_count} descriptors={local_desc_count}"
             )
             for service in local_services:
-                lines.append(f"    service {service.uuid} [{service.get_path()}]")
+                lines.append(f"    service '{service.name}' UUID={service.uuid}")
                 for characteristic in service.get_characteristics():
-                    lines.append(f"      chrc {characteristic.uuid} [{characteristic.get_path()}]")
+                    lines.append(f"      chrc '{characteristic.name}' UUID={characteristic.uuid}")
                     for descriptor in characteristic.get_descriptors():
-                        lines.append(f"        desc {descriptor.uuid} [{descriptor.get_path()}]")
+                        lines.append(f"        desc '{descriptor.name}' UUID={descriptor.uuid}")
         if self._client is not None:
             with self._lock:
                 all_devices = self._client.get_devices()
