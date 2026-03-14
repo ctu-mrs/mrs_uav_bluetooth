@@ -9,7 +9,7 @@ from gi.repository import GLib
 
 from .bluetooth_bridge_state import TopicExportBridgeState
 from .dbus_advertisement import Advertisement
-from .dbus_agent import AGENT_PATH, PairingAgent
+from .dbus_agent import PairingAgent
 from .dbus_client import BleClient
 from .dbus_common import BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_MANAGER_IFACE, LE_ADVERTISING_MANAGER_IFACE
 from .dbus_gatt import Application, find_adapter
@@ -117,8 +117,8 @@ class BluetoothDbusRuntime:
             on_event=self._on_pairing_event,
         )
         agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez"), "org.bluez.AgentManager1")
-        agent_mgr.RegisterAgent(AGENT_PATH, capability)
-        agent_mgr.RequestDefaultAgent(AGENT_PATH)
+        agent_mgr.RegisterAgent(PairingAgent.AGENT_PATH, capability)
+        agent_mgr.RequestDefaultAgent(PairingAgent.AGENT_PATH)
         self._pairing_agent_registered = True
         self._logger.info(f"Pairing agent registered (capability={capability})")
 
@@ -447,7 +447,7 @@ class BluetoothDbusRuntime:
         if self._pairing_agent_registered:
             try:
                 agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez"), "org.bluez.AgentManager1")
-                agent_mgr.UnregisterAgent(AGENT_PATH)
+                agent_mgr.UnregisterAgent(PairingAgent.AGENT_PATH)
             except Exception:
                 pass
             self._pairing_agent_registered = False
