@@ -78,8 +78,9 @@ class BluetoothNodeStatusMixin:
             for mac, dev in sorted(peers.items()):
                 bridge_state = self._peer_time_bridges.get(mac)
                 inactivity = max(0.0, time.monotonic() - bridge_state.last_activity_monotonic) if bridge_state is not None else -1.0
+                status_text = self._peer_status_text(mac, dev, bridge_state)
                 lines.append(
-                    f"    peer: {mac} {dev.alias or dev.name or '?'} RSSI={dev.rssi} paired={dev.paired and dev.trusted and dev.bonded} inactive_s={inactivity:.1f}"
+                    f"    peer: {mac} {dev.alias or dev.name or '?'} RSSI={dev.rssi} paired={dev.paired and dev.trusted and dev.bonded} inactive_s={inactivity:.1f} status={status_text}"
                 )
             if not peers:
                 lines.append("    peers: (none)")
@@ -115,6 +116,36 @@ class BluetoothNodeStatusMixin:
         for mac, topics in sorted(per_peer.items()):
             lines.append(f"    {self._peer_display_name(mac)} ({mac}): {', '.join(topics)}")
         return lines
+
+    def _peer_status_text(self, mac: str, dev, bridge_state) -> str:
+        if not dev.connected:
+            return "disconnected"
+        if dev.paired and dev.trusted and dev.bonded and bridge_state is not None and bridge_state.status == "ready":
+            return "fully-paired,time-bridge-ready"
+        parts = []
+        if dev.paired or dev.bonded:
+            parts.append("paired")
+        else:
+            parts.append("pairing-pending")
+        if dev.trusted:
+            parts.append("trusted")
+        else:
+            parts.append("trust-pending")
+        if bool(dev.services_resolved):
+            parts.append("services-resolved")
+        else:
+            parts.append("services-resolving")
+        if bridge_state is not None:
+            if bridge_state.status:
+                parts.append(f"bridge={bridge_state.status}")
+            if bridge_state.services_wait_started_monotonic > 0.0 and bridge_state.services_wait_grace_s > 0.0:
+                waited = max(0.0, time.monotonic() - bridge_state.services_wait_started_monotonic)
+                parts.append(f"wait={waited:.1f}/{bridge_state.services_wait_grace_s:.1f}s")
+            if bridge_state.pairing_failures > 0:
+                parts.append(f"pair_failures={bridge_state.pairing_failures}")
+            if bridge_state.detail:
+                parts.append(bridge_state.detail)
+        return ",".join(parts)
 
     def _header(self, frame_id=None) -> Header:
         header = Header()

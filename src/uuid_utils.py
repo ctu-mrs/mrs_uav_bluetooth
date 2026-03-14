@@ -44,12 +44,12 @@ def sanitize_topic_suffix(value: str) -> str:
 
 
 def named_service_uuid(name: str) -> str:
-    return uuid_from_name(f"service:{name.strip()}")
+    return uuid_from_name(f"svc:{name.strip()}")
 
 
 def named_characteristic_uuid(name: str) -> str:
-    return uuid_from_name(f"characteristic:{name.strip()}")
+    return uuid_from_name(f"chr:{name.strip()}")
 
 
 def named_descriptor_uuid(name: str) -> str:
-    return uuid_from_name(f"descriptor:{name.strip()}")
+    return uuid_from_name(f"dsc:{name.strip()}")

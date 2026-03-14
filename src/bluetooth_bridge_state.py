@@ -75,3 +75,9 @@ class PeerTimeBridgeState:
     current_hz: float = 0.0
     last_time_value_ns: int = 0
     last_rtt_s: float = 0.0
+    status: str = "connected"
+    detail: str = ""
+    services_wait_started_monotonic: float = 0.0
+    services_wait_grace_s: float = 0.0
+    pairing_requested_monotonic: float = 0.0
+    pairing_failures: int = 0
