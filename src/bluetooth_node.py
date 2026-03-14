@@ -38,6 +38,8 @@ class BluetoothNode(
         self._peer_security_attempts: Dict[str, float] = {}
         self._peer_repair_attempts: Dict[str, float] = {}
         self._peer_inactive_since: Dict[str, float] = {}
+        self._peer_connected_since: Dict[str, float] = {}
+        self._peer_service_retry_at: Dict[str, float] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
         self._last_dbus_warning_at: Dict[str, float] = {}
