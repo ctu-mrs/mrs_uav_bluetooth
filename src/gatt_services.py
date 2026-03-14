@@ -28,6 +28,17 @@ TIME_DESCRIPTOR_UUID = named_descriptor_uuid(TIME_DESCRIPTOR_NAME)
 TIME_WRITEBACK_DESCRIPTOR_UUID = named_descriptor_uuid(TIME_WRITEBACK_DESCRIPTOR_NAME)
 
 
+def topic_bridge_characteristic_uuid(bridge_name: str) -> str:
+    return named_characteristic_uuid(bridge_name)
+
+
+def topic_bridge_data_descriptor_uuid(bridge_name: str) -> str:
+    return named_descriptor_uuid(f"{bridge_name}/data")
+
+
+def topic_bridge_metadata_descriptor_uuid(bridge_name: str, key: str) -> str:
+    return named_descriptor_uuid(f"{bridge_name}/{key}")
+
 
 class WifiService(Service):
     def __init__(
@@ -134,8 +145,8 @@ class TimeService(Service):
 
 class TopicBridgeService(Service):
     def __init__(self, bus, index, topic_name: str, message_type: str, bridge_name: str, bridge_key: str, *, member_specs: Sequence[BridgeMemberSpec], rate_hz: float, payload_format: str):
-        service_uuid = named_service_uuid(f"{bridge_name}")
-        super().__init__(bus, index, service_uuid, primary=True, name=f"{bridge_name}")
+        service_uuid = named_service_uuid(f"bridge:{bridge_name}")
+        super().__init__(bus, index, service_uuid, primary=True, name=f"bridge:{bridge_name}")
         self.topic_name = topic_name
         self.message_type = message_type
         self.bridge_name = bridge_name
@@ -144,7 +155,7 @@ class TopicBridgeService(Service):
         self.rate_hz = float(rate_hz)
         self.payload_format = payload_format
         self._payload = b""
-        characteristic_uuid = named_characteristic_uuid(bridge_name)
+        characteristic_uuid = topic_bridge_characteristic_uuid(bridge_name)
         self._characteristic = NotifyingCharacteristic(
             bus,
             0,
@@ -157,7 +168,7 @@ class TopicBridgeService(Service):
         self._data_descriptor = ReadOnlyDescriptor(
             bus,
             0,
-            named_descriptor_uuid(f"{bridge_name}/data"),
+            topic_bridge_data_descriptor_uuid(bridge_name),
             self._characteristic,
             read_cb=lambda: self._payload,
             initial_value=b"",
@@ -166,7 +177,7 @@ class TopicBridgeService(Service):
         self._topic_descriptor = ReadOnlyDescriptor(
             bus,
             1,
-            named_descriptor_uuid(f"{bridge_name}/topic"),
+            topic_bridge_metadata_descriptor_uuid(bridge_name, "topic"),
             self._characteristic,
             read_cb=lambda: self.topic_name.encode("utf-8"),
             initial_value=self.topic_name.encode("utf-8"),
@@ -175,7 +186,7 @@ class TopicBridgeService(Service):
         self._type_descriptor = ReadOnlyDescriptor(
             bus,
             2,
-            named_descriptor_uuid(f"{bridge_name}/type"),
+            topic_bridge_metadata_descriptor_uuid(bridge_name, "type"),
             self._characteristic,
             read_cb=lambda: self.message_type.encode("utf-8"),
             initial_value=self.message_type.encode("utf-8"),
@@ -184,7 +195,7 @@ class TopicBridgeService(Service):
         self._format_descriptor = ReadOnlyDescriptor(
             bus,
             3,
-            named_descriptor_uuid(f"{bridge_name}/format"),
+            topic_bridge_metadata_descriptor_uuid(bridge_name, "format"),
             self._characteristic,
             read_cb=lambda: self.payload_format.encode("utf-8"),
             initial_value=self.payload_format.encode("utf-8"),
@@ -194,7 +205,7 @@ class TopicBridgeService(Service):
         self._member_descriptor = ReadOnlyDescriptor(
             bus,
             4,
-            named_descriptor_uuid(f"{bridge_name}/members"),
+            topic_bridge_metadata_descriptor_uuid(bridge_name, "members"),
             self._characteristic,
             read_cb=lambda: serializable_to_bytes(member_specs_to_serializable(self.member_specs)),
             initial_value=members_payload,
@@ -204,7 +215,7 @@ class TopicBridgeService(Service):
         self._rate_descriptor = ReadOnlyDescriptor(
             bus,
             5,
-            named_descriptor_uuid(f"{bridge_name}/rate_hz"),
+            topic_bridge_metadata_descriptor_uuid(bridge_name, "rate_hz"),
             self._characteristic,
             read_cb=lambda: f"{self.rate_hz:.6f}".encode("utf-8"),
             initial_value=rate_payload,
@@ -214,7 +225,7 @@ class TopicBridgeService(Service):
         self._key_descriptor = ReadOnlyDescriptor(
             bus,
             6,
-            named_descriptor_uuid(f"{bridge_name}/key"),
+            topic_bridge_metadata_descriptor_uuid(bridge_name, "key"),
             self._characteristic,
             read_cb=lambda: self.bridge_key.encode("utf-8"),
             initial_value=key_payload,
