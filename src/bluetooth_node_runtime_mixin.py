@@ -413,8 +413,11 @@ class BluetoothNodeRuntimeMixin:
             stale_macs.append(mac)
         pattern = str(self.get_parameter("auto_connect_pattern").value)
         for mac, device in snapshot.items():
-            if not device.connected or not self._is_uav_peer_candidate(device, pattern):
+            if not self._is_uav_peer_candidate(device, pattern):
                 self._peer_inactive_since.pop(mac, None)
+                continue
+            if not device.connected:
+                self._peer_inactive_since.setdefault(mac, now)
                 continue
             if mac in self._peer_time_bridges:
                 continue
@@ -478,10 +481,30 @@ class BluetoothNodeRuntimeMixin:
             whitelist_enabled = bool(whitelist_names or whitelist_macs)
             pattern = str(self.get_parameter("auto_connect_pattern").value)
             snapshot = self._client.get_devices(refresh=True)
-            self._auto_connect_attempts = {mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in snapshot}
-            self._peer_security_attempts = {mac: stamp for mac, stamp in self._peer_security_attempts.items() if mac in snapshot}
-            self._peer_repair_attempts = {mac: stamp for mac, stamp in self._peer_repair_attempts.items() if mac in snapshot}
-            self._peer_inactive_since = {mac: stamp for mac, stamp in self._peer_inactive_since.items() if mac in snapshot}
+            self._auto_connect_attempts = self._prune_attempt_map(
+                self._auto_connect_attempts,
+                snapshot,
+                now,
+                ttl_s=max(20.0, retry_period * 10.0),
+            )
+            self._peer_security_attempts = self._prune_attempt_map(
+                self._peer_security_attempts,
+                snapshot,
+                now,
+                ttl_s=max(20.0, retry_period * 10.0),
+            )
+            self._peer_repair_attempts = self._prune_attempt_map(
+                self._peer_repair_attempts,
+                snapshot,
+                now,
+                ttl_s=max(40.0, retry_period * 20.0),
+            )
+            self._peer_inactive_since = self._prune_attempt_map(
+                self._peer_inactive_since,
+                snapshot,
+                now,
+                ttl_s=max(40.0, retry_period * 20.0),
+            )
             lines = [
                 f"Auto-connect tick: {len(snapshot)} device(s), "
                 f"whitelist={sorted(whitelist_names) or '(none)'}, pattern={pattern}, "
@@ -616,6 +639,17 @@ class BluetoothNodeRuntimeMixin:
         refreshed_path = candidates[0] if candidates else (path or "")
         return False, refreshed_path
 
+    def _prune_attempt_map(self, attempts: Dict[str, float], snapshot: Dict[str, DeviceInfo], now_mono: float, *, ttl_s: float):
+        if not attempts:
+            return {}
+        ttl = max(0.0, float(ttl_s))
+        current_macs = set(snapshot.keys())
+        kept = {}
+        for mac, stamp in attempts.items():
+            if mac in current_macs or (ttl > 0.0 and now_mono - stamp <= ttl):
+                kept[mac] = stamp
+        return kept
+
     def _ensure_peer_services_resolved(self, mac: str, device: DeviceInfo, *, device_label: str) -> bool:
         if device.services_resolved:
             return True
@@ -633,7 +667,7 @@ class BluetoothNodeRuntimeMixin:
             mac,
             device_label,
             reason="services unresolved for too long",
-            min_wait_s=25.0,
+            min_wait_s=8.0,
         )
         return False
 
@@ -770,10 +804,13 @@ class BluetoothNodeRuntimeMixin:
         return time_bridge_ready or explicit_target
 
     def _ensure_peer_security(self, mac: str, device: DeviceInfo, retry_period: float):
+        pair_failures = getattr(self, "_peer_pair_failures", {})
         current = self._client.get_device(mac, refresh=True) or device
         security_ready = bool(current.trusted and (current.paired or current.bonded))
         if security_ready:
             self._peer_security_attempts.pop(mac, None)
+            pair_failures.pop(mac, None)
+            self._peer_pair_failures = pair_failures
             return
         now = time.monotonic()
         last_attempt = self._peer_security_attempts.get(mac, 0.0)
@@ -798,15 +835,22 @@ class BluetoothNodeRuntimeMixin:
             if paired_ok:
                 self.get_logger().info(f"Paired BLE peer {mac}")
                 self._log_verbose(f"Paired: {device_label}")
+                pair_failures.pop(mac, None)
             else:
                 self.get_logger().warning(f"Failed to pair BLE peer {mac}")
                 self._log_verbose(f"Pairing failed: {device_label}")
-                self._maybe_repair_peer_link(
-                    mac,
-                    device_label,
-                    reason="pairing failed (possible one-sided stale bond)",
-                    min_wait_s=0.0,
-                )
+                failures = pair_failures.get(mac, 0) + 1
+                pair_failures[mac] = failures
+                if failures >= 2 or bool(current.trusted):
+                    self._maybe_repair_peer_link(
+                        mac,
+                        device_label,
+                        reason="pairing failed repeatedly (possible one-sided stale bond)",
+                        min_wait_s=0.0,
+                    )
+                else:
+                    self._client.disconnect(mac, timeout=3.0)
+                    self._log_verbose(f"Pairing failed once for {device_label}, retrying after reconnect")
             current = self._client.get_device(mac, refresh=True) or current
         if (current.paired or current.bonded) and not current.trusted:
             if self._client.trust(mac):
@@ -818,6 +862,8 @@ class BluetoothNodeRuntimeMixin:
             current = self._client.get_device(mac, refresh=True) or current
         if current.trusted and (current.paired or current.bonded):
             self._peer_security_attempts.pop(mac, None)
+            pair_failures.pop(mac, None)
+        self._peer_pair_failures = pair_failures
 
     def _is_characteristic_notifying(self, mac: str, path: str) -> bool:
         for characteristic in self._client.list_characteristics(mac):
