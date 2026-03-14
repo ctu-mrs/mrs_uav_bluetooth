@@ -270,7 +270,11 @@ class BluetoothNodeRuntimeMixin:
             peer_candidate = self._is_uav_peer_candidate(device, pattern)
             if not peer_candidate:
                 continue
-            if reason == "scan policy tick" and not whitelist_enabled and not auto_connect_enabled:
+            if (
+                reason == "scan policy tick"
+                and not whitelist_enabled
+                and not auto_connect_enabled
+            ):
                 continue
             allowed = explicit_target or (auto_connect_enabled and not whitelist_enabled)
             if allowed:
@@ -792,8 +796,10 @@ class BluetoothNodeRuntimeMixin:
             )
             return False, False
         writeback_descriptor_path = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=path) or ""
-        peer_name = self._hostname_from_device(device) or mac.lower().replace(":", "_")
+        peer_name = self._peer_name_token(mac, device=device)
         status_topic_name = self._resolve_peer_topic_name(mac, "/time_status", device=device)
+        if re.search(r"/peers/[0-9]", status_topic_name):
+            status_topic_name = self._node_topic(f"peers/{peer_name}/time_status")
         existing = self._peer_time_bridges.get(mac)
         if (
             existing is not None
@@ -906,9 +912,29 @@ class BluetoothNodeRuntimeMixin:
         time_bridge_ready = False
         self._ensure_peer_security(mac, device, retry_period)
         current = self._client.get_device(mac, refresh=True) or device
+        security_ready = bool(current.trusted and (current.paired or current.bonded))
+        if not security_ready:
+            self._set_peer_time_status(mac, "pairing-pending", "waiting for paired+trusted")
+            return explicit_target
         if self._is_uav_peer_candidate(device, str(self.get_parameter("auto_connect_pattern").value)):
             time_bridge_ready, _ = self._ensure_peer_time_bridge(mac, current)
         return time_bridge_ready or explicit_target
+
+    def _peer_name_token(self, mac: str, *, device: DeviceInfo = None) -> str:
+        name = ""
+        if device is not None:
+            name = self._hostname_from_device(device)
+        if not name and self._client is not None:
+            current = self._client.get_device(mac)
+            if current is not None:
+                name = self._hostname_from_device(current)
+        token = re.sub(r"[^a-z0-9_]+", "_", str(name or "").strip().lower())
+        token = token.strip("_")
+        if not token:
+            token = f"peer_{mac.lower().replace(':', '_')}"
+        elif token[0].isdigit():
+            token = f"peer_{token}"
+        return token
 
     def _ensure_peer_security(self, mac: str, device: DeviceInfo, retry_period: float):
         pair_failures = getattr(self, "_peer_pair_failures", {})
@@ -997,8 +1023,10 @@ class BluetoothNodeRuntimeMixin:
         state = self._peer_time_bridges.get(mac)
         if state is None:
             device = self._client.get_device(mac) if self._client is not None else None
-            peer_name = ((device.alias or device.name) if device is not None else "") or mac.lower().replace(":", "_")
-            topic = self._resolve_peer_topic_name(mac, "/time_status")
+            peer_name = self._peer_name_token(mac, device=device)
+            topic = self._resolve_peer_topic_name(mac, "/time_status", device=device)
+            if re.search(r"/peers/[0-9]", topic):
+                topic = self._node_topic(f"peers/{peer_name}/time_status")
             publisher = self.create_publisher(BlePeerTimeStatus, topic, 10)
             state = PeerTimeBridgeState(
                 mac=mac,
