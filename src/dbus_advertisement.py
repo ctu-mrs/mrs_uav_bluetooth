@@ -3,11 +3,11 @@
 import dbus
 import dbus.service
 
-from .dbus_common import DBUS_PROP_IFACE, InvalidArgsException, LE_ADVERTISEMENT_IFACE, dict_with_byte_arrays
+from .dbus_common import BLUEZ_SERVICE_PATH, DBUS_PROP_IFACE, InvalidArgsException, LE_ADVERTISEMENT_IFACE, dict_with_byte_arrays
 
 
 class Advertisement(dbus.service.Object):
-    PATH_BASE = "/org/bluez/app/advertisement"
+    PATH_BASE = BLUEZ_SERVICE_PATH + "/app/advertisement"
 
     def __init__(self, bus, index, ad_type="peripheral"):
         self.path = self.PATH_BASE + str(index)

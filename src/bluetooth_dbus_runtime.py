@@ -11,7 +11,7 @@ from .bluetooth_bridge_state import TopicExportBridgeState
 from .dbus_advertisement import Advertisement
 from .dbus_agent import PairingAgent
 from .dbus_client import BleClient
-from .dbus_common import BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_MANAGER_IFACE, LE_ADVERTISING_MANAGER_IFACE
+from .dbus_common import BLUEZ_SERVICE_PATH, BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_MANAGER_IFACE, LE_ADVERTISING_MANAGER_IFACE, AGENT_MANAGER_IFACE, ADAPTER_IFACE
 from .dbus_gatt import Application, find_adapter
 from .gatt_services import TIME_SERVICE_UUID, WIFI_SERVICE_UUID, TimeService, TopicBridgeService, WifiService
 
@@ -116,7 +116,7 @@ class BluetoothDbusRuntime:
             auto_trust=auto_trust,
             on_event=self._on_pairing_event,
         )
-        agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez"), "org.bluez.AgentManager1")
+        agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), AGENT_MANAGER_IFACE)
         agent_mgr.RegisterAgent(PairingAgent.AGENT_PATH, capability)
         agent_mgr.RequestDefaultAgent(PairingAgent.AGENT_PATH)
         self._pairing_agent_registered = True
@@ -275,7 +275,7 @@ class BluetoothDbusRuntime:
     def set_adapter_props(self, powered=None, discoverable=None, pairable=None, alias=None, discoverable_timeout=None):
         self._require_setup()
         props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), DBUS_PROP_IFACE)
-        iface = "org.bluez.Adapter1"
+        iface = ADAPTER_IFACE
         if powered is not None:
             props.Set(iface, "Powered", dbus.Boolean(powered, variant_level=1))
         if alias is not None:
@@ -446,7 +446,7 @@ class BluetoothDbusRuntime:
         self.unregister_server_objects(topic_exports)
         if self._pairing_agent_registered:
             try:
-                agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez"), "org.bluez.AgentManager1")
+                agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), AGENT_MANAGER_IFACE)
                 agent_mgr.UnregisterAgent(PairingAgent.AGENT_PATH)
             except Exception:
                 pass

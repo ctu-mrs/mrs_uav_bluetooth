@@ -2,6 +2,8 @@
 
 import dbus
 
+BLUEZ_SERVICE_PATH = "/org/bluez"
+
 BLUEZ_SERVICE_NAME = "org.bluez"
 ADAPTER_IFACE = "org.bluez.Adapter1"
 DEVICE_IFACE = "org.bluez.Device1"
@@ -12,9 +14,11 @@ GATT_CHRC_IFACE = "org.bluez.GattCharacteristic1"
 GATT_DESC_IFACE = "org.bluez.GattDescriptor1"
 LE_ADVERTISING_MANAGER_IFACE = "org.bluez.LEAdvertisingManager1"
 LE_ADVERTISEMENT_IFACE = "org.bluez.LEAdvertisement1"
+AGENT_IFACE = "org.bluez.Agent1"
+AGENT_MANAGER_IFACE = "org.bluez.AgentManager1"
+
 DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 DBUS_PROP_IFACE = "org.freedesktop.DBus.Properties"
-AGENT_INTERFACE = "org.bluez.Agent1"
 
 
 class InvalidArgsException(dbus.exceptions.DBusException):

@@ -4,6 +4,7 @@ import dbus
 import dbus.service
 
 from .dbus_common import (
+    BLUEZ_SERVICE_PATH,
     BLUEZ_SERVICE_NAME,
     DBUS_OM_IFACE,
     DBUS_PROP_IFACE,
@@ -18,7 +19,7 @@ from .dbus_common import (
 )
 
 class Application(dbus.service.Object):
-    PATH = "/org/bluez/app"
+    PATH = BLUEZ_SERVICE_PATH + "/app"
 
     def __init__(self, bus, path=None):
         self.path = path or self.PATH
@@ -49,7 +50,7 @@ class Application(dbus.service.Object):
 
 
 class Service(dbus.service.Object):
-    PATH_BASE = "/org/bluez/app/service"
+    PATH_BASE = BLUEZ_SERVICE_PATH + "/app/service"
 
     def __init__(self, bus, index, uuid, primary=True, handle=0, includes=None):
         self.path = self.PATH_BASE + str(index)
