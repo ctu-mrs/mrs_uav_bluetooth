@@ -270,6 +270,11 @@ class BluetoothNodeRuntimeMixin:
             peer_candidate = self._is_uav_peer_candidate(device, pattern)
             if not peer_candidate:
                 continue
+            # If no whitelist is configured, treat auto_connect_enable as a connector toggle,
+            # not an authorization gate. This prevents transient config updates from
+            # disconnecting already valid peers and clearing their bond state.
+            if not whitelist_enabled and not auto_connect_enabled:
+                continue
             allowed = explicit_target or (auto_connect_enabled and not whitelist_enabled)
             if allowed:
                 continue
@@ -1026,6 +1031,8 @@ class BluetoothNodeRuntimeMixin:
         return False
 
     def _stop_notify_if_unused(self, path: str):
+        if not str(path or "").startswith("/"):
+            return
         if any(state.transport_endpoint == "characteristic" and state.path == path for state in self._notification_bridges.values()):
             return
         if any(state.characteristic_path == path for state in self._peer_time_bridges.values()):
