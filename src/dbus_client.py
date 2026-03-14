@@ -230,7 +230,8 @@ class BleClient:
         if device is None:
             return False
         try:
-            device.Connect()
+            # Bound the DBus method call itself so this helper cannot block indefinitely.
+            device.Connect(timeout=max(1.0, min(float(timeout), 6.0)))
         except dbus.DBusException as exc:
             message = str(exc)
             if (
@@ -246,6 +247,27 @@ class BleClient:
                 return True
             time.sleep(0.3)
         return False
+
+    def connect_async(self, mac: str, timeout: float = 6.0) -> bool:
+        device = self._find_device_obj(mac)
+        if device is None:
+            return False
+        try:
+            device.Connect(
+                reply_handler=lambda *_: None,
+                error_handler=lambda *_: None,
+                timeout=max(1.0, float(timeout)),
+            )
+            return True
+        except dbus.DBusException as exc:
+            message = str(exc)
+            if (
+                "Already Connected" in message
+                or "AlreadyConnected" in message
+                or "InProgress" in message
+            ):
+                return True
+            return False
 
     def disconnect(self, mac: str, timeout: float = 10.0) -> bool:
         device = self._find_device_obj(mac)

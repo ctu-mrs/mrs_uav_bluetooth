@@ -572,13 +572,17 @@ class BluetoothNodeRuntimeMixin:
                     continue
                 self._auto_connect_attempts[mac] = now
                 self._log_verbose(f"Auto-connect attempt: {device_label}")
-                connected = self._client.connect(mac, timeout=min(3.0, retry_period))
+                connect_requested = self._client.connect_async(mac, timeout=min(3.0, retry_period))
+                if not connect_requested:
+                    # Fallback to a short, bounded synchronous probe only when async request cannot be scheduled.
+                    connected = self._client.connect(mac, timeout=min(1.0, retry_period))
+                else:
+                    connected = False
                 if not connected:
                     refreshed = self._client.get_device(mac, refresh=True)
                     connected = bool(refreshed and refreshed.connected)
                 if not connected:
-                    self.get_logger().warning(f"Auto-connect failed: {device_label}")
-                    self._log_verbose(f"Auto-connect failed: {device_label}")
+                    self._log_verbose(f"Auto-connect pending/failed: {device_label}")
                     continue
                 current = self._client.get_device(mac, refresh=True) or device
                 if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
@@ -892,8 +896,17 @@ class BluetoothNodeRuntimeMixin:
                 self.get_logger().warning(
                     f"Peer {mac}: forcing service rediscovery before bond reset ({reason})"
                 )
-                recovered = self._force_peer_service_rediscovery(mac, device_label)
+                scheduled = self._run_background_once(
+                    f"service-rediscovery::{mac}",
+                    self._force_peer_service_rediscovery,
+                    mac,
+                    device_label,
+                )
                 self._peer_inactive_since[mac] = time.monotonic()
+                if scheduled:
+                    self._log_verbose(f"Scheduled background service rediscovery for {device_label}")
+                    return False
+                recovered = self._force_peer_service_rediscovery(mac, device_label)
                 if recovered:
                     self._peer_service_retry_at.pop(mac, None)
                     return False
