@@ -289,8 +289,26 @@ class BluetoothDbusRuntime:
 
     def _register_advertisement(self, ad_mgr, advertisement: Advertisement, service_uuids) -> bool:
         last_error = None
+        adv_capabilities = self._get_advertising_capabilities()
+        max_tx_power = adv_capabilities.get("max_tx_power")
+        if max_tx_power is not None:
+            advertisement.tx_power = max_tx_power
+            if adv_capabilities.get("can_set_tx_power"):
+                self._logger.info(f"Using maximum BLE advertisement TxPower ({max_tx_power} dBm)")
+            else:
+                self._logger.warning(
+                    "Controller reported MaxTxPower but not CanSetTxPower; "
+                    f"still attempting TxPower={max_tx_power} dBm"
+                )
+        else:
+            advertisement.tx_power = None
+
         attempts = []
-        for include_tx_power in (True, False):
+        include_tx_power_candidates = [True, False]
+        if not adv_capabilities.get("supports_tx_power_include"):
+            include_tx_power_candidates = [False]
+
+        for include_tx_power in include_tx_power_candidates:
             attempts.append(
                 (
                     include_tx_power,
@@ -341,6 +359,43 @@ class BluetoothDbusRuntime:
         self._logger.error(f"BLE advertisement unavailable; continuing without advertising: {last_error}")
         advertisement.destroy()
         return False
+
+    def _get_advertising_capabilities(self):
+        supports_tx_power_include = True
+        can_set_tx_power = False
+        max_tx_power = None
+
+        props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), DBUS_PROP_IFACE)
+        try:
+            adv_props = props.GetAll(LE_ADVERTISING_MANAGER_IFACE)
+        except Exception as exc:
+            self._logger.warning(f"Unable to query LEAdvertisingManager1 capabilities: {exc}")
+            return {
+                "supports_tx_power_include": supports_tx_power_include,
+                "can_set_tx_power": can_set_tx_power,
+                "max_tx_power": max_tx_power,
+            }
+
+        supported_includes = {str(value) for value in adv_props.get("SupportedIncludes", [])}
+        if supported_includes:
+            supports_tx_power_include = "tx-power" in supported_includes
+
+        supported_features = {str(value) for value in adv_props.get("SupportedFeatures", [])}
+        capabilities = adv_props.get("SupportedCapabilities", {})
+        if "MaxTxPower" in capabilities:
+            try:
+                max_tx_power = int(capabilities["MaxTxPower"])
+            except Exception:
+                max_tx_power = None
+        can_set_tx_power = "CanSetTxPower" in supported_features and max_tx_power is not None
+        if max_tx_power is None:
+            self._log_verbose("LEAdvertisingManager1 did not report MaxTxPower capability")
+
+        return {
+            "supports_tx_power_include": supports_tx_power_include,
+            "can_set_tx_power": can_set_tx_power,
+            "max_tx_power": max_tx_power,
+        }
 
     def _select_advertised_service_uuids(self, service_uuids, *, include_tx_power: bool):
         # Legacy LE advertising payload is limited to 31 bytes including flags.

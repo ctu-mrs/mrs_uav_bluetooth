@@ -3,23 +3,18 @@
 import dbus
 import dbus.service
 
-from .dbus_common import BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE
-
-AGENT_INTERFACE = "org.bluez.Agent1"
-AGENT_PATH = "/org/bluez/app/agent"
-
-
-class Rejected(dbus.DBusException):
-    _dbus_error_name = "org.bluez.Error.Rejected"
+from .dbus_common import AGENT_INTERFACE, BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, RejectedException
 
 
 class PairingAgent(dbus.service.Object):
+    AGENT_PATH = "/org/bluez/app/agent"
+
     def __init__(self, bus, auto_accept=False, auto_trust=True, on_event=None):
         self.bus = bus
         self._auto_accept = auto_accept
         self._auto_trust = auto_trust
         self._on_event = on_event
-        dbus.service.Object.__init__(self, bus, AGENT_PATH)
+        dbus.service.Object.__init__(self, bus, PairingAgent.AGENT_PATH)
 
     def _emit(self, event_type, device_path="", **kw):
         if self._on_event:
@@ -41,7 +36,7 @@ class PairingAgent(dbus.service.Object):
         self._emit("authorize_service", device, uuid=uuid)
         if self._auto_accept:
             return
-        raise Rejected("Connection rejected")
+        raise RejectedException("Connection rejected")
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="s")
     def RequestPinCode(self, device):
@@ -72,14 +67,14 @@ class PairingAgent(dbus.service.Object):
             if self._auto_trust:
                 self._set_trusted(device)
             return
-        raise Rejected("Passkey not confirmed")
+        raise RejectedException("Passkey not confirmed")
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="")
     def RequestAuthorization(self, device):
         self._emit("request_authorization", device)
         if self._auto_accept:
             return
-        raise Rejected("Authorization rejected")
+        raise RejectedException("Authorization rejected")
 
     @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
     def Cancel(self):

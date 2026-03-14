@@ -3,7 +3,7 @@
 import dbus
 import dbus.service
 
-from .dbus_common import DBUS_PROP_IFACE, LE_ADVERTISEMENT_IFACE, dict_with_byte_arrays
+from .dbus_common import DBUS_PROP_IFACE, InvalidArgsException, LE_ADVERTISEMENT_IFACE, dict_with_byte_arrays
 
 
 class Advertisement(dbus.service.Object):
@@ -138,7 +138,7 @@ class Advertisement(dbus.service.Object):
     @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
     def GetAll(self, interface):
         if interface != LE_ADVERTISEMENT_IFACE:
-            raise dbus.exceptions.DBusException("org.freedesktop.DBus.Error.InvalidArgs")
+            raise InvalidArgsException()
         return self.get_properties()[LE_ADVERTISEMENT_IFACE]
 
     @dbus.service.method(LE_ADVERTISEMENT_IFACE, in_signature="", out_signature="")

@@ -107,6 +107,7 @@ netplan_scripts_dir: /etc/ctu-mrs/uav-bluetooth/netplan-scripts
 # - transport_endpoint: characteristic | descriptor.
 # - members: Ordered packet layout for the compact BLE payload. Each member is
 #   packed little-endian and must use a fixed-width scalar type.
+#   Keep the total payload size at most 244 bytes (BLE message limit).
 #
 # Supported member types: bool, int8, uint8, int16, uint16, int32, uint32,
 # int64, uint64, float32, float64, time_ns.

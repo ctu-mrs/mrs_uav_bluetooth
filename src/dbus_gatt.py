@@ -1,7 +1,6 @@
 """D-Bus GATT application helpers."""
 
 import dbus
-import dbus.exceptions
 import dbus.service
 
 from .dbus_common import (
@@ -12,21 +11,11 @@ from .dbus_common import (
     GATT_DESC_IFACE,
     GATT_MANAGER_IFACE,
     GATT_SERVICE_IFACE,
+    InvalidArgsException,
+    NotSupportedException,
     dbus_byte_array,
     dbus_object_path_array,
 )
-
-
-class InvalidArgsException(dbus.exceptions.DBusException):
-    _dbus_error_name = "org.freedesktop.DBus.Error.InvalidArgs"
-
-
-class NotSupportedException(dbus.exceptions.DBusException):
-    _dbus_error_name = "org.bluez.Error.NotSupported"
-
-
-class FailedException(dbus.exceptions.DBusException):
-    _dbus_error_name = "org.bluez.Error.Failed"
 
 class Application(dbus.service.Object):
     PATH = "/org/bluez/app"

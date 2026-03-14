@@ -14,6 +14,23 @@ LE_ADVERTISING_MANAGER_IFACE = "org.bluez.LEAdvertisingManager1"
 LE_ADVERTISEMENT_IFACE = "org.bluez.LEAdvertisement1"
 DBUS_OM_IFACE = "org.freedesktop.DBus.ObjectManager"
 DBUS_PROP_IFACE = "org.freedesktop.DBus.Properties"
+AGENT_INTERFACE = "org.bluez.Agent1"
+
+
+class InvalidArgsException(dbus.exceptions.DBusException):
+    _dbus_error_name = "org.freedesktop.DBus.Error.InvalidArgs"
+
+
+class NotSupportedException(dbus.exceptions.DBusException):
+    _dbus_error_name = "org.bluez.Error.NotSupported"
+
+
+class FailedException(dbus.exceptions.DBusException):
+    _dbus_error_name = "org.bluez.Error.Failed"
+
+
+class RejectedException(dbus.exceptions.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
 
 
 def dbus_byte_array(value):
