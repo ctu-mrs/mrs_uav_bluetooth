@@ -657,9 +657,13 @@ class BluetoothNodeRuntimeMixin:
                     self._peer_connect_repair_at.pop(mac, None)
                     self._peer_connect_repair_count.pop(mac, None)
                     continue
+                device = self._prepare_disconnected_peer_security(mac, device, retry_period)
+                if device is None:
+                    continue
                 pending_since = self._peer_connect_started_since.setdefault(mac, now)
                 if self._maybe_recover_stalled_connect(mac, device, device_label, pending_since, retry_period):
-                    pending_since = self._peer_connect_started_since.setdefault(mac, time.monotonic())
+                    self._peer_connect_started_since.setdefault(mac, time.monotonic())
+                    continue
                 last_attempt = self._auto_connect_attempts.get(mac, 0.0)
                 if now - last_attempt < retry_period:
                     continue
@@ -728,6 +732,46 @@ class BluetoothNodeRuntimeMixin:
         self._clear_peer_local_state(mac, reason="missing healthy BLE time bridge")
         return True
 
+    def _prepare_disconnected_peer_security(self, mac: str, device: DeviceInfo, retry_period: float):
+        current = self._client.get_device(mac, refresh=True) or device
+        if current.connected:
+            self._peer_security_attempts.pop(mac, None)
+            return current
+        if not (current.paired or current.bonded):
+            return current
+        if current.trusted:
+            self._peer_security_attempts.pop(mac, None)
+            return current
+
+        now_mono = time.monotonic()
+        last_attempt = self._peer_security_attempts.get(mac, 0.0)
+        if now_mono - last_attempt < retry_period:
+            return None
+        self._peer_security_attempts[mac] = now_mono
+
+        device_label = f"{mac} ({self._hostname_from_device(current) or '?'})"
+        self._log_verbose(
+            f"Pre-connect trust repair for {device_label}: paired={current.paired} "
+            f"bonded={current.bonded} trusted={current.trusted}"
+        )
+        if not self._client.trust(mac):
+            self.get_logger().warning(f"Failed to trust BLE peer {mac} before connect")
+            self._log_verbose(f"Pre-connect trust failed: {device_label}")
+            self._set_peer_time_status(mac, "trust-failed", "Trusted=False before connect")
+            return None
+
+        refreshed = self._client.get_device(mac, refresh=True) or current
+        if refreshed.trusted:
+            self.get_logger().info(f"Trusted BLE peer {mac} before connect")
+            self._log_verbose(f"Pre-connect trusted: {device_label}")
+            self._set_peer_time_status(mac, "trusted", "Trusted=True before connect")
+            self._peer_security_attempts.pop(mac, None)
+            return refreshed
+
+        self._log_verbose(f"Pre-connect trust did not stick yet for {device_label}")
+        self._set_peer_time_status(mac, "trust-failed", "Trusted=False after pre-connect trust")
+        return None
+
     def _maybe_recover_stalled_connect(
         self,
         mac: str,
@@ -754,10 +798,11 @@ class BluetoothNodeRuntimeMixin:
         repair_count = int(self._peer_connect_repair_count.get(mac, 0.0))
 
         stale_security = bool(current.paired or current.bonded or current.trusted)
-        # Remove cached BlueZ device on the second+ attempt so it gets
-        # re-discovered fresh by the scanner.
-        remove_pairing = stale_security and repair_count >= 1
-        remove_device = repair_count >= 2
+        # Stuck discoverable-but-disconnected peers with cached security state
+        # are usually stale one-sided bonds. Clear that state on the first
+        # repair and fully drop the cached device on the second.
+        remove_pairing = stale_security
+        remove_device = repair_count >= 1
         self.get_logger().warning(
             f"Peer {mac} stayed discoverable but disconnected for {waited_s:.1f}s; repairing BLE link state"
         )
@@ -783,6 +828,7 @@ class BluetoothNodeRuntimeMixin:
         # so that the cooldown timer is properly enforced on subsequent ticks.
         self._peer_connect_repair_at[mac] = now_mono
         self._peer_connect_repair_count[mac] = float(repair_count + 1)
+        self._peer_connect_started_since[mac] = time.monotonic()
         if remove_device:
             # _clear_peer_local_state already called remove via
             # remove_pairing=True; this is a defensive second attempt in case
@@ -794,14 +840,9 @@ class BluetoothNodeRuntimeMixin:
             )
             return True
 
-        immediate_connected = self._client.connect(mac, timeout=max(3.0, min(8.0, retry_period * 2.0)))
-        self._peer_connect_started_since[mac] = time.monotonic()
-        if immediate_connected:
-            self._peer_connect_started_since.pop(mac, None)
-            self._peer_connect_repair_at.pop(mac, None)
-            self._log_verbose(f"Stalled connect repair recovered peer {device_label}")
-            return False
-        self._log_verbose(f"Stalled connect repair did not immediately recover {device_label}")
+        self._log_verbose(
+            f"Stalled connect repair reset local state for {device_label}; waiting for next auto-connect tick"
+        )
         return True
 
     def _drop_non_whitelisted_peer(self, mac: str, device: DeviceInfo):
