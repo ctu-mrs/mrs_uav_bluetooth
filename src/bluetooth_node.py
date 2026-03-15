@@ -63,6 +63,7 @@ class BluetoothNode(
         self._peer_writeback_pending: Dict[str, bytes] = {}
         self._peer_writeback_inflight: Set[str] = set()
         self._peer_writeback_last_sent: Dict[str, bytes] = {}
+        self._peer_writeback_retry_at: Dict[str, float] = {}
         self._pairing_repair_attempts: Dict[str, float] = {}
 
         self.devices_pub = None

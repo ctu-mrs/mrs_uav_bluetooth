@@ -223,6 +223,43 @@ class BluetoothNodeRuntimeMixin:
         self.get_logger().warning(message)
         self._log_verbose(message)
 
+    def _is_valid_log_name(self, name: str) -> bool:
+        candidate = str(name or "").strip()
+        if not candidate or candidate == "?":
+            return False
+        # Ignore placeholders that are just MAC-shaped aliases.
+        if re.match(r"^(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$", candidate):
+            return False
+        return True
+
+    def _format_discovered_device_entry(self, mac: str, device: DeviceInfo, *, prefer_hostname: bool) -> str:
+        if prefer_hostname:
+            hostname = self._hostname_from_device(device)
+            if self._is_valid_log_name(hostname):
+                return f"{mac} ({hostname})"
+            return mac
+        label = ""
+        for candidate in (device.name or "", device.alias or ""):
+            if self._is_valid_log_name(candidate):
+                label = candidate
+                break
+        if label:
+            return f"{mac} ({label})"
+        return mac
+
+    def _log_discovered_devices_summary(self, snapshot: Dict[str, DeviceInfo], pattern: str):
+        peers = []
+        others = []
+        for mac, device in sorted(snapshot.items()):
+            if self._is_uav_peer_candidate(device, pattern):
+                peers.append(self._format_discovered_device_entry(mac, device, prefer_hostname=True))
+            else:
+                others.append(self._format_discovered_device_entry(mac, device, prefer_hostname=False))
+        peers_text = ", ".join(peers) if peers else "(none)"
+        others_text = ", ".join(others) if others else "(none)"
+        self._log_verbose(f"Discovered peers: {peers_text}")
+        self._log_verbose(f"Discovered other: {others_text}")
+
     def _publish_scan_results(self):
         if self._client is None:
             return
@@ -238,17 +275,11 @@ class BluetoothNodeRuntimeMixin:
             self.devices_pub.publish(msg)
             self._refresh_notification_mapping(snapshot)
             self._cleanup_peer_time_bridges(snapshot)
-            if snapshot:
-                lines = [f"Scan results: {len(snapshot)} device(s)"]
-                for mac, dev in sorted(snapshot.items()):
-                    lines.append(
-                        f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
-                        f"  rssi={dev.rssi}  connected={dev.connected}"
-                        f"  paired={dev.paired}  trusted={dev.trusted}"
-                    )
-                self._log_verbose("\n".join(lines))
-            else:
-                self._log_verbose("Scan results: no devices found")
+            self._log_verbose(f"Scan results: {len(snapshot)} device(s)")
+            self._log_discovered_devices_summary(
+                snapshot,
+                pattern=str(self.get_parameter("auto_connect_pattern").value),
+            )
         except dbus.exceptions.DBusException as exc:
             self._dbus_warning("scan_results", f"Skipping BLE scan publish tick due to DBus error: {exc}")
 
@@ -445,6 +476,7 @@ class BluetoothNodeRuntimeMixin:
             if state is not None:
                 self.destroy_publisher(state.publisher)
                 self._stop_notify_if_unused(state.characteristic_path)
+                self._clear_peer_writeback_state(state.writeback_descriptor_path)
             self._peer_security_attempts.pop(mac, None)
             self._peer_repair_attempts.pop(mac, None)
             self._peer_inactive_since.pop(mac, None)
@@ -537,17 +569,12 @@ class BluetoothNodeRuntimeMixin:
                 now,
                 ttl_s=max(40.0, retry_period * 20.0),
             )
-            lines = [
+            self._log_verbose(
                 f"Auto-connect tick: {len(snapshot)} device(s), "
                 f"whitelist={sorted(whitelist_names) or '(none)'}, pattern={pattern}, "
                 f"enable={bool(self.get_parameter('auto_connect_enable').value)}"
-            ]
-            for mac, dev in sorted(snapshot.items()):
-                lines.append(
-                    f"  {mac}  name={dev.name or '?'}  alias={dev.alias or '?'}"
-                    f"  connected={dev.connected}  candidate={self._is_uav_peer_candidate(dev, pattern)}"
-                )
-            self._log_verbose("\n".join(lines))
+            )
+            self._log_discovered_devices_summary(snapshot, pattern)
             for mac, device in snapshot.items():
                 peer_candidate = self._is_uav_peer_candidate(device, pattern)
                 explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
@@ -655,6 +682,7 @@ class BluetoothNodeRuntimeMixin:
             state = self._peer_time_bridges.pop(mac)
             self.destroy_publisher(state.publisher)
             self._stop_notify_if_unused(state.characteristic_path)
+            self._clear_peer_writeback_state(state.writeback_descriptor_path)
         self._peer_security_attempts.pop(mac, None)
         self._peer_repair_attempts.pop(mac, None)
         self._peer_inactive_since.pop(mac, None)
@@ -754,6 +782,16 @@ class BluetoothNodeRuntimeMixin:
         if self._client.wait_services_resolved(mac, timeout=1.0):
             self._set_peer_time_status(mac, "services-resolved", "services_resolved=True")
             return True
+        # BlueZ can keep ServicesResolved=False while managed objects already expose
+        # the characteristic tree; treat this as good enough for bridge setup.
+        probe_path = self._resolve_peer_time_characteristic_path(mac, allow_wait=False)
+        if probe_path:
+            self._set_peer_time_status(
+                mac,
+                "services-resolved",
+                f"services_resolved=False,time_path={probe_path}",
+            )
+            return True
         self._log_verbose(f"Peer {mac}: services not resolved yet, delaying time bridge setup")
         self._maybe_repair_peer_link(
             mac,
@@ -789,7 +827,7 @@ class BluetoothNodeRuntimeMixin:
         self._log_verbose(f"Service rediscovery could not resolve time characteristic for {device_label}")
         return False
 
-    def _resolve_peer_time_characteristic_path(self, mac: str) -> str:
+    def _resolve_peer_time_characteristic_path(self, mac: str, *, allow_wait: bool = True) -> str:
         candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
         if candidates:
             return candidates[0]
@@ -798,6 +836,8 @@ class BluetoothNodeRuntimeMixin:
         candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
         if candidates:
             return candidates[0]
+        if not allow_wait:
+            return ""
         self._client.wait_services_resolved(mac, timeout=1.0)
         candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
         return candidates[0] if candidates else ""
@@ -954,6 +994,9 @@ class BluetoothNodeRuntimeMixin:
         return False
 
     def _prime_peer_time_bridge(self, state: PeerTimeBridgeState):
+        current = self._client.get_device(state.mac, refresh=True)
+        if current is None or not current.connected or not current.services_resolved:
+            return
         payload = self._client.read_characteristic(state.characteristic_path)
         if payload is not None:
             self._process_peer_time_payload(state.mac, state.characteristic_path, payload)
@@ -1162,7 +1205,11 @@ class BluetoothNodeRuntimeMixin:
     def _kick_peer_writeback(self, desc_path: str):
         if not desc_path:
             return
+        now = time.monotonic()
         with self._peer_writeback_lock:
+            retry_at = getattr(self, "_peer_writeback_retry_at", {}).get(desc_path, 0.0)
+            if now < retry_at:
+                return
             payload = self._peer_writeback_pending.get(desc_path)
             if payload is None:
                 return
@@ -1182,6 +1229,20 @@ class BluetoothNodeRuntimeMixin:
         with self._peer_writeback_lock:
             self._peer_writeback_inflight.discard(desc_path)
             self._peer_writeback_last_sent.pop(desc_path, None)
+            retry_map = getattr(self, "_peer_writeback_retry_at", {})
+            retry_map[desc_path] = time.monotonic() + 1.0
+            self._peer_writeback_retry_at = retry_map
+
+    def _clear_peer_writeback_state(self, desc_path: str):
+        if not desc_path:
+            return
+        with self._peer_writeback_lock:
+            self._peer_writeback_pending.pop(desc_path, None)
+            self._peer_writeback_inflight.discard(desc_path)
+            self._peer_writeback_last_sent.pop(desc_path, None)
+            retry_map = getattr(self, "_peer_writeback_retry_at", {})
+            retry_map.pop(desc_path, None)
+            self._peer_writeback_retry_at = retry_map
 
     def _buffer_import_topic_bridge(self, mac: str, chrc_path: str, data: bytes):
         for state in self._notification_bridges.values():
@@ -1196,6 +1257,12 @@ class BluetoothNodeRuntimeMixin:
 
     def _on_client_gatt_event(self, event_type: str, info: dict):
         self._log_verbose(f"GATT event {event_type}: {info}")
+        if event_type == "client_notify_disabled":
+            chrc_path = str(info.get("chrc_path", ""))
+            if chrc_path:
+                for state in self._peer_time_bridges.values():
+                    if state.characteristic_path == chrc_path:
+                        self._clear_peer_writeback_state(state.writeback_descriptor_path)
         if event_type in {"client_descriptor_write", "client_descriptor_write_failed"}:
             desc_path = str(info.get("desc_path", ""))
             self._handle_peer_writeback_event(desc_path, event_type == "client_descriptor_write")
@@ -1227,7 +1294,13 @@ class BluetoothNodeRuntimeMixin:
             self._peer_writeback_inflight.discard(desc_path)
             if not success:
                 self._peer_writeback_last_sent.pop(desc_path, None)
+                retry_map = getattr(self, "_peer_writeback_retry_at", {})
+                retry_map[desc_path] = time.monotonic() + 1.0
+                self._peer_writeback_retry_at = retry_map
                 return
+            retry_map = getattr(self, "_peer_writeback_retry_at", {})
+            retry_map.pop(desc_path, None)
+            self._peer_writeback_retry_at = retry_map
             latest = self._peer_writeback_pending.get(desc_path)
             sent = self._peer_writeback_last_sent.get(desc_path)
             if latest is None:
@@ -1253,9 +1326,13 @@ class BluetoothNodeRuntimeMixin:
             pending = self._peer_writeback_pending.pop(failed_desc_path, None)
             self._peer_writeback_inflight.discard(failed_desc_path)
             self._peer_writeback_last_sent.pop(failed_desc_path, None)
+            retry_map = getattr(self, "_peer_writeback_retry_at", {})
+            retry_map.pop(failed_desc_path, None)
             if pending is not None:
                 self._peer_writeback_pending[refreshed] = pending
                 self._peer_writeback_last_sent.pop(refreshed, None)
+                retry_map.pop(refreshed, None)
+            self._peer_writeback_retry_at = retry_map
         self._kick_peer_writeback(refreshed)
 
     def _on_pairing_event(self, event_type, device_path, **kwargs):
@@ -1356,7 +1433,12 @@ class BluetoothNodeRuntimeMixin:
             return
         state = self._peer_time_bridges.get(mac)
         if state is None:
-            self._log_verbose(f"Time writeback for unmanaged peer mac={mac} path={device_path}")
+            key = f"time_writeback_unmanaged::{mac}"
+            now = time.monotonic()
+            last = self._last_dbus_warning_at.get(key, 0.0)
+            if now - last >= 5.0:
+                self._last_dbus_warning_at[key] = now
+                self._log_verbose(f"Time writeback for unmanaged peer mac={mac} path={device_path}")
             return
         echoed_time_ns = struct.unpack("<Q", payload[:8])[0]
         if echoed_time_ns <= 0:

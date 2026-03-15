@@ -411,6 +411,7 @@ class BluetoothNodeConfigMixin:
                     self._expire_overlay_connections("explicit revert")
                     self._active_overlay_path = ""
                     self._reload_active_config()
+                    self._enforce_peer_connection_policy(reason="overlay revert")
                 response.success = True
                 response.message = "Reverted to default config"
                 response.active_config_path = self._active_config_source
@@ -424,9 +425,13 @@ class BluetoothNodeConfigMixin:
                 response.active_config_path = self._active_config_source
                 response.overlay_active = True
                 return response
+            if self._active_overlay_path:
+                # Switching overlays is a lease boundary for overlay-introduced peers.
+                self._expire_overlay_connections("overlay config changed")
             self._capture_overlay_connection_baseline()
             self._active_overlay_path = path
             self._reload_active_config()
+            self._enforce_peer_connection_policy(reason="overlay config changed")
             response.success = True
             response.message = f"Activated overlay config {path}"
             response.active_config_path = self._active_config_source
@@ -448,6 +453,7 @@ class BluetoothNodeConfigMixin:
         self._expire_overlay_connections("keepalive sentinel missing")
         self._active_overlay_path = ""
         self._reload_active_config()
+        self._enforce_peer_connection_policy(reason="overlay keepalive expired")
         self.get_logger().info(f"Overlay keepalive missing, reverted to default after {expired_path}")
 
     def _reload_active_config(self):
