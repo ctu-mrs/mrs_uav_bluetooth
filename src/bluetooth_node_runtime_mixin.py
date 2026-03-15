@@ -714,7 +714,24 @@ class BluetoothNodeRuntimeMixin:
                 kept[mac] = stamp
         return kept
 
+    def _has_live_peer_time_bridge(self, mac: str, *, idle_timeout_s: float = 20.0) -> bool:
+        state = self._peer_time_bridges.get(mac)
+        if state is None or not state.characteristic_path:
+            return False
+        try:
+            if self._is_characteristic_notifying(mac, state.characteristic_path):
+                return True
+        except dbus.exceptions.DBusException:
+            # Fall back to recent payload activity if BlueZ transiently rejects characteristic listing.
+            pass
+        return (time.monotonic() - state.last_activity_monotonic) <= max(1.0, float(idle_timeout_s))
+
     def _ensure_peer_services_resolved(self, mac: str, device: DeviceInfo, *, device_label: str) -> bool:
+        # BlueZ may keep ServicesResolved=False even after notifications are active.
+        # If the peer time bridge is alive, GATT is already usable for our purposes.
+        if self._has_live_peer_time_bridge(mac):
+            self._set_peer_time_status(mac, "services-resolved", "services_resolved=active_time_bridge")
+            return True
         if device.services_resolved:
             self._set_peer_time_status(mac, "services-resolved", "services_resolved=True")
             return True
@@ -788,6 +805,12 @@ class BluetoothNodeRuntimeMixin:
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> Tuple[bool, bool]:
         current = self._client.get_device(mac, refresh=True) or device
         device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
+        existing = self._peer_time_bridges.get(mac)
+        if existing is not None and self._has_live_peer_time_bridge(mac):
+            self._peer_inactive_since.pop(mac, None)
+            self._peer_service_retry_at.pop(mac, None)
+            self._set_peer_time_status(mac, "ready", f"time_path={existing.characteristic_path}")
+            return True, True
         if not self._ensure_peer_services_resolved(mac, current, device_label=device_label):
             return False, False
 
