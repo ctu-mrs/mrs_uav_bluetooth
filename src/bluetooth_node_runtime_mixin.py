@@ -286,8 +286,8 @@ class BluetoothNodeRuntimeMixin:
                 self.get_logger().info(f"Disconnecting {mac}: peer policy denies connection ({reason})")
                 self._log_verbose(f"Disconnecting disallowed peer {device_label}: {reason}")
             else:
-                self.get_logger().info(f"Clearing disallowed stale BLE bond for {mac} ({reason})")
-                self._log_verbose(f"Clearing stale disallowed peer {device_label}: {reason}")
+                self.get_logger().info(f"Marking disallowed peer {mac} as untrusted ({reason})")
+                self._log_verbose(f"Updating stale disallowed peer {device_label} trust state: {reason}")
             self._clear_peer_local_state(mac, device=device, reason=f"policy denies connection ({reason})")
             changed = True
 
@@ -624,12 +624,26 @@ class BluetoothNodeRuntimeMixin:
     def _drop_non_whitelisted_peer(self, mac: str, device: DeviceInfo):
         self._clear_peer_local_state(mac, device=device, reason="non-whitelisted peer")
 
-    def _clear_peer_local_state(self, mac: str, device: DeviceInfo = None, *, reason: str = ""):
+    def _clear_peer_local_state(
+        self,
+        mac: str,
+        device: DeviceInfo = None,
+        *,
+        reason: str = "",
+        remove_pairing: bool = False,
+        untrust: bool = True,
+    ):
         current = device or self._client.get_device(mac, refresh=True)
         self._client.disconnect(mac, timeout=5.0)
-        had_pairing_state = bool(current and (current.paired or current.bonded or current.trusted or current.path))
-        if had_pairing_state:
-            self._client.untrust(mac)
+        had_pairing_state = bool(current and (current.paired or current.bonded or current.trusted))
+        if untrust and had_pairing_state and bool(current and current.trusted):
+            if self._client.untrust(mac):
+                detail = f" ({reason})" if reason else ""
+                self.get_logger().info(f"Set peer {mac} trusted=False{detail}")
+            else:
+                detail = f" ({reason})" if reason else ""
+                self.get_logger().warning(f"Failed to set peer {mac} trusted=False{detail}")
+        if remove_pairing:
             removed = self._client.remove(mac)
             if removed:
                 detail = f": {reason}" if reason else ""
@@ -998,17 +1012,17 @@ class BluetoothNodeRuntimeMixin:
                 self._set_peer_time_status(mac, "pairing-failed", f"attempts={failures}")
                 if failures >= 2 or bool(current.trusted):
                     self.get_logger().warning(
-                        f"Repairing peer {mac}: pairing failed repeatedly (possible one-sided stale bond); clearing local bond/cache state"
+                        f"Repairing peer {mac}: pairing failed repeatedly (possible one-sided stale bond); resetting trust/connection state"
                     )
                     self._log_verbose(
-                        f"Repairing peer {device_label}: pairing failed repeatedly (possible one-sided stale bond)"
+                        f"Repairing peer {device_label}: pairing failed repeatedly (possible one-sided stale bond), preserving pairing"
                     )
                     self._clear_peer_local_state(
                         mac,
                         reason="pairing failed repeatedly (possible one-sided stale bond)",
                     )
                     self._peer_repair_attempts[mac] = time.monotonic()
-                    self._set_peer_time_status(mac, "repairing-pairing", "clearing local bond/cache")
+                    self._set_peer_time_status(mac, "repairing-pairing", "resetting trust/connection state")
                 else:
                     self._client.disconnect(mac, timeout=3.0)
                     self._log_verbose(f"Pairing failed once for {device_label}, retrying after reconnect")
@@ -1250,26 +1264,43 @@ class BluetoothNodeRuntimeMixin:
     def _repair_incoming_pairing_state(self, mac: str):
         if self._client is None:
             return
-        self.get_logger().warning(f"Incoming pairing for {mac}: clearing stale local bond/trust state")
-        # Keep this path fast because it runs during pairing-agent callbacks.
-        try:
-            self._client.disconnect(mac, timeout=1.0)
-        except Exception:
-            pass
-        try:
-            self._client.untrust(mac)
-        except Exception:
-            pass
-        try:
-            self._client.remove(mac)
-        except Exception:
-            pass
-        self._auto_connect_attempts.pop(mac, None)
-        self._peer_security_attempts.pop(mac, None)
-        self._peer_repair_attempts.pop(mac, None)
-        self._peer_inactive_since.pop(mac, None)
-        self._peer_connected_since.pop(mac, None)
-        self._peer_service_retry_at.pop(mac, None)
+        self.get_logger().warning(
+            f"Incoming pairing for {mac}: stale one-sided bond suspected, clearing local bond and re-pairing immediately"
+        )
+        # Keep this callback short; perform reset+re-pair in a background task.
+        self._clear_peer_local_state(
+            mac,
+            reason="incoming pairing while already paired",
+            remove_pairing=True,
+            untrust=True,
+        )
+        scheduled = self._run_background_once(
+            f"incoming-repair::{mac}",
+            self._reconnect_and_repair_peer,
+            mac,
+        )
+        if not scheduled:
+            self._log_verbose(f"Incoming pairing repair already running for {mac}")
+
+    def _reconnect_and_repair_peer(self, mac: str):
+        device_label = mac
+        device = self._client.get_device(mac, refresh=True)
+        if device is not None:
+            device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
+        self._log_verbose(f"Incoming pairing recovery: reconnecting {device_label}")
+        if not self._client.connect(mac, timeout=10.0):
+            self.get_logger().warning(f"Incoming pairing recovery failed to reconnect {mac}")
+            return
+        self._client.wait_services_resolved(mac, timeout=6.0)
+        paired = self._client.pair(mac, timeout=30.0)
+        if not paired:
+            self.get_logger().warning(f"Incoming pairing recovery failed to pair {mac}")
+            return
+        trusted = self._client.trust(mac)
+        if trusted:
+            self.get_logger().info(f"Incoming pairing recovery completed for {mac} (paired+trusted)")
+        else:
+            self.get_logger().warning(f"Incoming pairing recovery paired {mac} but trust step failed")
 
     def _hostname_from_device(self, device: DeviceInfo) -> str:
         if device.alias:
