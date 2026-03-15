@@ -113,6 +113,14 @@ class BleClient:
 
     @property
     def scanning(self):
+        return self.is_scanning()
+
+    def is_scanning(self) -> bool:
+        try:
+            discovering = self._adapter_props.Get(ADAPTER_IFACE, "Discovering")
+            self._scan_running = bool(discovering)
+        except dbus.DBusException:
+            pass
         return self._scan_running
 
     def refresh_devices(self) -> Dict[str, DeviceInfo]:
@@ -605,6 +613,10 @@ class BleClient:
 
     def _on_properties_changed(self, interface, changed, invalidated, path=""):
         del invalidated
+        if interface == ADAPTER_IFACE and str(path) == self._adapter_path:
+            if "Discovering" in changed:
+                self._scan_running = bool(changed.get("Discovering"))
+            return
         if interface == DEVICE_IFACE:
             self._update_device(str(path), changed)
 

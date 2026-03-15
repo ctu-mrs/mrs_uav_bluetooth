@@ -118,10 +118,16 @@ class BluetoothNodeStatusMixin:
         return lines
 
     def _peer_status_text(self, mac: str, dev, bridge_state) -> str:
+        session = self._peer_sessions.get(mac)
         if not dev.connected:
+            if session is not None and session.phase:
+                return f"disconnected,phase={session.phase}"
             return "disconnected"
         if dev.paired and dev.trusted and dev.bonded and bridge_state is not None and bridge_state.status == "ready":
-            return "fully-paired,time-bridge-ready"
+            ready_text = "fully-paired,time-bridge-ready"
+            if session is not None and session.phase:
+                ready_text = f"{ready_text},phase={session.phase}"
+            return ready_text
         parts = []
         if dev.paired or dev.bonded:
             parts.append("paired")
@@ -135,6 +141,8 @@ class BluetoothNodeStatusMixin:
             parts.append("services-resolved")
         else:
             parts.append("services-resolving")
+        if session is not None and session.phase:
+            parts.append(f"phase={session.phase}")
         if bridge_state is not None:
             if bridge_state.status:
                 parts.append(f"bridge={bridge_state.status}")

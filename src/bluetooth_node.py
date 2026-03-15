@@ -10,7 +10,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from .bluetooth_bridge_state import PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
+from .bluetooth_bridge_state import PeerConnectionSessionState, PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
 from .bluetooth_dbus_runtime import BluetoothDbusRuntime
 from .bluetooth_node_config_mixin import BluetoothNodeConfigMixin, SharedTopicConfig
 from .bluetooth_node_runtime_mixin import BluetoothNodeRuntimeMixin
@@ -34,15 +34,7 @@ class BluetoothNode(
         self._lock = threading.RLock()
         self._local_name = system_hostname() or "mrs-uav"
         self._pending_wifi_password = ""
-        self._auto_connect_attempts: Dict[str, float] = {}
-        self._peer_security_attempts: Dict[str, float] = {}
-        self._peer_repair_attempts: Dict[str, float] = {}
-        self._peer_inactive_since: Dict[str, float] = {}
-        self._peer_connected_since: Dict[str, float] = {}
-        self._peer_service_retry_at: Dict[str, float] = {}
-        self._peer_connect_started_since: Dict[str, float] = {}
-        self._peer_connect_repair_at: Dict[str, float] = {}
-        self._peer_connect_repair_count: Dict[str, float] = {}
+        self._peer_sessions: Dict[str, PeerConnectionSessionState] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
         self._last_dbus_warning_at: Dict[str, float] = {}
