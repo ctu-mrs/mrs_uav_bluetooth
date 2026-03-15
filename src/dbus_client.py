@@ -290,7 +290,8 @@ class BleClient:
         if device is None:
             return False
         try:
-            device.Pair()
+            # Keep Pair() bounded so one problematic peer cannot block the caller indefinitely.
+            device.Pair(timeout=max(2.0, min(float(timeout), 8.0)))
         except dbus.DBusException as exc:
             message = str(exc)
             if (
@@ -307,6 +308,28 @@ class BleClient:
                 return True
             time.sleep(0.5)
         return False
+
+    def pair_async(self, mac: str, timeout: float = 10.0) -> bool:
+        device = self._find_device_obj(mac)
+        if device is None:
+            return False
+        try:
+            device.Pair(
+                reply_handler=lambda *_: None,
+                error_handler=lambda *_: None,
+                timeout=max(2.0, min(float(timeout), 12.0)),
+            )
+            return True
+        except dbus.DBusException as exc:
+            message = str(exc)
+            if (
+                "AlreadyExists" in message
+                or "Already Paired" in message
+                or "AlreadyPaired" in message
+                or "InProgress" in message
+            ):
+                return True
+            return False
 
     def trust(self, mac: str) -> bool:
         return self._set_device_prop(mac, "Trusted", dbus.Boolean(True))

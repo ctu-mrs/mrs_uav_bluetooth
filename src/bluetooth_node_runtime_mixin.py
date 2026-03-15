@@ -562,7 +562,7 @@ class BluetoothNodeRuntimeMixin:
                     self._auto_connect_attempts.pop(mac, None)
                     if should_connect:
                         healthy = self._maintain_peer_connection(mac, device, retry_period, explicit_target=explicit_target)
-                        if not healthy and peer_candidate and not explicit_target:
+                        if not healthy and peer_candidate:
                             self._handle_unhealthy_peer_candidate(mac, device_label, retry_period)
                     continue
                 if not should_connect:
@@ -585,7 +585,7 @@ class BluetoothNodeRuntimeMixin:
                     self._log_verbose(f"Auto-connect pending/failed: {device_label}")
                     continue
                 current = self._client.get_device(mac, refresh=True) or device
-                if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target) and not explicit_target:
+                if peer_candidate and not self._maintain_peer_connection(mac, current, retry_period, explicit_target=explicit_target):
                     self._handle_unhealthy_peer_candidate(mac, device_label, retry_period)
                 else:
                     self._auto_connect_attempts.pop(mac, None)
@@ -928,10 +928,10 @@ class BluetoothNodeRuntimeMixin:
         security_ready = bool(current.trusted and (current.paired or current.bonded))
         if not security_ready:
             self._set_peer_time_status(mac, "pairing-pending", "waiting for paired+trusted")
-            return explicit_target
+            return False
         if self._is_uav_peer_candidate(device, str(self.get_parameter("auto_connect_pattern").value)):
             time_bridge_ready, _ = self._ensure_peer_time_bridge(mac, current)
-        return time_bridge_ready or explicit_target
+        return time_bridge_ready
 
     def _peer_name_token(self, mac: str, *, device: DeviceInfo = None) -> str:
         name = ""
@@ -970,21 +970,26 @@ class BluetoothNodeRuntimeMixin:
             f"Security state for {device_label}: paired={current.paired} trusted={current.trusted} bonded={current.bonded}"
         )
         if not (current.paired or current.bonded):
-            paired_ok = self._client.pair(mac, timeout=30.0)
-            if not paired_ok and current.trusted:
-                # Recover from stale one-sided bonds (peer removed pairing but local side kept trust/bond state).
-                self._log_verbose(f"Pairing retry after clearing stale trust for {device_label}")
-                self._client.untrust(mac)
-                self._client.disconnect(mac, timeout=5.0)
-                self._client.remove(mac)
-                self._client.connect(mac, timeout=10.0)
-                self._client.wait_services_resolved(mac, timeout=10.0)
-                paired_ok = self._client.pair(mac, timeout=30.0)
-            if paired_ok:
-                self.get_logger().info(f"Paired BLE peer {mac}")
-                self._log_verbose(f"Paired: {device_label}")
-                self._set_peer_time_status(mac, "pairing-succeeded", "paired=True")
-                pair_failures.pop(mac, None)
+            pair_timeout_s = max(4.0, min(12.0, retry_period * 2.0))
+            pair_requested = self._client.pair_async(mac, timeout=pair_timeout_s)
+            if pair_requested:
+                self._set_peer_time_status(mac, "pairing-in-progress", f"timeout={pair_timeout_s:.1f}s")
+                self._log_verbose(f"Pair requested for {device_label} (timeout={pair_timeout_s:.1f}s)")
+                # Keep this loop short so one problematic peer cannot stall the whole auto-connect tick.
+                probe_deadline = time.monotonic() + 1.0
+                while time.monotonic() < probe_deadline:
+                    current = self._client.get_device(mac, refresh=True) or current
+                    if current.paired or current.bonded:
+                        break
+                    time.sleep(0.2)
+                if current.paired or current.bonded:
+                    self.get_logger().info(f"Paired BLE peer {mac}")
+                    self._log_verbose(f"Paired: {device_label}")
+                    self._set_peer_time_status(mac, "pairing-succeeded", "paired=True")
+                    pair_failures.pop(mac, None)
+                else:
+                    self._peer_pair_failures = pair_failures
+                    return
             else:
                 self.get_logger().warning(f"Failed to pair BLE peer {mac}")
                 self._log_verbose(f"Pairing failed: {device_label}")
@@ -1007,6 +1012,8 @@ class BluetoothNodeRuntimeMixin:
                 else:
                     self._client.disconnect(mac, timeout=3.0)
                     self._log_verbose(f"Pairing failed once for {device_label}, retrying after reconnect")
+                self._peer_pair_failures = pair_failures
+                return
             current = self._client.get_device(mac, refresh=True) or current
         if (current.paired or current.bonded) and not current.trusted:
             if self._client.trust(mac):
