@@ -286,16 +286,9 @@ class BluetoothNodeRuntimeCoreMixin:
             self._dbus_warning("scan_results", f"Skipping BLE scan publish tick due to DBus error: {exc}")
 
     def _sync_scan_state_for_publish(self):
-        if not bool(self.get_parameter("enable_scan").value):
+        if self._client is None or not bool(self.get_parameter("enable_scan").value):
             return
-        pause_reason = self._get_scan_pause_reason()
-        if not pause_reason:
-            self._ensure_scan_running(reason="scan publish tick")
-            return
-        if not self._client.scanning:
-            return
-        self._log_verbose(f"Pausing BLE scan during peer bridge stabilization ({pause_reason})")
-        self._stop_scan()
+        self._ensure_scan_running(reason="scan publish tick")
 
     def _prune_attempt_map(self, attempts: Dict[str, float], snapshot: Dict[str, DeviceInfo], now_mono: float, *, ttl_s: float):
         if not attempts:
