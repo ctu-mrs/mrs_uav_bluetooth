@@ -13,7 +13,9 @@ from rclpy.node import Node
 from .bluetooth_bridge_state import PeerConnectionSessionState, PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
 from .bluetooth_dbus_runtime import BluetoothDbusRuntime
 from .bluetooth_node_config_mixin import BluetoothNodeConfigMixin, SharedTopicConfig
-from .bluetooth_node_runtime_mixin import BluetoothNodeRuntimeMixin
+from .bluetooth_node_runtime_bridge_mixin import BluetoothNodeRuntimeBridgeMixin
+from .bluetooth_node_runtime_core_mixin import BluetoothNodeRuntimeCoreMixin
+from .bluetooth_node_runtime_peer_mixin import BluetoothNodeRuntimePeerMixin
 from .bluetooth_node_service_mixin import BluetoothNodeServiceMixin
 from .bluetooth_node_status_mixin import BluetoothNodeStatusMixin
 from .dbus_client import BleClient
@@ -21,7 +23,9 @@ from .uuid_utils import system_hostname
 
 
 class BluetoothNode(
-    BluetoothNodeRuntimeMixin,
+    BluetoothNodeRuntimeCoreMixin,
+    BluetoothNodeRuntimeBridgeMixin,
+    BluetoothNodeRuntimePeerMixin,
     BluetoothNodeServiceMixin,
     BluetoothNodeStatusMixin,
     BluetoothNodeConfigMixin,

@@ -495,8 +495,13 @@ class BluetoothNodeConfigMixin:
             return
         to_disconnect = current_connected - self._overlay_connected_baseline
         for mac in sorted(to_disconnect):
-            self.get_logger().info(f"Disconnecting {mac}: overlay lease expired ({reason})")
-            self._client.disconnect(mac, timeout=5.0)
+            self.get_logger().info(f"Disconnecting {mac}: overlay lease expired ({reason}), clearing local bond/cache")
+            self._clear_peer_local_state(
+                mac,
+                reason=f"overlay lease expired ({reason})",
+                remove_pairing=True,
+                untrust=True,
+            )
         self._overlay_connected_baseline.clear()
 
     def _get_connected_peer_macs(self):
