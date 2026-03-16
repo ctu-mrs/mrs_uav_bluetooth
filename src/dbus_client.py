@@ -85,6 +85,8 @@ class DeviceInfo:
 
 
 class BleClient:
+    _DEVICE_REFRESH_TIMEOUT_S = 2.0
+
     def __init__(self, bus: dbus.SystemBus, adapter_path: str):
         self._bus = bus
         self._adapter_path = adapter_path
@@ -146,8 +148,13 @@ class BleClient:
         if not cached or not cached.path:
             return cached
         try:
-            props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, cached.path), DBUS_PROP_IFACE).GetAll(DEVICE_IFACE)
-        except dbus.DBusException:
+            props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, cached.path), DBUS_PROP_IFACE).GetAll(
+                DEVICE_IFACE,
+                timeout=self._DEVICE_REFRESH_TIMEOUT_S,
+            )
+        except dbus.DBusException as exc:
+            if self._is_transient_refresh_error(exc):
+                return cached
             with self._lock:
                 device = self._devices.get(mac.upper())
                 if device is not None:
@@ -225,11 +232,18 @@ class BleClient:
         return {mac: device for mac, device in devices.items() if device.connected}
 
     def wait_services_resolved(self, mac: str, timeout: float = 15.0) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            device = self.get_device(mac, refresh=True)
+        deadline = time.monotonic() + timeout
+        next_refresh = 0.0
+        while time.monotonic() < deadline:
+            device = self.get_device(mac, refresh=False)
             if device and device.services_resolved:
                 return True
+            now = time.monotonic()
+            if now >= next_refresh:
+                device = self.refresh_device(mac)
+                next_refresh = now + 1.0
+                if device and device.services_resolved:
+                    return True
             time.sleep(0.3)
         return False
 
@@ -694,6 +708,17 @@ class BleClient:
             return True
         except dbus.DBusException:
             return False
+
+    def _is_transient_refresh_error(self, exc: dbus.DBusException) -> bool:
+        message = str(exc)
+        transient_markers = (
+            "NoReply",
+            "Timed out",
+            "Timeout was reached",
+            "Did not receive a reply",
+            "org.freedesktop.DBus.Error.NoReply",
+        )
+        return any(marker in message for marker in transient_markers)
 
     def _on_chrc_notify(self, chrc_path, interface, changed, invalidated):
         del invalidated

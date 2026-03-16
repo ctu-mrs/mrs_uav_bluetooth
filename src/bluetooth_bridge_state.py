@@ -103,4 +103,6 @@ class PeerConnectionSessionState:
     missing_since_monotonic: float = 0.0
     connect_repair_count: int = 0
     pairing_failures: int = 0
+    services_wait_started_monotonic: float = 0.0
+    services_wait_grace_s: float = 0.0
     import_bridge_missing_since: dict = field(default_factory=dict)

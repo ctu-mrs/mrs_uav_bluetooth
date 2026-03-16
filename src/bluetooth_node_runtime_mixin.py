@@ -671,10 +671,8 @@ class BluetoothNodeRuntimeMixin:
         if device.connected:
             if session.connected_since_monotonic <= 0.0:
                 session.connected_since_monotonic = now
-            # Peer is actually connected; reset the stalled-connect timer so
-            # that time spent in the connected/pairing/trust/service-resolution
-            # phase is not counted toward the stalled-connect grace period.
-            session.connect_started_monotonic = 0.0
+            if session.connect_started_monotonic <= 0.0:
+                session.connect_started_monotonic = session.connected_since_monotonic
             session.phase = "connected"
             healthy = self._maintain_peer_connection(session, device, retry_period)
             if healthy:
@@ -747,7 +745,7 @@ class BluetoothNodeRuntimeMixin:
         if connected_since > missing_since:
             missing_since = connected_since
             session.missing_since_monotonic = connected_since
-        grace_s = max(90.0, retry_period * 4.0)
+        grace_s = max(20.0, retry_period * 4.0)
         waited_s = max(0.0, now_mono - missing_since)
         if waited_s < grace_s:
             self._log_verbose(
@@ -926,6 +924,8 @@ class BluetoothNodeRuntimeMixin:
             session.last_service_retry_monotonic = 0.0
             session.missing_since_monotonic = 0.0
             session.connect_repair_count = 0
+            session.services_wait_started_monotonic = 0.0
+            session.services_wait_grace_s = 0.0
             session.import_bridge_missing_since.clear()
 
     def _is_uav_peer_candidate(self, device: DeviceInfo, pattern: str) -> bool:
@@ -1001,10 +1001,18 @@ class BluetoothNodeRuntimeMixin:
         if device.services_resolved:
             self._set_peer_time_status(session.mac, "services-resolved", "services_resolved=True")
             return True
+        probe_path = self._resolve_peer_time_characteristic_path(session.mac, allow_wait=False)
+        if probe_path:
+            self._set_peer_time_status(
+                session.mac,
+                "services-resolved",
+                f"services_resolved=False,time_path={probe_path}",
+            )
+            return True
         wait_started = session.missing_since_monotonic or time.monotonic()
         if session.missing_since_monotonic <= 0.0:
             session.missing_since_monotonic = wait_started
-        grace_s = max(30.0, float(self.get_parameter("auto_connect_period").value) * 6.0)
+        grace_s = max(12.0, float(self.get_parameter("auto_connect_period").value) * 3.0)
         waited_s = max(0.0, time.monotonic() - wait_started)
         self._set_peer_time_status(
             session.mac,
@@ -1019,19 +1027,6 @@ class BluetoothNodeRuntimeMixin:
             session.mac,
             8.0,
         )
-        if self._client.wait_services_resolved(session.mac, timeout=1.0):
-            self._set_peer_time_status(session.mac, "services-resolved", "services_resolved=True")
-            return True
-        # BlueZ can keep ServicesResolved=False while managed objects already expose
-        # the characteristic tree; treat this as good enough for bridge setup.
-        probe_path = self._resolve_peer_time_characteristic_path(session.mac, allow_wait=False)
-        if probe_path:
-            self._set_peer_time_status(
-                session.mac,
-                "services-resolved",
-                f"services_resolved=False,time_path={probe_path}",
-            )
-            return True
         self._log_verbose(f"Peer {session.mac}: services not resolved yet, delaying time bridge setup")
         self._maybe_repair_peer_link(
             session,
@@ -1117,7 +1112,7 @@ class BluetoothNodeRuntimeMixin:
                     device_label,
                 )
             wait_started = session.missing_since_monotonic or time.monotonic()
-            grace_s = max(90.0, retry_period * 4.0)
+            grace_s = max(20.0, retry_period * 4.0)
             waited_s = max(0.0, time.monotonic() - wait_started)
             self._set_peer_time_status(
                 session.mac,
@@ -1254,7 +1249,7 @@ class BluetoothNodeRuntimeMixin:
 
     def _prime_peer_time_bridge(self, state: PeerTimeBridgeState):
         current = self._client.get_device(state.mac, refresh=True)
-        if current is None or not current.connected or not current.services_resolved:
+        if current is None or not current.connected:
             return
         payload = self._client.read_characteristic(state.characteristic_path)
         if payload is not None:
@@ -1377,34 +1372,30 @@ class BluetoothNodeRuntimeMixin:
         wait_grace_s: float = None,
     ):
         state = self._peer_time_bridges.get(mac)
-        if state is None:
-            device = self._client.get_device(mac) if self._client is not None else None
-            peer_name = self._peer_name_token(mac, device=device)
-            topic = self._resolve_peer_topic_name(mac, "/time_status", device=device)
-            if re.search(r"/peers/[0-9]", topic):
-                topic = self._node_topic(f"peers/{peer_name}/time_status")
-            publisher = self.create_publisher(BlePeerTimeStatus, topic, 10)
-            state = PeerTimeBridgeState(
-                mac=mac,
-                peer_name=peer_name,
-                status_topic_name=topic,
-                characteristic_path="",
-                writeback_descriptor_path="",
-                publisher=publisher,
-            )
-            self._peer_time_bridges[mac] = state
         session = self._peer_sessions.get(mac)
         if session is not None:
             session.phase = status
             session.detail = detail or ""
+            if wait_started is not None:
+                session.services_wait_started_monotonic = max(0.0, float(wait_started))
+                session.services_wait_grace_s = max(0.0, float(wait_grace_s or 0.0))
+            elif not status.startswith("waiting"):
+                session.services_wait_started_monotonic = 0.0
+                session.services_wait_grace_s = 0.0
             if status.startswith("pairing"):
                 session.pairing_failures = max(session.pairing_failures, 0)
+        if state is None:
+            return
         state.status = status
         state.detail = detail or ""
         if wait_started is not None:
             state.services_wait_started_monotonic = max(0.0, float(wait_started))
+        elif not status.startswith("waiting"):
+            state.services_wait_started_monotonic = 0.0
         if wait_grace_s is not None:
             state.services_wait_grace_s = max(0.0, float(wait_grace_s))
+        elif not status.startswith("waiting"):
+            state.services_wait_grace_s = 0.0
         if status.startswith("pairing"):
             state.pairing_requested_monotonic = time.monotonic()
             if session is not None:

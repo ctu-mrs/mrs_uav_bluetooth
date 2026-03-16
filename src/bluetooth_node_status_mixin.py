@@ -143,16 +143,27 @@ class BluetoothNodeStatusMixin:
             parts.append("services-resolving")
         if session is not None and session.phase:
             parts.append(f"phase={session.phase}")
+        wait_started = 0.0
+        wait_grace_s = 0.0
+        pairing_failures = 0
         if bridge_state is not None:
             if bridge_state.status:
                 parts.append(f"bridge={bridge_state.status}")
-            if bridge_state.services_wait_started_monotonic > 0.0 and bridge_state.services_wait_grace_s > 0.0:
-                waited = max(0.0, time.monotonic() - bridge_state.services_wait_started_monotonic)
-                parts.append(f"wait={waited:.1f}/{bridge_state.services_wait_grace_s:.1f}s")
-            if bridge_state.pairing_failures > 0:
-                parts.append(f"pair_failures={bridge_state.pairing_failures}")
+            wait_started = bridge_state.services_wait_started_monotonic
+            wait_grace_s = bridge_state.services_wait_grace_s
+            pairing_failures = bridge_state.pairing_failures
             if bridge_state.detail:
                 parts.append(bridge_state.detail)
+        if session is not None:
+            if wait_started <= 0.0:
+                wait_started = session.services_wait_started_monotonic
+                wait_grace_s = session.services_wait_grace_s
+            pairing_failures = max(pairing_failures, session.pairing_failures)
+        if wait_started > 0.0 and wait_grace_s > 0.0:
+            waited = max(0.0, time.monotonic() - wait_started)
+            parts.append(f"wait={waited:.1f}/{wait_grace_s:.1f}s")
+        if pairing_failures > 0:
+            parts.append(f"pair_failures={pairing_failures}")
         return ",".join(parts)
 
     def _header(self, frame_id=None) -> Header:
