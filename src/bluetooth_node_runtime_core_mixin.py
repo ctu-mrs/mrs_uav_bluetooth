@@ -237,8 +237,15 @@ class BluetoothNodeRuntimeCoreMixin:
         if self._client is None:
             return
         try:
+            pause_reason = ""
             if bool(self.get_parameter("enable_scan").value):
-                self._ensure_scan_running(reason="scan publish tick")
+                pause_reason = self._get_scan_pause_reason()
+                if pause_reason:
+                    if self._client.scanning:
+                        self._log_verbose(f"Pausing BLE scan during peer bridge stabilization ({pause_reason})")
+                        self._stop_scan()
+                else:
+                    self._ensure_scan_running(reason="scan publish tick")
             self._check_overlay_config_lease()
             snapshot = self._client.get_devices(refresh=True)
             snapshot = self._enforce_peer_connection_policy(snapshot=snapshot, reason="scan policy tick")

@@ -100,6 +100,7 @@ class BleClient:
         self._scan_running = False
         self._last_scan_request_monotonic = 0.0
         self._last_scan_property_check_monotonic = 0.0
+        self._discovering_false_since_monotonic = 0.0
         self._notification_cbs: Dict[int, Callable] = {}
         self._next_ntf_token = 1
         self._gatt_event_cbs: Dict[int, Callable] = {}
@@ -134,8 +135,12 @@ class BleClient:
                 if discovering:
                     self._scan_running = True
                     self._last_scan_request_monotonic = now
-                elif now - self._last_scan_request_monotonic >= self._SCAN_STATE_GRACE_S:
-                    self._scan_running = False
+                    self._discovering_false_since_monotonic = 0.0
+                else:
+                    if self._discovering_false_since_monotonic <= 0.0:
+                        self._discovering_false_since_monotonic = now
+                    elif now - self._discovering_false_since_monotonic >= self._SCAN_STATE_GRACE_S:
+                        self._scan_running = False
             except dbus.DBusException:
                 pass
         return self._scan_running
@@ -214,6 +219,7 @@ class BleClient:
             now = time.monotonic()
             self._last_scan_request_monotonic = now
             self._last_scan_property_check_monotonic = now
+            self._discovering_false_since_monotonic = 0.0
             return True
         except dbus.DBusException as exc:
             if "InProgress" in str(exc):
@@ -221,6 +227,7 @@ class BleClient:
                 now = time.monotonic()
                 self._last_scan_request_monotonic = now
                 self._last_scan_property_check_monotonic = now
+                self._discovering_false_since_monotonic = 0.0
                 return True
             return False
 
@@ -230,12 +237,14 @@ class BleClient:
             self._scan_running = False
             self._last_scan_request_monotonic = 0.0
             self._last_scan_property_check_monotonic = time.monotonic()
+            self._discovering_false_since_monotonic = self._last_scan_property_check_monotonic
             return True
         except dbus.DBusException as exc:
             if "NotAuthorized" in str(exc) or "No discovery started" in str(exc):
                 self._scan_running = False
                 self._last_scan_request_monotonic = 0.0
                 self._last_scan_property_check_monotonic = time.monotonic()
+                self._discovering_false_since_monotonic = self._last_scan_property_check_monotonic
                 return True
             return False
 
@@ -665,8 +674,12 @@ class BleClient:
                 if discovering:
                     self._scan_running = True
                     self._last_scan_request_monotonic = now
-                elif now - self._last_scan_request_monotonic >= self._SCAN_STATE_GRACE_S:
-                    self._scan_running = False
+                    self._discovering_false_since_monotonic = 0.0
+                else:
+                    if self._discovering_false_since_monotonic <= 0.0:
+                        self._discovering_false_since_monotonic = now
+                    elif now - self._discovering_false_since_monotonic >= self._SCAN_STATE_GRACE_S:
+                        self._scan_running = False
             return
         if interface == DEVICE_IFACE:
             self._update_device(str(path), changed)

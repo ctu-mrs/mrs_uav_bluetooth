@@ -18,6 +18,52 @@ from .uuid_utils import is_uav_hostname
 
 class BluetoothNodeRuntimePeerMixin:
 
+    def _get_scan_pause_reason(self, snapshot=None) -> str:
+        if self._client is None:
+            return ""
+        retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
+        pending_ttl_s = max(20.0, retry_period * 8.0)
+        now = time.monotonic()
+        devices = snapshot or {}
+        for mac, session in self._peer_sessions.items():
+            if not session.desired or not session.peer_candidate:
+                continue
+            if self._has_live_peer_time_bridge(mac):
+                continue
+            device = devices.get(mac) if devices else self._client.get_device(mac)
+            phase = str(session.phase or "")
+            connected = bool(device and device.connected)
+            stabilizing = phase.startswith("pairing") or phase.startswith("waiting")
+            stabilizing = stabilizing or phase in {
+                "connected",
+                "connect-pending",
+                "repairing-connect",
+                "services-resolved",
+                "time-notify-failed",
+                "trusted",
+            }
+            pending_connect = bool(
+                session.connect_started_monotonic > 0.0
+                and now - session.connect_started_monotonic <= pending_ttl_s
+            )
+            if connected or stabilizing or pending_connect:
+                state = phase or ("connected" if connected else "connect-pending")
+                return f"{mac}:{state}"
+        return ""
+
+    def _pause_scan_for_peer_stabilization(self, session: PeerConnectionSessionState, device: DeviceInfo = None):
+        if self._client is None or not bool(self.get_parameter("enable_scan").value):
+            return
+        if not session.peer_candidate or not session.desired:
+            return
+        if self._has_live_peer_time_bridge(session.mac):
+            return
+        if not self._client.scanning:
+            return
+        device_label = f"{session.mac} ({self._hostname_from_device(device) or session.peer_name or '?'})"
+        self._log_verbose(f"Pausing BLE scan while stabilizing peer {device_label}")
+        self._stop_scan()
+
     def _enforce_peer_connection_policy(self, snapshot=None, *, reason: str = "policy"):
         if self._client is None:
             return snapshot or {}
@@ -205,6 +251,9 @@ class BluetoothNodeRuntimePeerMixin:
         device_label = f"{session.mac} ({device.alias or device.name or '?'})"
         previous_phase = session.phase
         effectively_connected = self._is_peer_effectively_connected(session.mac, device=device)
+
+        if session.desired and session.peer_candidate:
+            self._pause_scan_for_peer_stabilization(session, device)
 
         if effectively_connected:
             if not device.connected:
