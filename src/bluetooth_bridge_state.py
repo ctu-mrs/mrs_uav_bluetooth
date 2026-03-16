@@ -101,6 +101,8 @@ class PeerConnectionSessionState:
     last_repair_monotonic: float = 0.0
     last_service_retry_monotonic: float = 0.0
     missing_since_monotonic: float = 0.0
+    bridge_wait_started_monotonic: float = 0.0
+    bridge_wait_reason: str = ""
     connect_repair_count: int = 0
     pairing_failures: int = 0
     services_wait_started_monotonic: float = 0.0
