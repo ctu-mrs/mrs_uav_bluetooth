@@ -19,6 +19,15 @@ from .gatt_services import (
 
 class BluetoothNodeRuntimeBridgeMixin:
 
+    IMPORT_BRIDGE_MISSING_PATH_GRACE_MIN_S = 8.0
+    IMPORT_BRIDGE_MISSING_PATH_GRACE_MULTIPLIER = 4.0
+    PEER_WRITEBACK_RETRY_DELAY_S = 1.0
+    PEER_WRITEBACK_WARNING_INTERVAL_S = 30.0
+    DESCRIPTOR_POLL_FALLBACK_PERIOD_S = 1.0
+    NOTIFY_REFRESH_WAIT_S = 1.5
+    EXPORT_SUBSCRIPTION_QUEUE_SIZE = 10
+    IMPORT_PUBLISH_QUEUE_SIZE = 10
+
     def _sync_configured_exports(self):
         removed = False
         for key in [item for item, state in self._topic_exports.items() if state.auto_managed]:
@@ -35,7 +44,7 @@ class BluetoothNodeRuntimeBridgeMixin:
                 shared.message_class,
                 shared.export_topic,
                 lambda msg, bridge_key=key: self._on_export_topic_message(bridge_key, msg),
-                10,
+                self.EXPORT_SUBSCRIPTION_QUEUE_SIZE,
             )
             self._topic_exports[key] = TopicExportBridgeState(
                 topic_name=shared.export_topic,
@@ -61,7 +70,10 @@ class BluetoothNodeRuntimeBridgeMixin:
         desired_keys = set()
         now_mono = time.monotonic()
         retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
-        missing_path_grace_s = max(8.0, retry_period * 4.0)
+        missing_path_grace_s = max(
+            self.IMPORT_BRIDGE_MISSING_PATH_GRACE_MIN_S,
+            retry_period * self.IMPORT_BRIDGE_MISSING_PATH_GRACE_MULTIPLIER,
+        )
         for shared in self._shared_topic_configs.values():
             if shared.mode not in {"import", "both"}:
                 continue
@@ -107,8 +119,13 @@ class BluetoothNodeRuntimeBridgeMixin:
                         if not started:
                             self._log_verbose(f"Failed to start notify for import bridge: {device_label}")
                             continue
+                        self._remember_notification_path(mac, path)
                     self._log_verbose(f"Creating import bridge: {device_label} -> {resolved_topic_name}")
-                    publisher = self.create_publisher(shared.message_class, resolved_topic_name, 10)
+                    publisher = self.create_publisher(
+                        shared.message_class,
+                        resolved_topic_name,
+                        self.IMPORT_PUBLISH_QUEUE_SIZE,
+                    )
                     self._notification_bridges[key] = TopicImportBridgeState(
                         mac=mac,
                         requested_topic_name=shared.import_topic_suffix,
@@ -139,8 +156,13 @@ class BluetoothNodeRuntimeBridgeMixin:
                     )
                     if not started:
                         continue
+                    self._remember_notification_path(mac, path)
                 if state.resolved_topic_name != resolved_topic_name or state.message_type != shared.message_type:
-                    replacement = self.create_publisher(shared.message_class, resolved_topic_name, 10)
+                    replacement = self.create_publisher(
+                        shared.message_class,
+                        resolved_topic_name,
+                        self.IMPORT_PUBLISH_QUEUE_SIZE,
+                    )
                     self.destroy_publisher(state.publisher)
                     state.publisher = replacement
                 state.requested_topic_name = shared.import_topic_suffix
@@ -185,6 +207,11 @@ class BluetoothNodeRuntimeBridgeMixin:
             for characteristic in characteristics:
                 path_to_mac[characteristic["path"]] = mac
         self._notification_path_to_mac = path_to_mac
+
+    def _remember_notification_path(self, mac: str, path: str):
+        if not mac or not str(path or "").startswith("/"):
+            return
+        self._notification_path_to_mac[path] = mac
 
     def _reconcile_import_bridges(self, snapshot):
         for state in self._notification_bridges.values():
@@ -240,7 +267,7 @@ class BluetoothNodeRuntimeBridgeMixin:
             return True, path
 
         self._log_verbose(f"Retrying notify setup for {label} on {mac}: path={path}")
-        self._client.wait_services_resolved(mac, timeout=1.5)
+        self._client.wait_services_resolved(mac, timeout=self.NOTIFY_REFRESH_WAIT_S)
 
         candidates = self._client.find_characteristics(mac, characteristic_uuid)
         if path and path in candidates:
@@ -330,7 +357,7 @@ class BluetoothNodeRuntimeBridgeMixin:
             self._peer_writeback_inflight.discard(desc_path)
             self._peer_writeback_last_sent.pop(desc_path, None)
             retry_map = getattr(self, "_peer_writeback_retry_at", {})
-            retry_map[desc_path] = time.monotonic() + 1.0
+            retry_map[desc_path] = time.monotonic() + self.PEER_WRITEBACK_RETRY_DELAY_S
             self._peer_writeback_retry_at = retry_map
 
     def _clear_peer_writeback_state(self, desc_path: str):
@@ -382,7 +409,7 @@ class BluetoothNodeRuntimeBridgeMixin:
                     key = (event_type, desc_path)
                     now = time.monotonic()
                     last = self._last_gatt_warning_at.get(key, 0.0)
-                    if now - last < 30.0:
+                    if now - last < self.PEER_WRITEBACK_WARNING_INTERVAL_S:
                         return
                     self._last_gatt_warning_at[key] = now
             self.get_logger().warning(f"BLE GATT event {event_type}: {info}")
@@ -395,7 +422,7 @@ class BluetoothNodeRuntimeBridgeMixin:
             if not success:
                 self._peer_writeback_last_sent.pop(desc_path, None)
                 retry_map = getattr(self, "_peer_writeback_retry_at", {})
-                retry_map[desc_path] = time.monotonic() + 1.0
+                retry_map[desc_path] = time.monotonic() + self.PEER_WRITEBACK_RETRY_DELAY_S
                 self._peer_writeback_retry_at = retry_map
                 return
             retry_map = getattr(self, "_peer_writeback_retry_at", {})

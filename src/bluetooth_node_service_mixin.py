@@ -14,6 +14,10 @@ from .uuid_utils import resolve_uuid
 
 class BluetoothNodeServiceMixin:
 
+    DEFAULT_CONNECT_TIMEOUT_S = 15.0
+    DEFAULT_DISCONNECT_TIMEOUT_S = 10.0
+    DEFAULT_PAIR_TIMEOUT_S = 30.0
+
     def _resolve_message_type(self, topic_name: str, explicit_message_type: str, prefer_publishers: bool):
         explicit = explicit_message_type.strip()
         if explicit:
@@ -84,9 +88,12 @@ class BluetoothNodeServiceMixin:
         return response
 
     def _handle_connect_device(self, request, response):
-        success = self._client.connect(request.mac, timeout=max(1.0, request.timeout or 15.0))
+        success = self._client.connect(request.mac, timeout=max(1.0, request.timeout or self.DEFAULT_CONNECT_TIMEOUT_S))
         if success and request.wait_for_services:
-            success = self._client.wait_services_resolved(request.mac, timeout=max(1.0, request.timeout or 15.0))
+            success = self._client.wait_services_resolved(
+                request.mac,
+                timeout=max(1.0, request.timeout or self.DEFAULT_CONNECT_TIMEOUT_S),
+            )
         device = self._client.get_device(request.mac, refresh=True)
         response.success = bool(success)
         response.message = "ok" if success else f"failed to connect {request.mac}"
@@ -95,12 +102,15 @@ class BluetoothNodeServiceMixin:
         return response
 
     def _handle_disconnect_device(self, request, response):
-        response.success = self._client.disconnect(request.mac, timeout=max(1.0, request.timeout or 10.0))
+        response.success = self._client.disconnect(
+            request.mac,
+            timeout=max(1.0, request.timeout or self.DEFAULT_DISCONNECT_TIMEOUT_S),
+        )
         response.message = "ok" if response.success else f"failed to disconnect {request.mac}"
         return response
 
     def _handle_pair_device(self, request, response):
-        success = self._client.pair(request.mac, timeout=max(1.0, request.timeout or 30.0))
+        success = self._client.pair(request.mac, timeout=max(1.0, request.timeout or self.DEFAULT_PAIR_TIMEOUT_S))
         if success and request.trust_after_pair:
             success = self._client.trust(request.mac)
         response.success = bool(success)

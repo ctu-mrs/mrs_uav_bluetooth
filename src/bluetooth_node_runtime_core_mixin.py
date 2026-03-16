@@ -35,16 +35,42 @@ from .netplan import NetplanConfiguration
 
 class BluetoothNodeRuntimeCoreMixin:
 
+    OVERLAY_KEEPALIVE_SUFFIX_DEFAULT = "overlay_keepalive"
+    DBUS_WARNING_INTERVAL_S = 5.0
+    SHUTDOWN_DISCONNECT_TIMEOUT_S = 5.0
+    DEVICES_PUBLISH_QUEUE_SIZE = 10
+    NOTIFICATIONS_PUBLISH_QUEUE_SIZE = 50
+    STATUS_PUBLISH_QUEUE_SIZE = 50
+    LOG_PUBLISH_QUEUE_SIZE = 200
+
     def _ensure_core_publishers(self):
         if self.devices_pub is not None:
             return
-        self.devices_pub = self.create_publisher(BleDeviceArray, self._node_topic("devices"), 10)
-        self.notifications_pub = self.create_publisher(BleNotification, self._node_topic("notifications"), 50)
-        self.status_pub = self.create_publisher(String, self._node_topic("status"), 50)
-        self.log_pub = self.create_publisher(String, self._node_topic("log"), 200)
+        self.devices_pub = self.create_publisher(
+            BleDeviceArray,
+            self._node_topic("devices"),
+            self.DEVICES_PUBLISH_QUEUE_SIZE,
+        )
+        self.notifications_pub = self.create_publisher(
+            BleNotification,
+            self._node_topic("notifications"),
+            self.NOTIFICATIONS_PUBLISH_QUEUE_SIZE,
+        )
+        self.status_pub = self.create_publisher(
+            String,
+            self._node_topic("status"),
+            self.STATUS_PUBLISH_QUEUE_SIZE,
+        )
+        self.log_pub = self.create_publisher(
+            String,
+            self._node_topic("log"),
+            self.LOG_PUBLISH_QUEUE_SIZE,
+        )
 
     def _setup_ros_interfaces(self):
-        keepalive_suffix = str(self.get_parameter("overlay_keepalive_topic_suffix").value or "overlay_keepalive").strip().strip("/")
+        keepalive_suffix = str(
+            self.get_parameter("overlay_keepalive_topic_suffix").value or self.OVERLAY_KEEPALIVE_SUFFIX_DEFAULT
+        ).strip().strip("/")
         if keepalive_suffix:
             self._overlay_keepalive_topic = self._node_topic(keepalive_suffix)
         self.create_service(ListDevices, "ble/list_devices", self._handle_list_devices)
@@ -188,7 +214,9 @@ class BluetoothNodeRuntimeCoreMixin:
         if self._time_service is not None:
             self._time_service.update()
 
-    def _dbus_warning(self, key: str, message: str, interval_s: float = 5.0):
+    def _dbus_warning(self, key: str, message: str, interval_s: float = None):
+        if interval_s is None:
+            interval_s = self.DBUS_WARNING_INTERVAL_S
         now = time.monotonic()
         last = self._last_dbus_warning_at.get(key, 0.0)
         if now - last < interval_s:
@@ -237,25 +265,17 @@ class BluetoothNodeRuntimeCoreMixin:
         if self._client is None:
             return
         try:
-            pause_reason = ""
-            if bool(self.get_parameter("enable_scan").value):
-                pause_reason = self._get_scan_pause_reason()
-                if pause_reason:
-                    if self._client.scanning:
-                        self._log_verbose(f"Pausing BLE scan during peer bridge stabilization ({pause_reason})")
-                        self._stop_scan()
-                else:
-                    self._ensure_scan_running(reason="scan publish tick")
+            self._sync_scan_state_for_publish()
             self._check_overlay_config_lease()
             snapshot = self._client.get_devices(refresh=True)
             snapshot = self._enforce_peer_connection_policy(snapshot=snapshot, reason="scan policy tick")
+            self._refresh_notification_mapping(snapshot)
             self._sync_auto_import_bridges(snapshot)
             self._reconcile_import_bridges(snapshot)
             msg = BleDeviceArray()
             msg.header = self._header(frame_id=self._local_frame_id())
             msg.devices = [self._device_to_msg(device) for device in snapshot.values()]
             self.devices_pub.publish(msg)
-            self._refresh_notification_mapping(snapshot)
             self._cleanup_peer_time_bridges(snapshot)
             self._log_verbose(f"Scan results: {len(snapshot)} device(s)")
             self._log_discovered_devices_summary(
@@ -264,6 +284,18 @@ class BluetoothNodeRuntimeCoreMixin:
             )
         except dbus.exceptions.DBusException as exc:
             self._dbus_warning("scan_results", f"Skipping BLE scan publish tick due to DBus error: {exc}")
+
+    def _sync_scan_state_for_publish(self):
+        if not bool(self.get_parameter("enable_scan").value):
+            return
+        pause_reason = self._get_scan_pause_reason()
+        if not pause_reason:
+            self._ensure_scan_running(reason="scan publish tick")
+            return
+        if not self._client.scanning:
+            return
+        self._log_verbose(f"Pausing BLE scan during peer bridge stabilization ({pause_reason})")
+        self._stop_scan()
 
     def _prune_attempt_map(self, attempts: Dict[str, float], snapshot: Dict[str, DeviceInfo], now_mono: float, *, ttl_s: float):
         if not attempts:
@@ -310,7 +342,7 @@ class BluetoothNodeRuntimeCoreMixin:
                 if not device.connected:
                     continue
                 try:
-                    self._client.disconnect(device.mac, timeout=5.0)
+                    self._client.disconnect(device.mac, timeout=self.SHUTDOWN_DISCONNECT_TIMEOUT_S)
                 except Exception:
                     pass
         for state in self._topic_exports.values():
