@@ -386,7 +386,7 @@ class BluetoothNodeRuntimeMixin:
             if shared.mode not in {"import", "both"}:
                 continue
             for mac, device in snapshot.items():
-                if not device.connected:
+                if not self._is_peer_effectively_connected(mac, device=device):
                     continue
                 if (device.alias or device.name or "").strip().lower() == self._local_name.strip().lower():
                     continue
@@ -516,7 +516,7 @@ class BluetoothNodeRuntimeMixin:
         for mac, state in self._peer_time_bridges.items():
             device = snapshot.get(mac)
             session = self._peer_sessions.get(mac)
-            if device is not None and device.connected:
+            if device is not None and self._is_peer_effectively_connected(mac, device=device):
                 # Only enforce inactivity timeout for fully ready bridges. Waiting states
                 # can be idle for a while during pairing/service resolution.
                 if state.status == "ready" and timeout > 0 and now - state.last_activity_monotonic >= timeout:
@@ -545,7 +545,7 @@ class BluetoothNodeRuntimeMixin:
                 session.connected_since_monotonic = 0.0
                 session.last_service_retry_monotonic = 0.0
                 continue
-            if not device.connected:
+            if not self._is_peer_effectively_connected(mac, device=device):
                 session.connected_since_monotonic = 0.0
                 if session.missing_since_monotonic <= 0.0:
                     session.missing_since_monotonic = now
@@ -581,7 +581,7 @@ class BluetoothNodeRuntimeMixin:
     def _reconcile_import_bridges(self, snapshot: Dict[str, DeviceInfo]):
         for state in self._notification_bridges.values():
             device = snapshot.get(state.mac)
-            if device is None or not device.connected:
+            if device is None or not self._is_peer_effectively_connected(state.mac, device=device):
                 continue
             if state.bridge_uuid:
                 current_path, notifying = self._find_remote_bridge_path(state.mac, state.bridge_uuid, state.transport_endpoint)
@@ -667,8 +667,12 @@ class BluetoothNodeRuntimeMixin:
         now = time.monotonic()
         device_label = f"{session.mac} ({device.alias or device.name or '?'})"
         previous_phase = session.phase
+        effectively_connected = self._is_peer_effectively_connected(session.mac, device=device)
 
-        if device.connected:
+        if effectively_connected:
+            if not device.connected:
+                device = device.copy()
+                device.connected = True
             if session.connected_since_monotonic <= 0.0:
                 session.connected_since_monotonic = now
             if session.connect_started_monotonic <= 0.0:
@@ -992,6 +996,11 @@ class BluetoothNodeRuntimeMixin:
             pass
         return (time.monotonic() - state.last_activity_monotonic) <= max(1.0, float(idle_timeout_s))
 
+    def _is_peer_effectively_connected(self, mac: str, device: DeviceInfo = None) -> bool:
+        if device is not None and device.connected:
+            return True
+        return self._has_live_peer_time_bridge(mac)
+
     def _ensure_peer_services_resolved(self, session: PeerConnectionSessionState, device: DeviceInfo, *, device_label: str) -> bool:
         # BlueZ may keep ServicesResolved=False even after notifications are active.
         # If the peer time bridge is alive, GATT is already usable for our purposes.
@@ -1001,12 +1010,31 @@ class BluetoothNodeRuntimeMixin:
         if device.services_resolved:
             self._set_peer_time_status(session.mac, "services-resolved", "services_resolved=True")
             return True
+        # BlueZ frequently never flips ServicesResolved=True even though the GATT
+        # hierarchy is already populated in the Object Manager.  Try finding the
+        # time characteristic directly — that is what we actually need.
         probe_path = self._resolve_peer_time_characteristic_path(session.mac, allow_wait=False)
         if probe_path:
+            self._log_verbose(
+                f"Peer {session.mac}: ServicesResolved=False but time characteristic found at {probe_path}; proceeding"
+            )
             self._set_peer_time_status(
                 session.mac,
                 "services-resolved",
                 f"services_resolved=False,time_path={probe_path}",
+            )
+            return True
+        # Still not visible — do a short blocking wait and one more look.
+        self._client.wait_services_resolved(session.mac, timeout=2.0)
+        probe_path = self._resolve_peer_time_characteristic_path(session.mac, allow_wait=False)
+        if probe_path:
+            self._log_verbose(
+                f"Peer {session.mac}: time characteristic appeared after short wait at {probe_path}; proceeding"
+            )
+            self._set_peer_time_status(
+                session.mac,
+                "services-resolved",
+                f"services_resolved=False,time_path={probe_path}(after_wait)",
             )
             return True
         wait_started = session.missing_since_monotonic or time.monotonic()
@@ -1023,9 +1051,9 @@ class BluetoothNodeRuntimeMixin:
         )
         self._run_background_once(
             f"resolve-services::{session.mac}",
-            self._client.wait_services_resolved,
+            self._background_resolve_services,
             session.mac,
-            8.0,
+            device_label,
         )
         self._log_verbose(f"Peer {session.mac}: services not resolved yet, delaying time bridge setup")
         self._maybe_repair_peer_link(
@@ -1035,6 +1063,17 @@ class BluetoothNodeRuntimeMixin:
             min_wait_s=grace_s,
         )
         return False
+
+    def _background_resolve_services(self, mac: str, device_label: str):
+        """Background task: wait for services + actively enumerate GATT objects."""
+        self._client.wait_services_resolved(mac, timeout=4.0)
+        # Even if the flag didn't flip, force-enumerate GATT objects so subsequent
+        # ticks can find the time characteristic.
+        try:
+            self._client.list_services(mac)
+            self._client.list_characteristics(mac)
+        except dbus.exceptions.DBusException as exc:
+            self._log_verbose(f"Background service enumeration failed for {device_label}: {exc}")
 
     def _force_peer_service_rediscovery(self, mac: str, device_label: str) -> bool:
         current = self._client.get_device(mac, refresh=True)
@@ -1055,9 +1094,29 @@ class BluetoothNodeRuntimeMixin:
         if not self._client.connect(mac, timeout=10.0):
             self._log_verbose(f"Service rediscovery reconnect failed for {device_label}")
             return False
-        self._client.wait_services_resolved(mac, timeout=8.0)
+        # After reconnect, try a short wait for the flag, but also actively
+        # enumerate GATT objects — BlueZ may never set ServicesResolved=True
+        # yet still expose the characteristics in the Object Manager.
+        self._client.wait_services_resolved(mac, timeout=3.0)
+        try:
+            self._client.list_services(mac)
+            self._client.list_characteristics(mac)
+        except dbus.exceptions.DBusException:
+            pass
         if self._resolve_peer_time_characteristic_path(mac):
             self._log_verbose(f"Service rediscovery recovered time characteristic for {device_label}")
+            return True
+        # One more attempt after a brief delay — GATT population can trail
+        # the connect completion by a second or two.
+        time.sleep(2.0)
+        self._client.get_device(mac, refresh=True)
+        try:
+            self._client.list_services(mac)
+            self._client.list_characteristics(mac)
+        except dbus.exceptions.DBusException:
+            pass
+        if self._resolve_peer_time_characteristic_path(mac):
+            self._log_verbose(f"Service rediscovery recovered time characteristic (delayed) for {device_label}")
             return True
         self._log_verbose(f"Service rediscovery could not resolve time characteristic for {device_label}")
         return False
@@ -1066,8 +1125,19 @@ class BluetoothNodeRuntimeMixin:
         candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
         if candidates:
             return candidates[0]
-        # One more pass after refreshing device props and a short resolve wait.
+        # Refresh device props and re-enumerate even when allow_wait=False;
+        # BlueZ may have populated the GATT objects without setting ServicesResolved.
         self._client.get_device(mac, refresh=True)
+        candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
+        if candidates:
+            return candidates[0]
+        # Force a fresh GetManagedObjects snapshot: the GATT hierarchy can
+        # appear in the Object Manager before ServicesResolved flips to True.
+        try:
+            self._client.list_services(mac)
+            self._client.list_characteristics(mac)
+        except dbus.exceptions.DBusException:
+            pass
         candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
         if candidates:
             return candidates[0]

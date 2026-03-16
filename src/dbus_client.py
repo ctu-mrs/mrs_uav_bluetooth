@@ -244,6 +244,12 @@ class BleClient:
                 next_refresh = now + 1.0
                 if device and device.services_resolved:
                     return True
+                # BlueZ may never set ServicesResolved=True even though the
+                # GATT hierarchy is populated.  Check for actual GATT objects.
+                if device and device.path:
+                    chars = self.list_characteristics(mac)
+                    if chars:
+                        return True
             time.sleep(0.3)
         return False
 
