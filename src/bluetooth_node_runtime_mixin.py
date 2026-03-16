@@ -1,5 +1,6 @@
 """Runtime BLE orchestration mixin for the Bluetooth node."""
 
+import random
 import re
 import struct
 import time
@@ -670,6 +671,10 @@ class BluetoothNodeRuntimeMixin:
         if device.connected:
             if session.connected_since_monotonic <= 0.0:
                 session.connected_since_monotonic = now
+            # Peer is actually connected; reset the stalled-connect timer so
+            # that time spent in the connected/pairing/trust/service-resolution
+            # phase is not counted toward the stalled-connect grace period.
+            session.connect_started_monotonic = 0.0
             session.phase = "connected"
             healthy = self._maintain_peer_connection(session, device, retry_period)
             if healthy:
@@ -812,11 +817,15 @@ class BluetoothNodeRuntimeMixin:
         now_mono = time.monotonic()
         pending_since = session.connect_started_monotonic or now_mono
         waited_s = max(0.0, now_mono - pending_since)
-        grace_s = max(12.0, retry_period * 4.0)
+        # Add per-peer jitter to break symmetry when two UAVs repair each other
+        # simultaneously.  The jitter is seeded from the MAC so it's stable
+        # across ticks but different between the two sides of a link.
+        jitter_s = random.Random(session.mac).uniform(0.0, max(5.0, retry_period * 2.0))
+        grace_s = max(12.0, retry_period * 4.0) + jitter_s
         if waited_s < grace_s:
             return False
         last_repair = session.last_repair_monotonic
-        repair_cooldown_s = max(15.0, retry_period * 5.0)
+        repair_cooldown_s = max(15.0, retry_period * 5.0) + jitter_s
         if now_mono - last_repair < repair_cooldown_s:
             self._log_verbose(
                 f"Stalled connect for {device_label}: cooldown active "
@@ -1089,8 +1098,24 @@ class BluetoothNodeRuntimeMixin:
         if not path:
             if session.missing_since_monotonic <= 0.0:
                 session.missing_since_monotonic = time.monotonic()
+            waited_s = max(0.0, time.monotonic() - session.missing_since_monotonic)
             self._log_verbose(f"Peer {device_label}: time characteristic {TIME_CHARACTERISTIC_UUID} not found")
             retry_period = max(1.0, float(self.get_parameter("auto_connect_period").value))
+            # If we just connected recently and the time char is missing,
+            # proactively force a service re-enumeration rather than waiting
+            # for the long grace period to expire.  BlueZ may have cached a
+            # stale GATT database from a previous connection.
+            early_rediscovery_s = max(8.0, retry_period * 2.0)
+            last_svc_retry = session.last_service_retry_monotonic
+            if waited_s >= early_rediscovery_s and (time.monotonic() - last_svc_retry >= early_rediscovery_s):
+                session.last_service_retry_monotonic = time.monotonic()
+                self._log_verbose(f"Proactive service rediscovery for {device_label}: time char missing for {waited_s:.1f}s")
+                self._run_background_once(
+                    f"service-rediscovery::{session.mac}",
+                    self._force_peer_service_rediscovery,
+                    session.mac,
+                    device_label,
+                )
             wait_started = session.missing_since_monotonic or time.monotonic()
             grace_s = max(90.0, retry_period * 4.0)
             waited_s = max(0.0, time.monotonic() - wait_started)

@@ -430,6 +430,7 @@ class BluetoothNodeConfigMixin:
                 self._expire_overlay_connections("overlay config changed")
             self._capture_overlay_connection_baseline()
             self._active_overlay_path = path
+            self._overlay_keepalive_miss_count = 0
             self._reload_active_config()
             self._enforce_peer_connection_policy(reason="overlay config changed")
             response.success = True
@@ -448,10 +449,23 @@ class BluetoothNodeConfigMixin:
         if not self._active_overlay_path:
             return
         if self._overlay_keepalive_active():
+            self._overlay_keepalive_miss_count = 0
+            return
+        # Require several consecutive misses before reverting so that a single
+        # transient ROS graph API glitch does not kill the overlay config.  The
+        # scan-results timer calls this every ~2 s, so 3 misses ≈ 6 s grace.
+        self._overlay_keepalive_miss_count = getattr(self, "_overlay_keepalive_miss_count", 0) + 1
+        required_misses = 3
+        if self._overlay_keepalive_miss_count < required_misses:
+            self._log_verbose(
+                f"Overlay keepalive miss {self._overlay_keepalive_miss_count}/{required_misses} "
+                f"for {self._active_overlay_path}"
+            )
             return
         expired_path = self._active_overlay_path
         self._expire_overlay_connections("keepalive sentinel missing")
         self._active_overlay_path = ""
+        self._overlay_keepalive_miss_count = 0
         self._reload_active_config()
         self._enforce_peer_connection_policy(reason="overlay keepalive expired")
         self.get_logger().info(f"Overlay keepalive missing, reverted to default after {expired_path}")

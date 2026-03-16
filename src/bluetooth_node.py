@@ -46,6 +46,7 @@ class BluetoothNode(
         self._active_overlay_path = ""
         self._overlay_connected_baseline: Set[str] = set()
         self._overlay_keepalive_topic = ""
+        self._overlay_keepalive_miss_count = 0
         self._default_config_path = self._resolve_default_config_path()
         self._active_config_source = self._default_config_path
         self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
