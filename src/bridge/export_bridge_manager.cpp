@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/bridge/export_bridge_manager.hpp"
 
 #include "mrs_uav_bluetooth/bridge/generic_message_bridge.hpp"
@@ -81,7 +81,7 @@ void ExportBridgeManager::publish_export_payload(const std::string& bridge_key,
 
 void ExportBridgeManager::destroy_export_bridge(TopicExportBridgeState& state) {
     if (state.publish_timer) {
-        node_.destroy_timer(state.publish_timer);
+        state.publish_timer->cancel();
         state.publish_timer.reset();
     }
     state.subscription.reset();
@@ -91,7 +91,7 @@ void ExportBridgeManager::destroy_export_bridge(TopicExportBridgeState& state) {
 void ExportBridgeManager::configure_export_rate_timer(const std::string& bridge_key,
                                                       TopicExportBridgeState& state) {
     if (state.publish_timer) {
-        node_.destroy_timer(state.publish_timer);
+        state.publish_timer->cancel();
         state.publish_timer.reset();
     }
     if (state.rate_hz <= 0.0) {

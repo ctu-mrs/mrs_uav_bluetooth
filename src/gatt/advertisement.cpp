@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/gatt/advertisement.hpp"
 
 namespace mrs_uav_bluetooth::gatt {
@@ -19,7 +19,6 @@ void Advertisement::export_object() {
 
     exported_->addVTable(
         sdbus::registerMethod("GetAll")
-            .onInterface(std::string(kDbusPropertiesIface))
             .withInputParamNames("interface")
             .withOutputParamNames("properties")
             .implementedAs([this](const std::string& iface)
@@ -35,7 +34,6 @@ void Advertisement::export_object() {
 
     exported_->addVTable(
         sdbus::registerMethod("Release")
-            .onInterface(std::string(kLeAdvertisementIface))
             .implementedAs([]() {})
     ).forInterface(std::string(kLeAdvertisementIface));
 }

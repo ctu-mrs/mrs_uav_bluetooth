@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/network/netplan_manager.hpp"
 
 #include <yaml-cpp/yaml.h>

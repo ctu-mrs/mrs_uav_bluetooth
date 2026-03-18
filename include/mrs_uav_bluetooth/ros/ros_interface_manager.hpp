@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
 #include "mrs_uav_bluetooth/ros/service_servers.hpp"

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/gatt/services/wifi_service.hpp"
 
 namespace mrs_uav_bluetooth::gatt::services {

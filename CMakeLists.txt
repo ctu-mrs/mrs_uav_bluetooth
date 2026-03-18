@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
 project(mrs_uav_bluetooth)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---- ROS 2 / ament dependencies ----
@@ -11,6 +11,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(rosidl_runtime_cpp REQUIRED)
 find_package(rosidl_typesupport_introspection_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(rcpputils REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
@@ -306,7 +307,7 @@ target_link_libraries(service_node
   ${cpp_typesupport_target}
 )
 ament_target_dependencies(service_node
-  rclcpp std_msgs std_srvs builtin_interfaces nav_msgs rcl_interfaces
+  rclcpp std_msgs std_srvs builtin_interfaces nav_msgs rcl_interfaces ament_index_cpp
 )
 
 add_executable(user_node
@@ -322,7 +323,7 @@ target_link_libraries(user_node
   ${cpp_typesupport_target}
 )
 ament_target_dependencies(user_node
-  rclcpp std_msgs std_srvs builtin_interfaces
+  rclcpp std_msgs std_srvs builtin_interfaces ament_index_cpp
 )
 
 # =====================================================================

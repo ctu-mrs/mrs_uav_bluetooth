@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/bluez/bluez_pairing_agent.hpp"
 
 namespace mrs_uav_bluetooth::bluez {
@@ -26,11 +26,11 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
 
     // Release()
     exported_object_->addVTable(
-        sdbus::registerMethod("Release").onInterface(agent_iface)
+        sdbus::registerMethod("Release")
             .implementedAs([this]() {
                 emit("agent_release");
             }),
-        sdbus::registerMethod("AuthorizeService").onInterface(agent_iface)
+        sdbus::registerMethod("AuthorizeService")
             .withInputParamNames("device", "uuid")
             .implementedAs([this](const sdbus::ObjectPath& device, const std::string& uuid) {
                 emit("authorize_service", std::string(device));
@@ -40,7 +40,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                 }
                 (void)uuid;
             }),
-        sdbus::registerMethod("RequestPinCode").onInterface(agent_iface)
+        sdbus::registerMethod("RequestPinCode")
             .withInputParamNames("device")
             .withOutputParamNames("pincode")
             .implementedAs([this](const sdbus::ObjectPath& device) -> std::string {
@@ -48,7 +48,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                 if (auto_trust_) set_trusted(std::string(device));
                 return "";
             }),
-        sdbus::registerMethod("RequestPasskey").onInterface(agent_iface)
+        sdbus::registerMethod("RequestPasskey")
             .withInputParamNames("device")
             .withOutputParamNames("passkey")
             .implementedAs([this](const sdbus::ObjectPath& device) -> uint32_t {
@@ -56,21 +56,21 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                 if (auto_trust_) set_trusted(std::string(device));
                 return 0;
             }),
-        sdbus::registerMethod("DisplayPasskey").onInterface(agent_iface)
+        sdbus::registerMethod("DisplayPasskey")
             .withInputParamNames("device", "passkey", "entered")
             .implementedAs([this](const sdbus::ObjectPath& device,
                                   uint32_t passkey, uint16_t entered) {
                 emit("display_passkey", std::string(device));
                 (void)passkey; (void)entered;
             }),
-        sdbus::registerMethod("DisplayPinCode").onInterface(agent_iface)
+        sdbus::registerMethod("DisplayPinCode")
             .withInputParamNames("device", "pincode")
             .implementedAs([this](const sdbus::ObjectPath& device,
                                   const std::string& pincode) {
                 emit("display_pin", std::string(device));
                 (void)pincode;
             }),
-        sdbus::registerMethod("RequestConfirmation").onInterface(agent_iface)
+        sdbus::registerMethod("RequestConfirmation")
             .withInputParamNames("device", "passkey")
             .implementedAs([this](const sdbus::ObjectPath& device, uint32_t passkey) {
                 emit("request_confirmation", std::string(device));
@@ -81,7 +81,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                 }
                 if (auto_trust_) set_trusted(std::string(device));
             }),
-        sdbus::registerMethod("RequestAuthorization").onInterface(agent_iface)
+        sdbus::registerMethod("RequestAuthorization")
             .withInputParamNames("device")
             .implementedAs([this](const sdbus::ObjectPath& device) {
                 emit("request_authorization", std::string(device));
@@ -90,7 +90,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                                        "Authorization rejected");
                 }
             }),
-        sdbus::registerMethod("Cancel").onInterface(agent_iface)
+        sdbus::registerMethod("Cancel")
             .implementedAs([this]() {
                 emit("cancel");
             })

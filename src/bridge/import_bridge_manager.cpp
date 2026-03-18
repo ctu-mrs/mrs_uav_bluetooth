@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/bridge/import_bridge_manager.hpp"
 
 #include "mrs_uav_bluetooth/bridge/generic_message_bridge.hpp"
@@ -46,7 +46,7 @@ void ImportBridgeManager::set_registry(BridgeRegistry* registry) {
 
 void ImportBridgeManager::destroy_import_bridge(TopicImportBridgeState& state) {
     if (state.poll_timer) {
-        node_.destroy_timer(state.poll_timer);
+        state.poll_timer->cancel();
         state.poll_timer.reset();
     }
     state.publisher.reset();
@@ -65,7 +65,7 @@ void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_
                                                       TopicImportBridgeState& state,
                                                       bluez::BluezClient& client) {
     if (state.poll_timer) {
-        node_.destroy_timer(state.poll_timer);
+        state.poll_timer->cancel();
         state.poll_timer.reset();
     }
     if (state.transport_endpoint != "descriptor" && state.rate_hz <= 0.0) {
@@ -167,7 +167,7 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
         if (state.transport_endpoint == "descriptor") {
             configure_import_poll_timer(bridge_key, state, client);
         } else if (state.poll_timer) {
-            node_.destroy_timer(state.poll_timer);
+            state.poll_timer->cancel();
             state.poll_timer.reset();
         }
 
@@ -200,7 +200,7 @@ bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
             client.stop_notify(state.path);
         }
         if (state.poll_timer) {
-            node_.destroy_timer(state.poll_timer);
+            state.poll_timer->cancel();
             state.poll_timer.reset();
         }
         if (!state.path.empty() || !state.pending_payload.empty()) {

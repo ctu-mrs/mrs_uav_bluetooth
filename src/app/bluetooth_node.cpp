@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/app/bluetooth_node.hpp"
 
 #include "mrs_uav_bluetooth/config/shared_topic_config.hpp"
@@ -391,7 +391,7 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
     ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
 
     if (status_timer_) {
-        destroy_timer(status_timer_);
+        status_timer_->cancel();
         status_timer_.reset();
     }
     if (cfg.status_report_period > 0.0) {
@@ -457,7 +457,7 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
     rebuild_server_objects();
 
     if (time_service_timer_) {
-        destroy_timer(time_service_timer_);
+        time_service_timer_->cancel();
         time_service_timer_.reset();
     }
     if (cfg.enable_time_service && cfg.time_update_period > 0.0) {
@@ -472,7 +472,7 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
     }
 
     if (wifi_service_timer_) {
-        destroy_timer(wifi_service_timer_);
+        wifi_service_timer_->cancel();
         wifi_service_timer_.reset();
     }
     if (cfg.enable_wifi_service && cfg.wifi_refresh_period > 0.0) {
@@ -678,7 +678,7 @@ void BluetoothNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
     }
 
     if (peer_timer_) {
-        destroy_timer(peer_timer_);
+        peer_timer_->cancel();
         peer_timer_.reset();
     }
 
@@ -688,7 +688,7 @@ void BluetoothNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
         peer_timer_.reset();
         peer_reconcile_deadline_ = std::chrono::steady_clock::time_point{};
         if (timer) {
-            destroy_timer(timer);
+            timer->cancel();
         }
         reconcile_peers();
     });
@@ -967,7 +967,7 @@ bool BluetoothNode::update_peer_time_bridge(const std::string& mac,
     const auto topic_name = peer_status_topic(mac, session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name);
     if (!bridge.publisher || bridge.status_topic_name != topic_name) {
         if (bridge.publisher) {
-            destroy_publisher(bridge.publisher);
+            bridge.publisher.reset();
         }
         bridge.publisher = create_publisher<mrs_uav_bluetooth::msg::BlePeerTimeStatus>(topic_name, 10);
         bridge.status_topic_name = topic_name;
@@ -1021,7 +1021,10 @@ void BluetoothNode::reconcile_peers() {
         if (device && !session.desired && device->connected) {
             session.phase = "policy_blocked";
             session.detail = "disconnecting disallowed peer";
-            client_->disconnect_async(mac);
+            client_->disconnect_async(
+                mac,
+                [](bool, const std::string&) {},
+                retry_period_s);
             pending_deadline = true;
             next_deadline_s = std::min(next_deadline_s, retry_period_s);
             continue;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/gatt/gatt_application.hpp"
 
 namespace mrs_uav_bluetooth::gatt {
@@ -24,7 +24,6 @@ void GattDescriptor::export_object() {
     // Properties interface – GetAll.
     exported_->addVTable(
         sdbus::registerMethod("GetAll")
-            .onInterface(std::string(kDbusPropertiesIface))
             .withInputParamNames("interface")
             .withOutputParamNames("properties")
             .implementedAs([this](const std::string& iface)
@@ -47,10 +46,16 @@ void GattDescriptor::export_object() {
             })
     ).forInterface(std::string(kDbusPropertiesIface));
 
+    exported_->addVTable(
+        sdbus::registerSignal("PropertiesChanged")
+            .withParameters<std::string,
+                            std::map<std::string, sdbus::Variant>,
+                            std::vector<std::string>>()
+    ).forInterface(std::string(kDbusPropertiesIface));
+
     // GattDescriptor1 interface.
     exported_->addVTable(
         sdbus::registerMethod("ReadValue")
-            .onInterface(std::string(kGattDescriptorIface))
             .withInputParamNames("options")
             .withOutputParamNames("value")
             .implementedAs([this](const std::map<std::string, sdbus::Variant>& opts)
@@ -58,17 +63,11 @@ void GattDescriptor::export_object() {
                 return on_read(opts);
             }),
         sdbus::registerMethod("WriteValue")
-            .onInterface(std::string(kGattDescriptorIface))
             .withInputParamNames("value", "options")
             .implementedAs([this](const std::vector<uint8_t>& data,
                                   const std::map<std::string, sdbus::Variant>& opts) {
                 on_write(data, opts);
-            }),
-        sdbus::registerSignal("PropertiesChanged")
-            .onInterface(std::string(kDbusPropertiesIface))
-            .withParameters<std::string,
-                           std::map<std::string, sdbus::Variant>,
-                           std::vector<std::string>>()
+            })
     ).forInterface(std::string(kGattDescriptorIface));
 }
 
@@ -126,7 +125,6 @@ void GattCharacteristic::export_object() {
     // Properties interface.
     exported_->addVTable(
         sdbus::registerMethod("GetAll")
-            .onInterface(std::string(kDbusPropertiesIface))
             .withInputParamNames("interface")
             .withOutputParamNames("properties")
             .implementedAs([this](const std::string& iface)
@@ -154,10 +152,16 @@ void GattCharacteristic::export_object() {
             })
     ).forInterface(std::string(kDbusPropertiesIface));
 
+    exported_->addVTable(
+        sdbus::registerSignal("PropertiesChanged")
+            .withParameters<std::string,
+                            std::map<std::string, sdbus::Variant>,
+                            std::vector<std::string>>()
+    ).forInterface(std::string(kDbusPropertiesIface));
+
     // GattCharacteristic1 interface.
     exported_->addVTable(
         sdbus::registerMethod("ReadValue")
-            .onInterface(std::string(kGattCharacteristicIface))
             .withInputParamNames("options")
             .withOutputParamNames("value")
             .implementedAs([this](const std::map<std::string, sdbus::Variant>& opts)
@@ -165,23 +169,15 @@ void GattCharacteristic::export_object() {
                 return on_read(opts);
             }),
         sdbus::registerMethod("WriteValue")
-            .onInterface(std::string(kGattCharacteristicIface))
             .withInputParamNames("value", "options")
             .implementedAs([this](const std::vector<uint8_t>& data,
                                   const std::map<std::string, sdbus::Variant>& opts) {
                 on_write(data, opts);
             }),
         sdbus::registerMethod("StartNotify")
-            .onInterface(std::string(kGattCharacteristicIface))
             .implementedAs([this]() { on_start_notify(); }),
         sdbus::registerMethod("StopNotify")
-            .onInterface(std::string(kGattCharacteristicIface))
-            .implementedAs([this]() { on_stop_notify(); }),
-        sdbus::registerSignal("PropertiesChanged")
-            .onInterface(std::string(kDbusPropertiesIface))
-            .withParameters<std::string,
-                           std::map<std::string, sdbus::Variant>,
-                           std::vector<std::string>>()
+            .implementedAs([this]() { on_stop_notify(); })
     ).forInterface(std::string(kGattCharacteristicIface));
 
     // Export child descriptors.
@@ -289,7 +285,6 @@ void GattService::export_object() {
 
     exported_->addVTable(
         sdbus::registerMethod("GetAll")
-            .onInterface(std::string(kDbusPropertiesIface))
             .withInputParamNames("interface")
             .withOutputParamNames("properties")
             .implementedAs([this](const std::string& iface)
@@ -406,7 +401,6 @@ void GattApplication::register_application(const std::string& adapter_path) {
 
     exported_->addVTable(
         sdbus::registerMethod("GetManagedObjects")
-            .onInterface(std::string(kDbusObjectManagerIface))
             .withOutputParamNames("objects")
             .implementedAs([this]() {
                 using MO = std::map<sdbus::ObjectPath,

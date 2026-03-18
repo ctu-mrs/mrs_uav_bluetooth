@@ -1,6 +1,7 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/network/nmcli_wrapper.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <filesystem>

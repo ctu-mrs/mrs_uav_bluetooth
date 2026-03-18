@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
 #include "mrs_uav_bluetooth/config/config_models.hpp"
 
 #include <rclcpp/generic_publisher.hpp>
 #include <rclcpp/generic_subscription.hpp>
+#include <rclcpp/node.hpp>
 #include <rclcpp/serialized_message.hpp>
 
 #include <memory>

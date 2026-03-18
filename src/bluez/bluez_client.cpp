@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/bluez/bluez_client.hpp"
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
 
@@ -190,6 +190,8 @@ void BluezClient::connect_async(const std::string& mac,
         return;
     }
 
+    const auto path = dev->object_path;
+
     auto operation = start_pending_operation(
         [this, mac]() {
             auto current = cache_.device_by_mac(mac);
@@ -204,7 +206,6 @@ void BluezClient::connect_async(const std::string& mac,
         std::chrono::milliseconds(static_cast<int64_t>(std::max(1.0, timeout_s) * 1000.0)),
         "connect timeout");
 
-    const auto path = dev->object_path;
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -357,6 +358,8 @@ void BluezClient::pair_async(const std::string& mac,
         return;
     }
 
+    const auto path = dev->object_path;
+
     auto operation = start_pending_operation(
         [this, mac]() {
             auto current = cache_.device_by_mac(mac);
@@ -371,7 +374,6 @@ void BluezClient::pair_async(const std::string& mac,
         std::chrono::milliseconds(static_cast<int64_t>(std::max(1.0, timeout_s) * 1000.0)),
         "pair timeout");
 
-    const auto path = dev->object_path;
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},

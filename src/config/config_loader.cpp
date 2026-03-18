@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/config/config_loader.hpp"
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 #include "mrs_uav_bluetooth/util/topic_utils.hpp"

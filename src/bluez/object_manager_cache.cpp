@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/bluez/object_manager_cache.hpp"
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
 
@@ -9,7 +9,7 @@ namespace mrs_uav_bluetooth::bluez {
 
 namespace {
 
-void dispatch_notifications(const ObjectManagerCache::PendingNotifications& notifications,
+void dispatch_notifications(const std::vector<std::pair<CacheEvent, std::string>>& notifications,
                            const std::function<void(CacheEvent, const std::string&)>& notify) {
     for (const auto& [event, path] : notifications) {
         notify(event, path);
@@ -75,8 +75,6 @@ void ObjectManagerCache::start() {
                           const std::vector<std::string>& ifaces) {
                  on_interfaces_removed(path, ifaces);
              });
-
-    om_proxy_->finishRegistration();
 
     // Additionally subscribe to PropertiesChanged on the root match-all path.
     // sdbus-c++ signal matching will deliver these for any path under /org/bluez.

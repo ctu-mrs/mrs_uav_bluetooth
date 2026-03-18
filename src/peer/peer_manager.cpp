@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/peer/peer_manager.hpp"
 
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
@@ -13,7 +13,8 @@ constexpr double kConnectAttemptGraceMultiplier = 2.0;
 constexpr double kServicesWaitGraceMin = 8.0;
 constexpr double kPairCooldownMin = 5.0;
 
-bool is_phase(const PeerConnectionSession& session, std::initializer_list<const char*> values) {
+bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
+              std::initializer_list<const char*> values) {
     for (const char* value : values) {
         if (session.phase == value) {
             return true;
@@ -282,9 +283,7 @@ void PeerManager::remove_time_bridge(const std::string& mac) {
     if (it == time_bridges_.end()) {
         return;
     }
-    if (it->second.publisher) {
-        node_.destroy_publisher(it->second.publisher);
-    }
+    it->second.publisher.reset();
     time_bridges_.erase(it);
 }
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/ros/ros_interface_manager.hpp"
 
 namespace mrs_uav_bluetooth::ros {
