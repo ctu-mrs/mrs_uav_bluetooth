@@ -1,6 +1,6 @@
 # MRS UAV Bluetooth
 
-This repository contains the MRS UAV Bluetooth tool. It consists of a ROS 2 node running in background as a system service. The node manages Bluetooth Low Energy (BLE) server and client for automatic discovery and connection management among peer UAVs in a swarm.
+This repository contains the MRS UAV Bluetooth tool. It is a ROS 2 system service that manages Bluetooth Low Energy (BLE) server and client behavior for automatic discovery and connection management among peer UAVs in a swarm.
 
 The package has two entrypoints:
 
