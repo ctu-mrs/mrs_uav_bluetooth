@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/gatt/advertisement.hpp"
 
+#include <future>
+
 namespace mrs_uav_bluetooth::gatt {
 
 using namespace mrs_uav_bluetooth::bluez;
@@ -49,9 +51,18 @@ void Advertisement::register_advertisement(const std::string& adapter_path) {
                                     sdbus::ServiceName{std::string(kBluezServiceName)},
                                     sdbus::ObjectPath{adapter_path});
     std::map<std::string, sdbus::Variant> options;
-    proxy->callMethod("RegisterAdvertisement")
+    auto future = proxy->callMethodAsync("RegisterAdvertisement")
         .onInterface(std::string(kLeAdvManagerIface))
-        .withArguments(sdbus::ObjectPath{path_}, options);
+        .withArguments(sdbus::ObjectPath{path_}, options)
+        .getResultAsFuture();
+
+    const auto status = future.wait_for(std::chrono::seconds(30));
+    if (status == std::future_status::timeout) {
+        throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.Timeout"},
+                           "RegisterAdvertisement timed out");
+    }
+
+    future.get();
     registered_ = true;
 }
 

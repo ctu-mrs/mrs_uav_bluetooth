@@ -8,6 +8,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -15,6 +16,10 @@
 #include <vector>
 
 namespace mrs_uav_bluetooth::gatt {
+
+using PropertyMap = std::map<std::string, sdbus::Variant>;
+using InterfacePropsMap = std::map<std::string, PropertyMap>;
+using ManagedObjects = std::map<sdbus::ObjectPath, InterfacePropsMap>;
 
 class GattService;
 class GattCharacteristic;
@@ -39,6 +44,9 @@ public:
 
     const std::string& path() const { return path_; }
     const std::string& uuid() const { return uuid_; }
+
+    PropertyMap get_properties() const;
+    ManagedObjects get_managed_objects() const;
 
     void set_value(const std::vector<uint8_t>& val, bool emit = false);
     std::vector<uint8_t> value() const;
@@ -88,6 +96,10 @@ public:
     const std::string& uuid() const { return uuid_; }
     const std::vector<std::string>& flags() const { return flags_; }
     bool notifying() const { return notifying_; }
+    void set_force_emit_value(bool enabled) { force_emit_value_ = enabled; }
+
+    PropertyMap get_properties() const;
+    ManagedObjects get_managed_objects() const;
 
     void add_descriptor(std::shared_ptr<GattDescriptor> desc);
     const std::vector<std::shared_ptr<GattDescriptor>>& descriptors() const { return descriptors_; }
@@ -118,6 +130,7 @@ protected:
     std::vector<std::string> flags_;
     GattService& parent_;
     bool notifying_{false};
+    bool force_emit_value_{false};
     uint16_t handle_{0};
     std::optional<uint16_t> mtu_;
 
@@ -150,15 +163,13 @@ public:
     const std::string& path() const { return path_; }
     const std::string& uuid() const { return uuid_; }
 
+    PropertyMap get_properties() const;
+    ManagedObjects get_managed_objects() const;
+
     void add_characteristic(std::shared_ptr<GattCharacteristic> chrc);
     const std::vector<std::shared_ptr<GattCharacteristic>>& characteristics() const {
         return characteristics_;
     }
-
-    /// Collect all D-Bus managed-object entries for this service and its children.
-    using InterfacePropsMap = std::map<std::string, std::map<std::string, sdbus::Variant>>;
-    using ManagedObjects = std::map<sdbus::ObjectPath, InterfacePropsMap>;
-    ManagedObjects get_managed_objects() const;
 
 private:
     bluez::DbusConnection& dbus_;
@@ -192,6 +203,7 @@ public:
 
     const std::string& path() const { return path_; }
     const std::vector<std::shared_ptr<GattService>>& services() const { return services_; }
+    ManagedObjects get_managed_objects() const;
 
 private:
     bluez::DbusConnection& dbus_;
@@ -199,7 +211,6 @@ private:
     std::string adapter_path_;
     rclcpp::Logger logger_;
     std::unique_ptr<sdbus::IObject> exported_;
-    std::optional<sdbus::Slot> object_manager_slot_;
     std::vector<std::shared_ptr<GattService>> services_;
     bool registered_{false};
 };

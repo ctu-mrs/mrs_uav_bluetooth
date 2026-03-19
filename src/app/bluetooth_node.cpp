@@ -514,12 +514,12 @@ void BluetoothNode::rebuild_server_objects() {
         return;
     }
 
-    gatt_app_ = std::make_unique<gatt::GattApplication>(*dbus_, "/org/bluez/mrs_bt/app", get_logger());
+    gatt_app_ = std::make_unique<gatt::GattApplication>(*dbus_, "/org/bluez/app", get_logger());
 
     int service_index = 0;
     if (active_config_.enable_wifi_service) {
         wifi_service_ = std::make_unique<gatt::services::WifiService>(
-            *dbus_, "/org/bluez/mrs_bt/app", service_index++,
+            *dbus_, "/org/bluez/app", service_index++,
             [this]() {
                 auto ssid = netplan_->get_current_ssid();
                 return ssid.empty() ? std::string("unknown") : ssid;
@@ -531,6 +531,7 @@ void BluetoothNode::rebuild_server_objects() {
             [this]() { return netplan_->get_configured_password(); });
         // Wire server-side notify observability for the wifi characteristic.
         for (const auto& chrc : wifi_service_->service()->characteristics()) {
+            chrc->set_force_emit_value(true);
             chrc->set_notify_callback([this, uuid = chrc->uuid()](bool enabled) {
                 RCLCPP_INFO(get_logger(), "[server] wifi characteristic %s: client %s notifications",
                             uuid.c_str(), enabled ? "started" : "stopped");
@@ -543,7 +544,7 @@ void BluetoothNode::rebuild_server_objects() {
 
     if (active_config_.enable_time_service) {
         time_service_ = std::make_unique<gatt::services::TimeService>(
-            *dbus_, "/org/bluez/mrs_bt/app", service_index++,
+            *dbus_, "/org/bluez/app", service_index++,
             [this](const std::vector<uint8_t>& payload,
                    const std::string& device_path,
                    uint64_t received_time_ns) {
@@ -551,6 +552,7 @@ void BluetoothNode::rebuild_server_objects() {
             });
         // Wire server-side notify observability for the time characteristic.
         for (const auto& chrc : time_service_->service()->characteristics()) {
+            chrc->set_force_emit_value(true);
             chrc->set_notify_callback([this, uuid = chrc->uuid()](bool enabled) {
                 RCLCPP_INFO(get_logger(), "[server] time characteristic %s: client %s notifications",
                             uuid.c_str(), enabled ? "started" : "stopped");
@@ -561,12 +563,12 @@ void BluetoothNode::rebuild_server_objects() {
         time_service_.reset();
     }
 
-    export_bridges_->rebuild_gatt_services(*gatt_app_, *dbus_, "/org/bluez/mrs_bt/app");
+    export_bridges_->rebuild_gatt_services(*gatt_app_, *dbus_, "/org/bluez/app");
     gatt_app_->register_application(adapter_path_);
 
     RCLCPP_INFO(get_logger(), "[node] GATT server registered, setting up advertisement");
     advertisement_ = std::make_unique<gatt::Advertisement>(
-        *dbus_, "/org/bluez/mrs_bt/app/advertisement0", "peripheral");
+        *dbus_, "/org/bluez/advertisement0", "peripheral");
     advertisement_->set_local_name(hostname_);
     if (wifi_service_) {
         advertisement_->add_service_uuid(wifi_service_->uuid());

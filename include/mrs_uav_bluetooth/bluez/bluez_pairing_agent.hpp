@@ -21,7 +21,7 @@ using AgentEventCallback = std::function<void(const std::string& event_type,
 /// Supports auto-accept and auto-trust modes.
 class BluezPairingAgent {
 public:
-    static constexpr const char* kAgentPath = "/org/bluez/mrs_bt/app/agent";
+    static constexpr const char* kAgentPath = "/org/bluez/mrs_bt/agent";
 
     BluezPairingAgent(DbusConnection& dbus,
                       rclcpp::Logger logger,

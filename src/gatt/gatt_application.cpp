@@ -3,6 +3,8 @@
 
 #include <future>
 
+#include <rclcpp/rclcpp.hpp>
+
 namespace mrs_uav_bluetooth::gatt {
 
 using namespace mrs_uav_bluetooth::bluez;
@@ -32,11 +34,12 @@ void GattDescriptor::export_object() {
             .withGetter([this]() -> std::string { return uuid_; }),
         sdbus::registerProperty("Characteristic")
             .withGetter([this]() -> sdbus::ObjectPath { return sdbus::ObjectPath{parent_.path()}; }),
-        sdbus::registerProperty("Flags")
-            .withGetter([this]() -> std::vector<std::string> { return flags_; }),
         sdbus::registerProperty("Handle")
-            .withGetter([this]() -> uint16_t { return handle_; })
-            .withSetter([this](uint16_t h) { handle_ = h; }),
+            .withGetter([this]() -> uint16_t { return handle_; }),
+        sdbus::registerProperty("Flags")
+            .withGetter([this]() -> std::vector<std::string> { 
+                return flags_.empty() ? std::vector<std::string>{"read"} : flags_; 
+            }),
         sdbus::registerProperty("Value")
             .withGetter([this]() -> std::vector<uint8_t> {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -56,9 +59,14 @@ void GattDescriptor::export_object() {
                 on_write(data, opts);
             })
     ).forInterface(std::string(kGattDescriptorIface));
+
+    //exported_->emitInterfacesAddedSignal();
 }
 
 void GattDescriptor::unexport() {
+    /*if (exported_) {
+        exported_->emitInterfacesRemovedSignal();
+    }*/
     exported_.reset();
 }
 
@@ -112,25 +120,24 @@ void GattCharacteristic::export_object() {
             .withGetter([this]() -> std::string { return uuid_; }),
         sdbus::registerProperty("Service")
             .withGetter([this]() -> sdbus::ObjectPath { return sdbus::ObjectPath{parent_.path()}; }),
+        sdbus::registerProperty("Descriptors")
+            .withGetter([this]() -> std::vector<sdbus::ObjectPath> { 
+                std::vector<sdbus::ObjectPath> desc_paths;
+                for (const auto& d : descriptors_) {
+                    desc_paths.push_back(sdbus::ObjectPath{d->path()});
+                }
+                return desc_paths; 
+            }),
+        sdbus::registerProperty("Handle")
+            .withGetter([this]() -> uint16_t { return handle_; }),
         sdbus::registerProperty("Flags")
             .withGetter([this]() -> std::vector<std::string> { return flags_; }),
-        sdbus::registerProperty("Handle")
-            .withGetter([this]() -> uint16_t { return handle_; })
-            .withSetter([this](uint16_t h) { handle_ = h; }),
         sdbus::registerProperty("Notifying")
             .withGetter([this]() -> bool { return notifying_; }),
         sdbus::registerProperty("Value")
             .withGetter([this]() -> std::vector<uint8_t> {
                 std::lock_guard<std::mutex> lock(mutex_);
                 return value_;
-            }),
-        sdbus::registerProperty("Descriptors")
-            .withGetter([this]() -> std::vector<sdbus::ObjectPath> {
-                std::vector<sdbus::ObjectPath> paths;
-                for (const auto& d : descriptors_) {
-                    paths.push_back(sdbus::ObjectPath{d->path()});
-                }
-                return paths;
             }),
         sdbus::registerMethod("ReadValue")
             .withInputParamNames("options")
@@ -151,16 +158,20 @@ void GattCharacteristic::export_object() {
             .implementedAs([this]() { on_stop_notify(); })
     ).forInterface(std::string(kGattCharacteristicIface));
 
-    // Export child descriptors.
     for (auto& desc : descriptors_) {
         desc->export_object();
     }
+
+    //exported_->emitInterfacesAddedSignal();
 }
 
 void GattCharacteristic::unexport() {
     for (auto& desc : descriptors_) {
         desc->unexport();
     }
+    /*if (exported_) {
+        exported_->emitInterfacesRemovedSignal();
+    }*/
     exported_.reset();
 }
 
@@ -174,6 +185,9 @@ void GattCharacteristic::set_value(const std::vector<uint8_t>& val, bool emit) {
         value_ = val;
     }
     if (emit && exported_) {
+        RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
+                    "[gatt] emit Value changed: %s (%zu bytes)",
+                    path_.c_str(), val.size());
         exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                               std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
     }
@@ -185,7 +199,7 @@ std::vector<uint8_t> GattCharacteristic::value() const {
 }
 
 void GattCharacteristic::publish(const std::vector<uint8_t>& data) {
-    set_value(data, notifying_);
+    set_value(data, notifying_ || force_emit_value_);
 }
 
 std::vector<uint8_t> GattCharacteristic::on_read(
@@ -210,6 +224,8 @@ void GattCharacteristic::on_write(const std::vector<uint8_t>& data,
 void GattCharacteristic::on_start_notify() {
     if (notifying_) return;
     notifying_ = true;
+    RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
+                "[gatt] StartNotify called on %s", path_.c_str());
     if (exported_) {
         exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                               std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
@@ -220,6 +236,8 @@ void GattCharacteristic::on_start_notify() {
 void GattCharacteristic::on_stop_notify() {
     if (!notifying_) return;
     notifying_ = false;
+    RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
+                "[gatt] StopNotify called on %s", path_.c_str());
     if (exported_) {
         exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                               std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
@@ -242,6 +260,7 @@ GattService::~GattService() { unexport(); }
 void GattService::export_object() {
     exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
 
+
     // Register BlueZ-expected properties on the GattService1 interface.
     // sdbus-c++ automatically provides org.freedesktop.DBus.Properties.
     exported_->addVTable(
@@ -249,17 +268,16 @@ void GattService::export_object() {
             .withGetter([this]() -> std::string { return uuid_; }),
         sdbus::registerProperty("Primary")
             .withGetter([this]() -> bool { return primary_; }),
-        sdbus::registerProperty("Handle")
-            .withGetter([this]() -> uint16_t { return handle_; })
-            .withSetter([this](uint16_t h) { handle_ = h; }),
         sdbus::registerProperty("Characteristics")
-            .withGetter([this]() -> std::vector<sdbus::ObjectPath> {
-                std::vector<sdbus::ObjectPath> paths;
+            .withGetter([this]() -> std::vector<sdbus::ObjectPath> { 
+                std::vector<sdbus::ObjectPath> chrc_paths;
                 for (const auto& c : characteristics_) {
-                    paths.push_back(sdbus::ObjectPath{c->path()});
+                    chrc_paths.push_back(sdbus::ObjectPath{c->path()});
                 }
-                return paths;
+                return chrc_paths; 
             }),
+        sdbus::registerProperty("Handle")
+            .withGetter([this]() -> uint16_t { return handle_; }),
         sdbus::registerProperty("Includes")
             .withGetter([]() -> std::vector<sdbus::ObjectPath> { return {}; })
     ).forInterface(std::string(kGattServiceIface));
@@ -267,12 +285,17 @@ void GattService::export_object() {
     for (auto& chrc : characteristics_) {
         chrc->export_object();
     }
+
+    //exported_->emitInterfacesAddedSignal();
 }
 
 void GattService::unexport() {
     for (auto& chrc : characteristics_) {
         chrc->unexport();
     }
+    /*if (exported_) {
+        exported_->emitInterfacesRemovedSignal();
+    }*/
     exported_.reset();
 }
 
@@ -280,7 +303,7 @@ void GattService::add_characteristic(std::shared_ptr<GattCharacteristic> chrc) {
     characteristics_.push_back(std::move(chrc));
 }
 
-GattService::ManagedObjects GattService::get_managed_objects() const {
+/*GattService::ManagedObjects GattService::get_managed_objects() const {
     ManagedObjects result;
     // Service properties.
     std::map<std::string, sdbus::Variant> svc_props;
@@ -325,7 +348,7 @@ GattService::ManagedObjects GattService::get_managed_objects() const {
         }
     }
     return result;
-}
+}*/
 
 // ===========================================================================
 // GattApplication
@@ -337,9 +360,9 @@ GattApplication::GattApplication(DbusConnection& dbus,
     : dbus_(dbus), path_(app_path), logger_(logger) {}
 
 GattApplication::~GattApplication() {
-    if (registered_) {
+    if (registered_ && !adapter_path_.empty()) {
         try {
-            // Best effort unregister — adapter_path is not stored, so skip.
+            unregister_application(adapter_path_);
         } catch (...) {}
     }
     exported_.reset();
@@ -350,19 +373,21 @@ void GattApplication::add_service(std::shared_ptr<GattService> svc) {
 }
 
 void GattApplication::register_application(const std::string& adapter_path) {
-    // Create the application-level D-Bus object and enable ObjectManager first.
-    // Keeping the slot alive guarantees ObjectManager is active for the full
-    // lifetime of the exported subtree.
-    RCLCPP_INFO(logger_, "Adding ObjectManager at %s", path_.c_str());
+    // Create the application-level D-Bus object.
+    RCLCPP_INFO(logger_, "Creating GATT application object at %s", path_.c_str());
     exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
-    object_manager_slot_.emplace(exported_->addObjectManager(sdbus::return_slot));
 
-    // Export services first.
+    // Export services FIRST — each service recursively exports its
+    // characteristics and descriptors.  They must exist on the bus BEFORE
+    // addObjectManager() because BlueZ will call GetManagedObjects
+    // immediately (or during RegisterApplication) and the automatic
+    // sd-bus ObjectManager enumerates objects already registered on the
+    // same connection under the ObjectManager path.
     for (auto& svc : services_) {
         RCLCPP_INFO(logger_, "Exporting GATT service at %s (uuid=%s, %zu characteristics)",
                     svc->path().c_str(), svc->uuid().c_str(), svc->characteristics().size());
         svc->export_object();
-        for (const auto& chrc : svc->characteristics()) {
+        for (auto& chrc : svc->characteristics()) {
             RCLCPP_INFO(logger_, "  Characteristic %s uuid=%s flags=[%s] %zu descriptors",
                         chrc->path().c_str(), chrc->uuid().c_str(),
                         [&]() {
@@ -374,8 +399,19 @@ void GattApplication::register_application(const std::string& adapter_path) {
                             return f;
                         }().c_str(),
                         chrc->descriptors().size());
+            for (auto& desc : chrc->descriptors()) {
+                RCLCPP_INFO(logger_, "    Descriptor %s uuid=%s",
+                            desc->path().c_str(), desc->uuid().c_str());
+            }
         }
     }
+
+    // Now enable the automatic ObjectManager on the application object.
+    // sd-bus will respond to GetManagedObjects by enumerating all objects
+    // below this path that carry at least one vtable — i.e. the services,
+    // characteristics and descriptors we just exported.
+    RCLCPP_INFO(logger_, "Adding ObjectManager at %s", path_.c_str());
+    object_manager_slot_.emplace(exported_->addObjectManager(sdbus::return_slot));
 
     // Register with BlueZ GattManager1 using ASYNC call.
     // A synchronous call would deadlock: sdbus-c++ v2 blocks the connection
