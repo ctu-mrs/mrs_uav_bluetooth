@@ -264,14 +264,20 @@ void ObjectManagerCache::load_initial_objects() {
         RCLCPP_WARN(logger_, "GetManagedObjects failed: %s", e.what());
         return;
     }
+    RCLCPP_INFO(logger_, "[cache] GetManagedObjects returned %zu objects", objects.size());
     std::lock_guard lock(mutex_);
     for (const auto& [path, ifaces] : objects) {
+        RCLCPP_DEBUG(logger_, "[cache] initial object: %s  interfaces=%zu", std::string(path).c_str(), ifaces.size());
         process_object(std::string(path), ifaces, nullptr);
     }
 }
 
 void ObjectManagerCache::on_interfaces_added(const sdbus::ObjectPath& path,
                                              const InterfaceMap& ifaces) {
+    RCLCPP_INFO(logger_, "[cache] InterfacesAdded path=%s  ifaces=%zu", std::string(path).c_str(), ifaces.size());
+    for (const auto& [iface, _] : ifaces) {
+        RCLCPP_DEBUG(logger_, "[cache]   iface: %s", iface.c_str());
+    }
     PendingNotifications notifications;
     {
         std::lock_guard lock(mutex_);
@@ -284,6 +290,10 @@ void ObjectManagerCache::on_interfaces_added(const sdbus::ObjectPath& path,
 
 void ObjectManagerCache::on_interfaces_removed(const sdbus::ObjectPath& path,
                                                const std::vector<std::string>& ifaces) {
+    RCLCPP_INFO(logger_, "[cache] InterfacesRemoved path=%s  ifaces=%zu", std::string(path).c_str(), ifaces.size());
+    for (const auto& iface : ifaces) {
+        RCLCPP_DEBUG(logger_, "[cache]   removed iface: %s", iface.c_str());
+    }
     PendingNotifications notifications;
     {
         std::lock_guard lock(mutex_);
@@ -302,12 +312,41 @@ void ObjectManagerCache::on_properties_changed(
     std::string path = std::string(path_obj);
     PendingNotifications notifications;
 
+    RCLCPP_DEBUG(logger_, "[cache] PropertiesChanged path=%s iface=%s changed_keys=%zu",
+                path.c_str(), interface.c_str(), changed.size());
+
     {
         std::lock_guard lock(mutex_);
 
         if (interface == std::string(kDeviceIface)) {
             auto it = devices_.find(path);
             if (it != devices_.end()) {
+                // Log key property changes at INFO level
+                if (changed.count("Connected")) {
+                    RCLCPP_INFO(logger_, "[cache] Device %s (%s) Connected=%s",
+                                it->second.mac.c_str(), path.c_str(),
+                                get_or<bool>(changed, "Connected", false) ? "true" : "false");
+                }
+                if (changed.count("Paired")) {
+                    RCLCPP_INFO(logger_, "[cache] Device %s Paired=%s",
+                                it->second.mac.c_str(),
+                                get_or<bool>(changed, "Paired", false) ? "true" : "false");
+                }
+                if (changed.count("Trusted")) {
+                    RCLCPP_INFO(logger_, "[cache] Device %s Trusted=%s",
+                                it->second.mac.c_str(),
+                                get_or<bool>(changed, "Trusted", false) ? "true" : "false");
+                }
+                if (changed.count("ServicesResolved")) {
+                    RCLCPP_INFO(logger_, "[cache] Device %s ServicesResolved=%s",
+                                it->second.mac.c_str(),
+                                get_or<bool>(changed, "ServicesResolved", false) ? "true" : "false");
+                }
+                if (changed.count("RSSI")) {
+                    RCLCPP_DEBUG(logger_, "[cache] Device %s RSSI=%d",
+                                it->second.mac.c_str(),
+                                get_or<int16_t>(changed, "RSSI", 0));
+                }
                 update_device_props(it->second, changed);
                 notifications.emplace_back(CacheEvent::DevicePropertyChanged, path);
             }
@@ -398,7 +437,13 @@ void ObjectManagerCache::process_object(const std::string& path,
 
     auto device_it = ifaces.find(std::string(kDeviceIface));
     if (device_it != ifaces.end()) {
-        devices_[path] = parse_device(path, device_it->second);
+        auto dev = parse_device(path, device_it->second);
+        RCLCPP_INFO(logger_, "[cache] Device added: %s mac=%s name='%s' connected=%s paired=%s trusted=%s",
+                    path.c_str(), dev.mac.c_str(), dev.name.c_str(),
+                    dev.connected ? "true" : "false",
+                    dev.paired ? "true" : "false",
+                    dev.trusted ? "true" : "false");
+        devices_[path] = std::move(dev);
         if (notifications) {
             notifications->emplace_back(CacheEvent::DeviceAdded, path);
         }
@@ -406,7 +451,11 @@ void ObjectManagerCache::process_object(const std::string& path,
 
     auto svc_it = ifaces.find(std::string(kGattServiceIface));
     if (svc_it != ifaces.end()) {
-        gatt_services_[path] = parse_gatt_service(path, svc_it->second);
+        auto svc = parse_gatt_service(path, svc_it->second);
+        RCLCPP_INFO(logger_, "[cache] GATT service added: %s uuid=%s device=%s primary=%s",
+                    path.c_str(), svc.uuid.c_str(), svc.device_path.c_str(),
+                    svc.primary ? "true" : "false");
+        gatt_services_[path] = std::move(svc);
         if (notifications) {
             notifications->emplace_back(CacheEvent::GattServiceAdded, path);
         }
@@ -414,7 +463,11 @@ void ObjectManagerCache::process_object(const std::string& path,
 
     auto chrc_it = ifaces.find(std::string(kGattCharacteristicIface));
     if (chrc_it != ifaces.end()) {
-        gatt_characteristics_[path] = parse_gatt_characteristic(path, chrc_it->second);
+        auto chrc = parse_gatt_characteristic(path, chrc_it->second);
+        RCLCPP_INFO(logger_, "[cache] GATT characteristic added: %s uuid=%s service=%s notifying=%s",
+                    path.c_str(), chrc.uuid.c_str(), chrc.service_path.c_str(),
+                    chrc.notifying ? "true" : "false");
+        gatt_characteristics_[path] = std::move(chrc);
         if (notifications) {
             notifications->emplace_back(CacheEvent::GattCharacteristicAdded, path);
         }
@@ -422,7 +475,10 @@ void ObjectManagerCache::process_object(const std::string& path,
 
     auto desc_it = ifaces.find(std::string(kGattDescriptorIface));
     if (desc_it != ifaces.end()) {
-        gatt_descriptors_[path] = parse_gatt_descriptor(path, desc_it->second);
+        auto desc = parse_gatt_descriptor(path, desc_it->second);
+        RCLCPP_INFO(logger_, "[cache] GATT descriptor added: %s uuid=%s chrc=%s",
+                    path.c_str(), desc.uuid.c_str(), desc.characteristic_path.c_str());
+        gatt_descriptors_[path] = std::move(desc);
         if (notifications) {
             notifications->emplace_back(CacheEvent::GattDescriptorAdded, path);
         }
@@ -556,6 +612,28 @@ void ObjectManagerCache::update_device_props(
     if (props.count("Blocked"))       dev.blocked = get_or<bool>(props, "Blocked", dev.blocked);
     if (props.count("ServicesResolved")) dev.services_resolved = get_or<bool>(props, "ServicesResolved", dev.services_resolved);
     if (props.count("UUIDs"))         dev.uuids = get_string_vector(props, "UUIDs");
+    if (props.count("ManufacturerData")) {
+        try {
+            auto raw = props.at("ManufacturerData").get<std::map<uint16_t, sdbus::Variant>>();
+            dev.manufacturer_data.clear();
+            for (const auto& [key, variant] : raw) {
+                try {
+                    dev.manufacturer_data[key] = variant.get<std::vector<uint8_t>>();
+                } catch (...) {}
+            }
+        } catch (...) {}
+    }
+    if (props.count("ServiceData")) {
+        try {
+            auto raw = props.at("ServiceData").get<std::map<std::string, sdbus::Variant>>();
+            dev.service_data.clear();
+            for (const auto& [key, variant] : raw) {
+                try {
+                    dev.service_data[key] = variant.get<std::vector<uint8_t>>();
+                } catch (...) {}
+            }
+        } catch (...) {}
+    }
     if (props.count("Adapter")) {
         try {
             dev.adapter = static_cast<std::string>(props.at("Adapter").get<sdbus::ObjectPath>());

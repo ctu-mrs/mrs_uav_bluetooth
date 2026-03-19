@@ -107,8 +107,15 @@ void UserOverlayNode::revert_overlay() {
     if (!set_active_config_client_) {
         return;
     }
+    // Guard against calling into ROS after context shutdown (Ctrl-C).
+    if (!rclcpp::ok()) {
+        return;
+    }
     if (!set_active_config_client_->service_is_ready() &&
         !set_active_config_client_->wait_for_service(std::chrono::duration<double>(deactivate_service_wait_timeout_sec_))) {
+        return;
+    }
+    if (!rclcpp::ok()) {
         return;
     }
     auto response = call_config_service("");
@@ -124,10 +131,16 @@ void UserOverlayNode::publish_keepalive() {
 
 mrs_uav_bluetooth::srv::SetActiveConfig::Response::SharedPtr
 UserOverlayNode::call_config_service(const std::string& config_path) {
+    if (!rclcpp::ok()) {
+        return nullptr;
+    }
     auto request = std::make_shared<mrs_uav_bluetooth::srv::SetActiveConfig::Request>();
     request->config_path = config_path;
     request->hold_seconds = 0.0;
     auto future = set_active_config_client_->async_send_request(request);
+    if (!rclcpp::ok()) {
+        return nullptr;
+    }
     const auto result = rclcpp::spin_until_future_complete(
         get_node_base_interface(), future, std::chrono::duration<double>(service_call_timeout_sec_));
     if (result != rclcpp::FutureReturnCode::SUCCESS) {

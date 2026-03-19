@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/gatt/gatt_application.hpp"
 
+#include <future>
+
 namespace mrs_uav_bluetooth::gatt {
 
 using namespace mrs_uav_bluetooth::bluez;
@@ -21,40 +23,25 @@ GattDescriptor::~GattDescriptor() { unexport(); }
 void GattDescriptor::export_object() {
     exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
 
-    // Properties interface – GetAll.
+    // Register BlueZ-expected properties + methods on the GattDescriptor1 interface.
+    // sdbus-c++ automatically provides org.freedesktop.DBus.Properties (GetAll,
+    // Get, Set, PropertiesChanged) for registered properties — do NOT register
+    // that interface manually, or BlueZ will reject the vtable.
     exported_->addVTable(
-        sdbus::registerMethod("GetAll")
-            .withInputParamNames("interface")
-            .withOutputParamNames("properties")
-            .implementedAs([this](const std::string& iface)
-                -> std::map<std::string, sdbus::Variant> {
-                if (iface != std::string(kGattDescriptorIface)) {
-                    throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.InvalidArgs"},
-                                       "Invalid interface");
-                }
-                std::map<std::string, sdbus::Variant> props;
-                props["Characteristic"] = sdbus::Variant{sdbus::ObjectPath{parent_.path()}};
-                props["UUID"] = sdbus::Variant{uuid_};
-                props["Flags"] = sdbus::Variant{flags_};
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (!value_.empty()) {
-                        props["Value"] = sdbus::Variant{value_};
-                    }
-                }
-                return props;
-            })
-    ).forInterface(std::string(kDbusPropertiesIface));
-
-    exported_->addVTable(
-        sdbus::registerSignal("PropertiesChanged")
-            .withParameters<std::string,
-                            std::map<std::string, sdbus::Variant>,
-                            std::vector<std::string>>()
-    ).forInterface(std::string(kDbusPropertiesIface));
-
-    // GattDescriptor1 interface.
-    exported_->addVTable(
+        sdbus::registerProperty("UUID")
+            .withGetter([this]() -> std::string { return uuid_; }),
+        sdbus::registerProperty("Characteristic")
+            .withGetter([this]() -> sdbus::ObjectPath { return sdbus::ObjectPath{parent_.path()}; }),
+        sdbus::registerProperty("Flags")
+            .withGetter([this]() -> std::vector<std::string> { return flags_; }),
+        sdbus::registerProperty("Handle")
+            .withGetter([this]() -> uint16_t { return handle_; })
+            .withSetter([this](uint16_t h) { handle_ = h; }),
+        sdbus::registerProperty("Value")
+            .withGetter([this]() -> std::vector<uint8_t> {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return value_;
+            }),
         sdbus::registerMethod("ReadValue")
             .withInputParamNames("options")
             .withOutputParamNames("value")
@@ -81,12 +68,8 @@ void GattDescriptor::set_value(const std::vector<uint8_t>& val, bool emit) {
         value_ = val;
     }
     if (emit && exported_) {
-        std::map<std::string, sdbus::Variant> changed;
-        changed["Value"] = sdbus::Variant{val};
-        exported_->emitSignal("PropertiesChanged")
-            .onInterface(std::string(kDbusPropertiesIface))
-            .withArguments(std::string{kGattDescriptorIface}, changed,
-                           std::vector<std::string>{});
+        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattDescriptorIface)},
+                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
     }
 }
 
@@ -122,45 +105,33 @@ GattCharacteristic::~GattCharacteristic() { unexport(); }
 void GattCharacteristic::export_object() {
     exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
 
-    // Properties interface.
+    // Register BlueZ-expected properties + methods on the GattCharacteristic1
+    // interface.  sdbus-c++ automatically provides org.freedesktop.DBus.Properties.
     exported_->addVTable(
-        sdbus::registerMethod("GetAll")
-            .withInputParamNames("interface")
-            .withOutputParamNames("properties")
-            .implementedAs([this](const std::string& iface)
-                -> std::map<std::string, sdbus::Variant> {
-                if (iface != std::string(kGattCharacteristicIface)) {
-                    throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.InvalidArgs"},
-                                       "Invalid interface");
-                }
-                std::map<std::string, sdbus::Variant> props;
-                props["Service"] = sdbus::Variant{sdbus::ObjectPath{parent_.path()}};
-                props["UUID"] = sdbus::Variant{uuid_};
-                props["Flags"] = sdbus::Variant{flags_};
-                props["Notifying"] = sdbus::Variant{notifying_};
-                // Descriptors.
-                std::vector<sdbus::ObjectPath> desc_paths;
+        sdbus::registerProperty("UUID")
+            .withGetter([this]() -> std::string { return uuid_; }),
+        sdbus::registerProperty("Service")
+            .withGetter([this]() -> sdbus::ObjectPath { return sdbus::ObjectPath{parent_.path()}; }),
+        sdbus::registerProperty("Flags")
+            .withGetter([this]() -> std::vector<std::string> { return flags_; }),
+        sdbus::registerProperty("Handle")
+            .withGetter([this]() -> uint16_t { return handle_; })
+            .withSetter([this](uint16_t h) { handle_ = h; }),
+        sdbus::registerProperty("Notifying")
+            .withGetter([this]() -> bool { return notifying_; }),
+        sdbus::registerProperty("Value")
+            .withGetter([this]() -> std::vector<uint8_t> {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return value_;
+            }),
+        sdbus::registerProperty("Descriptors")
+            .withGetter([this]() -> std::vector<sdbus::ObjectPath> {
+                std::vector<sdbus::ObjectPath> paths;
                 for (const auto& d : descriptors_) {
-                    desc_paths.push_back(sdbus::ObjectPath{d->path()});
+                    paths.push_back(sdbus::ObjectPath{d->path()});
                 }
-                props["Descriptors"] = sdbus::Variant{desc_paths};
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    props["Value"] = sdbus::Variant{value_};
-                }
-                return props;
-            })
-    ).forInterface(std::string(kDbusPropertiesIface));
-
-    exported_->addVTable(
-        sdbus::registerSignal("PropertiesChanged")
-            .withParameters<std::string,
-                            std::map<std::string, sdbus::Variant>,
-                            std::vector<std::string>>()
-    ).forInterface(std::string(kDbusPropertiesIface));
-
-    // GattCharacteristic1 interface.
-    exported_->addVTable(
+                return paths;
+            }),
         sdbus::registerMethod("ReadValue")
             .withInputParamNames("options")
             .withOutputParamNames("value")
@@ -203,12 +174,8 @@ void GattCharacteristic::set_value(const std::vector<uint8_t>& val, bool emit) {
         value_ = val;
     }
     if (emit && exported_) {
-        std::map<std::string, sdbus::Variant> changed;
-        changed["Value"] = sdbus::Variant{val};
-        exported_->emitSignal("PropertiesChanged")
-            .onInterface(std::string(kDbusPropertiesIface))
-            .withArguments(std::string{kGattCharacteristicIface}, changed,
-                           std::vector<std::string>{});
+        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
     }
 }
 
@@ -244,12 +211,8 @@ void GattCharacteristic::on_start_notify() {
     if (notifying_) return;
     notifying_ = true;
     if (exported_) {
-        std::map<std::string, sdbus::Variant> changed;
-        changed["Notifying"] = sdbus::Variant{true};
-        exported_->emitSignal("PropertiesChanged")
-            .onInterface(std::string(kDbusPropertiesIface))
-            .withArguments(std::string{kGattCharacteristicIface}, changed,
-                           std::vector<std::string>{});
+        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
     }
     if (notify_cb_) notify_cb_(true);
 }
@@ -258,12 +221,8 @@ void GattCharacteristic::on_stop_notify() {
     if (!notifying_) return;
     notifying_ = false;
     if (exported_) {
-        std::map<std::string, sdbus::Variant> changed;
-        changed["Notifying"] = sdbus::Variant{false};
-        exported_->emitSignal("PropertiesChanged")
-            .onInterface(std::string(kDbusPropertiesIface))
-            .withArguments(std::string{kGattCharacteristicIface}, changed,
-                           std::vector<std::string>{});
+        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
     }
     if (notify_cb_) notify_cb_(false);
 }
@@ -283,27 +242,27 @@ GattService::~GattService() { unexport(); }
 void GattService::export_object() {
     exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
 
+    // Register BlueZ-expected properties on the GattService1 interface.
+    // sdbus-c++ automatically provides org.freedesktop.DBus.Properties.
     exported_->addVTable(
-        sdbus::registerMethod("GetAll")
-            .withInputParamNames("interface")
-            .withOutputParamNames("properties")
-            .implementedAs([this](const std::string& iface)
-                -> std::map<std::string, sdbus::Variant> {
-                if (iface != std::string(kGattServiceIface)) {
-                    throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.InvalidArgs"},
-                                       "Invalid interface");
-                }
-                std::map<std::string, sdbus::Variant> props;
-                props["UUID"] = sdbus::Variant{uuid_};
-                props["Primary"] = sdbus::Variant{primary_};
-                std::vector<sdbus::ObjectPath> chrc_paths;
+        sdbus::registerProperty("UUID")
+            .withGetter([this]() -> std::string { return uuid_; }),
+        sdbus::registerProperty("Primary")
+            .withGetter([this]() -> bool { return primary_; }),
+        sdbus::registerProperty("Handle")
+            .withGetter([this]() -> uint16_t { return handle_; })
+            .withSetter([this](uint16_t h) { handle_ = h; }),
+        sdbus::registerProperty("Characteristics")
+            .withGetter([this]() -> std::vector<sdbus::ObjectPath> {
+                std::vector<sdbus::ObjectPath> paths;
                 for (const auto& c : characteristics_) {
-                    chrc_paths.push_back(sdbus::ObjectPath{c->path()});
+                    paths.push_back(sdbus::ObjectPath{c->path()});
                 }
-                props["Characteristics"] = sdbus::Variant{chrc_paths};
-                return props;
-            })
-    ).forInterface(std::string(kDbusPropertiesIface));
+                return paths;
+            }),
+        sdbus::registerProperty("Includes")
+            .withGetter([]() -> std::vector<sdbus::ObjectPath> { return {}; })
+    ).forInterface(std::string(kGattServiceIface));
 
     for (auto& chrc : characteristics_) {
         chrc->export_object();
@@ -391,44 +350,65 @@ void GattApplication::add_service(std::shared_ptr<GattService> svc) {
 }
 
 void GattApplication::register_application(const std::string& adapter_path) {
+    // Create the application-level D-Bus object and enable ObjectManager first.
+    // Keeping the slot alive guarantees ObjectManager is active for the full
+    // lifetime of the exported subtree.
+    RCLCPP_INFO(logger_, "Adding ObjectManager at %s", path_.c_str());
+    exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
+    object_manager_slot_.emplace(exported_->addObjectManager(sdbus::return_slot));
+
     // Export services first.
     for (auto& svc : services_) {
+        RCLCPP_INFO(logger_, "Exporting GATT service at %s (uuid=%s, %zu characteristics)",
+                    svc->path().c_str(), svc->uuid().c_str(), svc->characteristics().size());
         svc->export_object();
+        for (const auto& chrc : svc->characteristics()) {
+            RCLCPP_INFO(logger_, "  Characteristic %s uuid=%s flags=[%s] %zu descriptors",
+                        chrc->path().c_str(), chrc->uuid().c_str(),
+                        [&]() {
+                            std::string f;
+                            for (const auto& fl : chrc->flags()) {
+                                if (!f.empty()) f += ",";
+                                f += fl;
+                            }
+                            return f;
+                        }().c_str(),
+                        chrc->descriptors().size());
+        }
     }
 
-    // Export the ObjectManager at the application path.
-    exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
-
-    exported_->addVTable(
-        sdbus::registerMethod("GetManagedObjects")
-            .withOutputParamNames("objects")
-            .implementedAs([this]() {
-                using MO = std::map<sdbus::ObjectPath,
-                    std::map<std::string, std::map<std::string, sdbus::Variant>>>;
-                MO result;
-                for (const auto& svc : services_) {
-                    auto mo = svc->get_managed_objects();
-                    result.insert(mo.begin(), mo.end());
-                }
-                return result;
-            })
-    ).forInterface(std::string(kDbusObjectManagerIface));
-
-    // Register with BlueZ GattManager1.
+    // Register with BlueZ GattManager1 using ASYNC call.
+    // A synchronous call would deadlock: sdbus-c++ v2 blocks the connection
+    // for the duration of a sync call, but BlueZ calls GetManagedObjects back
+    // on the same connection before replying — deadlock.
+    RCLCPP_INFO(logger_, "Calling RegisterApplication (async) on %s", adapter_path.c_str());
     auto proxy = sdbus::createProxy(dbus_.connection(),
                                     sdbus::ServiceName{std::string(kBluezServiceName)},
                                     sdbus::ObjectPath{adapter_path});
     std::map<std::string, sdbus::Variant> options;
-    proxy->callMethod("RegisterApplication")
+    auto future = proxy->callMethodAsync("RegisterApplication")
         .onInterface(std::string(kGattManagerIface))
-        .withArguments(sdbus::ObjectPath{path_}, options);
+        .withArguments(sdbus::ObjectPath{path_}, options)
+        .getResultAsFuture();
+
+    // Wait for the async result with a generous timeout.
+    const auto status = future.wait_for(std::chrono::seconds(30));
+    if (status == std::future_status::timeout) {
+        RCLCPP_ERROR(logger_, "RegisterApplication timed out after 30 s");
+        throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.Timeout"},
+                           "RegisterApplication timed out");
+    }
+    // .get() will re-throw any sdbus::Error from BlueZ.
+    future.get();
 
     registered_ = true;
-    RCLCPP_INFO(logger_, "GATT application registered at %s", path_.c_str());
+    adapter_path_ = adapter_path;
+    RCLCPP_INFO(logger_, "GATT application registered successfully at %s", path_.c_str());
 }
 
 void GattApplication::unregister_application(const std::string& adapter_path) {
     if (!registered_) return;
+    RCLCPP_INFO(logger_, "Unregistering GATT application from %s", adapter_path.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -442,8 +422,10 @@ void GattApplication::unregister_application(const std::string& adapter_path) {
     for (auto& svc : services_) {
         svc->unexport();
     }
+    object_manager_slot_.reset();
     exported_.reset();
     registered_ = false;
+    RCLCPP_INFO(logger_, "GATT application unregistered");
 }
 
 }  // namespace mrs_uav_bluetooth::gatt

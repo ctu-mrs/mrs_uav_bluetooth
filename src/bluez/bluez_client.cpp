@@ -58,6 +58,12 @@ BluezClient::~BluezClient() {
         cache_.remove_observer(cache_observer_token_);
         cache_observer_token_ = 0;
     }
+
+    // Release per-characteristic notify match slots.
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        notify_match_slots_.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +71,7 @@ BluezClient::~BluezClient() {
 // ---------------------------------------------------------------------------
 
 bool BluezClient::start_scan(const std::string& transport) {
+    RCLCPP_INFO(logger_, "[client] start_scan transport=%s", transport.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -182,13 +189,18 @@ void BluezClient::connect_async(const std::string& mac,
                                 double timeout_s) {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) {
+        RCLCPP_WARN(logger_, "[client] connect_async(%s): device not found in cache", mac.c_str());
         cb(false, "device not found");
         return;
     }
     if (dev->connected) {
+        RCLCPP_DEBUG(logger_, "[client] connect_async(%s): already connected", mac.c_str());
         cb(true, "already connected");
         return;
     }
+
+    RCLCPP_INFO(logger_, "[client] connect_async(%s) path=%s timeout=%.1fs",
+                mac.c_str(), dev->object_path.c_str(), timeout_s);
 
     const auto path = dev->object_path;
 
@@ -214,10 +226,12 @@ void BluezClient::connect_async(const std::string& mac,
             .onInterface(std::string(kDeviceIface))
             .uponReplyInvoke([this, operation, mac](std::optional<sdbus::Error> err) {
                 if (!err) {
+                    RCLCPP_INFO(logger_, "[client] Connect(%s) D-Bus reply: success", mac.c_str());
                     evaluate_pending_operations();
                     return;
                 }
                 const auto message = err->getMessage();
+                RCLCPP_INFO(logger_, "[client] Connect(%s) D-Bus reply: %s", mac.c_str(), message.c_str());
                 if (message.find("AlreadyConnected") != std::string::npos) {
                     resolve_pending_operation(operation, true, message);
                     return;
@@ -255,14 +269,19 @@ void BluezClient::disconnect_async(const std::string& mac,
                                    double timeout_s) {
     const auto path = device_path_for_mac(mac);
     if (path.empty()) {
+        RCLCPP_DEBUG(logger_, "[client] disconnect_async(%s): device not present", mac.c_str());
         cb(true, "device not present");
         return;
     }
     auto dev = cache_.device_by_mac(mac);
     if (!dev || !dev->connected) {
+        RCLCPP_DEBUG(logger_, "[client] disconnect_async(%s): already disconnected", mac.c_str());
         cb(true, "already disconnected");
         return;
     }
+
+    RCLCPP_INFO(logger_, "[client] disconnect_async(%s) path=%s timeout=%.1fs",
+                mac.c_str(), path.c_str(), timeout_s);
 
     auto operation = start_pending_operation(
         [this, mac]() {
@@ -286,10 +305,12 @@ void BluezClient::disconnect_async(const std::string& mac,
             .onInterface(std::string(kDeviceIface))
             .uponReplyInvoke([this, operation, mac](std::optional<sdbus::Error> err) {
                 if (!err) {
+                    RCLCPP_INFO(logger_, "[client] Disconnect(%s) D-Bus reply: success", mac.c_str());
                     evaluate_pending_operations();
                     return;
                 }
                 const auto message = err->getMessage();
+                RCLCPP_INFO(logger_, "[client] Disconnect(%s) D-Bus reply: %s", mac.c_str(), message.c_str());
                 if (message.find("NotConnected") != std::string::npos ||
                     message.find("NoSuchObject") != std::string::npos) {
                     resolve_pending_operation(operation, true, message);
@@ -350,13 +371,18 @@ void BluezClient::pair_async(const std::string& mac,
                              double timeout_s) {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) {
+        RCLCPP_WARN(logger_, "[client] pair_async(%s): device not found", mac.c_str());
         cb(false, "device not found");
         return;
     }
     if (dev->paired) {
+        RCLCPP_DEBUG(logger_, "[client] pair_async(%s): already paired", mac.c_str());
         cb(true, "already paired");
         return;
     }
+
+    RCLCPP_INFO(logger_, "[client] pair_async(%s) path=%s timeout=%.1fs",
+                mac.c_str(), dev->object_path.c_str(), timeout_s);
 
     const auto path = dev->object_path;
 
@@ -382,10 +408,12 @@ void BluezClient::pair_async(const std::string& mac,
             .onInterface(std::string(kDeviceIface))
             .uponReplyInvoke([this, operation, mac](std::optional<sdbus::Error> err) {
                 if (!err) {
+                    RCLCPP_INFO(logger_, "[client] Pair(%s) D-Bus reply: success", mac.c_str());
                     evaluate_pending_operations();
                     return;
                 }
                 const auto message = err->getMessage();
+                RCLCPP_INFO(logger_, "[client] Pair(%s) D-Bus reply: %s", mac.c_str(), message.c_str());
                 if (message.find("AlreadyExists") != std::string::npos ||
                     message.find("AlreadyPaired") != std::string::npos) {
                     resolve_pending_operation(operation, true, message);
@@ -405,6 +433,7 @@ void BluezClient::pair_async(const std::string& mac,
 bool BluezClient::trust(const std::string& mac) {
     auto path = device_path_for_mac(mac);
     if (path.empty()) return false;
+    RCLCPP_INFO(logger_, "[client] trust(%s) path=%s", mac.c_str(), path.c_str());
     try {
         set_device_property(path, "Trusted", sdbus::Variant{true});
         return true;
@@ -429,6 +458,7 @@ bool BluezClient::untrust(const std::string& mac) {
 bool BluezClient::remove(const std::string& mac) {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return false;
+    RCLCPP_INFO(logger_, "[client] remove(%s) path=%s", mac.c_str(), dev->object_path.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -695,6 +725,7 @@ bool BluezClient::write_descriptor_async(const std::string& desc_path,
 // ---------------------------------------------------------------------------
 
 bool BluezClient::start_notify(const std::string& chrc_path) {
+    RCLCPP_INFO(logger_, "[client] start_notify path=%s", chrc_path.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -711,11 +742,16 @@ bool BluezClient::start_notify(const std::string& chrc_path) {
         }
     }
 
+    // Add a per-characteristic PropertiesChanged subscription to guarantee
+    // notification delivery, matching the Python _ensure_notify_match pattern.
+    ensure_notify_match(chrc_path);
+
     emit_gatt("client_notify_enabled", chrc_path);
     return true;
 }
 
 bool BluezClient::stop_notify(const std::string& chrc_path) {
+    RCLCPP_INFO(logger_, "[client] stop_notify path=%s", chrc_path.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -726,6 +762,7 @@ bool BluezClient::stop_notify(const std::string& chrc_path) {
         emit_gatt("client_notify_failed", chrc_path, e.getMessage());
         return false;
     }
+    remove_notify_match(chrc_path);
     emit_gatt("client_notify_disabled", chrc_path);
     return true;
 }
@@ -763,11 +800,16 @@ void BluezClient::on_cache_event(CacheEvent event, const std::string& object_pat
         if (auto adapter = cache_.adapter(adapter_path_)) {
             std::lock_guard<std::mutex> lock(mutex_);
             scan_running_ = adapter->discovering;
+            RCLCPP_DEBUG(logger_, "[client] adapter changed: discovering=%s",
+                         adapter->discovering ? "true" : "false");
         }
     }
     if (event == CacheEvent::GattCharacteristicValueChanged) {
         const auto characteristic = cache_.characteristic(object_path);
         if (characteristic) {
+            RCLCPP_DEBUG(logger_, "[client] notification from %s uuid=%s %zu bytes",
+                         object_path.c_str(), characteristic->uuid.c_str(),
+                         characteristic->value.size());
             std::vector<NotificationCallback> cbs;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -941,6 +983,74 @@ void BluezClient::evaluate_pending_operations(CacheEvent event, const std::strin
             resolve_pending_operation(operation, true, "ok");
         }
     }
+}
+
+void BluezClient::ensure_notify_match(const std::string& chrc_path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (notify_match_slots_.count(chrc_path)) {
+        return;
+    }
+    try {
+        auto& conn = dbus_.connection();
+        std::string rule = "type='signal',"
+                           "sender='org.bluez',"
+                           "interface='org.freedesktop.DBus.Properties',"
+                           "member='PropertiesChanged',"
+                           "path='" + chrc_path + "'";
+        auto slot = conn.addMatch(
+            rule,
+            [this, chrc_path](sdbus::Message msg) {
+                std::string interface;
+                std::map<std::string, sdbus::Variant> changed;
+                std::vector<std::string> invalidated;
+                msg >> interface >> changed >> invalidated;
+                if (interface != std::string(kGattCharacteristicIface)) {
+                    return;
+                }
+                auto value_it = changed.find("Value");
+                if (value_it == changed.end()) {
+                    return;
+                }
+                std::vector<uint8_t> data;
+                try {
+                    data = value_it->second.get<std::vector<uint8_t>>();
+                } catch (...) {
+                    return;
+                }
+                // Resolve UUID from cache.
+                std::string uuid;
+                if (auto chrc = cache_.characteristic(chrc_path)) {
+                    uuid = chrc->uuid;
+                }
+                RCLCPP_DEBUG(logger_, "[client] per-path notify from %s uuid=%s %zu bytes",
+                             chrc_path.c_str(), uuid.c_str(), data.size());
+                std::vector<NotificationCallback> cbs;
+                {
+                    std::lock_guard<std::mutex> cb_lock(mutex_);
+                    cbs.reserve(notification_cbs_.size());
+                    for (auto& [_, cb] : notification_cbs_) {
+                        cbs.push_back(cb);
+                    }
+                }
+                for (auto& cb : cbs) {
+                    try {
+                        cb(data, uuid, chrc_path);
+                    } catch (...) {
+                    }
+                }
+            },
+            sdbus::return_slot);
+        notify_match_slots_[chrc_path] = std::move(slot);
+        RCLCPP_DEBUG(logger_, "[client] added per-path notify match for %s", chrc_path.c_str());
+    } catch (const sdbus::Error& e) {
+        RCLCPP_WARN(logger_, "[client] failed to add per-path notify match for %s: %s",
+                    chrc_path.c_str(), e.getMessage().c_str());
+    }
+}
+
+void BluezClient::remove_notify_match(const std::string& chrc_path) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    notify_match_slots_.erase(chrc_path);
 }
 
 }  // namespace mrs_uav_bluetooth::bluez

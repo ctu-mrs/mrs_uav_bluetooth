@@ -481,7 +481,8 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
                 std::chrono::duration<double>(cfg.wifi_refresh_period)),
             [this]() {
                 if (wifi_service_ && netplan_) {
-                    wifi_service_->update(netplan_->get_current_ssid());
+                    auto ssid = netplan_->get_current_ssid();
+                    wifi_service_->update(ssid.empty() ? "unknown" : ssid);
                 }
             });
     }
@@ -490,6 +491,8 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
 }
 
 void BluetoothNode::rebuild_server_objects() {
+    RCLCPP_INFO(get_logger(), "[node] rebuild_server_objects: server=%s adv=%s",
+                gatt_app_ ? "active" : "null", advertisement_ ? "active" : "null");
     if (advertisement_ && !adapter_path_.empty()) {
         try {
             advertisement_->unregister_advertisement(adapter_path_);
@@ -517,12 +520,22 @@ void BluetoothNode::rebuild_server_objects() {
     if (active_config_.enable_wifi_service) {
         wifi_service_ = std::make_unique<gatt::services::WifiService>(
             *dbus_, "/org/bluez/mrs_bt/app", service_index++,
-            [this]() { return netplan_->get_current_ssid(); },
+            [this]() {
+                auto ssid = netplan_->get_current_ssid();
+                return ssid.empty() ? std::string("unknown") : ssid;
+            },
             [this](const std::string& ssid) { netplan_->set_current_network(ssid); },
             [this](const std::string& password) {
                 netplan_->set_current_network(netplan_->get_current_ssid(), password);
             },
             [this]() { return netplan_->get_configured_password(); });
+        // Wire server-side notify observability for the wifi characteristic.
+        for (const auto& chrc : wifi_service_->service()->characteristics()) {
+            chrc->set_notify_callback([this, uuid = chrc->uuid()](bool enabled) {
+                RCLCPP_INFO(get_logger(), "[server] wifi characteristic %s: client %s notifications",
+                            uuid.c_str(), enabled ? "started" : "stopped");
+            });
+        }
         gatt_app_->add_service(wifi_service_->service());
     } else {
         wifi_service_.reset();
@@ -536,6 +549,13 @@ void BluetoothNode::rebuild_server_objects() {
                    uint64_t received_time_ns) {
                 handle_time_writeback(payload, device_path, received_time_ns);
             });
+        // Wire server-side notify observability for the time characteristic.
+        for (const auto& chrc : time_service_->service()->characteristics()) {
+            chrc->set_notify_callback([this, uuid = chrc->uuid()](bool enabled) {
+                RCLCPP_INFO(get_logger(), "[server] time characteristic %s: client %s notifications",
+                            uuid.c_str(), enabled ? "started" : "stopped");
+            });
+        }
         gatt_app_->add_service(time_service_->service());
     } else {
         time_service_.reset();
@@ -544,6 +564,7 @@ void BluetoothNode::rebuild_server_objects() {
     export_bridges_->rebuild_gatt_services(*gatt_app_, *dbus_, "/org/bluez/mrs_bt/app");
     gatt_app_->register_application(adapter_path_);
 
+    RCLCPP_INFO(get_logger(), "[node] GATT server registered, setting up advertisement");
     advertisement_ = std::make_unique<gatt::Advertisement>(
         *dbus_, "/org/bluez/mrs_bt/app/advertisement0", "peripheral");
     advertisement_->set_local_name(hostname_);
@@ -563,20 +584,6 @@ void BluetoothNode::publish_periodic_status() {
     report += std::string("server=") + (gatt_app_ ? "active" : "off") + "\n";
     report += std::string("advertisement=") + (advertisement_ ? "active" : "off") + "\n";
     report += std::string("scan=") + (client_ && client_->is_scanning() ? "on" : "off") + "\n";
-    if (peers_ && !peers_->sessions().empty()) {
-        report += "peers:\n";
-        for (const auto& [mac, session] : peers_->sessions()) {
-            report += "  " + mac + " phase=" + session.phase;
-            if (!session.peer_name.empty()) {
-                report += " peer=" + session.peer_name;
-            }
-            if (!session.detail.empty()) {
-                report += " detail=" + session.detail;
-            }
-            report += "\n";
-        }
-    }
-    ros_->status_publisher().publish_report(report);
 
     std::map<std::string, bluez::DeviceInfo> devices_map;
     if (client_) {
@@ -584,6 +591,88 @@ void BluetoothNode::publish_periodic_status() {
             devices_map[device.mac] = device;
         }
     }
+    report += "devices: " + std::to_string(devices_map.size()) + "\n";
+    for (const auto& [mac, dev] : devices_map) {
+        report += "  " + mac;
+        if (!dev.name.empty()) {
+            report += " name='" + dev.name + "'";
+        } else if (!dev.alias.empty()) {
+            report += " alias='" + dev.alias + "'";
+        }
+        report += std::string(" conn=") + (dev.connected ? "Y" : "N");
+        report += std::string(" paired=") + (dev.paired ? "Y" : "N");
+        report += std::string(" trusted=") + (dev.trusted ? "Y" : "N");
+        report += std::string(" svc_resolved=") + (dev.services_resolved ? "Y" : "N");
+        report += " rssi=" + std::to_string(dev.rssi);
+        report += "\n";
+    }
+
+    if (peers_ && !peers_->sessions().empty()) {
+        report += "peers:\n";
+        for (const auto& [mac, session] : peers_->sessions()) {
+            report += "  " + mac + " phase=" + session.phase;
+            if (!session.peer_name.empty()) {
+                report += " peer=" + session.peer_name;
+            }
+            report += std::string(" desired=") + (session.desired ? "Y" : "N");
+            if (!session.detail.empty()) {
+                report += " detail=" + session.detail;
+            }
+            report += "\n";
+        }
+    }
+    if (peers_) {
+        report += "time_bridges: " + std::to_string(peers_->time_bridges().size()) + "\n";
+        for (const auto& [mac, bridge] : peers_->time_bridges()) {
+            report += "  " + mac + " status=" + bridge.status;
+            if (!bridge.characteristic_path.empty()) {
+                report += " chrc=" + bridge.characteristic_path;
+            }
+            report += "\n";
+        }
+    }
+
+    // Also log the status periodically to console for visibility
+    const auto connected_count = std::count_if(devices_map.begin(), devices_map.end(),
+                                                [](const auto& pair) { return pair.second.connected; });
+    RCLCPP_INFO(get_logger(), "[status] %zu devices (%zu connected), %zu sessions, %zu time_bridges, server=%s, adv=%s, scan=%s",
+                devices_map.size(),
+                static_cast<size_t>(connected_count),
+                peers_ ? peers_->sessions().size() : 0u,
+                peers_ ? peers_->time_bridges().size() : 0u,
+                gatt_app_ ? "active" : "off",
+                advertisement_ ? "active" : "off",
+                client_ && client_->is_scanning() ? "on" : "off");
+    if (peers_) {
+        for (const auto& [mac, session] : peers_->sessions()) {
+            auto dev_it = devices_map.find(mac);
+            const bool conn = dev_it != devices_map.end() && dev_it->second.connected;
+            const bool svc = dev_it != devices_map.end() && dev_it->second.services_resolved;
+            auto bridge_it = peers_->time_bridges().find(mac);
+            std::string bridge_status = bridge_it != peers_->time_bridges().end() ? bridge_it->second.status : "none";
+            // Show raw device name/alias separately from derived peer_name for debuggability
+            std::string device_label;
+            if (dev_it != devices_map.end()) {
+                if (!dev_it->second.name.empty()) {
+                    device_label = dev_it->second.name;
+                } else if (!dev_it->second.alias.empty()) {
+                    device_label = dev_it->second.alias;
+                }
+            }
+            RCLCPP_INFO(get_logger(), "[status] peer %s device='%s' peer_name='%s' phase=%s desired=%s conn=%s svc_resolved=%s bridge=%s detail=%s",
+                        mac.c_str(),
+                        device_label.c_str(),
+                        session.peer_name.c_str(),
+                        session.phase.c_str(),
+                        session.desired ? "Y" : "N",
+                        conn ? "Y" : "N",
+                        svc ? "Y" : "N",
+                        bridge_status.c_str(),
+                        session.detail.c_str());
+        }
+    }
+
+    ros_->status_publisher().publish_report(report);
     ros_->status_publisher().publish_devices(devices_map);
 }
 
@@ -592,36 +681,135 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
         return;
     }
 
+    // Skip high-frequency value changes
     if (event == bluez::CacheEvent::GattCharacteristicValueChanged ||
         event == bluez::CacheEvent::GattDescriptorValueChanged) {
         return;
     }
 
-    if (event == bluez::CacheEvent::DeviceAdded || event == bluez::CacheEvent::DevicePropertyChanged) {
+    // Log cache events with correct enum-to-name mapping
+    const char* event_name = [](bluez::CacheEvent e) -> const char* {
+        switch (e) {
+            case bluez::CacheEvent::DeviceAdded:                    return "DeviceAdded";
+            case bluez::CacheEvent::DeviceRemoved:                  return "DeviceRemoved";
+            case bluez::CacheEvent::DevicePropertyChanged:          return "DevicePropertyChanged";
+            case bluez::CacheEvent::GattServiceAdded:               return "GattServiceAdded";
+            case bluez::CacheEvent::GattServiceRemoved:             return "GattServiceRemoved";
+            case bluez::CacheEvent::GattCharacteristicAdded:        return "GattCharacteristicAdded";
+            case bluez::CacheEvent::GattCharacteristicChanged:      return "GattCharacteristicChanged";
+            case bluez::CacheEvent::GattCharacteristicValueChanged: return "GattCharacteristicValueChanged";
+            case bluez::CacheEvent::GattCharacteristicRemoved:      return "GattCharacteristicRemoved";
+            case bluez::CacheEvent::GattDescriptorAdded:            return "GattDescriptorAdded";
+            case bluez::CacheEvent::GattDescriptorChanged:          return "GattDescriptorChanged";
+            case bluez::CacheEvent::GattDescriptorValueChanged:     return "GattDescriptorValueChanged";
+            case bluez::CacheEvent::GattDescriptorRemoved:          return "GattDescriptorRemoved";
+            case bluez::CacheEvent::AdapterChanged:                 return "AdapterChanged";
+            default:                                                return "Unknown";
+        }
+    }(event);
+
+    if (event == bluez::CacheEvent::DeviceAdded) {
+        auto device = cache_->device(object_path);
+        if (!device) {
+            RCLCPP_WARN(get_logger(), "[node] on_cache_event: DeviceAdded path=%s but device not in cache", object_path.c_str());
+            return;
+        }
+        const auto peer_name = device_hostname_guess(*device);
+        RCLCPP_INFO(get_logger(), "[node] on_cache_event: DeviceAdded mac=%s name='%s' peer_name='%s' path=%s",
+                    device->mac.c_str(), device->name.c_str(), peer_name.c_str(), object_path.c_str());
+        peers_->sync_device(*device, active_config_, peer_name);
+        refresh_import_bridges_for_device(*device);
+    } else if (event == bluez::CacheEvent::DevicePropertyChanged) {
         auto device = cache_->device(object_path);
         if (!device) {
             return;
         }
+        RCLCPP_DEBUG(get_logger(), "[node] on_cache_event: DevicePropertyChanged mac=%s conn=%s paired=%s trusted=%s svc_resolved=%s path=%s",
+                     device->mac.c_str(),
+                     device->connected ? "Y" : "N",
+                     device->paired ? "Y" : "N",
+                     device->trusted ? "Y" : "N",
+                     device->services_resolved ? "Y" : "N",
+                     object_path.c_str());
         peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
         refresh_import_bridges_for_device(*device);
     } else if (event == bluez::CacheEvent::DeviceRemoved) {
-        const auto now = peers_->now_monotonic();
-        auto devices = client_ ? client_->get_devices() : std::vector<bluez::DeviceInfo>{};
-        std::set<std::string> current_macs;
-        for (const auto& device : devices) {
-            current_macs.insert(device.mac);
-        }
-        for (const auto& [mac, session] : peers_->sessions()) {
-            (void)session;
-            if (current_macs.find(mac) == current_macs.end()) {
-                peers_->note_missing_device(mac, now);
-                clear_peer_runtime(mac);
+        // Extract MAC from the removed object_path since the device is no longer in cache.
+        // Only mark the specific device as missing, not all sessions.
+        std::string removed_mac;
+        auto session_it = std::find_if(peers_->sessions().begin(), peers_->sessions().end(),
+            [&object_path, this](const auto& pair) {
+                // Match by D-Bus path: compare with cached device path
+                // Object paths are like /org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX
+                const auto& mac = pair.first;
+                auto dev = cache_->device_by_mac(mac);
+                return dev && dev->object_path == object_path;
+            });
+        if (session_it != peers_->sessions().end()) {
+            removed_mac = session_it->first;
+        } else {
+            // Device already gone from cache, try to find MAC from path
+            // Path format: /org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX
+            const auto dev_pos = object_path.rfind("/dev_");
+            if (dev_pos != std::string::npos) {
+                auto mac_part = object_path.substr(dev_pos + 5);
+                std::replace(mac_part.begin(), mac_part.end(), '_', ':');
+                removed_mac = mac_part;
             }
         }
-    } else if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
-        if (const auto device = cache_->device(*device_path)) {
-            peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-            refresh_import_bridges_for_device(*device);
+
+        if (!removed_mac.empty()) {
+            RCLCPP_INFO(get_logger(), "[node] on_cache_event: DeviceRemoved mac=%s path=%s",
+                        removed_mac.c_str(), object_path.c_str());
+            if (peers_->sessions().count(removed_mac)) {
+                peers_->note_missing_device(removed_mac, peers_->now_monotonic());
+                clear_peer_runtime(removed_mac);
+            }
+        } else {
+            RCLCPP_DEBUG(get_logger(), "[node] on_cache_event: DeviceRemoved path=%s (no matching session)",
+                         object_path.c_str());
+        }
+    } else if (event == bluez::CacheEvent::GattServiceAdded || event == bluez::CacheEvent::GattServiceRemoved) {
+        RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+        if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
+            if (const auto device = cache_->device(*device_path)) {
+                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                refresh_import_bridges_for_device(*device);
+            }
+        }
+    } else if (event == bluez::CacheEvent::GattCharacteristicAdded || event == bluez::CacheEvent::GattCharacteristicRemoved) {
+        if (const auto chrc = cache_->characteristic(object_path)) {
+            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s uuid=%s path=%s",
+                        event_name, chrc->uuid.c_str(), object_path.c_str());
+        } else {
+            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+        }
+        if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
+            if (const auto device = cache_->device(*device_path)) {
+                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                refresh_import_bridges_for_device(*device);
+            }
+        }
+    } else if (event == bluez::CacheEvent::GattDescriptorAdded || event == bluez::CacheEvent::GattDescriptorRemoved) {
+        if (const auto desc = cache_->descriptor(object_path)) {
+            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s uuid=%s chrc=%s path=%s",
+                        event_name, desc->uuid.c_str(), desc->characteristic_path.c_str(), object_path.c_str());
+        } else {
+            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+        }
+        if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
+            if (const auto device = cache_->device(*device_path)) {
+                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                refresh_import_bridges_for_device(*device);
+            }
+        }
+    } else {
+        RCLCPP_DEBUG(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+        if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
+            if (const auto device = cache_->device(*device_path)) {
+                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                refresh_import_bridges_for_device(*device);
+            }
         }
     }
 
@@ -631,7 +819,8 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
 void BluetoothNode::on_gatt_event(const std::string& event_type,
                                   const std::string& object_path,
                                   const std::string& detail) {
-    (void)detail;
+    RCLCPP_INFO(get_logger(), "[node] on_gatt_event: type=%s path=%s detail=%s",
+                event_type.c_str(), object_path.c_str(), detail.c_str());
 
     if (!cache_ || !client_) {
         return;
@@ -657,6 +846,8 @@ void BluetoothNode::on_gatt_event(const std::string& event_type,
 }
 
 void BluetoothNode::on_pairing_event(const std::string& event_type, const std::string& device_path) {
+    RCLCPP_INFO(get_logger(), "[node] on_pairing_event: type=%s device=%s",
+                event_type.c_str(), device_path.c_str());
     if (!peers_ || !cache_) {
         return;
     }
@@ -859,6 +1050,8 @@ void BluetoothNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const
 void BluetoothNode::on_notification(const std::vector<uint8_t>& data,
                                     const std::string& uuid,
                                     const std::string& characteristic_path) {
+    RCLCPP_DEBUG(get_logger(), "[node] on_notification: uuid=%s path=%s %zu bytes",
+                uuid.c_str(), characteristic_path.c_str(), data.size());
     if (!cache_ || !ros_) {
         return;
     }
@@ -955,8 +1148,29 @@ bool BluetoothNode::update_peer_time_bridge(const std::string& mac,
                                             peer::PeerConnectionSession& session) {
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
     const auto writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
+    const auto peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
+
+    // Log available GATT objects for this device to help debug resolution issues
+    const auto services = client_->list_services(mac);
+    const auto characteristics = client_->list_characteristics(mac);
+    const auto descriptors = client_->list_descriptors(mac);
+    RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): %zu services, %zu characteristics, %zu descriptors resolved",
+                mac.c_str(), services.size(), characteristics.size(), descriptors.size());
+    for (const auto& svc : services) {
+        RCLCPP_DEBUG(get_logger(), "[node]   service: %s uuid=%s", svc.object_path.c_str(), svc.uuid.c_str());
+    }
+    for (const auto& chrc : characteristics) {
+        RCLCPP_DEBUG(get_logger(), "[node]   characteristic: %s uuid=%s", chrc.object_path.c_str(), chrc.uuid.c_str());
+    }
+    for (const auto& desc : descriptors) {
+        RCLCPP_DEBUG(get_logger(), "[node]   descriptor: %s uuid=%s chrc=%s",
+                     desc.object_path.c_str(), desc.uuid.c_str(), desc.characteristic_path.c_str());
+    }
+
     const auto characteristic_path = client_->find_characteristic(mac, time_characteristic_uuid);
     if (characteristic_path.empty()) {
+        RCLCPP_INFO(get_logger(), "[node] update_peer_time_bridge(%s): time characteristic uuid=%s not found among %zu characteristics",
+                    mac.c_str(), time_characteristic_uuid.c_str(), characteristics.size());
         clear_peer_runtime(mac);
         session.phase = "connected_unready";
         session.detail = "peer time characteristic not available";
@@ -964,7 +1178,7 @@ bool BluetoothNode::update_peer_time_bridge(const std::string& mac,
     }
 
     auto& bridge = peers_->time_bridges()[mac];
-    const auto topic_name = peer_status_topic(mac, session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name);
+    const auto topic_name = peer_status_topic(mac, peer_name);
     if (!bridge.publisher || bridge.status_topic_name != topic_name) {
         if (bridge.publisher) {
             bridge.publisher.reset();
@@ -974,20 +1188,35 @@ bool BluetoothNode::update_peer_time_bridge(const std::string& mac,
     }
 
     bridge.mac = mac;
-    bridge.peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
+    bridge.peer_name = peer_name;
     bridge.characteristic_path = characteristic_path;
-    bridge.writeback_descriptor_path = client_->find_descriptor(mac, writeback_descriptor_uuid, characteristic_path);
+    // Descriptors are optional — many devices (phones, etc.) don't resolve them.
+    // The writeback descriptor is a nice-to-have for RTT measurement.
+    const auto wb_path = client_->find_descriptor(mac, writeback_descriptor_uuid, characteristic_path);
+    if (wb_path.empty() && !descriptors.empty()) {
+        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): writeback descriptor uuid=%s not found (descriptors resolved=%zu)",
+                     mac.c_str(), writeback_descriptor_uuid.c_str(), descriptors.size());
+    } else if (wb_path.empty()) {
+        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): no descriptors resolved for this device, writeback disabled",
+                     mac.c_str());
+    }
+    bridge.writeback_descriptor_path = wb_path;
     bridge.status = "connected";
     bridge.detail = characteristic_path;
     bridge.services_wait_grace_s = session.services_wait_grace_s;
     bridge.pairing_failures = session.pairing_failures;
 
     if (client_->start_notify(characteristic_path)) {
+        RCLCPP_INFO(get_logger(), "[node] update_peer_time_bridge(%s): notifications enabled on %s (writeback=%s)",
+                    mac.c_str(), characteristic_path.c_str(),
+                    wb_path.empty() ? "none" : wb_path.c_str());
         session.phase = "ready";
         session.detail = "peer time bridge active";
         return true;
     }
 
+    RCLCPP_WARN(get_logger(), "[node] update_peer_time_bridge(%s): failed to enable notifications on %s",
+                mac.c_str(), characteristic_path.c_str());
     session.phase = "connected_unready";
     session.detail = "failed to enable peer time notifications";
     return false;
@@ -1000,10 +1229,16 @@ void BluetoothNode::reconcile_peers() {
 
     const auto now = peers_->now_monotonic();
     const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
+    const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
     std::set<std::string> current_macs;
     for (const auto& device : client_->get_devices()) {
         current_macs.insert(device.mac);
     }
+
+    RCLCPP_INFO(get_logger(), "[reconcile] start: %zu sessions, %zu devices, auto_connect=%s, whitelist=%zu entries",
+                peers_->sessions().size(), current_macs.size(),
+                active_config_.auto_connect_enable ? "on" : "off",
+                active_config_.auto_connect_whitelist.size());
 
     peers_->prune_sessions(current_macs, now, std::max(5.0, active_config_.peer_connection_timeout));
 
@@ -1012,15 +1247,25 @@ void BluetoothNode::reconcile_peers() {
 
     for (auto& [mac, session] : peers_->sessions()) {
         const auto device = client_->get_device(mac);
-        if (!device || !device->connected) {
+        const auto device_label = mac + " (" + session.peer_name + ")";
+        const bool is_connected = device && device->connected;
+
+        // Only clear runtime state for desired peers that disconnected.
+        // Don't clear runtime for non-desired devices (e.g. phones) — they were never managed.
+        if (session.desired && !is_connected) {
             clear_peer_runtime(mac);
-        } else {
+        } else if (is_connected) {
             refresh_import_bridges_for_device(*device);
         }
 
-        if (device && !session.desired && device->connected) {
+        // Policy enforcement: Only auto-disconnect devices that are peer candidates
+        // blocked by whitelist policy. Never disconnect non-peer devices (phones, etc.)
+        // that happen to be connected — they are not managed by auto-connect.
+        if (is_connected && !session.desired && session.peer_candidate && whitelist_enabled) {
+            RCLCPP_INFO(get_logger(), "[reconcile] %s: peer_candidate blocked by whitelist, disconnecting",
+                        device_label.c_str());
             session.phase = "policy_blocked";
-            session.detail = "disconnecting disallowed peer";
+            session.detail = "peer not present in whitelist";
             client_->disconnect_async(
                 mac,
                 [](bool, const std::string&) {},
@@ -1030,7 +1275,17 @@ void BluetoothNode::reconcile_peers() {
             continue;
         }
 
+        // Skip non-desired sessions entirely — they are not managed by us.
+        if (!session.desired) {
+            continue;
+        }
+
         if (device && peers_->should_attempt_trust(session, *device, now, retry_period_s)) {
+            RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting trust (paired=%s bonded=%s trusted=%s)",
+                        device_label.c_str(),
+                        device->paired ? "Y" : "N",
+                        device->bonded ? "Y" : "N",
+                        device->trusted ? "Y" : "N");
             if (client_->trust(mac)) {
                 session.phase = "securing";
                 session.detail = "trust repair requested";
@@ -1042,6 +1297,8 @@ void BluetoothNode::reconcile_peers() {
         }
 
         if (peers_->should_attempt_connect(session, now, retry_period_s)) {
+            RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
+                        device_label.c_str(), session.phase.c_str());
             if (client_->connect_async(mac)) {
                 session.phase = "connecting";
                 session.detail = "auto-connect requested";
@@ -1054,6 +1311,8 @@ void BluetoothNode::reconcile_peers() {
         }
 
         if (peers_->should_attempt_pair(session, now, retry_period_s)) {
+            RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair (phase=%s)",
+                        device_label.c_str(), session.phase.c_str());
             if (client_->pair_async(mac)) {
                 session.phase = "securing";
                 session.detail = "auto-pair requested";
@@ -1064,7 +1323,9 @@ void BluetoothNode::reconcile_peers() {
             continue;
         }
 
-        if (device && device->connected && device->trusted && (device->paired || device->bonded) && device->services_resolved) {
+        if (is_connected && device->trusted && (device->paired || device->bonded) && device->services_resolved) {
+            RCLCPP_INFO(get_logger(), "[reconcile] %s: fully ready, updating time bridge",
+                        device_label.c_str());
             if (!update_peer_time_bridge(mac, *device, session)) {
                 pending_deadline = true;
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
@@ -1072,15 +1333,20 @@ void BluetoothNode::reconcile_peers() {
             continue;
         }
 
-        if (session.desired) {
-            pending_deadline = true;
-            if (session.services_wait_started_monotonic > 0.0 && session.services_wait_grace_s > 0.0) {
-                const auto remaining = std::max(0.1,
-                    session.services_wait_started_monotonic + session.services_wait_grace_s - now);
-                next_deadline_s = std::min(next_deadline_s, remaining);
-            } else {
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
-            }
+        // Desired but not yet fully ready — reschedule
+        RCLCPP_DEBUG(get_logger(), "[reconcile] %s: desired but pending (phase=%s conn=%s paired=%s trusted=%s svc_resolved=%s)",
+                     device_label.c_str(), session.phase.c_str(),
+                     is_connected ? "Y" : "N",
+                     device ? (device->paired ? "Y" : "N") : "?",
+                     device ? (device->trusted ? "Y" : "N") : "?",
+                     device ? (device->services_resolved ? "Y" : "N") : "?");
+        pending_deadline = true;
+        if (session.services_wait_started_monotonic > 0.0 && session.services_wait_grace_s > 0.0) {
+            const auto remaining = std::max(0.1,
+                session.services_wait_started_monotonic + session.services_wait_grace_s - now);
+            next_deadline_s = std::min(next_deadline_s, remaining);
+        } else {
+            next_deadline_s = std::min(next_deadline_s, retry_period_s);
         }
     }
 

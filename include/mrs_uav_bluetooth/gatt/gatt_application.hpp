@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -55,6 +56,7 @@ protected:
     std::string uuid_;
     std::vector<std::string> flags_;
     GattCharacteristic& parent_;
+    uint16_t handle_{0};
 
     mutable std::mutex mutex_;
     std::vector<uint8_t> value_;
@@ -84,6 +86,7 @@ public:
 
     const std::string& path() const { return path_; }
     const std::string& uuid() const { return uuid_; }
+    const std::vector<std::string>& flags() const { return flags_; }
     bool notifying() const { return notifying_; }
 
     void add_descriptor(std::shared_ptr<GattDescriptor> desc);
@@ -115,6 +118,8 @@ protected:
     std::vector<std::string> flags_;
     GattService& parent_;
     bool notifying_{false};
+    uint16_t handle_{0};
+    std::optional<uint16_t> mtu_;
 
     mutable std::mutex mutex_;
     std::vector<uint8_t> value_;
@@ -160,6 +165,7 @@ private:
     std::string path_;
     std::string uuid_;
     bool primary_;
+    uint16_t handle_{0};
     std::unique_ptr<sdbus::IObject> exported_;
     std::vector<std::shared_ptr<GattCharacteristic>> characteristics_;
 };
@@ -190,8 +196,10 @@ public:
 private:
     bluez::DbusConnection& dbus_;
     std::string path_;
+    std::string adapter_path_;
     rclcpp::Logger logger_;
     std::unique_ptr<sdbus::IObject> exported_;
+    std::optional<sdbus::Slot> object_manager_slot_;
     std::vector<std::shared_ptr<GattService>> services_;
     bool registered_{false};
 };

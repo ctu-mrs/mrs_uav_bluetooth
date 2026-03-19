@@ -99,17 +99,27 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
 
     session.missing_since_monotonic = 0.0;
 
+    const bool whitelist_enabled = !config.auto_connect_whitelist.empty();
     session.peer_candidate = matches_auto_connect_policy(device, config, session.peer_name);
-    session.desired = session.explicit_target || session.peer_candidate;
+
+    // When whitelist is enabled, only explicit targets are desired among peer candidates.
+    // When whitelist is empty, any matching peer candidate is desired (if auto_connect is on).
+    session.desired = session.explicit_target ||
+                      (session.peer_candidate && !whitelist_enabled);
     session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
 
     if (!session.desired) {
         session.connected_since_monotonic = 0.0;
         session.services_wait_started_monotonic = 0.0;
-        set_session_phase(session,
-                          session.peer_candidate ? "policy_blocked" : "idle",
-                          session.peer_name.empty() ? "device does not match peer policy"
-                                                    : "peer does not match auto-connect policy");
+        if (whitelist_enabled && session.peer_candidate && !session.explicit_target) {
+            set_session_phase(session, "policy_blocked", "peer not present in whitelist");
+        } else if (!session.peer_candidate) {
+            set_session_phase(session, "idle",
+                              session.peer_name.empty() ? "device does not match peer policy"
+                                                        : "not a peer candidate");
+        } else {
+            set_session_phase(session, "idle", "auto-connect disabled");
+        }
         return;
     }
 

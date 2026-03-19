@@ -17,22 +17,21 @@ Advertisement::~Advertisement() {
 void Advertisement::export_object() {
     exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
 
+    // Register BlueZ-expected properties + methods on the LEAdvertisement1
+    // interface.  sdbus-c++ automatically provides org.freedesktop.DBus.Properties.
     exported_->addVTable(
-        sdbus::registerMethod("GetAll")
-            .withInputParamNames("interface")
-            .withOutputParamNames("properties")
-            .implementedAs([this](const std::string& iface)
-                -> std::map<std::string, sdbus::Variant> {
-                if (iface != std::string(kLeAdvertisementIface)) {
-                    throw sdbus::Error(
-                        sdbus::Error::Name{"org.freedesktop.DBus.Error.InvalidArgs"},
-                        "Invalid interface");
-                }
-                return get_properties();
-            })
-    ).forInterface(std::string(kDbusPropertiesIface));
-
-    exported_->addVTable(
+        sdbus::registerProperty("Type")
+            .withGetter([this]() -> std::string { return ad_type_; }),
+        sdbus::registerProperty("ServiceUUIDs")
+            .withGetter([this]() -> std::vector<std::string> { return service_uuids_; }),
+        sdbus::registerProperty("LocalName")
+            .withGetter([this]() -> std::string { return local_name_; }),
+        sdbus::registerProperty("Discoverable")
+            .withGetter([this]() -> bool { return discoverable_; }),
+        sdbus::registerProperty("DiscoverableTimeout")
+            .withGetter([this]() -> uint16_t { return discoverable_timeout_; }),
+        sdbus::registerProperty("Includes")
+            .withGetter([this]() -> std::vector<std::string> { return includes_; }),
         sdbus::registerMethod("Release")
             .implementedAs([]() {})
     ).forInterface(std::string(kLeAdvertisementIface));
