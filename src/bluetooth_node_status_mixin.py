@@ -118,16 +118,10 @@ class BluetoothNodeStatusMixin:
         return lines
 
     def _peer_status_text(self, mac: str, dev, bridge_state) -> str:
-        session = self._peer_sessions.get(mac)
         if not dev.connected:
-            if session is not None and session.phase:
-                return f"disconnected,phase={session.phase}"
             return "disconnected"
         if dev.paired and dev.trusted and dev.bonded and bridge_state is not None and bridge_state.status == "ready":
-            ready_text = "fully-paired,time-bridge-ready"
-            if session is not None and session.phase:
-                ready_text = f"{ready_text},phase={session.phase}"
-            return ready_text
+            return "fully-paired,time-bridge-ready"
         parts = []
         if dev.paired or dev.bonded:
             parts.append("paired")
@@ -141,29 +135,16 @@ class BluetoothNodeStatusMixin:
             parts.append("services-resolved")
         else:
             parts.append("services-resolving")
-        if session is not None and session.phase:
-            parts.append(f"phase={session.phase}")
-        wait_started = 0.0
-        wait_grace_s = 0.0
-        pairing_failures = 0
         if bridge_state is not None:
             if bridge_state.status:
                 parts.append(f"bridge={bridge_state.status}")
-            wait_started = bridge_state.services_wait_started_monotonic
-            wait_grace_s = bridge_state.services_wait_grace_s
-            pairing_failures = bridge_state.pairing_failures
+            if bridge_state.services_wait_started_monotonic > 0.0 and bridge_state.services_wait_grace_s > 0.0:
+                waited = max(0.0, time.monotonic() - bridge_state.services_wait_started_monotonic)
+                parts.append(f"wait={waited:.1f}/{bridge_state.services_wait_grace_s:.1f}s")
+            if bridge_state.pairing_failures > 0:
+                parts.append(f"pair_failures={bridge_state.pairing_failures}")
             if bridge_state.detail:
                 parts.append(bridge_state.detail)
-        if session is not None:
-            if wait_started <= 0.0:
-                wait_started = session.services_wait_started_monotonic
-                wait_grace_s = session.services_wait_grace_s
-            pairing_failures = max(pairing_failures, session.pairing_failures)
-        if wait_started > 0.0 and wait_grace_s > 0.0:
-            waited = max(0.0, time.monotonic() - wait_started)
-            parts.append(f"wait={waited:.1f}/{wait_grace_s:.1f}s")
-        if pairing_failures > 0:
-            parts.append(f"pair_failures={pairing_failures}")
         return ",".join(parts)
 
     def _header(self, frame_id=None) -> Header:

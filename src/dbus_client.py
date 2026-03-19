@@ -85,10 +85,6 @@ class DeviceInfo:
 
 
 class BleClient:
-    _DEVICE_REFRESH_TIMEOUT_S = 2.0
-    _SCAN_STATE_GRACE_S = 6.0
-    _SCAN_STATE_POLL_INTERVAL_S = 3.0
-
     def __init__(self, bus: dbus.SystemBus, adapter_path: str):
         self._bus = bus
         self._adapter_path = adapter_path
@@ -98,9 +94,6 @@ class BleClient:
         self._devices: Dict[str, DeviceInfo] = {}
         self._lock = threading.RLock()
         self._scan_running = False
-        self._last_scan_request_monotonic = 0.0
-        self._last_scan_property_check_monotonic = 0.0
-        self._discovering_false_since_monotonic = 0.0
         self._notification_cbs: Dict[int, Callable] = {}
         self._next_ntf_token = 1
         self._gatt_event_cbs: Dict[int, Callable] = {}
@@ -120,29 +113,6 @@ class BleClient:
 
     @property
     def scanning(self):
-        return self.is_scanning()
-
-    def is_scanning(self) -> bool:
-        now = time.monotonic()
-        should_refresh = (
-            not self._scan_running
-            or now - self._last_scan_property_check_monotonic >= self._SCAN_STATE_POLL_INTERVAL_S
-        )
-        if should_refresh:
-            self._last_scan_property_check_monotonic = now
-            try:
-                discovering = bool(self._adapter_props.Get(ADAPTER_IFACE, "Discovering"))
-                if discovering:
-                    self._scan_running = True
-                    self._last_scan_request_monotonic = now
-                    self._discovering_false_since_monotonic = 0.0
-                else:
-                    if self._discovering_false_since_monotonic <= 0.0:
-                        self._discovering_false_since_monotonic = now
-                    elif now - self._discovering_false_since_monotonic >= self._SCAN_STATE_GRACE_S:
-                        self._scan_running = False
-            except dbus.DBusException:
-                pass
         return self._scan_running
 
     def refresh_devices(self) -> Dict[str, DeviceInfo]:
@@ -168,13 +138,8 @@ class BleClient:
         if not cached or not cached.path:
             return cached
         try:
-            props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, cached.path), DBUS_PROP_IFACE).GetAll(
-                DEVICE_IFACE,
-                timeout=self._DEVICE_REFRESH_TIMEOUT_S,
-            )
-        except dbus.DBusException as exc:
-            if self._is_transient_refresh_error(exc):
-                return cached
+            props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, cached.path), DBUS_PROP_IFACE).GetAll(DEVICE_IFACE)
+        except dbus.DBusException:
             with self._lock:
                 device = self._devices.get(mac.upper())
                 if device is not None:
@@ -216,18 +181,10 @@ class BleClient:
             self._adapter.SetDiscoveryFilter(dbus_dict(filters))
             self._adapter.StartDiscovery()
             self._scan_running = True
-            now = time.monotonic()
-            self._last_scan_request_monotonic = now
-            self._last_scan_property_check_monotonic = now
-            self._discovering_false_since_monotonic = 0.0
             return True
         except dbus.DBusException as exc:
             if "InProgress" in str(exc):
                 self._scan_running = True
-                now = time.monotonic()
-                self._last_scan_request_monotonic = now
-                self._last_scan_property_check_monotonic = now
-                self._discovering_false_since_monotonic = 0.0
                 return True
             return False
 
@@ -235,16 +192,10 @@ class BleClient:
         try:
             self._adapter.StopDiscovery()
             self._scan_running = False
-            self._last_scan_request_monotonic = 0.0
-            self._last_scan_property_check_monotonic = time.monotonic()
-            self._discovering_false_since_monotonic = self._last_scan_property_check_monotonic
             return True
         except dbus.DBusException as exc:
             if "NotAuthorized" in str(exc) or "No discovery started" in str(exc):
                 self._scan_running = False
-                self._last_scan_request_monotonic = 0.0
-                self._last_scan_property_check_monotonic = time.monotonic()
-                self._discovering_false_since_monotonic = self._last_scan_property_check_monotonic
                 return True
             return False
 
@@ -266,24 +217,11 @@ class BleClient:
         return {mac: device for mac, device in devices.items() if device.connected}
 
     def wait_services_resolved(self, mac: str, timeout: float = 15.0) -> bool:
-        deadline = time.monotonic() + timeout
-        next_refresh = 0.0
-        while time.monotonic() < deadline:
-            device = self.get_device(mac, refresh=False)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            device = self.get_device(mac, refresh=True)
             if device and device.services_resolved:
                 return True
-            now = time.monotonic()
-            if now >= next_refresh:
-                device = self.refresh_device(mac)
-                next_refresh = now + 1.0
-                if device and device.services_resolved:
-                    return True
-                # BlueZ may never set ServicesResolved=True even though the
-                # GATT hierarchy is populated.  Check for actual GATT objects.
-                if device and device.path:
-                    chars = self.list_characteristics(mac)
-                    if chars:
-                        return True
             time.sleep(0.3)
         return False
 
@@ -667,20 +605,6 @@ class BleClient:
 
     def _on_properties_changed(self, interface, changed, invalidated, path=""):
         del invalidated
-        if interface == ADAPTER_IFACE and str(path) == self._adapter_path:
-            if "Discovering" in changed:
-                discovering = bool(changed.get("Discovering"))
-                now = time.monotonic()
-                if discovering:
-                    self._scan_running = True
-                    self._last_scan_request_monotonic = now
-                    self._discovering_false_since_monotonic = 0.0
-                else:
-                    if self._discovering_false_since_monotonic <= 0.0:
-                        self._discovering_false_since_monotonic = now
-                    elif now - self._discovering_false_since_monotonic >= self._SCAN_STATE_GRACE_S:
-                        self._scan_running = False
-            return
         if interface == DEVICE_IFACE:
             self._update_device(str(path), changed)
 
@@ -758,17 +682,6 @@ class BleClient:
             return True
         except dbus.DBusException:
             return False
-
-    def _is_transient_refresh_error(self, exc: dbus.DBusException) -> bool:
-        message = str(exc)
-        transient_markers = (
-            "NoReply",
-            "Timed out",
-            "Timeout was reached",
-            "Did not receive a reply",
-            "org.freedesktop.DBus.Error.NoReply",
-        )
-        return any(marker in message for marker in transient_markers)
 
     def _on_chrc_notify(self, chrc_path, interface, changed, invalidated):
         del invalidated

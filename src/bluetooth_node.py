@@ -10,12 +10,10 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from .bluetooth_bridge_state import PeerConnectionSessionState, PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
+from .bluetooth_bridge_state import PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
 from .bluetooth_dbus_runtime import BluetoothDbusRuntime
 from .bluetooth_node_config_mixin import BluetoothNodeConfigMixin, SharedTopicConfig
-from .bluetooth_node_runtime_bridge_mixin import BluetoothNodeRuntimeBridgeMixin
-from .bluetooth_node_runtime_core_mixin import BluetoothNodeRuntimeCoreMixin
-from .bluetooth_node_runtime_peer_mixin import BluetoothNodeRuntimePeerMixin
+from .bluetooth_node_runtime_mixin import BluetoothNodeRuntimeMixin
 from .bluetooth_node_service_mixin import BluetoothNodeServiceMixin
 from .bluetooth_node_status_mixin import BluetoothNodeStatusMixin
 from .dbus_client import BleClient
@@ -23,19 +21,12 @@ from .uuid_utils import system_hostname
 
 
 class BluetoothNode(
-    BluetoothNodeRuntimeCoreMixin,
-    BluetoothNodeRuntimeBridgeMixin,
-    BluetoothNodeRuntimePeerMixin,
+    BluetoothNodeRuntimeMixin,
     BluetoothNodeServiceMixin,
     BluetoothNodeStatusMixin,
     BluetoothNodeConfigMixin,
     Node,
 ):
-
-    BACKGROUND_EXECUTOR_WORKERS = 6
-    BACKGROUND_ERROR_LOG_INTERVAL_S = 5.0
-    EXECUTOR_THREADS = 16
-    EXECUTOR_SHUTDOWN_TIMEOUT_S = 2.0
 
     def __init__(self):
         super().__init__("mrs_uav_bluetooth")
@@ -43,7 +34,12 @@ class BluetoothNode(
         self._lock = threading.RLock()
         self._local_name = system_hostname() or "mrs-uav"
         self._pending_wifi_password = ""
-        self._peer_sessions: Dict[str, PeerConnectionSessionState] = {}
+        self._auto_connect_attempts: Dict[str, float] = {}
+        self._peer_security_attempts: Dict[str, float] = {}
+        self._peer_repair_attempts: Dict[str, float] = {}
+        self._peer_inactive_since: Dict[str, float] = {}
+        self._peer_connected_since: Dict[str, float] = {}
+        self._peer_service_retry_at: Dict[str, float] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
         self._last_dbus_warning_at: Dict[str, float] = {}
@@ -55,15 +51,11 @@ class BluetoothNode(
         self._active_overlay_path = ""
         self._overlay_connected_baseline: Set[str] = set()
         self._overlay_keepalive_topic = ""
-        self._overlay_keepalive_miss_count = 0
         self._default_config_path = self._resolve_default_config_path()
         self._active_config_source = self._default_config_path
         self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
         self._shutting_down = False
-        self._background_executor = ThreadPoolExecutor(
-            max_workers=self.BACKGROUND_EXECUTOR_WORKERS,
-            thread_name_prefix="ble-bg",
-        )
+        self._background_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ble-bg")
         self._background_lock = threading.RLock()
         self._background_inflight: Set[str] = set()
         self._background_error_at: Dict[str, float] = {}
@@ -119,7 +111,7 @@ class BluetoothNode(
             return
         now = time.monotonic()
         last = self._background_error_at.get(key, 0.0)
-        if now - last < self.BACKGROUND_ERROR_LOG_INTERVAL_S:
+        if now - last < 5.0:
             return
         self._background_error_at[key] = now
         self.get_logger().warning(f"Background BLE task {key} failed: {exc}")
@@ -167,7 +159,7 @@ class BluetoothNode(
 def main(args: Optional[Sequence[str]] = None):
     rclpy.init(args=args)
     node = BluetoothNode()
-    executor = MultiThreadedExecutor(num_threads=BluetoothNode.EXECUTOR_THREADS)
+    executor = MultiThreadedExecutor(num_threads=16)
     executor.add_node(node)
     try:
         executor.spin()
@@ -180,7 +172,7 @@ def main(args: Optional[Sequence[str]] = None):
             executor.remove_node(node)
         except Exception:
             pass
-        executor.shutdown(timeout_sec=BluetoothNode.EXECUTOR_SHUTDOWN_TIMEOUT_S)
+        executor.shutdown(timeout_sec=2.0)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

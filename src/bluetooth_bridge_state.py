@@ -81,30 +81,3 @@ class PeerTimeBridgeState:
     services_wait_grace_s: float = 0.0
     pairing_requested_monotonic: float = 0.0
     pairing_failures: int = 0
-
-
-@dataclass
-class PeerConnectionSessionState:
-    mac: str
-    desired: bool = False
-    explicit_target: bool = False
-    peer_candidate: bool = False
-    peer_name: str = ""
-    phase: str = "idle"
-    detail: str = ""
-    first_seen_monotonic: float = field(default_factory=time.monotonic)
-    last_seen_monotonic: float = field(default_factory=time.monotonic)
-    last_connect_attempt_monotonic: float = 0.0
-    connect_started_monotonic: float = 0.0
-    connected_since_monotonic: float = 0.0
-    last_security_attempt_monotonic: float = 0.0
-    last_repair_monotonic: float = 0.0
-    last_service_retry_monotonic: float = 0.0
-    missing_since_monotonic: float = 0.0
-    bridge_wait_started_monotonic: float = 0.0
-    bridge_wait_reason: str = ""
-    connect_repair_count: int = 0
-    pairing_failures: int = 0
-    services_wait_started_monotonic: float = 0.0
-    services_wait_grace_s: float = 0.0
-    import_bridge_missing_since: dict = field(default_factory=dict)
