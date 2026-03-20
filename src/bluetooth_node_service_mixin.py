@@ -14,6 +14,17 @@ from .uuid_utils import resolve_uuid
 
 class BluetoothNodeServiceMixin:
 
+    def _log_service_gatt_action(self, action: str, path: str, *, descriptor: bool = False, payload: bytes = None, success: bool = None, extra: str = ""):
+        target = "descriptor" if descriptor else "characteristic"
+        parts = [f"Service {action}", f"target={target}", f"path={path}"]
+        if success is not None:
+            parts.append(f"success={'Y' if success else 'N'}")
+        if payload is not None:
+            parts.append(self._format_payload_preview(payload))
+        if extra:
+            parts.append(extra)
+        self._log_verbose(" ".join(parts))
+
     def _resolve_message_type(self, topic_name: str, explicit_message_type: str, prefer_publishers: bool):
         explicit = explicit_message_type.strip()
         if explicit:
@@ -151,26 +162,60 @@ class BluetoothNodeServiceMixin:
         return response
 
     def _handle_read_gatt_value(self, request, response):
+        self._log_service_gatt_action("read-request", request.path, descriptor=request.descriptor)
         data = self._client.read_descriptor(request.path) if request.descriptor else self._client.read_characteristic(request.path)
         response.success = data is not None
         response.message = "ok" if data is not None else f"read failed for {request.path}"
         response.value = list(data or b"")
+        self._log_service_gatt_action(
+            "read-result",
+            request.path,
+            descriptor=request.descriptor,
+            payload=data,
+            success=response.success,
+        )
         return response
 
     def _handle_write_gatt_value(self, request, response):
         payload = bytes(request.value)
+        self._log_service_gatt_action(
+            "write-request",
+            request.path,
+            descriptor=request.descriptor,
+            payload=payload,
+            extra=f"with_response={'Y' if request.with_response else 'N'}" if not request.descriptor else "",
+        )
         if request.descriptor:
             success = self._client.write_descriptor(request.path, payload)
         else:
             success = self._client.write_characteristic(request.path, payload, with_response=request.with_response)
         response.success = bool(success)
         response.message = "ok" if success else f"write failed for {request.path}"
+        self._log_service_gatt_action(
+            "write-result",
+            request.path,
+            descriptor=request.descriptor,
+            payload=payload,
+            success=response.success,
+        )
         return response
 
     def _handle_set_notify(self, request, response):
+        self._log_service_gatt_action(
+            "notify-request",
+            request.path,
+            success=request.enable,
+            extra=f"enable={'Y' if request.enable else 'N'}",
+        )
         success = self._client.start_notify(request.path) if request.enable else self._client.stop_notify(request.path)
         response.success = bool(success)
         response.message = "ok" if success else f"notify change failed for {request.path}"
+        self._log_service_gatt_action(
+            "notify-result",
+            request.path,
+            success=response.success,
+            extra=f"enable={'Y' if request.enable else 'N'}",
+        )
         return response
 
     def _handle_set_scan_enabled(self, request, response):

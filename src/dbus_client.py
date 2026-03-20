@@ -98,6 +98,8 @@ class BleClient:
         self._next_ntf_token = 1
         self._gatt_event_cbs: Dict[int, Callable] = {}
         self._next_gatt_token = 1
+        self._device_event_cbs: Dict[int, Callable] = {}
+        self._next_device_token = 1
         self._notify_matches: Dict[str, object] = {}
 
         self._bus.add_signal_receiver(self._on_interfaces_added, dbus_interface=DBUS_OM_IFACE, signal_name="InterfacesAdded")
@@ -117,6 +119,7 @@ class BleClient:
 
     def refresh_devices(self) -> Dict[str, DeviceInfo]:
         seen_paths = set()
+        stale_events = []
         for path, ifaces in self._managed_objects().items():
             path_str = str(path)
             if not path_str.startswith(self._adapter_path + "/"):
@@ -129,9 +132,19 @@ class BleClient:
         with self._lock:
             for device in self._devices.values():
                 if device.path and device.path.startswith(self._adapter_path + "/") and device.path not in seen_paths:
+                    changed_fields = []
+                    if device.connected:
+                        changed_fields.append("connected")
                     device.connected = False
+                    if device.services_resolved:
+                        changed_fields.append("services_resolved")
                     device.services_resolved = False
-            return {mac: device.copy() for mac, device in self._devices.items()}
+                    if changed_fields:
+                        stale_events.append((device.mac, device.copy(), tuple(changed_fields)))
+            snapshot = {mac: device.copy() for mac, device in self._devices.items()}
+        for mac, device, changed_fields in stale_events:
+            self._emit_device(mac, device, changed_fields)
+        return snapshot
 
     def refresh_device(self, mac: str) -> Optional[DeviceInfo]:
         cached = self.get_device(mac)
@@ -284,6 +297,19 @@ class BleClient:
                 return True
             time.sleep(0.3)
         return False
+
+    def disconnect_async(self, mac: str) -> bool:
+        device = self._find_device_obj(mac)
+        if device is None:
+            return True
+        try:
+            device.Disconnect(
+                reply_handler=lambda *_: None,
+                error_handler=lambda *_: None,
+            )
+            return True
+        except dbus.DBusException:
+            return False
 
     def pair(self, mac: str, timeout: float = 30.0) -> bool:
         device = self._find_device_obj(mac)
@@ -577,6 +603,12 @@ class BleClient:
         self._gatt_event_cbs[token] = cb
         return token
 
+    def add_device_handler(self, cb: Callable) -> int:
+        token = self._next_device_token
+        self._next_device_token += 1
+        self._device_event_cbs[token] = cb
+        return token
+
     def _managed_objects(self):
         return self._object_manager.GetManagedObjects()
 
@@ -594,14 +626,16 @@ class BleClient:
     def _on_interfaces_removed(self, path, interfaces):
         if DEVICE_IFACE not in interfaces:
             return
+        removed = None
         with self._lock:
-            stale = None
             for mac, device in self._devices.items():
                 if device.path == str(path):
-                    stale = mac
+                    removed = device.copy()
                     break
-            if stale:
-                self._devices.pop(stale, None)
+            if removed is not None:
+                self._devices.pop(removed.mac, None)
+        if removed is not None:
+            self._emit_device(removed.mac, removed, ("removed", "connected", "services_resolved"))
 
     def _on_properties_changed(self, interface, changed, invalidated, path=""):
         del invalidated
@@ -618,11 +652,31 @@ class BleClient:
                         break
         if not mac:
             return
+        observed_fields = (
+            "path",
+            "adapter",
+            "address_type",
+            "name",
+            "alias",
+            "icon",
+            "appearance",
+            "rssi",
+            "tx_power",
+            "pathloss",
+            "connected",
+            "paired",
+            "bonded",
+            "trusted",
+            "blocked",
+            "services_resolved",
+        )
         with self._lock:
             device = self._devices.get(mac)
+            is_new = device is None
             if device is None:
                 device = DeviceInfo(mac, path)
                 self._devices[mac] = device
+            previous = {field: getattr(device, field) for field in observed_fields}
             if not device.path:
                 device.path = path
             device.last_seen = time.time()
@@ -662,6 +716,12 @@ class BleClient:
                 device.manufacturer_data = decode_manufacturer_dict(props["ManufacturerData"])
             if "ServiceData" in props:
                 device.service_data = decode_byte_dict(props["ServiceData"])
+            changed_fields = [field for field in observed_fields if getattr(device, field) != previous[field]]
+            snapshot = device.copy()
+        if is_new:
+            changed_fields.insert(0, "added")
+        if changed_fields:
+            self._emit_device(mac, snapshot, tuple(changed_fields))
 
     def _find_device_obj(self, mac: str):
         device = self.get_device(mac)
@@ -709,5 +769,12 @@ class BleClient:
         for cb in list(self._gatt_event_cbs.values()):
             try:
                 cb(event_type, kw)
+            except Exception:
+                continue
+
+    def _emit_device(self, mac: str, device: DeviceInfo, changed_fields):
+        for cb in list(self._device_event_cbs.values()):
+            try:
+                cb(mac, device.copy(), changed_fields)
             except Exception:
                 continue
