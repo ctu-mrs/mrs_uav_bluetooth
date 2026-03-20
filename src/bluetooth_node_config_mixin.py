@@ -1,6 +1,5 @@
 """Configuration and runtime utility mixin for the Bluetooth node."""
 
-import hashlib
 import logging
 import os
 import re
@@ -28,6 +27,8 @@ class SharedTopicConfig:
     mode: str
     bridge_key: str
     bridge_name: str
+    bridge_topic_suffix: str
+    bridge_scoped_by_hostname: bool
     export_topic: str
     import_topic_suffix: str
     message_type: str
@@ -207,6 +208,8 @@ class BluetoothNodeConfigMixin:
         for index, raw in enumerate(raw_items or []):
             if not isinstance(raw, dict):
                 raise ValueError(f"shared_topics[{index}] must be a mapping")
+            if "key" in raw:
+                raise ValueError(f"shared_topics[{index}].key is no longer supported")
             mode = str(raw.get("mode", "both")).strip().lower() or "both"
             if mode not in {"export", "import", "both"}:
                 raise ValueError(f"shared_topics[{index}].mode must be export, import, or both")
@@ -214,11 +217,10 @@ class BluetoothNodeConfigMixin:
             if export_topic == "/":
                 raise ValueError(f"shared_topics[{index}] requires export_topic")
             canonical_topic = self._canonical_shared_topic(export_topic)
-            key_source = str(raw.get("key", canonical_topic)).strip()
-            if not key_source:
+            bridge_key = canonical_topic
+            if not bridge_key:
                 raise ValueError(f"shared_topics[{index}] produced an empty bridge key")
-            bridge_key = hashlib.md5(key_source.encode("utf-8")).hexdigest()
-            bridge_name = bridge_key
+            bridge_name = export_topic
             message_type = str(raw.get("message_type", "")).strip()
             if not message_type:
                 raise ValueError(f"shared_topics[{index}] requires message_type")
@@ -238,6 +240,8 @@ class BluetoothNodeConfigMixin:
                 mode=mode,
                 bridge_key=bridge_key,
                 bridge_name=bridge_name,
+                bridge_topic_suffix=canonical_topic,
+                bridge_scoped_by_hostname=(bridge_name != canonical_topic),
                 export_topic=export_topic,
                 import_topic_suffix=import_topic_suffix.lstrip("/"),
                 message_type=message_type,
@@ -287,7 +291,24 @@ class BluetoothNodeConfigMixin:
             return normalized_topic
         return f"{scoped_prefix}{normalized_topic}"
 
+    def _bridge_topic_name_for_host(self, shared: SharedTopicConfig, hostname: str) -> str:
+        if not shared.bridge_scoped_by_hostname:
+            return shared.bridge_name
+        host_segment = sanitize_topic_suffix(hostname)
+        if not host_segment:
+            return ""
+        suffix = shared.bridge_topic_suffix if shared.bridge_topic_suffix != "/" else ""
+        return f"/{host_segment}{suffix}"
+
+    def _bridge_topic_name_for_peer(self, shared: SharedTopicConfig, mac: str, device: DeviceInfo = None) -> str:
+        current_device = device or (self._client.get_device(mac, refresh=True) if self._client is not None else None)
+        peer_name = self._hostname_from_device(current_device) if current_device is not None else ""
+        return self._bridge_topic_name_for_host(shared, peer_name)
+
     def _peer_display_name(self, mac: str) -> str:
+        runtime_status = self._peer_status.get(mac)
+        if runtime_status is not None and runtime_status.peer_name:
+            return runtime_status.peer_name
         state = self._peer_time_bridges.get(mac)
         if state is not None and state.peer_name:
             return state.peer_name
@@ -379,8 +400,8 @@ class BluetoothNodeConfigMixin:
 
     def _normalize_transport_endpoint(self, endpoint: str) -> str:
         candidate = endpoint.strip().lower() or "characteristic"
-        if candidate not in {"characteristic", "descriptor"}:
-            raise ValueError("transport_endpoint must be 'characteristic' or 'descriptor'")
+        if candidate != "characteristic":
+            raise ValueError("transport_endpoint must be 'characteristic'")
         return candidate
 
     def _handle_reload_config(self, request, response):

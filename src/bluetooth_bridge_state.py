@@ -68,16 +68,24 @@ class PeerTimeBridgeState:
     peer_name: str
     status_topic_name: str
     characteristic_path: str
-    writeback_descriptor_path: str
+    writeback_characteristic_path: str
     publisher: object
     last_activity_monotonic: float = field(default_factory=time.monotonic)
     last_publish_monotonic: float = 0.0
     current_hz: float = 0.0
     last_time_value_ns: int = 0
     last_rtt_s: float = 0.0
-    status: str = "connected"
+    status: str = "ready"
     detail: str = ""
-    services_wait_started_monotonic: float = 0.0
-    services_wait_grace_s: float = 0.0
-    pairing_requested_monotonic: float = 0.0
-    pairing_failures: int = 0
+    wait_started_monotonic: float = 0.0
+    wait_timeout_s: float = 0.0
+
+
+@dataclass
+class PeerRuntimeStatus:
+    mac: str
+    peer_name: str
+    status: str = "disconnected"
+    detail: str = ""
+    wait_started_monotonic: float = 0.0
+    wait_timeout_s: float = 0.0

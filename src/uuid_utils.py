@@ -49,7 +49,3 @@ def named_service_uuid(name: str) -> str:
 
 def named_characteristic_uuid(name: str) -> str:
     return uuid_from_name(f"chr:{name.strip()}")
-
-
-def named_descriptor_uuid(name: str) -> str:
-    return uuid_from_name(f"dsc:{name.strip()}")

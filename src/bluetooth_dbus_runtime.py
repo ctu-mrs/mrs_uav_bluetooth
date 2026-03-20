@@ -259,12 +259,12 @@ class BluetoothDbusRuntime:
             return
         DBusGMainLoop(set_as_default=True)
         self._bus = dbus.SystemBus()
-        self._adapter_path = find_adapter(self._bus)
+        self._glib.start()
+        self._dbus_queue = SerializedDbusQueue(self._glib.invoke, self._logger, self._log_verbose)
+        self._adapter_path = self._call_dbus_method(find_adapter, "find BLE adapter", self._bus, timeout=10.0)
         if not self._adapter_path:
             raise RuntimeError("No Bluetooth adapter with GattManager1 found")
         self._logger.info(f"Using adapter {self._adapter_path}")
-        self._glib.start()
-        self._dbus_queue = SerializedDbusQueue(self._glib.invoke, self._logger, self._log_verbose)
         self.set_adapter_props(powered=True)
         self._client = BleClient(self._bus, self._adapter_path, dbus_queue=self._dbus_queue)
 
@@ -279,8 +279,8 @@ class BluetoothDbusRuntime:
             on_event=self._on_pairing_event,
         )
         agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), AGENT_MANAGER_IFACE)
-        agent_mgr.RegisterAgent(PairingAgent.AGENT_PATH, capability)
-        agent_mgr.RequestDefaultAgent(PairingAgent.AGENT_PATH)
+        self._call_dbus_method(agent_mgr.RegisterAgent, "register pairing agent", PairingAgent.AGENT_PATH, capability, timeout=10.0)
+        self._call_dbus_method(agent_mgr.RequestDefaultAgent, "request default pairing agent", PairingAgent.AGENT_PATH, timeout=10.0)
         self._pairing_agent_registered = True
         self._logger.info(f"Pairing agent registered (capability={capability})")
 
@@ -440,15 +440,50 @@ class BluetoothDbusRuntime:
         props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), DBUS_PROP_IFACE)
         iface = ADAPTER_IFACE
         if powered is not None:
-            props.Set(iface, "Powered", dbus.Boolean(powered, variant_level=1))
+            self._call_dbus_method(
+                props.Set,
+                "set adapter Powered",
+                iface,
+                "Powered",
+                dbus.Boolean(powered, variant_level=1),
+                timeout=10.0,
+            )
         if alias is not None:
-            props.Set(iface, "Alias", dbus.String(alias, variant_level=1))
+            self._call_dbus_method(
+                props.Set,
+                "set adapter Alias",
+                iface,
+                "Alias",
+                dbus.String(alias, variant_level=1),
+                timeout=10.0,
+            )
         if discoverable_timeout is not None:
-            props.Set(iface, "DiscoverableTimeout", dbus.UInt32(discoverable_timeout, variant_level=1))
+            self._call_dbus_method(
+                props.Set,
+                "set adapter DiscoverableTimeout",
+                iface,
+                "DiscoverableTimeout",
+                dbus.UInt32(discoverable_timeout, variant_level=1),
+                timeout=10.0,
+            )
         if discoverable is not None:
-            props.Set(iface, "Discoverable", dbus.Boolean(discoverable, variant_level=1))
+            self._call_dbus_method(
+                props.Set,
+                "set adapter Discoverable",
+                iface,
+                "Discoverable",
+                dbus.Boolean(discoverable, variant_level=1),
+                timeout=10.0,
+            )
         if pairable is not None:
-            props.Set(iface, "Pairable", dbus.Boolean(pairable, variant_level=1))
+            self._call_dbus_method(
+                props.Set,
+                "set adapter Pairable",
+                iface,
+                "Pairable",
+                dbus.Boolean(pairable, variant_level=1),
+                timeout=10.0,
+            )
 
     def _register_advertisement(self, ad_mgr, advertisement: Advertisement, service_uuids) -> bool:
         last_error = None
@@ -530,7 +565,12 @@ class BluetoothDbusRuntime:
 
         props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), DBUS_PROP_IFACE)
         try:
-            adv_props = props.GetAll(LE_ADVERTISING_MANAGER_IFACE)
+            adv_props = self._call_dbus_method(
+                props.GetAll,
+                "read advertising capabilities",
+                LE_ADVERTISING_MANAGER_IFACE,
+                timeout=10.0,
+            )
         except Exception as exc:
             self._logger.warning(f"Unable to query LEAdvertisingManager1 capabilities: {exc}")
             return {
@@ -610,7 +650,7 @@ class BluetoothDbusRuntime:
         if self._pairing_agent_registered:
             try:
                 agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), AGENT_MANAGER_IFACE)
-                agent_mgr.UnregisterAgent(PairingAgent.AGENT_PATH)
+                self._call_dbus_method(agent_mgr.UnregisterAgent, "unregister pairing agent", PairingAgent.AGENT_PATH, timeout=10.0)
             except Exception:
                 pass
             self._pairing_agent_registered = False
@@ -629,6 +669,12 @@ class BluetoothDbusRuntime:
         if self._dbus_queue is None:
             raise RuntimeError("Bluetooth DBus runtime queue is not initialized")
         return self._dbus_queue.submit_async_method(method, operation, *args, timeout=timeout, wait=True)
+
+    def _call_dbus_method(self, method, operation: str, *args, timeout: float = 30.0):
+        if self._dbus_queue is None:
+            raise RuntimeError("Bluetooth DBus runtime queue is not initialized")
+        reply = self._dbus_queue.submit_call(lambda: method(*args), operation, timeout=timeout, wait=True)
+        return reply[0] if reply else None
 
     def _require_setup(self):
         if self._bus is None or not self._adapter_path:

@@ -120,32 +120,15 @@ class BluetoothNodeStatusMixin:
     def _peer_status_text(self, mac: str, dev, bridge_state) -> str:
         if not dev.connected:
             return "disconnected"
-        if dev.paired and dev.trusted and dev.bonded and bridge_state is not None and bridge_state.status == "ready":
-            return "fully-paired,time-bridge-ready"
-        parts = []
-        if dev.paired or dev.bonded:
-            parts.append("paired")
-        else:
-            parts.append("pairing-pending")
-        if dev.trusted:
-            parts.append("trusted")
-        else:
-            parts.append("trust-pending")
-        if bool(dev.services_resolved):
-            parts.append("services-resolved")
-        else:
-            parts.append("services-resolving")
-        if bridge_state is not None:
-            if bridge_state.status:
-                parts.append(f"bridge={bridge_state.status}")
-            if bridge_state.services_wait_started_monotonic > 0.0 and bridge_state.services_wait_grace_s > 0.0:
-                waited = max(0.0, time.monotonic() - bridge_state.services_wait_started_monotonic)
-                parts.append(f"wait={waited:.1f}/{bridge_state.services_wait_grace_s:.1f}s")
-            if bridge_state.pairing_failures > 0:
-                parts.append(f"pair_failures={bridge_state.pairing_failures}")
-            if bridge_state.detail:
-                parts.append(bridge_state.detail)
-        return ",".join(parts)
+        runtime_status = self._peer_status.get(mac)
+        status_word = runtime_status.status if runtime_status is not None and runtime_status.status else "connected"
+        extras = []
+        if runtime_status is not None and runtime_status.wait_started_monotonic > 0.0 and runtime_status.wait_timeout_s > 0.0:
+            waited = max(0.0, time.monotonic() - runtime_status.wait_started_monotonic)
+            extras.append(f"wait={waited:.1f}/{runtime_status.wait_timeout_s:.1f}s")
+        if runtime_status is not None and runtime_status.detail:
+            extras.append(runtime_status.detail)
+        return status_word if not extras else f"{status_word} {' '.join(extras)}"
 
     def _header(self, frame_id=None) -> Header:
         header = Header()

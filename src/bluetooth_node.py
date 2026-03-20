@@ -8,7 +8,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from .bluetooth_bridge_state import PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
+from .bluetooth_bridge_state import PeerRuntimeStatus, PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
 from .bluetooth_dbus_runtime import BluetoothDbusRuntime
 from .bluetooth_node_config_mixin import BluetoothNodeConfigMixin, SharedTopicConfig
 from .bluetooth_node_runtime_mixin import BluetoothNodeRuntimeMixin
@@ -42,6 +42,7 @@ class BluetoothNode(
         self._topic_exports: Dict[str, TopicExportBridgeState] = {}
         self._notification_bridges: Dict[str, TopicImportBridgeState] = {}
         self._peer_time_bridges: Dict[str, PeerTimeBridgeState] = {}
+        self._peer_status: Dict[str, PeerRuntimeStatus] = {}
         self._shared_topic_configs: Dict[str, SharedTopicConfig] = {}
         self._active_overlay_path = ""
         self._overlay_connected_baseline: Set[str] = set()

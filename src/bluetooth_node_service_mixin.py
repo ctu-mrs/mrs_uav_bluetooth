@@ -1,15 +1,13 @@
 """ROS service handlers and bridge control mixin for the Bluetooth node."""
 
-import hashlib
-
 import dbus
 from rosidl_runtime_py.utilities import get_message
 
 from .bluetooth_bridge_state import TopicExportBridgeState, TopicImportBridgeState
 from .bridge_payload import decode_message_payload, encode_message_payload, normalize_member_specs, payload_format_for_member_specs
-from .dbus_common import BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_CHRC_IFACE, GATT_DESC_IFACE
-from .gatt_services import topic_bridge_characteristic_uuid, topic_bridge_data_descriptor_uuid
-from .uuid_utils import resolve_uuid
+from .dbus_common import BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_CHRC_IFACE
+from .gatt_services import topic_bridge_characteristic_uuid
+from .uuid_utils import is_uuid, resolve_uuid
 
 
 class BluetoothNodeServiceMixin:
@@ -47,40 +45,24 @@ class BluetoothNodeServiceMixin:
         return candidates[0], get_message(candidates[0])
 
     def _resolve_remote_characteristic(self, mac: str, identifier: str, transport_endpoint: str):
+        if transport_endpoint != "characteristic":
+            raise ValueError("Only characteristic transport is supported")
         candidate = identifier.strip()
-        if candidate.startswith("/"):
+        if candidate.startswith("/org/"):
             props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, candidate), DBUS_PROP_IFACE)
             try:
                 uuid = str(props.Get(GATT_CHRC_IFACE, "UUID"))
                 return candidate, uuid, "characteristic"
             except Exception:
-                try:
-                    uuid = str(props.Get(GATT_DESC_IFACE, "UUID"))
-                    return candidate, uuid, "descriptor"
-                except Exception:
-                    return candidate, "", transport_endpoint
-        if transport_endpoint == "descriptor":
-            descriptor_uuid = topic_bridge_data_descriptor_uuid(candidate)
-            path = self._client.find_descriptor(mac, descriptor_uuid)
-            if not path:
-                self._client.wait_for_descriptors(mac, descriptor_uuids=[descriptor_uuid], timeout=self.DESCRIPTOR_DISCOVERY_TIMEOUT_S, settle_delay_s=self.DESCRIPTOR_SETTLE_DELAY_S)
-                path = self._client.find_descriptor(mac, descriptor_uuid)
-            if path:
-                return path, descriptor_uuid, transport_endpoint
-        else:
-            characteristic_uuid = topic_bridge_characteristic_uuid(candidate)
-            path = self._client.find_characteristic(mac, characteristic_uuid)
-            if path:
-                return path, characteristic_uuid, transport_endpoint
-        resolved_uuid = resolve_uuid(candidate)
-        if transport_endpoint == "descriptor":
-            path = self._client.find_descriptor(mac, resolved_uuid)
-            if not path:
-                self._client.wait_for_descriptors(mac, descriptor_uuids=[resolved_uuid], timeout=self.DESCRIPTOR_DISCOVERY_TIMEOUT_S, settle_delay_s=self.DESCRIPTOR_SETTLE_DELAY_S)
-                path = self._client.find_descriptor(mac, resolved_uuid)
-        else:
-            path = self._client.find_characteristic(mac, resolved_uuid)
+                return candidate, "", transport_endpoint
+        resolved_uuid = resolve_uuid(candidate) if is_uuid(candidate) else topic_bridge_characteristic_uuid(candidate)
+        path = self._client.find_characteristic(mac, resolved_uuid)
         return path or "", resolved_uuid, transport_endpoint
+
+    def _reject_descriptor_request(self, response, message: str):
+        response.success = False
+        response.message = message
+        return response
 
     def _handle_list_devices(self, request, response):
         devices = self._client.get_connected_devices(refresh=True) if request.connected_only else self._client.get_devices(refresh=True)
@@ -150,26 +132,27 @@ class BluetoothNodeServiceMixin:
         return response
 
     def _handle_list_gatt_descriptors(self, request, response):
-        items = self._client.list_descriptors(request.mac, chrc_path=request.characteristic_path or None)
-        response.success = True
-        response.message = "ok"
-        response.descriptors = [self._descriptor_to_msg(item) for item in items]
+        del request
+        response.success = False
+        response.message = "Descriptor operations are deprecated"
+        response.descriptors = []
         return response
 
     def _handle_find_gatt_path(self, request, response):
         resolved_name = resolve_uuid(request.uuid)
         if request.descriptor:
-            path = self._client.find_descriptor(request.mac, resolved_name, chrc_path=request.characteristic_path or None)
-        else:
-            path = self._client.find_characteristic(request.mac, resolved_name)
+            return self._reject_descriptor_request(response, "Descriptor operations are deprecated")
+        path = self._client.find_characteristic(request.mac, resolved_name)
         response.success = bool(path)
         response.message = "ok" if path else f"uuid {resolved_name} not found"
         response.path = path or ""
         return response
 
     def _handle_read_gatt_value(self, request, response):
+        if request.descriptor:
+            return self._reject_descriptor_request(response, "Descriptor read is deprecated")
         self._log_service_gatt_action("read-request", request.path, descriptor=request.descriptor)
-        data = self._client.read_descriptor(request.path) if request.descriptor else self._client.read_characteristic(request.path)
+        data = self._client.read_characteristic(request.path)
         response.success = data is not None
         response.message = "ok" if data is not None else f"read failed for {request.path}"
         response.value = list(data or b"")
@@ -183,6 +166,8 @@ class BluetoothNodeServiceMixin:
         return response
 
     def _handle_write_gatt_value(self, request, response):
+        if request.descriptor:
+            return self._reject_descriptor_request(response, "Descriptor write is deprecated")
         payload = bytes(request.value)
         self._log_service_gatt_action(
             "write-request",
@@ -191,10 +176,7 @@ class BluetoothNodeServiceMixin:
             payload=payload,
             extra=f"with_response={'Y' if request.with_response else 'N'}" if not request.descriptor else "",
         )
-        if request.descriptor:
-            success = self._client.write_descriptor(request.path, payload)
-        else:
-            success = self._client.write_characteristic(request.path, payload, with_response=request.with_response)
+        success = self._client.write_characteristic(request.path, payload, with_response=request.with_response)
         response.success = bool(success)
         response.message = "ok" if success else f"write failed for {request.path}"
         self._log_service_gatt_action(
@@ -261,9 +243,11 @@ class BluetoothNodeServiceMixin:
         transport_endpoint = self._normalize_transport_endpoint(request.transport_endpoint)
         message_type, message_class = self._resolve_message_type(topic_name, request.message_type, prefer_publishers=True)
         member_specs = normalize_member_specs(request.member_paths, message_class=message_class)
+        if not member_specs:
+            raise ValueError("member_paths must define at least one field")
         payload_format = payload_format_for_member_specs(member_specs)
-        bridge_key = hashlib.md5(bridge_name.encode("utf-8")).hexdigest()
-        bridge_uuid = topic_bridge_data_descriptor_uuid(bridge_name) if transport_endpoint == "descriptor" else topic_bridge_characteristic_uuid(bridge_name)
+        bridge_key = bridge_name
+        bridge_uuid = topic_bridge_characteristic_uuid(bridge_name)
         existing_key = None
         for key, state in self._topic_exports.items():
             if state.topic_name == topic_name and state.bridge_name == bridge_name and not state.auto_managed:
@@ -337,7 +321,7 @@ class BluetoothNodeServiceMixin:
         response.success = True
         response.message = "ok"
         response.resolved_uuid = state.bridge_uuid
-        response.resolved_path = state.service.transport_path(state.transport_endpoint) if state.service is not None else ""
+        response.resolved_path = state.service.characteristic_path() if state.service is not None else ""
         response.resolved_topic = state.topic_name
         response.resolved_message_type = state.message_type
         response.resolved_member_paths = list(state.member_paths)
@@ -394,12 +378,13 @@ class BluetoothNodeServiceMixin:
         bridge_name = (request.characteristic or topic_name).strip()
         transport_endpoint = self._normalize_transport_endpoint(request.transport_endpoint)
         message_type, message_class = self._resolve_message_type(topic_name, request.message_type, prefer_publishers=False)
-        remote_member_specs, remote_payload_format, remote_rate_hz, remote_bridge_key = self._read_remote_bridge_metadata(mac, bridge_name, message_class=message_class)
-        member_specs = normalize_member_specs(request.member_paths, message_class=message_class) or remote_member_specs
-        rate_hz = max(0.0, float(request.rate_hz or remote_rate_hz or 0.0))
-        payload_format = remote_payload_format or payload_format_for_member_specs(member_specs)
+        member_specs = normalize_member_specs(request.member_paths, message_class=message_class)
+        if not member_specs:
+            raise ValueError("member_paths must define at least one field")
+        rate_hz = max(0.0, float(request.rate_hz or 0.0))
+        payload_format = payload_format_for_member_specs(member_specs)
         path, bridge_uuid, transport_endpoint = self._resolve_remote_characteristic(mac, bridge_name, transport_endpoint)
-        bridge_key = remote_bridge_key or hashlib.md5(bridge_name.encode("utf-8")).hexdigest()
+        bridge_key = bridge_name
 
         if not request.enable:
             removed = None
@@ -520,10 +505,6 @@ class BluetoothNodeServiceMixin:
         if state.poll_timer is not None:
             self.destroy_timer(state.poll_timer)
             state.poll_timer = None
-        if state.transport_endpoint == "descriptor":
-            period = 1.0 / state.rate_hz if state.rate_hz > 0 else 1.0
-            state.poll_timer = self.create_timer(period, lambda key=bridge_key: self._poll_import_bridge(key))
-            return
         if state.rate_hz <= 0:
             return
         state.poll_timer = self.create_timer(1.0 / state.rate_hz, lambda key=bridge_key: self._flush_import_bridge(key))
@@ -539,15 +520,6 @@ class BluetoothNodeServiceMixin:
             return
         payload = state.pending_payload
         state.pending_payload = b""
-        self._publish_import_payload(state, payload)
-
-    def _poll_import_bridge(self, bridge_key: str):
-        state = self._notification_bridges.get(bridge_key)
-        if state is None or state.transport_endpoint != "descriptor":
-            return
-        payload = self._client.read_descriptor(state.path)
-        if payload is None or payload == state.last_payload:
-            return
         self._publish_import_payload(state, payload)
 
     def _publish_import_payload(self, state: TopicImportBridgeState, payload: bytes):
