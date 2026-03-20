@@ -39,6 +39,8 @@ class BluetoothNode(
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
         self._last_dbus_warning_at: Dict[str, float] = {}
         self._scan_transport = self.get_parameter("scan_mode").get_parameter_value().string_value
+        self._idle_scan_started_at = 0.0
+        self._idle_scan_next_allowed_at = 0.0
         self._topic_exports: Dict[str, TopicExportBridgeState] = {}
         self._notification_bridges: Dict[str, TopicImportBridgeState] = {}
         self._peer_time_bridges: Dict[str, PeerTimeBridgeState] = {}

@@ -129,15 +129,7 @@ class BluetoothNodeRuntimeMixin:
             self._rebuild_server()
         else:
             self._dbus.unregister_server_objects(self._topic_exports)
-        desired_scan = bool(self.get_parameter("enable_scan").value)
-        desired_transport = str(self.get_parameter("scan_mode").value)
-        if desired_scan:
-            if self._client is not None and self._client.scanning and self._scan_transport == desired_transport:
-                pass
-            else:
-                self._start_scan(desired_transport)
-        else:
-            self._stop_scan()
+        self._update_scan_state(reason="runtime config")
         self._enforce_peer_connection_policy(reason="config update")
         if not initial:
             self.get_logger().info(f"Applied config from {self._active_config_source}")
@@ -207,6 +199,100 @@ class BluetoothNodeRuntimeMixin:
 
     def _stop_scan(self):
         return self._dbus.stop_scan()
+
+    def _idle_scan_window_s(self) -> float:
+        return max(0.5, float(self.get_parameter("scan_publish_period").value))
+
+    def _idle_scan_interval_s(self) -> float:
+        return max(self._idle_scan_window_s(), float(self.get_parameter("auto_connect_period").value))
+
+    def _should_scan_for_peer_setup(self, snapshot: Dict[str, DeviceInfo] = None) -> bool:
+        if self._client is None:
+            return False
+        if not bool(self.get_parameter("enable_scan").value):
+            return False
+
+        snapshot = snapshot or self._client.get_devices()
+        whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
+        whitelist_enabled = bool(whitelist_names or whitelist_macs)
+        pattern = str(self.get_parameter("auto_connect_pattern").value)
+
+        has_known_target = False
+        has_disconnected_target = False
+        has_connected_target_pending = False
+        has_ready_target = False
+
+        for mac, device in snapshot.items():
+            peer_candidate = self._is_uav_peer_candidate(device, pattern)
+            explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
+            should_connect = explicit_target or (peer_candidate and not whitelist_enabled)
+            if not should_connect:
+                continue
+            has_known_target = True
+            if not device.connected:
+                has_disconnected_target = True
+                continue
+            if self._has_live_peer_time_bridge(mac):
+                has_ready_target = True
+                continue
+            has_connected_target_pending = True
+
+        if has_connected_target_pending:
+            return False
+        if has_disconnected_target:
+            return True
+        if self._peer_repair_reasons:
+            return True
+        if self._peer_setup_started_at and not has_ready_target:
+            return True
+        if not has_known_target and not has_ready_target:
+            return True
+        return False
+
+    def _update_scan_state(self, snapshot: Dict[str, DeviceInfo] = None, *, reason: str = ""):
+        if self._client is None:
+            return
+
+        desired_transport = str(self.get_parameter("scan_mode").value)
+        continuous_scan = self._should_scan_for_peer_setup(snapshot)
+
+        if continuous_scan:
+            self._idle_scan_started_at = 0.0
+            self._idle_scan_next_allowed_at = 0.0
+            if self._client.scanning and self._scan_transport == desired_transport:
+                return
+            if self._start_scan(desired_transport):
+                if reason:
+                    self._log_verbose(f"Scan enabled: {reason}")
+            return
+
+        now = time.monotonic()
+        idle_window_s = self._idle_scan_window_s()
+        idle_interval_s = self._idle_scan_interval_s()
+
+        if self._client.scanning:
+            if self._idle_scan_started_at <= 0.0:
+                self._idle_scan_started_at = now
+            window_expired = (now - self._idle_scan_started_at) >= idle_window_s
+            transport_changed = self._scan_transport != desired_transport
+            if not window_expired and not transport_changed:
+                return
+            if self._stop_scan():
+                self._idle_scan_started_at = 0.0
+                self._idle_scan_next_allowed_at = now + max(0.0, idle_interval_s - idle_window_s)
+                if reason:
+                    self._log_verbose(f"Scan paused: {reason}")
+            return
+
+        if now < self._idle_scan_next_allowed_at:
+            return
+
+        if self._start_scan(desired_transport):
+            self._idle_scan_started_at = now
+            self._idle_scan_next_allowed_at = 0.0
+            if reason:
+                self._log_verbose(f"Scan enabled: {reason}")
+            return
 
     def _get_wifi_name(self) -> str:
         ssid = self._netplan.get_current_ssid()
@@ -348,6 +434,7 @@ class BluetoothNodeRuntimeMixin:
                 snapshot,
                 pattern=str(self.get_parameter("auto_connect_pattern").value),
             )
+            self._update_scan_state(snapshot, reason="scan publish")
         except dbus.exceptions.DBusException as exc:
             self._dbus_warning("scan_results", f"Skipping BLE scan publish tick due to DBus error: {exc}")
 
@@ -619,6 +706,7 @@ class BluetoothNodeRuntimeMixin:
                 self._log_verbose(f"Auto-connect attempt: {device_label}")
                 if not self._client.connect_async(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
                     self._log_verbose(f"Auto-connect request rejected: {device_label}")
+            self._update_scan_state(snapshot, reason="auto-connect tick")
         except dbus.exceptions.DBusException as exc:
             self._dbus_warning("auto_connect", f"Skipping auto-connect tick due to DBus error: {exc}")
 
@@ -986,6 +1074,7 @@ class BluetoothNodeRuntimeMixin:
         if self._is_uav_peer_candidate(device, str(self.get_parameter("auto_connect_pattern").value)):
             return self._ensure_peer_time_bridge(mac, current)
         self._clear_peer_setup_state(mac)
+        self._set_peer_time_status(mac, "paired")
         return True
 
     def _peer_name_token(self, mac: str, *, device: DeviceInfo = None) -> str:
@@ -1008,8 +1097,7 @@ class BluetoothNodeRuntimeMixin:
         current = self._client.get_device(mac, refresh=True) or device
         security_ready = bool(current.trusted and (current.paired or current.bonded))
         if security_ready:
-            self._clear_peer_setup_state(mac)
-            self._set_peer_time_status(mac, "paired")
+            self._peer_pair_requested_at.pop(mac, None)
             return True
         self._mark_peer_setup_pending(mac)
         device_label = f"{mac} ({self._hostname_from_device(current) or '?'})"
@@ -1024,8 +1112,7 @@ class BluetoothNodeRuntimeMixin:
                 self._set_peer_time_status(mac, "failed", "trust")
                 return False
         if current.trusted and (current.paired or current.bonded):
-            self._clear_peer_setup_state(mac)
-            self._set_peer_time_status(mac, "paired")
+            self._peer_pair_requested_at.pop(mac, None)
             return True
         now = time.monotonic()
         last_attempt = self._peer_pair_requested_at.get(mac, 0.0)
@@ -1222,10 +1309,12 @@ class BluetoothNodeRuntimeMixin:
         )
         if mac in self._peer_repair_reasons:
             self._progress_peer_repair(mac, device)
+            self._update_scan_state(reason=f"device event {mac} repair")
             return
         if not device.connected:
             self._log_verbose(f"Removing peer runtime state for disconnected device {mac}")
             self._drop_peer_runtime_state(mac)
+            self._update_scan_state(reason=f"device event {mac} disconnected")
             return
         whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
         whitelist_enabled = bool(whitelist_names or whitelist_macs)
@@ -1237,6 +1326,7 @@ class BluetoothNodeRuntimeMixin:
             retry_period = max(self.CONNECT_RETRY_MIN_S, float(self.get_parameter("auto_connect_period").value))
             self._log_verbose(f"Device event triggers peer maintenance for {mac}")
             self._maintain_peer_connection(mac, device, retry_period)
+        self._update_scan_state(reason=f"device event {mac}")
 
     def _handle_peer_writeback_event(self, desc_path: str, success: bool):
         if not desc_path:
