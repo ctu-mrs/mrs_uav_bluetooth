@@ -695,7 +695,7 @@ class BluetoothNodeRuntimeMixin:
                 self._auto_connect_attempts[mac] = time.monotonic()
                 self._mark_peer_setup_pending(mac)
                 self._log_verbose(f"Auto-connect attempt: {device_label}")
-                if not self._client.connect_async(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
+                if not self._client.connect(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
                     self._log_verbose(f"Auto-connect request rejected: {device_label}")
             self._update_scan_state(snapshot, reason="auto-connect tick")
         except dbus.exceptions.DBusException as exc:
@@ -775,7 +775,7 @@ class BluetoothNodeRuntimeMixin:
         self._mark_peer_setup_pending(mac)
         if not current.connected:
             self._log_verbose(f"Pair repair waiting for reconnect: {device_label} reason={reason}")
-            if self._client.connect_async(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
+            if self._client.connect(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
                 self._set_peer_time_status(mac, "repairing", reason)
                 self._log_verbose(f"Reconnect requested for {device_label}")
             else:
@@ -788,7 +788,7 @@ class BluetoothNodeRuntimeMixin:
                 self._log_verbose(f"Pair repair pending pair completion for {device_label}")
                 return False
             self._peer_pair_requested_at[mac] = time.monotonic()
-            if self._client.pair_async(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
+            if self._client.pair(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
                 self._set_peer_time_status(mac, "repairing", reason)
                 self._log_verbose(f"Pair requested for repair on {device_label}")
             else:
@@ -823,7 +823,7 @@ class BluetoothNodeRuntimeMixin:
         device: DeviceInfo = None,
         *,
         reason: str = "",
-        remove_pairing: bool = False,
+        remove_pairing: bool = True,
         untrust: bool = True,
     ):
         current = device or self._client.get_device(mac, refresh=True)
@@ -832,7 +832,7 @@ class BluetoothNodeRuntimeMixin:
             f"Clearing local peer state for {device_label}: reason={reason or 'n/a'} "
             f"remove_pairing={remove_pairing} untrust={untrust}"
         )
-        self._client.disconnect_async(mac)
+        self._client.disconnect(mac)
         had_pairing_state = bool(current and (current.paired or current.bonded or current.trusted))
         if untrust and had_pairing_state and bool(current and current.trusted):
             if self._client.untrust(mac):
@@ -1118,7 +1118,7 @@ class BluetoothNodeRuntimeMixin:
         self._log_verbose(
             f"Security state for {device_label}: paired={current.paired} trusted={current.trusted} bonded={current.bonded}"
         )
-        if self._client.pair_async(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
+        if self._client.pair(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
             self._log_verbose(f"Pair requested for {device_label}")
             return False
         self.get_logger().warning(f"Repairing peer {mac}: pair request rejected, clearing stale local bond")
@@ -1233,7 +1233,7 @@ class BluetoothNodeRuntimeMixin:
             sent = getattr(self, "_peer_writeback_last_sent", {})
             sent[desc_path] = payload
             self._peer_writeback_last_sent = sent
-        if self._client.write_characteristic_async(desc_path, payload, with_response=False):
+        if self._client.write_characteristic(desc_path, payload, with_response=False):
             return
         with self._peer_writeback_lock:
             self._peer_writeback_inflight.discard(desc_path)
@@ -1486,7 +1486,7 @@ class BluetoothNodeRuntimeMixin:
                 if not device.connected:
                     continue
                 try:
-                    self._client.disconnect_async(device.mac)
+                    self._client.disconnect(device.mac)
                 except Exception:
                     pass
         for state in self._topic_exports.values():
