@@ -103,17 +103,37 @@ class SerializedDbusQueue:
         *args,
         timeout: float = 30.0,
         wait: bool = False,
+        release_on_submit: bool = False,
         on_reply=None,
         on_error=None,
     ):
         def _runner(request):
+            def _invoke_callback(callback, *callback_args):
+                if callback is None:
+                    return
+                try:
+                    callback(*callback_args)
+                except Exception as exc:
+                    self._logger.warning(f"DBus callback failed while handling {request.operation}: {exc}")
+                    self._log_verbose(f"DBus callback failure operation={request.operation} error={exc}")
+
             try:
                 method(
                     *args,
-                    reply_handler=lambda *reply_args: self._finish(request, reply=reply_args),
-                    error_handler=lambda error: self._finish(request, error=error),
+                    reply_handler=(
+                        (lambda *reply_args: _invoke_callback(request.on_reply, *reply_args))
+                        if release_on_submit
+                        else (lambda *reply_args: self._finish(request, reply=reply_args))
+                    ),
+                    error_handler=(
+                        (lambda error: _invoke_callback(request.on_error, error))
+                        if release_on_submit
+                        else (lambda error: self._finish(request, error=error))
+                    ),
                     timeout=timeout,
                 )
+                if release_on_submit:
+                    self._finish(request, reply=())
             except Exception as exc:
                 self._finish(request, error=exc)
 
