@@ -1307,8 +1307,10 @@ class BluetoothNodeRuntimeMixin:
             return
         if not device.connected:
             self._log_verbose(f"Removing peer runtime state for disconnected device {mac}")
-            #self._drop_peer_runtime_state(mac)
-            self._clear_peer_local_state(mac, device=device, reason="Client disconnection event")
+            if not device.paired:
+                self._drop_peer_runtime_state(mac)
+            else:
+                self._clear_peer_local_state(mac, device=device, reason="Unpairing on disconnection event")
             self._update_scan_state(reason=f"device event {mac} disconnected and unpaired")
             return
         whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
