@@ -239,6 +239,26 @@ class BluetoothNodeRuntimeMixin:
             return True
         return has_disconnected_target or not has_known_target
 
+    def _should_defer_scan_refresh(self, snapshot: Dict[str, DeviceInfo] = None) -> bool:
+        if self._client is None:
+            return False
+
+        snapshot = snapshot or self._client.get_devices()
+        whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
+        whitelist_enabled = bool(whitelist_names or whitelist_macs)
+        pattern = str(self.get_parameter("auto_connect_pattern").value)
+
+        for mac, device in snapshot.items():
+            peer_candidate = self._is_uav_peer_candidate(device, pattern)
+            explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
+            should_connect = explicit_target or (peer_candidate and not whitelist_enabled)
+            if not should_connect or not device.connected:
+                continue
+            state = self._peer_status.get(mac)
+            if state is None or state.status != "ready":
+                return True
+        return False
+
     def _update_scan_state(self, snapshot: Dict[str, DeviceInfo] = None, *, reason: str = ""):
         if self._client is None:
             return
@@ -388,8 +408,11 @@ class BluetoothNodeRuntimeMixin:
             return
         try:
             self._check_overlay_config_lease()
-            snapshot = self._client.get_devices(refresh=True)
-            snapshot = self._enforce_peer_connection_policy(snapshot=snapshot, reason="scan policy tick")
+            cached_snapshot = self._client.get_devices(refresh=False)
+            defer_scan_refresh = self._should_defer_scan_refresh(cached_snapshot)
+            snapshot = self._client.get_devices(refresh=not defer_scan_refresh)
+            if not defer_scan_refresh:
+                snapshot = self._enforce_peer_connection_policy(snapshot=snapshot, reason="scan policy tick")
             self._progress_peer_repairs(snapshot)
             self._sync_auto_import_bridges(snapshot)
             self._reconcile_import_bridges(snapshot)
@@ -399,7 +422,10 @@ class BluetoothNodeRuntimeMixin:
             self.devices_pub.publish(msg)
             self._refresh_notification_mapping(snapshot)
             self._cleanup_peer_time_bridges(snapshot)
-            self._log_verbose(f"Scan results: {len(snapshot)} device(s)")
+            if defer_scan_refresh:
+                self._log_verbose("Scan refresh deferred: peer setup still in progress")
+            else:
+                self._log_verbose(f"Scan results: {len(snapshot)} device(s)")
             self._log_discovered_devices_summary(
                 snapshot,
                 pattern=str(self.get_parameter("auto_connect_pattern").value),
@@ -635,7 +661,8 @@ class BluetoothNodeRuntimeMixin:
             whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
             whitelist_enabled = bool(whitelist_names or whitelist_macs)
             pattern = str(self.get_parameter("auto_connect_pattern").value)
-            snapshot = self._client.get_devices(refresh=True)
+            cached_snapshot = self._client.get_devices(refresh=False)
+            snapshot = self._client.get_devices(refresh=not self._should_defer_scan_refresh(cached_snapshot))
             self._prune_peer_runtime_state(snapshot)
             self._log_verbose(
                 f"Auto-connect tick: {len(snapshot)} device(s), "
