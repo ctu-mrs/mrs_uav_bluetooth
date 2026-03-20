@@ -56,6 +56,8 @@ class BluetoothNodeRuntimeMixin:
     DISCONNECT_TIMEOUT_S = 5.0
     PAIR_REQUEST_TIMEOUT_S = 12.0
     PEER_SETUP_TIMEOUT_S = 30.0
+    PEER_GATT_LOOKUP_TIMEOUT_S = 2.0
+    PEER_GATT_LOOKUP_INTERVAL_S = 0.2
     LIVE_BRIDGE_IDLE_TIMEOUT_S = 20.0
     PAIRING_REPAIR_COOLDOWN_S = 20.0
     WRITEBACK_RETRY_DELAY_S = 1.0
@@ -219,7 +221,7 @@ class BluetoothNodeRuntimeMixin:
 
         has_known_target = False
         has_disconnected_target = False
-        has_connected_target_pending = False
+        has_connected_target = False
         has_ready_target = False
 
         for mac, device in snapshot.items():
@@ -232,12 +234,12 @@ class BluetoothNodeRuntimeMixin:
             if not device.connected:
                 has_disconnected_target = True
                 continue
+            has_connected_target = True
             if self._has_live_peer_time_bridge(mac):
                 has_ready_target = True
-                continue
-            has_connected_target_pending = True
+            continue
 
-        if has_connected_target_pending:
+        if has_connected_target:
             return False
         if has_disconnected_target:
             return True
@@ -938,10 +940,37 @@ class BluetoothNodeRuntimeMixin:
             pass
         return (time.monotonic() - state.last_activity_monotonic) <= max(1.0, float(idle_timeout_s))
 
+    def _resolve_peer_characteristic_path(
+        self,
+        mac: str,
+        characteristic_uuid: str,
+        *,
+        lookup_timeout_s: float = None,
+    ) -> str:
+        if self._client is None:
+            return ""
+        timeout_s = self.PEER_GATT_LOOKUP_TIMEOUT_S if lookup_timeout_s is None else max(0.0, float(lookup_timeout_s))
+        deadline = time.monotonic() + timeout_s
+
+        while True:
+            candidates = self._client.find_characteristics(mac, characteristic_uuid)
+            if candidates:
+                return candidates[0]
+
+            current = self._client.get_device(mac, refresh=True)
+            if current is None or not current.connected:
+                return ""
+            if not current.services_resolved:
+                return ""
+            if time.monotonic() >= deadline:
+                return ""
+
+            time.sleep(min(self.PEER_GATT_LOOKUP_INTERVAL_S, max(0.0, deadline - time.monotonic())))
+
     def _ensure_peer_services_resolved(self, mac: str, device: DeviceInfo, *, device_label: str) -> bool:
         if self._has_live_peer_time_bridge(mac):
             return True
-        if device.services_resolved or self._resolve_peer_time_characteristic_path(mac):
+        if device.services_resolved or self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID):
             return True
         wait_started = self._mark_peer_setup_pending(mac)
         self._set_peer_time_status(
@@ -954,20 +983,10 @@ class BluetoothNodeRuntimeMixin:
         return False
 
     def _resolve_peer_time_characteristic_path(self, mac: str) -> str:
-        candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
-        if candidates:
-            return candidates[0]
-        self._client.get_device(mac, refresh=True)
-        candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
-        return candidates[0] if candidates else ""
+        return self._resolve_peer_characteristic_path(mac, TIME_CHARACTERISTIC_UUID)
 
     def _resolve_peer_time_writeback_path(self, mac: str) -> str:
-        candidates = self._client.find_characteristics(mac, TIME_WRITE_CHARACTERISTIC_UUID)
-        if candidates:
-            return candidates[0]
-        self._client.get_device(mac, refresh=True)
-        candidates = self._client.find_characteristics(mac, TIME_WRITE_CHARACTERISTIC_UUID)
-        return candidates[0] if candidates else ""
+        return self._resolve_peer_characteristic_path(mac, TIME_WRITE_CHARACTERISTIC_UUID)
 
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> bool:
         current = self._client.get_device(mac, refresh=True) or device
