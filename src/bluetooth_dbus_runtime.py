@@ -60,6 +60,7 @@ class SerializedDbusQueue:
             self.completed = threading.Event()
             self.reply = ()
             self.error = None
+            self.timer = None
 
     def __init__(self, dispatcher: Callable[[Callable[[], None]], None], logger: Any, log_verbose: Callable[[str], None]):
         self._dispatcher = dispatcher
@@ -123,6 +124,9 @@ class SerializedDbusQueue:
         with self._lock:
             self._pending.append(request)
             should_dispatch = self._active is None
+        request.timer = threading.Timer(max(1.0, float(timeout)) + 0.5, lambda: self._expire(request))
+        request.timer.daemon = True
+        request.timer.start()
         if should_dispatch:
             self._dispatcher(self._pump)
         if not wait:
@@ -147,8 +151,12 @@ class SerializedDbusQueue:
                 return
             request.reply = reply or ()
             request.error = error
+            timer = request.timer
+            request.timer = None
             if self._active is request:
                 self._active = None
+        if timer is not None:
+            timer.cancel()
         try:
             if error is not None:
                 if request.on_error is not None:
@@ -160,6 +168,12 @@ class SerializedDbusQueue:
             self._log_verbose(f"DBus callback failure operation={request.operation} error={exc}")
         request.completed.set()
         self._dispatcher(self._pump)
+
+    def _expire(self, request):
+        message = f"Timed out while waiting to {request.operation}"
+        self._logger.warning(message)
+        self._log_verbose(f"DBus queue timeout operation={request.operation}")
+        self._finish(request, error=TimeoutError(message))
 
 
 class BluetoothDbusRuntime:

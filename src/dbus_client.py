@@ -851,7 +851,10 @@ class BleClient:
     def _run_serialized(self, func: Callable[[], object], operation: str, *, timeout: float = 30.0):
         if self._dbus_queue is None:
             return func()
-        reply = self._dbus_queue.submit_call(func, operation, timeout=timeout, wait=True)
+        try:
+            reply = self._dbus_queue.submit_call(func, operation, timeout=timeout, wait=True)
+        except TimeoutError:
+            return func()
         if not reply:
             return None
         if len(reply) == 1:
