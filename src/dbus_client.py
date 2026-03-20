@@ -2,7 +2,7 @@
 
 import threading
 import time
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import dbus
 
@@ -22,6 +22,9 @@ from .dbus_common import (
     decode_byte_dict,
     decode_manufacturer_dict,
 )
+
+if TYPE_CHECKING:
+    from .bluetooth_dbus_runtime import SerializedDbusQueue
 
 
 class DeviceInfo:
@@ -85,12 +88,13 @@ class DeviceInfo:
 
 
 class BleClient:
-    def __init__(self, bus: dbus.SystemBus, adapter_path: str):
+    def __init__(self, bus: dbus.SystemBus, adapter_path: str, dbus_queue: Optional["SerializedDbusQueue"] = None):
         self._bus = bus
         self._adapter_path = adapter_path
         self._adapter = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), ADAPTER_IFACE)
         self._adapter_props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), DBUS_PROP_IFACE)
         self._object_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
+        self._dbus_queue = dbus_queue
         self._devices: Dict[str, DeviceInfo] = {}
         self._lock = threading.RLock()
         self._scan_running = False
@@ -151,7 +155,10 @@ class BleClient:
         if not cached or not cached.path:
             return cached
         try:
-            props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, cached.path), DBUS_PROP_IFACE).GetAll(DEVICE_IFACE)
+            props = self._run_serialized(
+                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, cached.path), DBUS_PROP_IFACE).GetAll(DEVICE_IFACE),
+                f"refresh device {mac}",
+            )
         except dbus.DBusException:
             with self._lock:
                 device = self._devices.get(mac.upper())
@@ -164,12 +171,16 @@ class BleClient:
         return self.get_device(mac)
 
     def get_adapter_info(self):
-        props = self._adapter_props.GetAll(ADAPTER_IFACE)
+        props = self._run_serialized(lambda: self._adapter_props.GetAll(ADAPTER_IFACE), "get adapter info", timeout=10.0)
         return {str(key): props[key] for key in props.keys()}
 
     def set_adapter_property(self, prop: str, value) -> bool:
         try:
-            self._adapter_props.Set(ADAPTER_IFACE, prop, value)
+            self._run_serialized(
+                lambda: self._adapter_props.Set(ADAPTER_IFACE, prop, value),
+                f"set adapter property {prop}",
+                timeout=10.0,
+            )
             return True
         except dbus.DBusException:
             return False
@@ -191,8 +202,14 @@ class BleClient:
         if auto_connect is not None:
             filters["AutoConnect"] = dbus.Boolean(auto_connect)
         try:
-            self._adapter.SetDiscoveryFilter(dbus_dict(filters))
-            self._adapter.StartDiscovery()
+            self._run_serialized(
+                lambda: (
+                    self._adapter.SetDiscoveryFilter(dbus_dict(filters)),
+                    self._adapter.StartDiscovery(),
+                ),
+                "start BLE discovery",
+                timeout=10.0,
+            )
             self._scan_running = True
             return True
         except dbus.DBusException as exc:
@@ -203,7 +220,7 @@ class BleClient:
 
     def stop_scan(self) -> bool:
         try:
-            self._adapter.StopDiscovery()
+            self._run_serialized(self._adapter.StopDiscovery, "stop BLE discovery", timeout=10.0)
             self._scan_running = False
             return True
         except dbus.DBusException as exc:
@@ -238,13 +255,47 @@ class BleClient:
             time.sleep(0.3)
         return False
 
+    def wait_for_descriptors(
+        self,
+        mac: str,
+        *,
+        descriptor_uuids: Optional[List[str]] = None,
+        chrc_path: Optional[str] = None,
+        timeout: float = 5.0,
+        settle_delay_s: float = 0.2,
+    ) -> bool:
+        expected = {str(item).lower() for item in (descriptor_uuids or []) if str(item).strip()}
+        deadline = time.time() + max(0.1, float(timeout))
+        if settle_delay_s > 0:
+            time.sleep(float(settle_delay_s))
+        while time.time() < deadline:
+            descriptors = self.list_descriptors(mac, chrc_path=chrc_path)
+            if expected:
+                available = {str(item.get("uuid", "")).lower() for item in descriptors}
+                if expected.issubset(available):
+                    return True
+            elif descriptors:
+                return True
+            self.get_device(mac, refresh=True)
+            time.sleep(0.25)
+        descriptors = self.list_descriptors(mac, chrc_path=chrc_path)
+        if expected:
+            available = {str(item.get("uuid", "")).lower() for item in descriptors}
+            return expected.issubset(available)
+        return bool(descriptors)
+
     def connect(self, mac: str, timeout: float = 15.0) -> bool:
         device = self._find_device_obj(mac)
         if device is None:
             return False
         try:
             # Bound the DBus method call itself so this helper cannot block indefinitely.
-            device.Connect(timeout=max(1.0, min(float(timeout), 6.0)))
+            call_timeout = max(1.0, min(float(timeout), 6.0))
+            self._run_serialized(
+                lambda: device.Connect(timeout=call_timeout),
+                f"connect {mac}",
+                timeout=call_timeout,
+            )
         except dbus.DBusException as exc:
             message = str(exc)
             if (
@@ -266,11 +317,7 @@ class BleClient:
         if device is None:
             return False
         try:
-            device.Connect(
-                reply_handler=lambda *_: None,
-                error_handler=lambda *_: None,
-                timeout=max(1.0, float(timeout)),
-            )
+            self._run_async_method(device.Connect, f"connect {mac}", timeout=max(1.0, float(timeout)))
             return True
         except dbus.DBusException as exc:
             message = str(exc)
@@ -287,7 +334,7 @@ class BleClient:
         if device is None:
             return True
         try:
-            device.Disconnect()
+            self._run_serialized(device.Disconnect, f"disconnect {mac}", timeout=max(1.0, float(timeout)))
         except dbus.DBusException:
             pass
         deadline = time.time() + timeout
@@ -303,10 +350,7 @@ class BleClient:
         if device is None:
             return True
         try:
-            device.Disconnect(
-                reply_handler=lambda *_: None,
-                error_handler=lambda *_: None,
-            )
+            self._run_async_method(device.Disconnect, f"disconnect {mac}")
             return True
         except dbus.DBusException:
             return False
@@ -317,7 +361,12 @@ class BleClient:
             return False
         try:
             # Keep Pair() bounded so one problematic peer cannot block the caller indefinitely.
-            device.Pair(timeout=max(2.0, min(float(timeout), 8.0)))
+            call_timeout = max(2.0, min(float(timeout), 8.0))
+            self._run_serialized(
+                lambda: device.Pair(timeout=call_timeout),
+                f"pair {mac}",
+                timeout=call_timeout,
+            )
         except dbus.DBusException as exc:
             message = str(exc)
             if (
@@ -340,9 +389,9 @@ class BleClient:
         if device is None:
             return False
         try:
-            device.Pair(
-                reply_handler=lambda *_: None,
-                error_handler=lambda *_: None,
+            self._run_async_method(
+                device.Pair,
+                f"pair {mac}",
                 timeout=max(2.0, min(float(timeout), 12.0)),
             )
             return True
@@ -368,7 +417,11 @@ class BleClient:
         if not device or not device.path:
             return False
         try:
-            self._adapter.RemoveDevice(dbus.ObjectPath(device.path))
+            self._run_serialized(
+                lambda: self._adapter.RemoveDevice(dbus.ObjectPath(device.path)),
+                f"remove device {mac}",
+                timeout=10.0,
+            )
             with self._lock:
                 self._devices.pop(mac.upper(), None)
             return True
@@ -464,8 +517,12 @@ class BleClient:
 
     def read_characteristic(self, chrc_path: str) -> Optional[bytes]:
         try:
-            characteristic = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE)
-            value = bytes_from_variant(characteristic.ReadValue({}))
+            value = self._run_serialized(
+                lambda: bytes_from_variant(
+                    dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE).ReadValue({})
+                ),
+                f"read characteristic {chrc_path}",
+            )
             self._emit_gatt("client_read", chrc_path=chrc_path, value=value)
             return value
         except dbus.DBusException as exc:
@@ -474,9 +531,14 @@ class BleClient:
 
     def write_characteristic(self, chrc_path: str, data: bytes, with_response=True) -> bool:
         try:
-            characteristic = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE)
             options = {"type": dbus.String("request" if with_response else "command")}
-            characteristic.WriteValue(dbus_byte_array(data), dbus_dict(options))
+            self._run_serialized(
+                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE).WriteValue(
+                    dbus_byte_array(data),
+                    dbus_dict(options),
+                ),
+                f"write characteristic {chrc_path}",
+            )
             self._emit_gatt("client_write", chrc_path=chrc_path, value=data, with_response=with_response)
             return True
         except dbus.DBusException as exc:
@@ -494,12 +556,14 @@ class BleClient:
             def _error_handler(error):
                 self._emit_gatt("client_write_failed", chrc_path=chrc_path, error=str(error), with_response=with_response)
 
-            characteristic.WriteValue(
+            self._run_async_method(
+                characteristic.WriteValue,
+                f"write characteristic {chrc_path}",
                 dbus_byte_array(data),
                 dbus_dict(options),
-                reply_handler=_reply_handler,
-                error_handler=_error_handler,
                 timeout=timeout,
+                on_reply=_reply_handler,
+                on_error=_error_handler,
             )
             return True
         except dbus.DBusException as exc:
@@ -508,8 +572,12 @@ class BleClient:
 
     def read_descriptor(self, desc_path: str) -> Optional[bytes]:
         try:
-            descriptor = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, desc_path), GATT_DESC_IFACE)
-            value = bytes_from_variant(descriptor.ReadValue({}))
+            value = self._run_serialized(
+                lambda: bytes_from_variant(
+                    dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, desc_path), GATT_DESC_IFACE).ReadValue({})
+                ),
+                f"read descriptor {desc_path}",
+            )
             self._emit_gatt("client_descriptor_read", desc_path=desc_path, value=value)
             return value
         except dbus.DBusException as exc:
@@ -518,8 +586,13 @@ class BleClient:
 
     def write_descriptor(self, desc_path: str, data: bytes) -> bool:
         try:
-            descriptor = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, desc_path), GATT_DESC_IFACE)
-            descriptor.WriteValue(dbus_byte_array(data), dbus_dict({}))
+            self._run_serialized(
+                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, desc_path), GATT_DESC_IFACE).WriteValue(
+                    dbus_byte_array(data),
+                    dbus_dict({}),
+                ),
+                f"write descriptor {desc_path}",
+            )
             self._emit_gatt("client_descriptor_write", desc_path=desc_path, value=data)
             return True
         except dbus.DBusException as exc:
@@ -536,12 +609,14 @@ class BleClient:
             def _error_handler(error):
                 self._emit_gatt("client_descriptor_write_failed", desc_path=desc_path, error=str(error))
 
-            descriptor.WriteValue(
+            self._run_async_method(
+                descriptor.WriteValue,
+                f"write descriptor {desc_path}",
                 dbus_byte_array(data),
                 dbus_dict({}),
-                reply_handler=_reply_handler,
-                error_handler=_error_handler,
                 timeout=timeout,
+                on_reply=_reply_handler,
+                on_error=_error_handler,
             )
             return True
         except dbus.DBusException as exc:
@@ -560,9 +635,10 @@ class BleClient:
 
     def start_notify(self, chrc_path: str) -> bool:
         try:
-            chrc_obj = self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path)
-            characteristic = dbus.Interface(chrc_obj, GATT_CHRC_IFACE)
-            characteristic.StartNotify()
+            self._run_serialized(
+                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE).StartNotify(),
+                f"start notify {chrc_path}",
+            )
             self._ensure_notify_match(chrc_path)
             self._emit_gatt("client_notify_enabled", chrc_path=chrc_path)
             return True
@@ -580,8 +656,10 @@ class BleClient:
 
     def stop_notify(self, chrc_path: str) -> bool:
         try:
-            characteristic = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE)
-            characteristic.StopNotify()
+            self._run_serialized(
+                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, chrc_path), GATT_CHRC_IFACE).StopNotify(),
+                f"stop notify {chrc_path}",
+            )
             match = self._notify_matches.pop(chrc_path, None)
             if match is not None:
                 match.remove()
@@ -610,7 +688,7 @@ class BleClient:
         return token
 
     def _managed_objects(self):
-        return self._object_manager.GetManagedObjects()
+        return self._run_serialized(self._object_manager.GetManagedObjects, "read managed objects", timeout=10.0)
 
     def _populate_known_devices(self):
         for path, ifaces in self._managed_objects().items():
@@ -738,7 +816,7 @@ class BleClient:
             return False
         try:
             props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device.path), DBUS_PROP_IFACE)
-            props.Set(DEVICE_IFACE, prop, value)
+            self._run_serialized(lambda: props.Set(DEVICE_IFACE, prop, value), f"set {prop} for {mac}", timeout=10.0)
             return True
         except dbus.DBusException:
             return False
@@ -760,10 +838,44 @@ class BleClient:
 
     def _resolve_uuid(self, path: str, interface: str) -> str:
         try:
-            props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, path), DBUS_PROP_IFACE)
-            return str(props.Get(interface, "UUID"))
+            return str(
+                self._run_serialized(
+                    lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, path), DBUS_PROP_IFACE).Get(interface, "UUID"),
+                    f"resolve UUID for {path}",
+                    timeout=10.0,
+                )
+            )
         except Exception:
             return ""
+
+    def _run_serialized(self, func: Callable[[], object], operation: str, *, timeout: float = 30.0):
+        if self._dbus_queue is None:
+            return func()
+        reply = self._dbus_queue.submit_call(func, operation, timeout=timeout, wait=True)
+        if not reply:
+            return None
+        if len(reply) == 1:
+            return reply[0]
+        return reply
+
+    def _run_async_method(self, method, operation: str, *args, timeout: float = 30.0, on_reply=None, on_error=None):
+        if self._dbus_queue is None:
+            method(
+                *args,
+                reply_handler=on_reply or (lambda *_: None),
+                error_handler=on_error or (lambda *_: None),
+                timeout=timeout,
+            )
+            return True
+        return self._dbus_queue.submit_async_method(
+            method,
+            operation,
+            *args,
+            timeout=timeout,
+            wait=False,
+            on_reply=on_reply,
+            on_error=on_error,
+        )
 
     def _emit_gatt(self, event_type: str, **kw):
         for cb in list(self._gatt_event_cbs.values()):

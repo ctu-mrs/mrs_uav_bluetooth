@@ -64,6 +64,8 @@ class BluetoothNodeRuntimeMixin:
     WRITEBACK_RETRY_DELAY_S = 1.0
     TIME_WRITEBACK_WARNING_INTERVAL_S = 5.0
     LOG_PAYLOAD_PREVIEW_BYTES = 24
+    DESCRIPTOR_DISCOVERY_TIMEOUT_S = 5.0
+    DESCRIPTOR_SETTLE_DELAY_S = 0.2
 
     def _ensure_core_publishers(self):
         if self.devices_pub is not None:
@@ -884,6 +886,22 @@ class BluetoothNodeRuntimeMixin:
         candidates = self._client.find_characteristics(mac, TIME_CHARACTERISTIC_UUID)
         return candidates[0] if candidates else ""
 
+    def _wait_for_peer_descriptors(self, mac: str, *, chrc_path: str = None, descriptor_uuids=None, label: str = "") -> bool:
+        if self._client is None:
+            return False
+        ready = self._client.wait_for_descriptors(
+            mac,
+            descriptor_uuids=list(descriptor_uuids or []),
+            chrc_path=chrc_path,
+            timeout=self.DESCRIPTOR_DISCOVERY_TIMEOUT_S,
+            settle_delay_s=self.DESCRIPTOR_SETTLE_DELAY_S,
+        )
+        if not ready:
+            expected = ",".join(descriptor_uuids or []) or "any"
+            target = label or chrc_path or mac
+            self._log_verbose(f"Descriptor discovery still incomplete for {target}: expected={expected}")
+        return ready
+
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> bool:
         current = self._client.get_device(mac, refresh=True) or device
         device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
@@ -908,6 +926,12 @@ class BluetoothNodeRuntimeMixin:
                 wait_grace_s=self.PEER_SETUP_TIMEOUT_S,
             )
             return False
+        self._wait_for_peer_descriptors(
+            mac,
+            chrc_path=path,
+            descriptor_uuids=[TIME_WRITEBACK_DESCRIPTOR_UUID],
+            label=f"time bridge {device_label}",
+        )
         writeback_descriptor_path = self._client.find_descriptor(mac, TIME_WRITEBACK_DESCRIPTOR_UUID, chrc_path=path) or ""
         peer_name = self._peer_name_token(mac, device=device)
         status_topic_name = self._resolve_peer_topic_name(mac, "/time_status", device=device)
@@ -953,6 +977,12 @@ class BluetoothNodeRuntimeMixin:
             self._log_verbose(f"Time notify still pending for {device_label}: path={path}")
             return False
         state.characteristic_path = path
+        self._wait_for_peer_descriptors(
+            mac,
+            chrc_path=path,
+            descriptor_uuids=[TIME_WRITEBACK_DESCRIPTOR_UUID],
+            label=f"time bridge {device_label}",
+        )
         state.writeback_descriptor_path = self._client.find_descriptor(
             mac,
             TIME_WRITEBACK_DESCRIPTOR_UUID,
@@ -1394,6 +1424,11 @@ class BluetoothNodeRuntimeMixin:
             "rate_hz": topic_bridge_metadata_descriptor_uuid(bridge_name, "rate_hz"),
             "key": topic_bridge_metadata_descriptor_uuid(bridge_name, "key"),
         }
+        self._wait_for_peer_descriptors(
+            mac,
+            descriptor_uuids=list(metadata_specs.values()),
+            label=f"bridge metadata {bridge_name}",
+        )
         raw_values = {}
         for key, descriptor_uuid in metadata_specs.items():
             path = self._client.find_descriptor(mac, descriptor_uuid)

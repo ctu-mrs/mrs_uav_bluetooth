@@ -1,7 +1,9 @@
 """DBus lifecycle helpers used by the ROS Bluetooth node."""
 
+from collections import deque
 import threading
-from typing import Any, Callable, Dict, Optional
+import time
+from typing import Any, Callable, Deque, Dict, Optional
 
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
@@ -36,11 +38,135 @@ class GlibMainLoopThread:
         self._mainloop = None
         self._thread = None
 
+    def invoke(self, callback: Callable[[], None]):
+        if self._mainloop is None:
+            raise RuntimeError("GLib main loop is not running")
+
+        def _run_once():
+            callback()
+            return False
+
+        GLib.idle_add(_run_once)
+
+
+class SerializedDbusQueue:
+    class _Request:
+        def __init__(self, runner, operation: str, timeout: float, on_reply=None, on_error=None):
+            self.runner = runner
+            self.operation = operation
+            self.timeout = timeout
+            self.on_reply = on_reply
+            self.on_error = on_error
+            self.completed = threading.Event()
+            self.reply = ()
+            self.error = None
+
+    def __init__(self, dispatcher: Callable[[Callable[[], None]], None], logger: Any, log_verbose: Callable[[str], None]):
+        self._dispatcher = dispatcher
+        self._logger = logger
+        self._log_verbose = log_verbose
+        self._lock = threading.RLock()
+        self._pending: Deque[SerializedDbusQueue._Request] = deque()
+        self._active = None
+
+    def submit_call(
+        self,
+        func: Callable[[], Any],
+        operation: str,
+        *,
+        timeout: float = 30.0,
+        wait: bool = False,
+        on_reply=None,
+        on_error=None,
+    ):
+        def _runner(request):
+            try:
+                reply = func()
+            except Exception as exc:
+                self._finish(request, error=exc)
+                return
+            if reply is None:
+                reply_args = ()
+            elif isinstance(reply, tuple):
+                reply_args = reply
+            else:
+                reply_args = (reply,)
+            self._finish(request, reply=reply_args)
+
+        return self._submit(_runner, operation, timeout=timeout, wait=wait, on_reply=on_reply, on_error=on_error)
+
+    def submit_async_method(
+        self,
+        method,
+        operation: str,
+        *args,
+        timeout: float = 30.0,
+        wait: bool = False,
+        on_reply=None,
+        on_error=None,
+    ):
+        def _runner(request):
+            try:
+                method(
+                    *args,
+                    reply_handler=lambda *reply_args: self._finish(request, reply=reply_args),
+                    error_handler=lambda error: self._finish(request, error=error),
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                self._finish(request, error=exc)
+
+        return self._submit(_runner, operation, timeout=timeout, wait=wait, on_reply=on_reply, on_error=on_error)
+
+    def _submit(self, runner, operation: str, *, timeout: float, wait: bool, on_reply=None, on_error=None):
+        request = self._Request(runner, operation, timeout, on_reply=on_reply, on_error=on_error)
+        with self._lock:
+            self._pending.append(request)
+            should_dispatch = self._active is None
+        if should_dispatch:
+            self._dispatcher(self._pump)
+        if not wait:
+            return True
+        if not request.completed.wait(max(1.0, float(timeout)) + 1.0):
+            raise TimeoutError(f"Timed out while waiting to {operation}")
+        if request.error is not None:
+            raise request.error
+        return request.reply
+
+    def _pump(self):
+        with self._lock:
+            if self._active is not None or not self._pending:
+                return
+            request = self._pending.popleft()
+            self._active = request
+        request.runner(request)
+
+    def _finish(self, request, *, reply=(), error=None):
+        with self._lock:
+            if request.completed.is_set():
+                return
+            request.reply = reply or ()
+            request.error = error
+            if self._active is request:
+                self._active = None
+        try:
+            if error is not None:
+                if request.on_error is not None:
+                    request.on_error(error)
+            elif request.on_reply is not None:
+                request.on_reply(*request.reply)
+        except Exception as exc:
+            self._logger.warning(f"DBus callback failed while handling {request.operation}: {exc}")
+            self._log_verbose(f"DBus callback failure operation={request.operation} error={exc}")
+        request.completed.set()
+        self._dispatcher(self._pump)
+
 
 class BluetoothDbusRuntime:
     _LEGACY_ADV_MAX_BYTES = 31
     _ADV_FLAGS_BYTES = 3
     _ADV_TX_POWER_BYTES = 3
+    _GATT_APPLICATION_SETTLE_S = 0.2
 
     def __init__(
         self,
@@ -64,6 +190,7 @@ class BluetoothDbusRuntime:
         self._wifi_service = None
         self._time_service = None
         self._pairing_agent_registered = False
+        self._dbus_queue = None
 
     @property
     def adapter_path(self) -> str:
@@ -103,8 +230,9 @@ class BluetoothDbusRuntime:
             raise RuntimeError("No Bluetooth adapter with GattManager1 found")
         self._logger.info(f"Using adapter {self._adapter_path}")
         self._glib.start()
+        self._dbus_queue = SerializedDbusQueue(self._glib.invoke, self._logger, self._log_verbose)
         self.set_adapter_props(powered=True)
-        self._client = BleClient(self._bus, self._adapter_path)
+        self._client = BleClient(self._bus, self._adapter_path, dbus_queue=self._dbus_queue)
 
     def ensure_pairing_agent(self, *, auto_accept: bool, auto_trust: bool, capability: str):
         self._require_setup()
@@ -205,6 +333,7 @@ class BluetoothDbusRuntime:
             app_registered = True
             self._app = app
             self._logger.info(f"GATT application registered ({service_index} services)")
+            time.sleep(self._GATT_APPLICATION_SETTLE_S)
 
             advertisement_registered = self._register_advertisement(ad_mgr, advertisement, service_uuids)
             if advertisement_registered:
@@ -460,31 +589,12 @@ class BluetoothDbusRuntime:
         self._bus = None
         self._adapter_path = ""
         self._agent = None
+        self._dbus_queue = None
 
     def _call_dbus_method_async(self, method, operation: str, *args, timeout: float = 30.0):
-        completed = threading.Event()
-        result = {}
-
-        def reply_handler(*reply_args):
-            result["reply"] = reply_args
-            completed.set()
-
-        def error_handler(error):
-            result["error"] = error
-            completed.set()
-
-        method(
-            *args,
-            reply_handler=reply_handler,
-            error_handler=error_handler,
-            timeout=timeout,
-        )
-        if not completed.wait(timeout + 1.0):
-            raise TimeoutError(f"Timed out while waiting to {operation}")
-        error = result.get("error")
-        if error is not None:
-            raise error
-        return result.get("reply", ())
+        if self._dbus_queue is None:
+            raise RuntimeError("Bluetooth DBus runtime queue is not initialized")
+        return self._dbus_queue.submit_async_method(method, operation, *args, timeout=timeout, wait=True)
 
     def _require_setup(self):
         if self._bus is None or not self._adapter_path:

@@ -62,6 +62,9 @@ class BluetoothNodeServiceMixin:
         if transport_endpoint == "descriptor":
             descriptor_uuid = topic_bridge_data_descriptor_uuid(candidate)
             path = self._client.find_descriptor(mac, descriptor_uuid)
+            if not path:
+                self._client.wait_for_descriptors(mac, descriptor_uuids=[descriptor_uuid], timeout=self.DESCRIPTOR_DISCOVERY_TIMEOUT_S, settle_delay_s=self.DESCRIPTOR_SETTLE_DELAY_S)
+                path = self._client.find_descriptor(mac, descriptor_uuid)
             if path:
                 return path, descriptor_uuid, transport_endpoint
         else:
@@ -72,6 +75,9 @@ class BluetoothNodeServiceMixin:
         resolved_uuid = resolve_uuid(candidate)
         if transport_endpoint == "descriptor":
             path = self._client.find_descriptor(mac, resolved_uuid)
+            if not path:
+                self._client.wait_for_descriptors(mac, descriptor_uuids=[resolved_uuid], timeout=self.DESCRIPTOR_DISCOVERY_TIMEOUT_S, settle_delay_s=self.DESCRIPTOR_SETTLE_DELAY_S)
+                path = self._client.find_descriptor(mac, resolved_uuid)
         else:
             path = self._client.find_characteristic(mac, resolved_uuid)
         return path or "", resolved_uuid, transport_endpoint
