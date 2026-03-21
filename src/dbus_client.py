@@ -97,6 +97,7 @@ class BleClient:
         self._gatt_characteristics: Dict[str, Dict[str, dict]] = {}
         self._gatt_descriptors: Dict[str, Dict[str, dict]] = {}
         self._lock = threading.RLock()
+        self._operation_lock = threading.RLock()
         self._scan_running = False
         self._notification_cbs: Dict[int, Callable] = {}
         self._next_ntf_token = 1
@@ -297,44 +298,14 @@ class BleClient:
             )
 
     def connect(self, mac: str, timeout: float = 15.0) -> bool:
+        del timeout
         device_path = self._find_device_path(mac)
         if not device_path:
             return False
         try:
-            # Bound the DBus method call itself so this helper cannot block indefinitely.
-            call_timeout = max(1.0, min(float(timeout), 6.0))
             self._run_serialized(
-                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Connect(
-                    timeout=call_timeout
-                ),
+                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Connect(),
                 f"connect {mac}",
-                timeout=call_timeout,
-            )
-        except dbus.DBusException as exc:
-            message = str(exc)
-            if (
-                "Already Connected" not in message
-                and "AlreadyConnected" not in message
-                and "InProgress" not in message
-            ):
-                return False
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            current = self.get_device(mac, refresh=True)
-            if current and current.connected:
-                return True
-            time.sleep(0.3)
-        return False
-
-    def connect_async(self, mac: str, timeout: float = 6.0) -> bool:
-        device_path = self._find_device_path(mac)
-        if not device_path:
-            return False
-        try:
-            self._run_async_method(
-                dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Connect,
-                f"connect {mac}",
-                timeout=max(1.0, float(timeout)),
             )
             return True
         except dbus.DBusException as exc:
@@ -345,7 +316,11 @@ class BleClient:
                 or "InProgress" in message
             ):
                 return True
-            return False
+            current = self.get_device(mac, refresh=True)
+            return bool(current and current.connected)
+
+    def connect_async(self, mac: str, timeout: float = 6.0) -> bool:
+        return self.connect(mac, timeout=timeout)
 
     def disconnect(self, mac: str, timeout: float = 10.0) -> bool:
         device_path = self._find_device_path(mac)
@@ -355,7 +330,6 @@ class BleClient:
             self._run_serialized(
                 lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Disconnect(),
                 f"disconnect {mac}",
-                timeout=max(1.0, float(timeout)),
             )
         except dbus.DBusException:
             pass
@@ -368,58 +342,17 @@ class BleClient:
         return False
 
     def disconnect_async(self, mac: str) -> bool:
-        device_path = self._find_device_path(mac)
-        if not device_path:
-            return True
-        try:
-            self._run_async_method(
-                dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Disconnect,
-                f"disconnect {mac}",
-            )
-            return True
-        except dbus.DBusException:
-            return False
+        return self.disconnect(mac)
 
     def pair(self, mac: str, timeout: float = 30.0) -> bool:
+        del timeout
         device_path = self._find_device_path(mac)
         if not device_path:
             return False
         try:
-            # Keep Pair() bounded so one problematic peer cannot block the caller indefinitely.
-            call_timeout = max(2.0, min(float(timeout), 8.0))
             self._run_serialized(
-                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Pair(
-                    timeout=call_timeout
-                ),
+                lambda: dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Pair(),
                 f"pair {mac}",
-                timeout=call_timeout,
-            )
-        except dbus.DBusException as exc:
-            message = str(exc)
-            if (
-                "AlreadyExists" not in message
-                and "Already Paired" not in message
-                and "AlreadyPaired" not in message
-                and "InProgress" not in message
-            ):
-                return False
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            current = self.get_device(mac, refresh=True)
-            if current and current.paired:
-                return True
-            time.sleep(0.5)
-        return False
-
-    def pair_async(self, mac: str, timeout: float = 10.0) -> bool:
-        device_path = self._find_device_path(mac)
-        if not device_path:
-            return False
-        try:
-            self._run_async_method(
-                dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, device_path), DEVICE_IFACE).Pair,
-                f"pair {mac}",
-                timeout=max(2.0, min(float(timeout), 12.0)),
             )
             return True
         except dbus.DBusException as exc:
@@ -431,7 +364,11 @@ class BleClient:
                 or "InProgress" in message
             ):
                 return True
-            return False
+            current = self.get_device(mac, refresh=True)
+            return bool(current and current.paired)
+
+    def pair_async(self, mac: str, timeout: float = 10.0) -> bool:
+        return self.pair(mac, timeout=timeout)
 
     def trust(self, mac: str) -> bool:
         return self._set_device_prop(mac, "Trusted", dbus.Boolean(True))
@@ -1133,14 +1070,15 @@ class BleClient:
 
     def _run_serialized(self, func: Callable[[], object], operation: str, *, timeout: float = 30.0):
         del operation
-        if self._call_sync is None:
+        del timeout
+        with self._operation_lock:
             return func()
-        return self._call_sync(func, timeout)
 
     def _run_async_method(self, method, operation: str, *args, timeout: float = 30.0, on_reply=None, on_error=None):
         del operation
+        del timeout
         try:
-            result = self._run_serialized(lambda: method(*args, timeout=timeout), "dbus async method", timeout=timeout)
+            result = self._run_serialized(lambda: method(*args), "dbus async method")
         except dbus.DBusException as exc:
             if on_error is not None:
                 on_error(exc)

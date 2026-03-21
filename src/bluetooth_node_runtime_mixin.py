@@ -1216,35 +1216,23 @@ class BluetoothNodeRuntimeMixin:
             self._log_verbose(f"Peer {device_label}: active time bridge already proves remote GATT usability")
             self._clear_peer_connect_tracking(mac)
             return True
-        if self._client.refresh_gatt(mac) and self._resolve_peer_time_paths(mac)[0]:
-            self._log_verbose(f"Peer {device_label}: resolved remote time characteristic from managed GATT tree")
-            self._clear_peer_connect_tracking(mac)
-            return True
-        if self._resolve_peer_time_paths(mac)[0]:
-            self._log_verbose(f"Peer {device_label}: time paths found before ServicesResolved became stable")
-            self._clear_peer_connect_tracking(mac)
-            return True
-        if self._remote_gatt_is_usable(mac):
-            self._clear_peer_connect_tracking(mac)
-            return True
-        self._client.wait_services_resolved(mac, timeout=min(1.0, self.CONNECT_RETRY_MIN_S + 0.5))
+        self._client.refresh_gatt(mac)
         refreshed = self._client.get_device(mac, refresh=True) or device
         if not refreshed.connected:
             self._clear_peer_connect_tracking(mac)
             self._clear_peer_setup_state(mac)
             return False
-        if self._remote_gatt_is_usable(mac):
-            if refreshed.services_resolved:
-                self._log_verbose(f"Peer {device_label}: ServicesResolved became true after short wait")
-            else:
-                self._log_verbose(f"Peer {device_label}: remote GATT objects appeared before ServicesResolved settled")
+        time_path, writeback_path = self._resolve_peer_time_paths(mac)
+        if time_path and writeback_path:
+            self._log_verbose(f"Peer {device_label}: resolved remote time service from managed objects")
             self._clear_peer_connect_tracking(mac)
             return True
-        if self._client.refresh_gatt(mac) and self._resolve_peer_time_paths(mac)[0]:
-            self._log_verbose(f"Peer {device_label}: remote GATT tree is usable even though ServicesResolved is still false")
-            self._clear_peer_connect_tracking(mac)
-            return True
-        empty_since = self._peer_empty_gatt_since.get(mac, time.monotonic())
+
+        if refreshed.services_resolved:
+            empty_since = self._peer_empty_gatt_since.setdefault(mac, time.monotonic())
+        else:
+            self._peer_empty_gatt_since.pop(mac, None)
+            empty_since = time.monotonic()
         empty_duration = time.monotonic() - empty_since
         if refreshed.services_resolved and empty_duration >= self.PEER_EMPTY_GATT_GRACE_S:
             self._log_remote_gatt_services(mac, context="broken-empty-gatt")
@@ -1258,67 +1246,50 @@ class BluetoothNodeRuntimeMixin:
         )
         self._log_remote_gatt_services(mac, context="waiting-services")
         self._log_verbose(
-            f"Peer {device_label}: services not resolved yet, delaying time bridge setup "
+            f"Peer {device_label}: waiting for BlueZ to expose remote time service "
             f"(empty_gatt_for={empty_duration:.1f}s)"
         )
         return False
 
     def _resolve_peer_time_paths(self, mac: str) -> Tuple[str, str]:
-        def _find_paths() -> Tuple[str, str]:
-            service_path = self._client.find_service(mac, TIME_SERVICE_UUID)
-            time_path = ""
-            writeback_path = ""
-            time_matches = self._client.find_characteristics(
-                mac,
-                TIME_CHARACTERISTIC_UUID,
-                service_path=service_path or None,
-                service_uuid=TIME_SERVICE_UUID,
-            )
-            writeback_matches = self._client.find_characteristics(
-                mac,
-                TIME_WRITE_CHARACTERISTIC_UUID,
-                service_path=service_path or None,
-                service_uuid=TIME_SERVICE_UUID,
-            )
-            if time_matches:
-                time_path = time_matches[0]
-            if writeback_matches:
-                writeback_path = writeback_matches[0]
-            if time_path and writeback_path:
-                return time_path, writeback_path
-
-            # BlueZ may expose remote characteristic objects before the service
-            # cache is fully rebuilt after a reconnect. Fall back to the raw
-            # remote characteristic list and accept a unique pair that belongs
-            # to the same remote service object.
-            characteristics = self._client.list_characteristics(mac)
-            time_candidates = [
-                item for item in characteristics if str(item.get("uuid", "")).lower() == TIME_CHARACTERISTIC_UUID.lower()
-            ]
-            writeback_candidates = [
-                item
-                for item in characteristics
-                if str(item.get("uuid", "")).lower() == TIME_WRITE_CHARACTERISTIC_UUID.lower()
-            ]
-            if len(time_candidates) == 1 and len(writeback_candidates) == 1:
-                time_candidate = time_candidates[0]
-                writeback_candidate = writeback_candidates[0]
-                if self._characteristics_share_service(time_candidate, writeback_candidate):
-                    return str(time_candidate.get("path", "")), str(writeback_candidate.get("path", ""))
-            if len(time_candidates) == 1 and len(writeback_candidates) == 1:
-                return str(time_candidates[0].get("path", "")), str(writeback_candidates[0].get("path", ""))
-            return time_path, writeback_path
-
-        time_path, writeback_path = _find_paths()
+        service_path = self._client.find_service(mac, TIME_SERVICE_UUID)
+        time_path = ""
+        writeback_path = ""
+        time_matches = self._client.find_characteristics(
+            mac,
+            TIME_CHARACTERISTIC_UUID,
+            service_path=service_path or None,
+            service_uuid=TIME_SERVICE_UUID,
+        )
+        writeback_matches = self._client.find_characteristics(
+            mac,
+            TIME_WRITE_CHARACTERISTIC_UUID,
+            service_path=service_path or None,
+            service_uuid=TIME_SERVICE_UUID,
+        )
+        if time_matches:
+            time_path = time_matches[0]
+        if writeback_matches:
+            writeback_path = writeback_matches[0]
         if time_path and writeback_path:
             return time_path, writeback_path
-        self._client.refresh_gatt(mac)
-        time_path, writeback_path = _find_paths()
-        if time_path and writeback_path:
-            return time_path, writeback_path
-        self._client.get_device(mac, refresh=True)
-        refreshed_time_path, refreshed_writeback_path = _find_paths()
-        return refreshed_time_path, refreshed_writeback_path
+
+        characteristics = self._client.list_characteristics(mac)
+        time_candidates = [
+            item for item in characteristics if str(item.get("uuid", "")).lower() == TIME_CHARACTERISTIC_UUID.lower()
+        ]
+        writeback_candidates = [
+            item
+            for item in characteristics
+            if str(item.get("uuid", "")).lower() == TIME_WRITE_CHARACTERISTIC_UUID.lower()
+        ]
+        if len(time_candidates) == 1 and len(writeback_candidates) == 1:
+            time_candidate = time_candidates[0]
+            writeback_candidate = writeback_candidates[0]
+            if self._characteristics_share_service(time_candidate, writeback_candidate):
+                return str(time_candidate.get("path", "")), str(writeback_candidate.get("path", ""))
+            return str(time_candidate.get("path", "")), str(writeback_candidate.get("path", ""))
+        return time_path, writeback_path
 
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> bool:
         current = self._client.get_device(mac, refresh=True) or device
@@ -1476,28 +1447,15 @@ class BluetoothNodeRuntimeMixin:
         now = time.monotonic()
         last_attempt = self._peer_pair_requested_at.get(mac, 0.0)
         if now - last_attempt < retry_period:
-            self._set_peer_time_status(mac, "pairing", f"timeout={retry_period:.1f}s")
+            self._set_peer_time_status(mac, "pairing", f"retry={retry_period:.1f}s")
             return False
         self._peer_pair_requested_at[mac] = now
-        self._set_peer_time_status(mac, "pairing", f"timeout={self.PAIR_REQUEST_TIMEOUT_S:.1f}s")
+        self._set_peer_time_status(mac, "pairing", "requesting")
         self._log_verbose(
             f"Security state for {device_label}: paired={current.paired} trusted={current.trusted} bonded={current.bonded}"
         )
         if self._client.pair(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
-            self._log_verbose(f"Pair completed for {device_label}")
-            current = self._client.get_device(mac, refresh=True) or current
-            if (current.paired or current.bonded) and not current.trusted:
-                if self._client.trust(mac):
-                    self.get_logger().info(f"Trusted BLE peer {mac}")
-                    self._log_verbose(f"Trusted after pair: {device_label}")
-                    current = self._client.get_device(mac, refresh=True) or current
-                else:
-                    self.get_logger().warning(f"Failed to trust BLE peer {mac}")
-                    self._log_verbose(f"Trust failed after pair: {device_label}")
-                    return False
-            if current.trusted and (current.paired or current.bonded):
-                self._peer_pair_requested_at.pop(mac, None)
-                return True
+            self._log_verbose(f"Pair requested for {device_label}")
             return False
         self.get_logger().warning(f"Repairing peer {mac}: pair request rejected, clearing stale local bond")
         self._request_peer_pair_repair(mac, "pair request rejected", device=current, reset_local=True)
