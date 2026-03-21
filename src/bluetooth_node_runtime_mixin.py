@@ -226,6 +226,15 @@ class BluetoothNodeRuntimeMixin:
             rssi,
         )
 
+    def _peer_identity_name(self, device: DeviceInfo, pattern: str) -> str:
+        for candidate in (device.alias or "", device.name or "", self._hostname_from_device(device)):
+            normalized = str(candidate or "").strip().lower()
+            if not normalized:
+                continue
+            if is_uav_hostname(normalized, pattern=pattern):
+                return normalized
+        return ""
+
     def _select_peer_targets(
         self,
         snapshot: Dict[str, DeviceInfo],
@@ -243,7 +252,7 @@ class BluetoothNodeRuntimeMixin:
             if not should_connect:
                 continue
 
-            peer_name = self._hostname_from_device(device).strip().lower()
+            peer_name = self._peer_identity_name(device, pattern)
             selection_key = f"mac::{mac.upper()}" if mac.upper() in whitelist_macs else f"peer::{peer_name or mac.lower()}"
             candidate = {
                 "mac": mac,
@@ -909,6 +918,7 @@ class BluetoothNodeRuntimeMixin:
         if reason:
             self._log_verbose(f"Completed peer pair repair for {mac}: {reason}")
         self._peer_repair_reasons.pop(mac, None)
+        self._pending_peer_repairs.pop(mac, None)
         self._clear_peer_connect_tracking(mac)
         self._clear_peer_setup_state(mac)
 
@@ -1021,17 +1031,18 @@ class BluetoothNodeRuntimeMixin:
         changed = False
 
         for mac, reason in pending.items():
-            if mac in self._peer_repair_reasons:
-                continue
             device = snapshot.get(mac)
             if device is None:
                 device = self._client.get_device(mac, refresh=True)
             if device is None:
-                self._log_verbose(f"Skipping queued peer repair for {mac}: device no longer available")
+                self._log_verbose(f"Executing queued peer repair for {mac}: device no longer available")
                 self._drop_peer_runtime_state(mac)
-                self._set_peer_time_status(mac, "disconnected", reason)
-                continue
-            self._repair_broken_peer(mac, device, reason)
+            else:
+                device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
+                self._log_verbose(f"Executing queued peer repair for {device_label}: {reason}")
+                self._clear_peer_local_state(mac, device=device, reason=reason, remove_pairing=True, untrust=True)
+            self._complete_peer_pair_repair(mac)
+            self._set_peer_time_status(mac, "disconnected", reason)
             changed = True
 
         if changed:
@@ -1052,72 +1063,23 @@ class BluetoothNodeRuntimeMixin:
         current = device or (self._client.get_device(mac, refresh=True) if self._client is not None else None)
         device_label = f"{mac} ({self._hostname_from_device(current) or '?'})" if current is not None else mac
         self._drop_peer_runtime_state(mac)
-        if reset_local and current is not None:
-            self._log_verbose(
-                f"Resetting local pairing for {device_label}: "
-                f"paired={current.paired} bonded={current.bonded} trusted={current.trusted}"
-            )
-            if current.trusted:
-                self._client.untrust(mac)
-            if current.paired or current.bonded or current.trusted:
-                self._client.remove(mac)
         self._pairing_repair_attempts[mac] = time.monotonic()
         self._peer_repair_reasons[mac] = reason
-        self._mark_peer_setup_pending(mac)
+        self._pending_peer_repairs[mac] = reason
         self._set_peer_time_status(mac, "repairing", reason)
+        if reset_local and current is not None:
+            self._log_verbose(
+                f"Queued local bond/cache reset for {device_label}: "
+                f"paired={current.paired} bonded={current.bonded} trusted={current.trusted}"
+            )
         self._log_verbose(f"Requested pair repair for {device_label}: {reason}")
 
     def _progress_peer_repair(self, mac: str, device: DeviceInfo = None) -> bool:
         reason = self._peer_repair_reasons.get(mac)
         if reason is None or self._client is None:
             return False
-        current = device or self._client.get_device(mac, refresh=True)
-        if current is None:
-            self._log_verbose(f"Pair repair waiting for device object: {mac} ({reason})")
-            return False
-        device_label = f"{mac} ({self._hostname_from_device(current) or '?'})"
-        if current.trusted and (current.paired or current.bonded):
-            self._complete_peer_pair_repair(mac)
-            self._set_peer_time_status(mac, "paired")
-            self._log_verbose(f"Pair repair completed for {device_label}")
-            return True
-        self._mark_peer_setup_pending(mac)
-        if not current.connected:
-            self._log_verbose(f"Pair repair waiting for reconnect: {device_label} reason={reason}")
-            self._mark_peer_connect_attempt(mac)
-            if self._client.connect_async(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
-                self._set_peer_time_status(mac, "repairing", reason)
-                self._log_verbose(f"Reconnect requested for {device_label}")
-            else:
-                self._log_verbose(f"Reconnect request not submitted for {device_label}")
-            return False
-        if not (current.paired or current.bonded):
-            last_attempt = self._peer_pair_requested_at.get(mac, 0.0)
-            if time.monotonic() - last_attempt < self.CONNECT_RETRY_MIN_S:
-                self._set_peer_time_status(mac, "repairing", reason)
-                self._log_verbose(f"Pair repair pending pair completion for {device_label}")
-                return False
-            self._peer_pair_requested_at[mac] = time.monotonic()
-            if self._client.pair_async(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
-                self._set_peer_time_status(mac, "repairing", reason)
-                self._log_verbose(f"Pair requested for repair on {device_label}")
-            else:
-                self._set_peer_time_status(mac, "failed", reason)
-                self._log_verbose(f"Pair request rejected during repair for {device_label}")
-            return False
-        if not current.trusted:
-            self._log_verbose(f"Pair repair waiting for trust on {device_label}")
-            if self._client.trust(mac):
-                refreshed = self._client.get_device(mac, refresh=True) or current
-                if refreshed.trusted:
-                    self._complete_peer_pair_repair(mac)
-                    self._set_peer_time_status(mac, "paired")
-                    self._log_verbose(f"Pair repair trusted {device_label}")
-                    return True
-                self._log_verbose(f"Trust requested for {device_label}, awaiting property update")
-            else:
-                self._set_peer_time_status(mac, "failed", reason)
-                self._log_verbose(f"Trust request failed during repair for {device_label}")
+        if mac in self._pending_peer_repairs:
+            self._log_verbose(f"Pair repair pending local reset for {mac}: {reason}")
             return False
         return False
 
