@@ -37,6 +37,7 @@ class BluetoothNode(
         self._peer_pair_requested_at: Dict[str, float] = {}
         self._peer_empty_gatt_since: Dict[str, float] = {}
         self._peer_repair_reasons: Dict[str, str] = {}
+        self._pending_peer_repairs: Dict[str, str] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
         self._last_dbus_warning_at: Dict[str, float] = {}
