@@ -314,7 +314,7 @@ class BluetoothNodeRuntimeMixin:
         return not self._idle_scan_allowed(snapshot)
 
     def _update_scan_state(self, snapshot: Dict[str, DeviceInfo] = None, *, reason: str = ""):
-        if self._client is None:
+        if self._client is None or self._shutting_down:
             return
 
         desired_transport = str(self.get_parameter("scan_mode").value)
@@ -558,7 +558,6 @@ class BluetoothNodeRuntimeMixin:
             snapshot = self._client.get_devices(refresh=True)
             self._enforce_peer_setup_timeouts(snapshot)
             snapshot = self._enforce_peer_connection_policy(snapshot=snapshot, reason="scan policy tick")
-            self._progress_peer_repairs(snapshot)
             self._sync_auto_import_bridges(snapshot)
             self._reconcile_import_bridges(snapshot)
             msg = BleDeviceArray()
@@ -843,7 +842,8 @@ class BluetoothNodeRuntimeMixin:
                     self._log_verbose(f"Dropping non-whitelisted peer: {device_label}")
                     self._drop_non_whitelisted_peer(mac, device)
             selected_targets = self._select_peer_targets(snapshot, pattern, whitelist_names, whitelist_macs)
-            for mac, target in selected_targets.items():
+            ordered_targets = sorted(selected_targets.items(), key=lambda item: item[1]["score"], reverse=True)
+            for mac, target in ordered_targets:
                 device = target["device"]
                 device_label = f"{mac} ({device.alias or device.name or '?'})"
                 if device.connected:
@@ -863,10 +863,15 @@ class BluetoothNodeRuntimeMixin:
                 self._mark_peer_connect_attempt(mac)
                 self._mark_peer_setup_pending(mac)
                 self._log_verbose(f"Auto-connect attempt: {device_label}")
-                if not self._client.connect_async(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
+                if not self._client.connect(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
                     self._log_verbose(f"Auto-connect request rejected: {device_label}")
                     self._clear_peer_connect_tracking(mac)
                     self._clear_peer_setup_state(mac)
+                    continue
+                current = self._client.get_device(mac, refresh=True) or device
+                if current.connected:
+                    self._maintain_peer_connection(mac, current, retry_period)
+                break
             self._update_scan_state(snapshot, reason="auto-connect tick")
         except dbus.exceptions.DBusException as exc:
             self._dbus_warning("auto_connect", f"Skipping auto-connect tick due to DBus error: {exc}")
@@ -1088,21 +1093,6 @@ class BluetoothNodeRuntimeMixin:
             )
         self._log_verbose(f"Requested pair repair for {device_label}: {reason}")
 
-    def _progress_peer_repair(self, mac: str, device: DeviceInfo = None) -> bool:
-        reason = self._peer_repair_reasons.get(mac)
-        if reason is None or self._client is None:
-            return False
-        if mac in self._pending_peer_repairs:
-            self._log_verbose(f"Pair repair pending local reset for {mac}: {reason}")
-            return False
-        return False
-
-    def _progress_peer_repairs(self, snapshot: Dict[str, DeviceInfo]):
-        if not self._peer_repair_reasons:
-            return
-        for mac in list(self._peer_repair_reasons.keys()):
-            self._progress_peer_repair(mac, snapshot.get(mac))
-
     def _clear_peer_local_state(
         self,
         mac: str,
@@ -1118,7 +1108,7 @@ class BluetoothNodeRuntimeMixin:
             f"Clearing local peer state for {device_label}: reason={reason or 'n/a'} "
             f"remove_pairing={remove_pairing} untrust={untrust}"
         )
-        self._client.disconnect_async(mac)
+        self._client.disconnect(mac, timeout=self.DISCONNECT_TIMEOUT_S)
         had_pairing_state = bool(current and (current.paired or current.bonded or current.trusted))
         if untrust and had_pairing_state and bool(current and current.trusted):
             if self._client.untrust(mac):
@@ -1216,6 +1206,12 @@ class BluetoothNodeRuntimeMixin:
         return (time.monotonic() - state.last_activity_monotonic) <= max(1.0, float(idle_timeout_s))
 
     def _ensure_peer_services_resolved(self, mac: str, device: DeviceInfo, *, device_label: str) -> bool:
+        if device is None or not device.connected:
+            self._clear_peer_connect_tracking(mac)
+            self._clear_peer_setup_state(mac)
+            if mac not in self._peer_repair_reasons and mac not in self._pending_peer_repairs:
+                self._set_peer_time_status(mac, "disconnected", "link lost before remote GATT became usable")
+            return False
         if self._has_live_peer_time_bridge(mac):
             self._log_verbose(f"Peer {device_label}: active time bridge already proves remote GATT usability")
             self._clear_peer_connect_tracking(mac)
@@ -1233,6 +1229,10 @@ class BluetoothNodeRuntimeMixin:
             return True
         self._client.wait_services_resolved(mac, timeout=min(1.0, self.CONNECT_RETRY_MIN_S + 0.5))
         refreshed = self._client.get_device(mac, refresh=True) or device
+        if not refreshed.connected:
+            self._clear_peer_connect_tracking(mac)
+            self._clear_peer_setup_state(mac)
+            return False
         if self._remote_gatt_is_usable(mac):
             if refreshed.services_resolved:
                 self._log_verbose(f"Peer {device_label}: ServicesResolved became true after short wait")
@@ -1322,6 +1322,8 @@ class BluetoothNodeRuntimeMixin:
 
     def _ensure_peer_time_bridge(self, mac: str, device: DeviceInfo) -> bool:
         current = self._client.get_device(mac, refresh=True) or device
+        if current is None or not current.connected:
+            return False
         device_label = f"{mac} ({self._hostname_from_device(device) or '?'})"
         existing = self._peer_time_bridges.get(mac)
         if existing is not None and self._has_live_peer_time_bridge(mac):
@@ -1420,7 +1422,9 @@ class BluetoothNodeRuntimeMixin:
 
     def _maintain_peer_connection(self, mac: str, device: DeviceInfo, retry_period: float) -> bool:
         current = self._client.get_device(mac, refresh=True) or device
-        if mac in self._peer_repair_reasons and not self._progress_peer_repair(mac, current):
+        if current is None or not current.connected:
+            return False
+        if mac in self._peer_repair_reasons:
             return False
         if not self._ensure_peer_security(mac, current, retry_period):
             return False
@@ -1448,6 +1452,8 @@ class BluetoothNodeRuntimeMixin:
 
     def _ensure_peer_security(self, mac: str, device: DeviceInfo, retry_period: float):
         current = self._client.get_device(mac, refresh=True) or device
+        if current is None or not current.connected:
+            return False
         security_ready = bool(current.trusted and (current.paired or current.bonded))
         if security_ready:
             self._peer_pair_requested_at.pop(mac, None)
@@ -1477,8 +1483,21 @@ class BluetoothNodeRuntimeMixin:
         self._log_verbose(
             f"Security state for {device_label}: paired={current.paired} trusted={current.trusted} bonded={current.bonded}"
         )
-        if self._client.pair_async(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
-            self._log_verbose(f"Pair requested for {device_label}")
+        if self._client.pair(mac, timeout=self.PAIR_REQUEST_TIMEOUT_S):
+            self._log_verbose(f"Pair completed for {device_label}")
+            current = self._client.get_device(mac, refresh=True) or current
+            if (current.paired or current.bonded) and not current.trusted:
+                if self._client.trust(mac):
+                    self.get_logger().info(f"Trusted BLE peer {mac}")
+                    self._log_verbose(f"Trusted after pair: {device_label}")
+                    current = self._client.get_device(mac, refresh=True) or current
+                else:
+                    self.get_logger().warning(f"Failed to trust BLE peer {mac}")
+                    self._log_verbose(f"Trust failed after pair: {device_label}")
+                    return False
+            if current.trusted and (current.paired or current.bonded):
+                self._peer_pair_requested_at.pop(mac, None)
+                return True
             return False
         self.get_logger().warning(f"Repairing peer {mac}: pair request rejected, clearing stale local bond")
         self._request_peer_pair_repair(mac, "pair request rejected", device=current, reset_local=True)
@@ -1653,6 +1672,8 @@ class BluetoothNodeRuntimeMixin:
             self.get_logger().warning(f"BLE GATT event {event_type}: {info}")
 
     def _on_client_device_event(self, mac: str, device: DeviceInfo, changed_fields):
+        if self._shutting_down:
+            return
         relevant_fields = {"added", "removed", "connected", "paired", "bonded", "trusted", "services_resolved"}
         if not any(field in relevant_fields for field in changed_fields):
             return
@@ -1685,8 +1706,8 @@ class BluetoothNodeRuntimeMixin:
         peer_candidate = self._is_uav_peer_candidate(device, pattern)
         explicit_target = self._matches_auto_connect_whitelist(device, whitelist_names, whitelist_macs)
         should_connect = explicit_target or (peer_candidate and not whitelist_enabled)
-        if should_connect:
-            self._log_verbose(f"Device event queued peer maintenance for {mac}")
+        if should_connect and not device.services_resolved:
+            self._mark_peer_setup_pending(mac)
         self._update_scan_state(reason=f"device event {mac}")
 
     def _handle_peer_writeback_event(self, desc_path: str, success: bool):
@@ -1853,7 +1874,7 @@ class BluetoothNodeRuntimeMixin:
                 if not device.connected:
                     continue
                 try:
-                    self._client.disconnect_async(device.mac)
+                    self._client.disconnect(device.mac, timeout=self.DISCONNECT_TIMEOUT_S)
                 except Exception:
                     pass
         for state in self._topic_exports.values():

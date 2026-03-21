@@ -21,6 +21,7 @@ class GlibMainLoopThread:
     def __init__(self):
         self._mainloop = None
         self._thread = None
+        self._thread_ident = None
         self._started = threading.Event()
 
     def start(self):
@@ -30,6 +31,7 @@ class GlibMainLoopThread:
         self._started.clear()
 
         def _run_mainloop():
+            self._thread_ident = threading.get_ident()
             self._started.set()
             self._mainloop.run()
 
@@ -48,6 +50,7 @@ class GlibMainLoopThread:
             self._thread.join(timeout=2.0)
         self._mainloop = None
         self._thread = None
+        self._thread_ident = None
         self._started.clear()
 
     def invoke(self, callback: Callable[[], None]):
@@ -59,6 +62,32 @@ class GlibMainLoopThread:
             return False
 
         GLib.idle_add(_run_once)
+
+    def call(self, callback: Callable[[], Any], timeout: float = 30.0):
+        if self._mainloop is None:
+            raise RuntimeError("GLib main loop is not running")
+        if threading.get_ident() == self._thread_ident:
+            return callback()
+
+        completed = threading.Event()
+        result = {}
+
+        def _run_once():
+            try:
+                result["value"] = callback()
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                completed.set()
+            return False
+
+        GLib.idle_add(_run_once)
+        wait_timeout = None if timeout is None or timeout <= 0 else float(timeout)
+        if not completed.wait(wait_timeout):
+            raise TimeoutError("Timed out waiting for GLib D-Bus call")
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
 
 
 class BluetoothDbusRuntime:
@@ -130,21 +159,24 @@ class BluetoothDbusRuntime:
             raise RuntimeError("No Bluetooth adapter with GattManager1 found")
         self._logger.info(f"Using adapter {self._adapter_path}")
         self.set_adapter_props(powered=True)
-        self._client = BleClient(self._bus, self._adapter_path)
+        self._client = BleClient(self._bus, self._adapter_path, call_sync=self._glib.call)
 
     def ensure_pairing_agent(self, *, auto_accept: bool, auto_trust: bool, capability: str):
         self._require_setup()
         if self._pairing_agent_registered:
             return
-        self._agent = PairingAgent(
-            self._bus,
-            auto_accept=auto_accept,
-            auto_trust=auto_trust,
-            on_event=self._on_pairing_event,
+        self._agent = self._glib.call(
+            lambda: PairingAgent(
+                self._bus,
+                auto_accept=auto_accept,
+                auto_trust=auto_trust,
+                on_event=self._on_pairing_event,
+            ),
+            timeout=10.0,
         )
         agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), AGENT_MANAGER_IFACE)
-        agent_mgr.RegisterAgent(PairingAgent.AGENT_PATH, capability, timeout=10.0)
-        agent_mgr.RequestDefaultAgent(PairingAgent.AGENT_PATH, timeout=10.0)
+        self._call_dbus_method(agent_mgr.RegisterAgent, "register pairing agent", PairingAgent.AGENT_PATH, capability, timeout=10.0)
+        self._call_dbus_method(agent_mgr.RequestDefaultAgent, "request default pairing agent", PairingAgent.AGENT_PATH, timeout=10.0)
         self._pairing_agent_registered = True
         self._logger.info(f"Pairing agent registered (capability={capability})")
 
@@ -244,9 +276,12 @@ class BluetoothDbusRuntime:
         self._logger.info(
             f"Registering GATT application ({service_index} services, {len(profile_uuids)} client profile UUIDs)"
         )
-        gatt_mgr.RegisterApplication(
+        self._call_dbus_method(
+            gatt_mgr.RegisterApplication,
+            "register gatt application",
             app.get_path(),
             {},
+            timeout=10.0,
             reply_handler=_register_app_reply,
             error_handler=_register_app_error,
         )
@@ -258,11 +293,13 @@ class BluetoothDbusRuntime:
         if self._advertisement is not None:
             try:
                 ad_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), LE_ADVERTISING_MANAGER_IFACE)
-                ad_mgr.UnregisterAdvertisement(
+                self._call_dbus_method(
+                    ad_mgr.UnregisterAdvertisement,
+                    "unregister advertisement",
                     self._advertisement.get_path(),
+                    timeout=10.0,
                     reply_handler=lambda: None,
                     error_handler=lambda error: self._log_verbose(f"Ignore advertisement unregister error: {error}"),
-                    timeout=10.0,
                 )
             except Exception:
                 pass
@@ -271,11 +308,13 @@ class BluetoothDbusRuntime:
         if self._app is not None:
             try:
                 gatt_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), GATT_MANAGER_IFACE)
-                gatt_mgr.UnregisterApplication(
+                self._call_dbus_method(
+                    gatt_mgr.UnregisterApplication,
+                    "unregister gatt application",
                     self._app.get_path(),
+                    timeout=10.0,
                     reply_handler=lambda: None,
                     error_handler=lambda error: self._log_verbose(f"Ignore GATT app unregister error: {error}"),
-                    timeout=10.0,
                 )
             except Exception:
                 pass
@@ -325,7 +364,7 @@ class BluetoothDbusRuntime:
 
     def _set_adapter_property(self, props, prop_name: str, value, *, ignore_busy: bool):
         try:
-            props.Set(ADAPTER_IFACE, prop_name, value, timeout=10.0)
+            self._call_dbus_method(props.Set, f"set adapter property {prop_name}", ADAPTER_IFACE, prop_name, value, timeout=10.0)
         except dbus.DBusException as exc:
             if ignore_busy and self._is_bluez_busy_error(exc):
                 self._logger.warning(f"BlueZ busy while setting adapter {prop_name}; continuing")
@@ -419,7 +458,9 @@ class BluetoothDbusRuntime:
                 )
                 _attempt(index + 1)
 
-            ad_mgr.RegisterAdvertisement(
+            self._call_dbus_method(
+                ad_mgr.RegisterAdvertisement,
+                "register advertisement",
                 advertisement.get_path(),
                 {},
                 reply_handler=_reply_handler,
@@ -535,9 +576,17 @@ class BluetoothDbusRuntime:
         self._adapter_path = ""
         self._agent = None
 
-    def _call_dbus_method(self, method, operation: str, *args, timeout: float = 30.0):
-        del operation, timeout
-        return method(*args)
+    def _call_dbus_method(self, method, operation: str, *args, timeout: float = 30.0, **kwargs):
+        del operation
+
+        def _invoke():
+            call_kwargs = dict(kwargs)
+            if timeout is not None:
+                call_kwargs.setdefault("timeout", timeout)
+            return method(*args, **call_kwargs)
+
+        wait_timeout = None if timeout is None else max(1.0, float(timeout)) + 1.0
+        return self._glib.call(_invoke, timeout=wait_timeout)
 
     def _cleanup_failed_server_build(
         self,

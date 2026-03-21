@@ -85,9 +85,10 @@ class DeviceInfo:
 
 
 class BleClient:
-    def __init__(self, bus: dbus.SystemBus, adapter_path: str):
+    def __init__(self, bus: dbus.SystemBus, adapter_path: str, call_sync: Optional[Callable] = None):
         self._bus = bus
         self._adapter_path = adapter_path
+        self._call_sync = call_sync
         self._adapter = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), ADAPTER_IFACE)
         self._adapter_props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), DBUS_PROP_IFACE)
         self._object_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
@@ -1131,17 +1132,24 @@ class BleClient:
             return ""
 
     def _run_serialized(self, func: Callable[[], object], operation: str, *, timeout: float = 30.0):
-        del operation, timeout
-        return func()
+        del operation
+        if self._call_sync is None:
+            return func()
+        return self._call_sync(func, timeout)
 
     def _run_async_method(self, method, operation: str, *args, timeout: float = 30.0, on_reply=None, on_error=None):
         del operation
-        method(
-            *args,
-            reply_handler=on_reply or (lambda *_: None),
-            error_handler=on_error or (lambda *_: None),
-            timeout=timeout,
-        )
+        try:
+            result = self._run_serialized(lambda: method(*args, timeout=timeout), "dbus async method", timeout=timeout)
+        except dbus.DBusException as exc:
+            if on_error is not None:
+                on_error(exc)
+            raise
+        if on_reply is not None:
+            if result is None:
+                on_reply()
+            else:
+                on_reply(result)
         return True
 
     def _emit_gatt(self, event_type: str, **kw):
