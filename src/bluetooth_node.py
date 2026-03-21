@@ -32,8 +32,10 @@ class BluetoothNode(
         self._local_name = system_hostname() or "mrs-uav"
         self._pending_wifi_password = ""
         self._auto_connect_attempts: Dict[str, float] = {}
+        self._peer_connect_started_at: Dict[str, float] = {}
         self._peer_setup_started_at: Dict[str, float] = {}
         self._peer_pair_requested_at: Dict[str, float] = {}
+        self._peer_empty_gatt_since: Dict[str, float] = {}
         self._peer_repair_reasons: Dict[str, str] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}

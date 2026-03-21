@@ -57,6 +57,8 @@ class BluetoothNodeRuntimeMixin:
     DISCONNECT_TIMEOUT_S = 5.0
     PAIR_REQUEST_TIMEOUT_S = 12.0
     PEER_SETUP_TIMEOUT_S = 30.0
+    PEER_EMPTY_GATT_GRACE_S = 4.0
+    PEER_RECONNECT_STALL_S = 18.0
     LIVE_BRIDGE_IDLE_TIMEOUT_S = 20.0
     PAIRING_REPAIR_COOLDOWN_S = 20.0
     WRITEBACK_RETRY_DELAY_S = 1.0
@@ -768,14 +770,21 @@ class BluetoothNodeRuntimeMixin:
                         self._maintain_peer_connection(mac, device, retry_period)
                     else:
                         self._clear_peer_setup_state(mac)
+                        self._clear_peer_connect_tracking(mac)
                     continue
                 if not should_connect:
                     self._clear_peer_setup_state(mac)
+                    self._clear_peer_connect_tracking(mac)
+                    continue
+                connect_started = self._peer_connect_started_at.get(mac, 0.0)
+                if connect_started and (time.monotonic() - connect_started) >= self.PEER_RECONNECT_STALL_S and (device.paired or device.bonded or device.trusted):
+                    self._repair_broken_peer(mac, device, "reconnect attempts exhausted with stale local bond/cache")
                     continue
                 last_attempt = self._auto_connect_attempts.get(mac, 0.0)
                 if time.monotonic() - last_attempt < retry_period:
                     continue
                 self._auto_connect_attempts[mac] = time.monotonic()
+                self._mark_peer_connect_attempt(mac)
                 self._mark_peer_setup_pending(mac)
                 self._log_verbose(f"Auto-connect attempt: {device_label}")
                 if not self._client.connect_async(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
@@ -786,6 +795,52 @@ class BluetoothNodeRuntimeMixin:
 
     def _drop_non_whitelisted_peer(self, mac: str, device: DeviceInfo):
         self._clear_peer_local_state(mac, device=device, reason="non-whitelisted peer")
+
+    def _mark_peer_connect_attempt(self, mac: str) -> float:
+        return self._peer_connect_started_at.setdefault(mac, time.monotonic())
+
+    def _clear_peer_connect_tracking(self, mac: str):
+        self._peer_connect_started_at.pop(mac, None)
+        self._peer_empty_gatt_since.pop(mac, None)
+
+    def _peer_gatt_counts(self, mac: str) -> Tuple[int, int, int]:
+        services = self._client.list_services(mac)
+        characteristics = self._client.list_characteristics(mac)
+        descriptors = self._client.list_descriptors(mac)
+        return len(services), len(characteristics), len(descriptors)
+
+    def _remote_gatt_is_usable(self, mac: str) -> bool:
+        services_count, characteristics_count, descriptors_count = self._peer_gatt_counts(mac)
+        has_objects = bool(services_count or characteristics_count or descriptors_count)
+        if has_objects:
+            self._peer_empty_gatt_since.pop(mac, None)
+            return True
+        self._peer_empty_gatt_since.setdefault(mac, time.monotonic())
+        return False
+
+    def _repair_broken_peer(self, mac: str, device: DeviceInfo, reason: str) -> bool:
+        if mac in self._peer_repair_reasons:
+            return False
+        current = self._client.get_device(mac, refresh=True) or device
+        device_label = f"{mac} ({self._hostname_from_device(current) or '?'})"
+        self.get_logger().warning(f"Repairing peer {mac}: {reason}")
+        self._log_verbose(f"Repairing peer {device_label}: {reason}")
+        self._request_peer_pair_repair(mac, reason, device=current, reset_local=True)
+        return False
+
+    def _disconnect_requires_peer_repair(self, mac: str, device: DeviceInfo) -> str:
+        if mac in self._peer_repair_reasons:
+            return ""
+        had_security_state = bool(device.paired or device.bonded or device.trusted)
+        runtime_status = self._peer_status.get(mac)
+        if mac in self._peer_empty_gatt_since and had_security_state:
+            return "remote GATT tree stayed empty"
+        if runtime_status is not None and runtime_status.status in {"pairing", "waiting-services", "waiting-time", "repairing"} and had_security_state:
+            return f"disconnected during {runtime_status.status}"
+        connect_started = self._peer_connect_started_at.get(mac, 0.0)
+        if connect_started and had_security_state:
+            return "disconnected before peer setup completed"
+        return ""
 
     def _mark_peer_setup_pending(self, mac: str) -> float:
         return self._peer_setup_started_at.setdefault(mac, time.monotonic())
@@ -799,6 +854,7 @@ class BluetoothNodeRuntimeMixin:
         if reason:
             self._log_verbose(f"Completed peer pair repair for {mac}: {reason}")
         self._peer_repair_reasons.pop(mac, None)
+        self._clear_peer_connect_tracking(mac)
         self._clear_peer_setup_state(mac)
 
     def _drop_peer_runtime_state(self, mac: str):
@@ -810,6 +866,7 @@ class BluetoothNodeRuntimeMixin:
             self.destroy_publisher(state.publisher)
             self._stop_notify_if_unused(state.characteristic_path)
             self._clear_peer_writeback_state(state.writeback_characteristic_path)
+        self._clear_peer_connect_tracking(mac)
         self._clear_peer_setup_state(mac)
         self._auto_connect_attempts.pop(mac, None)
         self._peer_status.pop(mac, None)
@@ -858,6 +915,7 @@ class BluetoothNodeRuntimeMixin:
         self._mark_peer_setup_pending(mac)
         if not current.connected:
             self._log_verbose(f"Pair repair waiting for reconnect: {device_label} reason={reason}")
+            self._mark_peer_connect_attempt(mac)
             if self._client.connect_async(mac, timeout=self.CONNECT_REQUEST_TIMEOUT_S):
                 self._set_peer_time_status(mac, "repairing", reason)
                 self._log_verbose(f"Reconnect requested for {device_label}")
@@ -981,11 +1039,17 @@ class BluetoothNodeRuntimeMixin:
         self._auto_connect_attempts = {
             mac: stamp for mac, stamp in self._auto_connect_attempts.items() if mac in current_macs
         }
+        self._peer_connect_started_at = {
+            mac: stamp for mac, stamp in self._peer_connect_started_at.items() if mac in current_macs
+        }
         self._peer_setup_started_at = {
             mac: stamp for mac, stamp in self._peer_setup_started_at.items() if mac in current_macs
         }
         self._peer_pair_requested_at = {
             mac: stamp for mac, stamp in self._peer_pair_requested_at.items() if mac in current_macs
+        }
+        self._peer_empty_gatt_since = {
+            mac: stamp for mac, stamp in self._peer_empty_gatt_since.items() if mac in current_macs
         }
         self._pairing_repair_attempts = {
             mac: stamp for mac, stamp in self._pairing_repair_attempts.items() if mac in current_macs
@@ -1009,23 +1073,37 @@ class BluetoothNodeRuntimeMixin:
     def _ensure_peer_services_resolved(self, mac: str, device: DeviceInfo, *, device_label: str) -> bool:
         if self._has_live_peer_time_bridge(mac):
             self._log_verbose(f"Peer {device_label}: active time bridge already proves remote GATT usability")
+            self._clear_peer_connect_tracking(mac)
             return True
         if self._client.refresh_gatt(mac) and self._resolve_peer_time_paths(mac)[0]:
             self._log_verbose(f"Peer {device_label}: resolved remote time characteristic from managed GATT tree")
+            self._clear_peer_connect_tracking(mac)
             return True
         if self._resolve_peer_time_paths(mac)[0]:
             self._log_verbose(f"Peer {device_label}: time paths found before ServicesResolved became stable")
+            self._clear_peer_connect_tracking(mac)
             return True
-        if device.services_resolved:
+        if self._remote_gatt_is_usable(mac):
+            self._clear_peer_connect_tracking(mac)
             return True
         self._client.wait_services_resolved(mac, timeout=min(1.0, self.CONNECT_RETRY_MIN_S + 0.5))
         refreshed = self._client.get_device(mac, refresh=True) or device
-        if refreshed.services_resolved:
-            self._log_verbose(f"Peer {device_label}: ServicesResolved became true after short wait")
+        if self._remote_gatt_is_usable(mac):
+            if refreshed.services_resolved:
+                self._log_verbose(f"Peer {device_label}: ServicesResolved became true after short wait")
+            else:
+                self._log_verbose(f"Peer {device_label}: remote GATT objects appeared before ServicesResolved settled")
+            self._clear_peer_connect_tracking(mac)
             return True
         if self._client.refresh_gatt(mac) and self._resolve_peer_time_paths(mac)[0]:
             self._log_verbose(f"Peer {device_label}: remote GATT tree is usable even though ServicesResolved is still false")
+            self._clear_peer_connect_tracking(mac)
             return True
+        empty_since = self._peer_empty_gatt_since.get(mac, time.monotonic())
+        empty_duration = time.monotonic() - empty_since
+        if refreshed.services_resolved and empty_duration >= self.PEER_EMPTY_GATT_GRACE_S:
+            self._log_remote_gatt_services(mac, context="broken-empty-gatt")
+            return self._repair_broken_peer(mac, refreshed, "services resolved but remote GATT tree stayed empty")
         wait_started = self._mark_peer_setup_pending(mac)
         self._set_peer_time_status(
             mac,
@@ -1034,7 +1112,10 @@ class BluetoothNodeRuntimeMixin:
             wait_grace_s=self.PEER_SETUP_TIMEOUT_S,
         )
         self._log_remote_gatt_services(mac, context="waiting-services")
-        self._log_verbose(f"Peer {device_label}: services not resolved yet, delaying time bridge setup")
+        self._log_verbose(
+            f"Peer {device_label}: services not resolved yet, delaying time bridge setup "
+            f"(empty_gatt_for={empty_duration:.1f}s)"
+        )
         return False
 
     def _resolve_peer_time_paths(self, mac: str) -> Tuple[str, str]:
@@ -1172,6 +1253,7 @@ class BluetoothNodeRuntimeMixin:
             )
             self._peer_time_bridges[mac] = state
         state.characteristic_path = path
+        self._clear_peer_connect_tracking(mac)
         self._clear_peer_setup_state(mac)
         self._set_peer_time_status(mac, "ready")
         if new_bridge:
@@ -1440,9 +1522,13 @@ class BluetoothNodeRuntimeMixin:
             self._update_scan_state(reason=f"device event {mac} repair")
             return
         if not device.connected:
-            self._log_verbose(f"Removing peer runtime state for disconnected device {mac}")
-            self._drop_peer_runtime_state(mac)
-            self._set_peer_time_status(mac, "disconnected")
+            repair_reason = self._disconnect_requires_peer_repair(mac, device)
+            if repair_reason:
+                self._repair_broken_peer(mac, device, repair_reason)
+            else:
+                self._log_verbose(f"Removing peer runtime state for disconnected device {mac}")
+                self._drop_peer_runtime_state(mac)
+                self._set_peer_time_status(mac, "disconnected")
             self._update_scan_state(reason=f"device event {mac} disconnected")
             return
         whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
