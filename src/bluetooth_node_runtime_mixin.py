@@ -966,6 +966,27 @@ class BluetoothNodeRuntimeMixin:
                 time_path = time_matches[0]
             if writeback_matches:
                 writeback_path = writeback_matches[0]
+            if time_path and writeback_path:
+                return time_path, writeback_path
+
+            # BlueZ may expose remote characteristic objects before the service
+            # cache is fully rebuilt after a reconnect. Fall back to the raw
+            # remote characteristic list and accept a unique pair that belongs
+            # to the same remote service object.
+            characteristics = self._client.list_characteristics(mac)
+            time_candidates = [
+                item for item in characteristics if str(item.get("uuid", "")).lower() == TIME_CHARACTERISTIC_UUID.lower()
+            ]
+            writeback_candidates = [
+                item
+                for item in characteristics
+                if str(item.get("uuid", "")).lower() == TIME_WRITE_CHARACTERISTIC_UUID.lower()
+            ]
+            if len(time_candidates) == 1 and len(writeback_candidates) == 1:
+                time_candidate = time_candidates[0]
+                writeback_candidate = writeback_candidates[0]
+                if time_candidate.get("service") == writeback_candidate.get("service"):
+                    return str(time_candidate.get("path", "")), str(writeback_candidate.get("path", ""))
             return time_path, writeback_path
 
         time_path, writeback_path = _find_paths()

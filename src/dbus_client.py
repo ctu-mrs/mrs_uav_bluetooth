@@ -473,9 +473,16 @@ class BleClient:
 
     def find_service(self, mac: str, uuid: str) -> Optional[str]:
         uuid_lower = uuid.lower()
-        for service in self.list_services(mac):
+        services = self.list_services(mac)
+        for service in services:
             if service["uuid"].lower() == uuid_lower:
                 return service["path"]
+        device = self.get_device(mac)
+        if device and device.services_resolved:
+            self._refresh_gatt_for_device(device.path)
+            for service in self.list_services(mac):
+                if service["uuid"].lower() == uuid_lower:
+                    return service["path"]
         return None
 
     def find_characteristic(self, mac: str, uuid: str) -> Optional[str]:
@@ -492,21 +499,32 @@ class BleClient:
     ) -> List[str]:
         uuid_lower = uuid.lower()
         service_uuid_lower = service_uuid.lower() if service_uuid else ""
-        candidates = []
-        for characteristic in self.list_characteristics(mac):
-            if characteristic["uuid"].lower() != uuid_lower:
-                continue
-            if service_path and characteristic["service"] != service_path:
-                continue
-            if service_uuid_lower:
-                owning_service = self._get_cached_service_by_path(mac, characteristic["service"])
-                if owning_service is None or owning_service["uuid"].lower() != service_uuid_lower:
+
+        def _collect_candidates() -> List[str]:
+            candidates = []
+            for characteristic in self.list_characteristics(mac):
+                if characteristic["uuid"].lower() != uuid_lower:
                     continue
-            path = characteristic["path"]
-            if path in candidates:
-                continue
-            candidates.append(path)
-        return candidates
+                if service_path and characteristic["service"] != service_path:
+                    continue
+                if service_uuid_lower:
+                    owning_service = self._get_cached_service_by_path(mac, characteristic["service"])
+                    if owning_service is None or owning_service["uuid"].lower() != service_uuid_lower:
+                        continue
+                path = characteristic["path"]
+                if path in candidates:
+                    continue
+                candidates.append(path)
+            return candidates
+
+        candidates = _collect_candidates()
+        if candidates:
+            return candidates
+        device = self.get_device(mac)
+        if device and device.services_resolved:
+            self._refresh_gatt_for_device(device.path)
+            return _collect_candidates()
+        return []
 
     def find_descriptor(self, mac: str, uuid: str, chrc_path: Optional[str] = None) -> Optional[str]:
         uuid_lower = uuid.lower()
@@ -778,6 +796,8 @@ class BleClient:
             "blocked",
             "services_resolved",
         )
+        refresh_gatt_cache = False
+        clear_gatt_cache = False
         with self._lock:
             device = self._devices.get(mac)
             is_new = device is None
@@ -825,9 +845,22 @@ class BleClient:
             if "ServiceData" in props:
                 device.service_data = decode_byte_dict(props["ServiceData"])
             changed_fields = [field for field in observed_fields if getattr(device, field) != previous[field]]
+            if "services_resolved" in changed_fields:
+                if device.services_resolved:
+                    refresh_gatt_cache = True
+                else:
+                    clear_gatt_cache = True
             snapshot = device.copy()
+            device_path = device.path
         if is_new:
             changed_fields.insert(0, "added")
+        if clear_gatt_cache and device_path:
+            with self._lock:
+                self._gatt_services.pop(device_path, None)
+                self._gatt_characteristics.pop(device_path, None)
+                self._gatt_descriptors.pop(device_path, None)
+        elif refresh_gatt_cache and device_path:
+            self._refresh_gatt_for_device(device_path)
         if changed_fields:
             self._emit_device(mac, snapshot, tuple(changed_fields))
 
