@@ -60,6 +60,7 @@ class BluetoothNodeRuntimeMixin:
     PEER_EMPTY_GATT_GRACE_S = 4.0
     PEER_RECONNECT_STALL_S = 18.0
     LIVE_BRIDGE_IDLE_TIMEOUT_S = 20.0
+    PEER_READY_RECOVERY_GRACE_S = 4.0
     PAIRING_REPAIR_COOLDOWN_S = 20.0
     WRITEBACK_RETRY_DELAY_S = 1.0
     TIME_WRITEBACK_WARNING_INTERVAL_S = 5.0
@@ -496,6 +497,7 @@ class BluetoothNodeRuntimeMixin:
             cached_snapshot = self._client.get_devices(refresh=False)
             defer_scan_refresh = self._should_defer_scan_refresh(cached_snapshot)
             snapshot = self._client.get_devices(refresh=not defer_scan_refresh)
+            self._enforce_peer_setup_timeouts(snapshot)
             if not defer_scan_refresh:
                 snapshot = self._enforce_peer_connection_policy(snapshot=snapshot, reason="scan policy tick")
             self._progress_peer_repairs(snapshot)
@@ -690,6 +692,25 @@ class BluetoothNodeRuntimeMixin:
         for mac, state in self._peer_time_bridges.items():
             device = snapshot.get(mac)
             if device is not None and device.connected:
+                if state.status == "ready":
+                    inactive_s = now - state.last_activity_monotonic
+                    notify_stopped = False
+                    try:
+                        notify_stopped = bool(state.characteristic_path) and not self._is_characteristic_notifying(mac, state.characteristic_path)
+                    except dbus.exceptions.DBusException:
+                        notify_stopped = False
+                    if (
+                        inactive_s >= self.PEER_READY_RECOVERY_GRACE_S
+                        and (not device.services_resolved or notify_stopped)
+                    ):
+                        reasons = []
+                        if not device.services_resolved:
+                            reasons.append("services no longer resolved")
+                        if notify_stopped:
+                            reasons.append("time notifications stopped")
+                        self._repair_broken_peer(mac, device, ", ".join(reasons) + " after bridge became ready")
+                        stale_macs.append(mac)
+                        continue
                 # Only enforce inactivity timeout for fully ready bridges. Waiting states
                 # can be idle for a while during pairing/service resolution.
                 if state.status == "ready" and timeout > 0 and now - state.last_activity_monotonic >= timeout:
@@ -749,6 +770,7 @@ class BluetoothNodeRuntimeMixin:
             cached_snapshot = self._client.get_devices(refresh=False)
             snapshot = self._client.get_devices(refresh=not self._should_defer_scan_refresh(cached_snapshot))
             self._prune_peer_runtime_state(snapshot)
+            self._enforce_peer_setup_timeouts(snapshot)
             self._log_verbose(
                 f"Auto-connect tick: {len(snapshot)} device(s), "
                 f"whitelist={sorted(whitelist_names) or '(none)'}, pattern={pattern}, "
@@ -857,19 +879,105 @@ class BluetoothNodeRuntimeMixin:
         self._clear_peer_connect_tracking(mac)
         self._clear_peer_setup_state(mac)
 
+    def _drop_peer_time_bridge(self, mac: str):
+        state = self._peer_time_bridges.pop(mac, None)
+        if state is None:
+            return
+        self.destroy_publisher(state.publisher)
+        self._stop_notify_if_unused(state.characteristic_path)
+        self._clear_peer_writeback_state(state.writeback_characteristic_path)
+
+    def _is_peer_connection_loss_error(self, error: str) -> bool:
+        text = str(error or "").lower()
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "not connected",
+                "failed to connect",
+                "connection aborted",
+                "connection terminated",
+                "software caused connection abort",
+                "host is down",
+                "timed out",
+                "att error: 0x01",
+            )
+        )
+
+    def _transition_peer_bridge_out_of_ready(self, mac: str, detail: str):
+        state = self._peer_time_bridges.get(mac)
+        device = self._client.get_device(mac, refresh=True) if self._client is not None else None
+        if state is not None:
+            self._drop_peer_time_bridge(mac)
+        if device is None or not device.connected:
+            self._clear_peer_connect_tracking(mac)
+            self._clear_peer_setup_state(mac)
+            self._set_peer_time_status(mac, "disconnected", detail)
+            return
+        wait_started = self._mark_peer_setup_pending(mac)
+        next_status = "waiting-services"
+        if device.services_resolved:
+            next_status = "waiting-time"
+        self._set_peer_time_status(
+            mac,
+            next_status,
+            detail,
+            wait_started=wait_started,
+            wait_grace_s=self.PEER_SETUP_TIMEOUT_S,
+        )
+
+    def _handle_peer_bridge_gatt_event(self, event_type: str, info: dict):
+        chrc_path = str(info.get("chrc_path", ""))
+        if not chrc_path:
+            return
+        error_text = str(info.get("error", ""))
+        for mac, state in list(self._peer_time_bridges.items()):
+            tracked_paths = {state.characteristic_path, state.writeback_characteristic_path}
+            tracked_paths.discard("")
+            if chrc_path not in tracked_paths:
+                continue
+            if event_type == "client_notify_disabled":
+                self._log_verbose(f"Peer {mac}: notify disabled for active time bridge")
+                self._transition_peer_bridge_out_of_ready(mac, "time bridge notify disabled")
+                return
+            if event_type.endswith("failed") and self._is_peer_connection_loss_error(error_text):
+                self._log_verbose(f"Peer {mac}: dropping ready bridge after {event_type}: {error_text}")
+                self._transition_peer_bridge_out_of_ready(mac, f"{event_type}: {error_text}")
+                return
+
     def _drop_peer_runtime_state(self, mac: str):
         for key, bridge in list(self._notification_bridges.items()):
             if bridge.mac == mac:
                 self._remove_import_bridge(key, bridge)
-        state = self._peer_time_bridges.pop(mac, None)
-        if state is not None:
-            self.destroy_publisher(state.publisher)
-            self._stop_notify_if_unused(state.characteristic_path)
-            self._clear_peer_writeback_state(state.writeback_characteristic_path)
+        self._drop_peer_time_bridge(mac)
         self._clear_peer_connect_tracking(mac)
         self._clear_peer_setup_state(mac)
         self._auto_connect_attempts.pop(mac, None)
         self._peer_status.pop(mac, None)
+
+    def _enforce_peer_setup_timeouts(self, snapshot: Dict[str, DeviceInfo]):
+        now = time.monotonic()
+        for mac, runtime_status in list(self._peer_status.items()):
+            wait_started = float(runtime_status.wait_started_monotonic or 0.0)
+            wait_timeout_s = float(runtime_status.wait_timeout_s or 0.0)
+            if wait_started <= 0.0 or wait_timeout_s <= 0.0:
+                continue
+            if (now - wait_started) < wait_timeout_s:
+                continue
+            device = snapshot.get(mac)
+            reason = f"peer setup timed out during {runtime_status.status}"
+            if device is None:
+                self._log_verbose(f"Peer {mac}: {reason}; device object disappeared")
+                self._drop_peer_runtime_state(mac)
+                self._set_peer_time_status(mac, "disconnected", reason)
+                continue
+            if device.connected or device.paired or device.bonded or device.trusted:
+                self._repair_broken_peer(mac, device, reason)
+                continue
+            self._log_verbose(f"Peer {mac}: {reason}; clearing stale local runtime state")
+            self._drop_peer_runtime_state(mac)
+            self._set_peer_time_status(mac, "disconnected", reason)
 
     def _request_peer_pair_repair(
         self,
@@ -1480,6 +1588,7 @@ class BluetoothNodeRuntimeMixin:
 
     def _on_client_gatt_event(self, event_type: str, info: dict):
         self._log_verbose(self._format_gatt_event_log(event_type, info))
+        self._handle_peer_bridge_gatt_event(event_type, info)
         if event_type == "client_notify_disabled":
             chrc_path = str(info.get("chrc_path", ""))
             if chrc_path:
