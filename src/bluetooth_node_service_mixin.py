@@ -6,7 +6,7 @@ from rosidl_runtime_py.utilities import get_message
 from .bluetooth_bridge_state import TopicExportBridgeState, TopicImportBridgeState
 from .bridge_payload import decode_message_payload, encode_message_payload, normalize_member_specs, payload_format_for_member_specs
 from .dbus_common import BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_CHRC_IFACE
-from .gatt_services import topic_bridge_characteristic_uuid
+from .gatt_services import topic_bridge_characteristic_uuid, topic_bridge_service_uuid
 from .uuid_utils import is_uuid, resolve_uuid
 
 
@@ -56,7 +56,12 @@ class BluetoothNodeServiceMixin:
             except Exception:
                 return candidate, "", transport_endpoint
         resolved_uuid = resolve_uuid(candidate) if is_uuid(candidate) else topic_bridge_characteristic_uuid(candidate)
-        path = self._client.find_characteristic(mac, resolved_uuid)
+        service_uuid = None if is_uuid(candidate) else topic_bridge_service_uuid(candidate)
+        if service_uuid is None:
+            path = self._client.find_characteristic(mac, resolved_uuid)
+        else:
+            matches = self._client.find_characteristics(mac, resolved_uuid, service_uuid=service_uuid)
+            path = matches[0] if matches else ""
         return path or "", resolved_uuid, transport_endpoint
 
     def _reject_descriptor_request(self, response, message: str):

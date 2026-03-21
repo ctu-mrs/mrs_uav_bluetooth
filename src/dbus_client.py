@@ -92,6 +92,9 @@ class BleClient:
         self._adapter_props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, adapter_path), DBUS_PROP_IFACE)
         self._object_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
         self._devices: Dict[str, DeviceInfo] = {}
+        self._gatt_services: Dict[str, Dict[str, dict]] = {}
+        self._gatt_characteristics: Dict[str, Dict[str, dict]] = {}
+        self._gatt_descriptors: Dict[str, Dict[str, dict]] = {}
         self._lock = threading.RLock()
         self._scan_running = False
         self._notification_cbs: Dict[int, Callable] = {}
@@ -443,76 +446,62 @@ class BleClient:
         device = self.get_device(mac)
         if not device or not device.path:
             return []
-        services = []
-        for path, ifaces in self._managed_objects().items():
-            if not str(path).startswith(device.path + "/"):
-                continue
-            props = ifaces.get(GATT_SERVICE_IFACE)
-            if not props:
-                continue
-            services.append({
-                "path": str(path),
-                "uuid": str(props.get("UUID", "")),
-                "primary": bool(props.get("Primary", True)),
-                "device": str(props.get("Device", "")) if "Device" in props else "",
-                "includes": [str(item) for item in props.get("Includes", [])],
-            })
-        return services
+        self._ensure_gatt_cache(device)
+        with self._lock:
+            services = list(self._gatt_services.get(device.path, {}).values())
+        return sorted((dict(item) for item in services), key=lambda item: item["path"])
 
     def list_characteristics(self, mac: str) -> List[dict]:
         device = self.get_device(mac)
         if not device or not device.path:
             return []
-        characteristics = []
-        for path, ifaces in self._managed_objects().items():
-            if not str(path).startswith(device.path + "/"):
-                continue
-            props = ifaces.get(GATT_CHRC_IFACE)
-            if not props:
-                continue
-            characteristics.append({
-                "path": str(path),
-                "service": str(props.get("Service", "")),
-                "uuid": str(props.get("UUID", "")),
-                "flags": [str(flag) for flag in props.get("Flags", [])],
-                "notifying": bool(props.get("Notifying", False)),
-                "mtu": int(props["MTU"]) if "MTU" in props else 0,
-            })
-        return characteristics
+        self._ensure_gatt_cache(device)
+        with self._lock:
+            characteristics = list(self._gatt_characteristics.get(device.path, {}).values())
+        return sorted((dict(item) for item in characteristics), key=lambda item: item["path"])
 
     def list_descriptors(self, mac: str, chrc_path: Optional[str] = None) -> List[dict]:
         device = self.get_device(mac)
         if not device or not device.path:
             return []
-        descriptors = []
-        prefix = chrc_path + "/" if chrc_path else device.path + "/"
-        for path, ifaces in self._managed_objects().items():
-            if not str(path).startswith(prefix):
-                continue
-            props = ifaces.get(GATT_DESC_IFACE)
-            if not props:
-                continue
-            descriptors.append({
-                "path": str(path),
-                "characteristic": str(props.get("Characteristic", "")),
-                "uuid": str(props.get("UUID", "")),
-                "flags": [str(flag) for flag in props.get("Flags", [])],
-            })
-        return descriptors
+        self._ensure_gatt_cache(device)
+        with self._lock:
+            descriptors = list(self._gatt_descriptors.get(device.path, {}).values())
+        if chrc_path:
+            descriptors = [item for item in descriptors if item["characteristic"] == chrc_path]
+        return sorted((dict(item) for item in descriptors), key=lambda item: item["path"])
 
-    def find_characteristic(self, mac: str, uuid: str) -> Optional[str]:
+    def find_service(self, mac: str, uuid: str) -> Optional[str]:
         uuid_lower = uuid.lower()
-        for characteristic in self.list_characteristics(mac):
-            if characteristic["uuid"].lower() == uuid_lower:
-                return characteristic["path"]
+        for service in self.list_services(mac):
+            if service["uuid"].lower() == uuid_lower:
+                return service["path"]
         return None
 
-    def find_characteristics(self, mac: str, uuid: str) -> List[str]:
+    def find_characteristic(self, mac: str, uuid: str) -> Optional[str]:
+        matches = self.find_characteristics(mac, uuid)
+        return matches[0] if matches else None
+
+    def find_characteristics(
+        self,
+        mac: str,
+        uuid: str,
+        *,
+        service_path: Optional[str] = None,
+        service_uuid: Optional[str] = None,
+    ) -> List[str]:
         uuid_lower = uuid.lower()
+        service_uuid_lower = service_uuid.lower() if service_uuid else ""
         candidates = []
         for characteristic in self.list_characteristics(mac):
             if characteristic["uuid"].lower() != uuid_lower:
                 continue
+            if service_path and characteristic["service"] != service_path:
+                continue
+            if service_uuid_lower:
+                owning_service = self._get_cached_service_by_path(mac, characteristic["service"])
+                if owning_service is None or owning_service["uuid"].lower() != service_uuid_lower:
+                    continue
             path = characteristic["path"]
             if path in candidates:
                 continue
@@ -702,31 +691,64 @@ class BleClient:
         for path, ifaces in self._managed_objects().items():
             props = ifaces.get(DEVICE_IFACE)
             if not props or not str(path).startswith(self._adapter_path + "/"):
+                if GATT_SERVICE_IFACE in ifaces:
+                    self._update_gatt_service(str(path), ifaces[GATT_SERVICE_IFACE])
+                if GATT_CHRC_IFACE in ifaces:
+                    self._update_gatt_characteristic(str(path), ifaces[GATT_CHRC_IFACE])
+                if GATT_DESC_IFACE in ifaces:
+                    self._update_gatt_descriptor(str(path), ifaces[GATT_DESC_IFACE])
                 continue
             self._update_device(str(path), props)
+            if GATT_SERVICE_IFACE in ifaces:
+                self._update_gatt_service(str(path), ifaces[GATT_SERVICE_IFACE])
+            if GATT_CHRC_IFACE in ifaces:
+                self._update_gatt_characteristic(str(path), ifaces[GATT_CHRC_IFACE])
+            if GATT_DESC_IFACE in ifaces:
+                self._update_gatt_descriptor(str(path), ifaces[GATT_DESC_IFACE])
 
     def _on_interfaces_added(self, path, interfaces):
         if DEVICE_IFACE in interfaces:
             self._update_device(str(path), interfaces[DEVICE_IFACE])
+        if GATT_SERVICE_IFACE in interfaces:
+            self._update_gatt_service(str(path), interfaces[GATT_SERVICE_IFACE])
+        if GATT_CHRC_IFACE in interfaces:
+            self._update_gatt_characteristic(str(path), interfaces[GATT_CHRC_IFACE])
+        if GATT_DESC_IFACE in interfaces:
+            self._update_gatt_descriptor(str(path), interfaces[GATT_DESC_IFACE])
 
     def _on_interfaces_removed(self, path, interfaces):
-        if DEVICE_IFACE not in interfaces:
-            return
-        removed = None
-        with self._lock:
-            for mac, device in self._devices.items():
-                if device.path == str(path):
-                    removed = device.copy()
-                    break
+        path_str = str(path)
+        if DEVICE_IFACE in interfaces:
+            removed = None
+            with self._lock:
+                for mac, device in self._devices.items():
+                    if device.path == path_str:
+                        removed = device.copy()
+                        break
+                if removed is not None:
+                    self._devices.pop(removed.mac, None)
+                    self._gatt_services.pop(path_str, None)
+                    self._gatt_characteristics.pop(path_str, None)
+                    self._gatt_descriptors.pop(path_str, None)
             if removed is not None:
-                self._devices.pop(removed.mac, None)
-        if removed is not None:
-            self._emit_device(removed.mac, removed, ("removed", "connected", "services_resolved"))
+                self._emit_device(removed.mac, removed, ("removed", "connected", "services_resolved"))
+        if GATT_SERVICE_IFACE in interfaces:
+            self._remove_gatt_service(path_str)
+        if GATT_CHRC_IFACE in interfaces:
+            self._remove_gatt_characteristic(path_str)
+        if GATT_DESC_IFACE in interfaces:
+            self._remove_gatt_descriptor(path_str)
 
     def _on_properties_changed(self, interface, changed, invalidated, path=""):
         del invalidated
         if interface == DEVICE_IFACE:
             self._update_device(str(path), changed)
+        elif interface == GATT_SERVICE_IFACE:
+            self._update_gatt_service(str(path), changed)
+        elif interface == GATT_CHRC_IFACE:
+            self._update_gatt_characteristic(str(path), changed)
+        elif interface == GATT_DESC_IFACE:
+            self._update_gatt_descriptor(str(path), changed)
 
     def _update_device(self, path: str, props: dict):
         mac = str(props.get("Address", "")).upper()
@@ -814,6 +836,198 @@ class BleClient:
         if not device or not device.path:
             return ""
         return str(device.path)
+
+    def _ensure_gatt_cache(self, device: DeviceInfo):
+        if not device.path:
+            return
+        with self._lock:
+            has_cache = bool(
+                self._gatt_services.get(device.path)
+                or self._gatt_characteristics.get(device.path)
+                or self._gatt_descriptors.get(device.path)
+            )
+        if has_cache or not device.services_resolved:
+            return
+        self._refresh_gatt_for_device(device.path)
+
+    def _refresh_gatt_for_device(self, device_path: str):
+        if not device_path:
+            return
+        with self._lock:
+            self._gatt_services.pop(device_path, None)
+            self._gatt_characteristics.pop(device_path, None)
+            self._gatt_descriptors.pop(device_path, None)
+        for path, ifaces in self._managed_objects().items():
+            path_str = str(path)
+            if GATT_SERVICE_IFACE in ifaces:
+                props = ifaces[GATT_SERVICE_IFACE]
+                if str(props.get("Device", "")) == device_path or path_str.startswith(device_path + "/"):
+                    self._update_gatt_service(path_str, props)
+            if GATT_CHRC_IFACE in ifaces:
+                props = ifaces[GATT_CHRC_IFACE]
+                if self._infer_device_path_from_chrc_props(path_str, props) == device_path:
+                    self._update_gatt_characteristic(path_str, props)
+            if GATT_DESC_IFACE in ifaces:
+                props = ifaces[GATT_DESC_IFACE]
+                if self._infer_device_path_from_desc_props(path_str, props) == device_path:
+                    self._update_gatt_descriptor(path_str, props)
+
+    def _update_gatt_service(self, path: str, props: dict):
+        device_path = self._infer_device_path_from_service_props(path, props)
+        if not device_path:
+            return
+        with self._lock:
+            bucket = self._gatt_services.setdefault(device_path, {})
+            item = bucket.get(path, {"path": path, "uuid": "", "primary": True, "device": device_path, "includes": []})
+            if "UUID" in props:
+                item["uuid"] = str(props.get("UUID", ""))
+            if "Primary" in props:
+                item["primary"] = bool(props.get("Primary", True))
+            if "Device" in props:
+                item["device"] = str(props.get("Device", ""))
+            if "Includes" in props:
+                item["includes"] = [str(include) for include in props.get("Includes", [])]
+            bucket[path] = item
+
+    def _update_gatt_characteristic(self, path: str, props: dict):
+        device_path = self._infer_device_path_from_chrc_props(path, props)
+        if not device_path:
+            return
+        with self._lock:
+            bucket = self._gatt_characteristics.setdefault(device_path, {})
+            item = bucket.get(path, {"path": path, "service": "", "uuid": "", "flags": [], "notifying": False, "mtu": 0})
+            if "Service" in props:
+                item["service"] = str(props.get("Service", ""))
+            if "UUID" in props:
+                item["uuid"] = str(props.get("UUID", ""))
+            if "Flags" in props:
+                item["flags"] = [str(flag) for flag in props.get("Flags", [])]
+            if "Notifying" in props:
+                item["notifying"] = bool(props.get("Notifying", False))
+            if "MTU" in props:
+                item["mtu"] = int(props["MTU"])
+            bucket[path] = item
+
+    def _update_gatt_descriptor(self, path: str, props: dict):
+        device_path = self._infer_device_path_from_desc_props(path, props)
+        if not device_path:
+            return
+        with self._lock:
+            bucket = self._gatt_descriptors.setdefault(device_path, {})
+            item = bucket.get(path, {"path": path, "characteristic": "", "uuid": "", "flags": []})
+            if "Characteristic" in props:
+                item["characteristic"] = str(props.get("Characteristic", ""))
+            if "UUID" in props:
+                item["uuid"] = str(props.get("UUID", ""))
+            if "Flags" in props:
+                item["flags"] = [str(flag) for flag in props.get("Flags", [])]
+            bucket[path] = item
+
+    def _remove_gatt_service(self, path: str):
+        with self._lock:
+            for device_path, services in list(self._gatt_services.items()):
+                if path not in services:
+                    continue
+                services.pop(path, None)
+                for chrc_path, characteristic in list(self._gatt_characteristics.get(device_path, {}).items()):
+                    if characteristic.get("service") != path:
+                        continue
+                    self._gatt_characteristics[device_path].pop(chrc_path, None)
+                    for desc_path, descriptor in list(self._gatt_descriptors.get(device_path, {}).items()):
+                        if descriptor.get("characteristic") == chrc_path:
+                            self._gatt_descriptors[device_path].pop(desc_path, None)
+                if not services:
+                    self._gatt_services.pop(device_path, None)
+                return
+
+    def _remove_gatt_characteristic(self, path: str):
+        with self._lock:
+            for device_path, characteristics in list(self._gatt_characteristics.items()):
+                if path not in characteristics:
+                    continue
+                characteristics.pop(path, None)
+                for desc_path, descriptor in list(self._gatt_descriptors.get(device_path, {}).items()):
+                    if descriptor.get("characteristic") == path:
+                        self._gatt_descriptors[device_path].pop(desc_path, None)
+                if not characteristics:
+                    self._gatt_characteristics.pop(device_path, None)
+                return
+
+    def _remove_gatt_descriptor(self, path: str):
+        with self._lock:
+            for device_path, descriptors in list(self._gatt_descriptors.items()):
+                if path in descriptors:
+                    descriptors.pop(path, None)
+                    if not descriptors:
+                        self._gatt_descriptors.pop(device_path, None)
+                    return
+
+    def _infer_device_path_from_service_props(self, path: str, props: dict) -> str:
+        device_path = str(props.get("Device", ""))
+        if device_path:
+            return device_path
+        marker = "/service"
+        if marker in path:
+            prefix = path.split(marker, 1)[0]
+            if "/dev_" in prefix:
+                return prefix
+        with self._lock:
+            for device in self._devices.values():
+                if path.startswith(device.path + "/"):
+                    return device.path
+        return ""
+
+    def _infer_device_path_from_chrc_props(self, path: str, props: dict) -> str:
+        service_path = str(props.get("Service", ""))
+        if service_path:
+            device_path = self._device_path_for_service(service_path)
+            if device_path:
+                return device_path
+        marker = "/char"
+        if marker in path:
+            service_path = path.split(marker, 1)[0]
+            return self._device_path_for_service(service_path)
+        return ""
+
+    def _infer_device_path_from_desc_props(self, path: str, props: dict) -> str:
+        characteristic_path = str(props.get("Characteristic", ""))
+        if characteristic_path:
+            device_path = self._device_path_for_characteristic(characteristic_path)
+            if device_path:
+                return device_path
+        marker = "/desc"
+        if marker in path:
+            characteristic_path = path.split(marker, 1)[0]
+            return self._device_path_for_characteristic(characteristic_path)
+        return ""
+
+    def _device_path_for_service(self, service_path: str) -> str:
+        with self._lock:
+            for device_path, services in self._gatt_services.items():
+                if service_path in services:
+                    return device_path
+        if "/dev_" in service_path and "/service" in service_path:
+            return service_path.split("/service", 1)[0]
+        return ""
+
+    def _device_path_for_characteristic(self, characteristic_path: str) -> str:
+        with self._lock:
+            for device_path, characteristics in self._gatt_characteristics.items():
+                if characteristic_path in characteristics:
+                    return device_path
+        if "/char" in characteristic_path:
+            service_path = characteristic_path.split("/char", 1)[0]
+            return self._device_path_for_service(service_path)
+        return ""
+
+    def _get_cached_service_by_path(self, mac: str, service_path: str) -> Optional[dict]:
+        device = self.get_device(mac)
+        if not device or not device.path:
+            return None
+        self._ensure_gatt_cache(device)
+        with self._lock:
+            service = self._gatt_services.get(device.path, {}).get(service_path)
+            return dict(service) if service is not None else None
 
     def _set_device_prop(self, mac: str, prop: str, value) -> bool:
         device = self.get_device(mac)

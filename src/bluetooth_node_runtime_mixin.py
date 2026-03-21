@@ -36,6 +36,7 @@ from .dbus_client import DeviceInfo
 from .netplan import NetplanConfiguration
 from .gatt_services import (
     TIME_CHARACTERISTIC_UUID,
+    TIME_SERVICE_UUID,
     TIME_WRITE_CHARACTERISTIC_UUID,
     topic_bridge_characteristic_uuid,
 )
@@ -137,6 +138,9 @@ class BluetoothNodeRuntimeMixin:
 
     def _rebuild_server(self):
         with self._lock:
+            client_profile_uuids = []
+            if bool(self.get_parameter("enable_time_service").value):
+                client_profile_uuids.append(TIME_SERVICE_UUID)
             self._log_verbose(
                 f"Rebuilding GATT server: wifi={bool(self.get_parameter('enable_wifi_service').value)}, "
                 f"time={bool(self.get_parameter('enable_time_service').value)}, "
@@ -144,6 +148,7 @@ class BluetoothNodeRuntimeMixin:
             )
             self._dbus.rebuild_server(
                 self._topic_exports,
+                client_profile_uuids=client_profile_uuids,
                 enable_wifi_service=bool(self.get_parameter("enable_wifi_service").value),
                 enable_time_service=bool(self.get_parameter("enable_time_service").value),
                 advertise_mode=self.get_parameter("advertise_mode").value,
@@ -942,19 +947,25 @@ class BluetoothNodeRuntimeMixin:
 
     def _resolve_peer_time_paths(self, mac: str) -> Tuple[str, str]:
         def _find_paths() -> Tuple[str, str]:
+            service_path = self._client.find_service(mac, TIME_SERVICE_UUID)
             time_path = ""
             writeback_path = ""
-            for characteristic in self._client.list_characteristics(mac):
-                uuid = str(characteristic.get("uuid") or "").lower()
-                path = str(characteristic.get("path") or "")
-                if not path:
-                    continue
-                if not time_path and uuid == TIME_CHARACTERISTIC_UUID.lower():
-                    time_path = path
-                elif not writeback_path and uuid == TIME_WRITE_CHARACTERISTIC_UUID.lower():
-                    writeback_path = path
-                if time_path and writeback_path:
-                    break
+            time_matches = self._client.find_characteristics(
+                mac,
+                TIME_CHARACTERISTIC_UUID,
+                service_path=service_path or None,
+                service_uuid=TIME_SERVICE_UUID,
+            )
+            writeback_matches = self._client.find_characteristics(
+                mac,
+                TIME_WRITE_CHARACTERISTIC_UUID,
+                service_path=service_path or None,
+                service_uuid=TIME_SERVICE_UUID,
+            )
+            if time_matches:
+                time_path = time_matches[0]
+            if writeback_matches:
+                writeback_path = writeback_matches[0]
             return time_path, writeback_path
 
         time_path, writeback_path = _find_paths()
@@ -1307,11 +1318,9 @@ class BluetoothNodeRuntimeMixin:
             return
         if not device.connected:
             self._log_verbose(f"Removing peer runtime state for disconnected device {mac}")
-            if not device.paired:
-                self._drop_peer_runtime_state(mac)
-            else:
-                self._clear_peer_local_state(mac, device=device, reason="Unpairing on disconnection event")
-            self._update_scan_state(reason=f"device event {mac} disconnected and unpaired")
+            self._drop_peer_runtime_state(mac)
+            self._set_peer_time_status(mac, "disconnected")
+            self._update_scan_state(reason=f"device event {mac} disconnected")
             return
         whitelist_names, whitelist_macs = self._get_auto_connect_whitelist()
         whitelist_enabled = bool(whitelist_names or whitelist_macs)

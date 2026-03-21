@@ -13,7 +13,7 @@ from .dbus_advertisement import Advertisement
 from .dbus_agent import PairingAgent
 from .dbus_client import BleClient
 from .dbus_common import BLUEZ_SERVICE_PATH, BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_MANAGER_IFACE, LE_ADVERTISING_MANAGER_IFACE, AGENT_MANAGER_IFACE, ADAPTER_IFACE
-from .dbus_gatt import Application, find_adapter
+from .dbus_gatt import Application, Profile, find_adapter
 from .gatt_services import TIME_SERVICE_UUID, WIFI_SERVICE_UUID, TimeService, TopicBridgeService, WifiService
 
 
@@ -152,6 +152,7 @@ class BluetoothDbusRuntime:
         self,
         topic_exports: Dict[str, TopicExportBridgeState],
         *,
+        client_profile_uuids,
         enable_wifi_service: bool,
         enable_time_service: bool,
         advertise_mode: str,
@@ -169,6 +170,7 @@ class BluetoothDbusRuntime:
 
         app = Application(self._bus)
         service_index = 0
+        profile_index = 0
         if enable_wifi_service:
             self._wifi_service = WifiService(
                 self._bus,
@@ -199,6 +201,10 @@ class BluetoothDbusRuntime:
             app.add_service(state.service)
             service_index += 1
 
+        profile_uuids = [str(uuid) for uuid in client_profile_uuids if str(uuid).strip()]
+        if profile_uuids:
+            app.add_profile(Profile(self._bus, profile_index, profile_uuids))
+
         service_uuids = []
         if self._time_service is not None:
             service_uuids.append(TIME_SERVICE_UUID)
@@ -223,7 +229,9 @@ class BluetoothDbusRuntime:
         def _register_app_reply():
             if generation != self._server_generation or self._app is not app:
                 return
-            self._logger.info(f"GATT application registered ({service_index} services)")
+            self._logger.info(
+                f"GATT application registered ({service_index} services, {len(profile_uuids)} client profile UUIDs)"
+            )
             GLib.timeout_add(
                 max(1, int(self._GATT_APPLICATION_SETTLE_S * 1000)),
                 lambda: self._register_advertisement(service_uuids, generation),
@@ -233,7 +241,9 @@ class BluetoothDbusRuntime:
             self._logger.error(f"Failed to register GATT application: {error}")
             self._cleanup_failed_server_build(app, topic_exports, generation)
 
-        self._logger.info(f"Registering GATT application ({service_index} services)")
+        self._logger.info(
+            f"Registering GATT application ({service_index} services, {len(profile_uuids)} client profile UUIDs)"
+        )
         gatt_mgr.RegisterApplication(
             app.get_path(),
             {},

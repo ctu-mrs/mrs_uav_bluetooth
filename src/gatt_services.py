@@ -28,6 +28,10 @@ def topic_bridge_characteristic_uuid(bridge_name: str) -> str:
     return named_characteristic_uuid(bridge_name)
 
 
+def topic_bridge_service_uuid(bridge_name: str) -> str:
+    return named_service_uuid(f"bridge:{bridge_name}")
+
+
 class WifiService(Service):
     def __init__(
         self,
@@ -114,7 +118,7 @@ class TimeService(Service):
 
 class TopicBridgeService(Service):
     def __init__(self, bus, index, topic_name: str, message_type: str, bridge_name: str, bridge_key: str, *, member_specs: Sequence[BridgeMemberSpec], rate_hz: float, payload_format: str):
-        service_uuid = named_service_uuid(f"bridge:{bridge_name}")
+        service_uuid = topic_bridge_service_uuid(bridge_name)
         super().__init__(bus, index, service_uuid, primary=True, name=f"bridge:{bridge_name}")
         self.topic_name = topic_name
         self.message_type = message_type
