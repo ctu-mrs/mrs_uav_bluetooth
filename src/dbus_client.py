@@ -283,6 +283,18 @@ class BleClient:
             return expected.issubset(available)
         return bool(descriptors)
 
+    def refresh_gatt(self, mac: str) -> bool:
+        device = self.get_device(mac, refresh=True)
+        if not device or not device.path:
+            return False
+        self._refresh_gatt_for_device(device.path)
+        with self._lock:
+            return bool(
+                self._gatt_services.get(device.path)
+                or self._gatt_characteristics.get(device.path)
+                or self._gatt_descriptors.get(device.path)
+            )
+
     def connect(self, mac: str, timeout: float = 15.0) -> bool:
         device_path = self._find_device_path(mac)
         if not device_path:
@@ -478,7 +490,7 @@ class BleClient:
             if service["uuid"].lower() == uuid_lower:
                 return service["path"]
         device = self.get_device(mac)
-        if device and device.services_resolved:
+        if device and device.path and (device.connected or device.services_resolved):
             self._refresh_gatt_for_device(device.path)
             for service in self.list_services(mac):
                 if service["uuid"].lower() == uuid_lower:
@@ -521,7 +533,7 @@ class BleClient:
         if candidates:
             return candidates
         device = self.get_device(mac)
-        if device and device.services_resolved:
+        if device and device.path and (device.connected or device.services_resolved):
             self._refresh_gatt_for_device(device.path)
             return _collect_candidates()
         return []
@@ -848,8 +860,14 @@ class BleClient:
             if "services_resolved" in changed_fields:
                 if device.services_resolved:
                     refresh_gatt_cache = True
-                else:
+                elif not device.connected:
+                    # BlueZ documents ServicesResolved only as the discovery state.
+                    # It does not say remote GATT objects are invalid while the link
+                    # stays connected, so only drop cached remote objects after an
+                    # actual disconnect.
                     clear_gatt_cache = True
+            if "connected" in changed_fields and not device.connected:
+                clear_gatt_cache = True
             snapshot = device.copy()
             device_path = device.path
         if is_new:
@@ -879,8 +897,13 @@ class BleClient:
                 or self._gatt_characteristics.get(device.path)
                 or self._gatt_descriptors.get(device.path)
             )
-        if has_cache or not device.services_resolved:
+        if has_cache:
             return
+        if not device.connected and not device.services_resolved:
+            return
+        # Remote GATT services live under the device object path in BlueZ.
+        # Rebuild the cache whenever the peer is still connected, even if
+        # ServicesResolved is lagging or flapping.
         self._refresh_gatt_for_device(device.path)
 
     def _refresh_gatt_for_device(self, device_path: str):

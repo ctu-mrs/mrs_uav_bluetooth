@@ -395,6 +395,84 @@ class BluetoothNodeRuntimeMixin:
             pieces.append(f"error={error}")
         return "GATT " + " ".join(pieces)
 
+    def _log_remote_gatt_services(self, mac: str, *, context: str = ""):
+        if self._client is None:
+            return
+        try:
+            device = self._client.get_device(mac, refresh=True)
+            if device is None:
+                self._log_verbose(f"Remote GATT {mac}: device unavailable {context}".rstrip())
+                return
+            self._client.refresh_gatt(mac)
+            services = self._client.list_services(mac)
+            characteristics = self._client.list_characteristics(mac)
+            descriptors = self._client.list_descriptors(mac)
+        except dbus.exceptions.DBusException as exc:
+            self._dbus_warning(f"remote_gatt::{mac}", f"Failed to inspect remote GATT for {mac}: {exc}")
+            return
+
+        suffix = f" context={context}" if context else ""
+        self._log_verbose(
+            f"Remote GATT {mac}: connected={device.connected} services_resolved={device.services_resolved} "
+            f"services={len(services)} characteristics={len(characteristics)} descriptors={len(descriptors)}{suffix}"
+        )
+
+        characteristics_by_service = {}
+        for characteristic in characteristics:
+            characteristics_by_service.setdefault(str(characteristic.get("service", "")), []).append(characteristic)
+
+        descriptors_by_characteristic = {}
+        for descriptor in descriptors:
+            descriptors_by_characteristic.setdefault(str(descriptor.get("characteristic", "")), []).append(descriptor)
+
+        logged_service_paths = set()
+        for service in sorted(services, key=lambda item: str(item.get("path", ""))):
+            service_path = str(service.get("path", ""))
+            service_uuid = str(service.get("uuid", ""))
+            primary = "Y" if service.get("primary", True) else "N"
+            logged_service_paths.add(service_path)
+            self._log_verbose(
+                f"Remote GATT service {mac}: uuid={service_uuid or '-'} primary={primary} path={service_path or '-'}"
+            )
+            for characteristic in sorted(characteristics_by_service.get(service_path, []), key=lambda item: str(item.get("path", ""))):
+                flags = ",".join(str(flag) for flag in characteristic.get("flags", [])) or "-"
+                characteristic_path = str(characteristic.get("path", ""))
+                self._log_verbose(
+                    f"Remote GATT characteristic {mac}: service={service_uuid or '-'} uuid={characteristic.get('uuid') or '-'} "
+                    f"notifying={'Y' if characteristic.get('notifying') else 'N'} flags={flags} path={characteristic_path or '-'}"
+                )
+                for descriptor in sorted(descriptors_by_characteristic.get(characteristic_path, []), key=lambda item: str(item.get("path", ""))):
+                    descriptor_flags = ",".join(str(flag) for flag in descriptor.get("flags", [])) or "-"
+                    self._log_verbose(
+                        f"Remote GATT descriptor {mac}: characteristic={characteristic.get('uuid') or '-'} "
+                        f"uuid={descriptor.get('uuid') or '-'} flags={descriptor_flags} path={descriptor.get('path') or '-'}"
+                    )
+
+        orphan_characteristics = [
+            characteristic
+            for characteristic in characteristics
+            if str(characteristic.get("service", "")) not in logged_service_paths
+        ]
+        for characteristic in sorted(orphan_characteristics, key=lambda item: str(item.get("path", ""))):
+            flags = ",".join(str(flag) for flag in characteristic.get("flags", [])) or "-"
+            characteristic_path = str(characteristic.get("path", ""))
+            self._log_verbose(
+                f"Remote GATT orphan characteristic {mac}: service={characteristic.get('service') or '-'} "
+                f"uuid={characteristic.get('uuid') or '-'} notifying={'Y' if characteristic.get('notifying') else 'N'} "
+                f"flags={flags} path={characteristic_path or '-'}"
+            )
+
+    def _characteristics_share_service(self, first: dict, second: dict) -> bool:
+        first_service = str(first.get("service", ""))
+        second_service = str(second.get("service", ""))
+        if first_service and second_service:
+            return first_service == second_service
+        first_path = str(first.get("path", ""))
+        second_path = str(second.get("path", ""))
+        if "/char" in first_path and "/char" in second_path:
+            return first_path.split("/char", 1)[0] == second_path.split("/char", 1)[0]
+        return False
+
     def _log_discovered_devices_summary(self, snapshot: Dict[str, DeviceInfo], pattern: str):
         peers = []
         others = []
@@ -930,10 +1008,23 @@ class BluetoothNodeRuntimeMixin:
 
     def _ensure_peer_services_resolved(self, mac: str, device: DeviceInfo, *, device_label: str) -> bool:
         if self._has_live_peer_time_bridge(mac):
+            self._log_verbose(f"Peer {device_label}: active time bridge already proves remote GATT usability")
+            return True
+        if self._client.refresh_gatt(mac) and self._resolve_peer_time_paths(mac)[0]:
+            self._log_verbose(f"Peer {device_label}: resolved remote time characteristic from managed GATT tree")
             return True
         if self._resolve_peer_time_paths(mac)[0]:
+            self._log_verbose(f"Peer {device_label}: time paths found before ServicesResolved became stable")
             return True
         if device.services_resolved:
+            return True
+        self._client.wait_services_resolved(mac, timeout=min(1.0, self.CONNECT_RETRY_MIN_S + 0.5))
+        refreshed = self._client.get_device(mac, refresh=True) or device
+        if refreshed.services_resolved:
+            self._log_verbose(f"Peer {device_label}: ServicesResolved became true after short wait")
+            return True
+        if self._client.refresh_gatt(mac) and self._resolve_peer_time_paths(mac)[0]:
+            self._log_verbose(f"Peer {device_label}: remote GATT tree is usable even though ServicesResolved is still false")
             return True
         wait_started = self._mark_peer_setup_pending(mac)
         self._set_peer_time_status(
@@ -942,6 +1033,7 @@ class BluetoothNodeRuntimeMixin:
             wait_started=wait_started,
             wait_grace_s=self.PEER_SETUP_TIMEOUT_S,
         )
+        self._log_remote_gatt_services(mac, context="waiting-services")
         self._log_verbose(f"Peer {device_label}: services not resolved yet, delaying time bridge setup")
         return False
 
@@ -985,10 +1077,16 @@ class BluetoothNodeRuntimeMixin:
             if len(time_candidates) == 1 and len(writeback_candidates) == 1:
                 time_candidate = time_candidates[0]
                 writeback_candidate = writeback_candidates[0]
-                if time_candidate.get("service") == writeback_candidate.get("service"):
+                if self._characteristics_share_service(time_candidate, writeback_candidate):
                     return str(time_candidate.get("path", "")), str(writeback_candidate.get("path", ""))
+            if len(time_candidates) == 1 and len(writeback_candidates) == 1:
+                return str(time_candidates[0].get("path", "")), str(writeback_candidates[0].get("path", ""))
             return time_path, writeback_path
 
+        time_path, writeback_path = _find_paths()
+        if time_path and writeback_path:
+            return time_path, writeback_path
+        self._client.refresh_gatt(mac)
         time_path, writeback_path = _find_paths()
         if time_path and writeback_path:
             return time_path, writeback_path
@@ -1009,6 +1107,7 @@ class BluetoothNodeRuntimeMixin:
 
         path, writeback_characteristic_path = self._resolve_peer_time_paths(mac)
         if not path:
+            self._log_remote_gatt_services(mac, context="missing-time-characteristic")
             self._log_verbose(f"Peer {device_label}: time characteristic {TIME_CHARACTERISTIC_UUID} not found")
             wait_started = self._mark_peer_setup_pending(mac)
             self._set_peer_time_status(
@@ -1019,6 +1118,7 @@ class BluetoothNodeRuntimeMixin:
             )
             return False
         if not writeback_characteristic_path:
+            self._log_remote_gatt_services(mac, context="missing-time-writeback-characteristic")
             wait_started = self._mark_peer_setup_pending(mac)
             self._set_peer_time_status(
                 mac,
@@ -1333,6 +1433,8 @@ class BluetoothNodeRuntimeMixin:
             f"paired={device.paired} bonded={device.bonded} trusted={device.trusted} "
             f"services_resolved={device.services_resolved}"
         )
+        if device.connected and "services_resolved" in changed_fields:
+            self._log_remote_gatt_services(mac, context=f"device-event services_resolved={device.services_resolved}")
         if mac in self._peer_repair_reasons:
             self._progress_peer_repair(mac, device)
             self._update_scan_state(reason=f"device event {mac} repair")
