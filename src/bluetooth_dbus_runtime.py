@@ -1,7 +1,6 @@
 """DBus lifecycle helpers used by the ROS Bluetooth node."""
 
 import threading
-import time
 from typing import Any, Callable, Dict, Optional
 
 import dbus
@@ -13,7 +12,7 @@ from .dbus_advertisement import Advertisement
 from .dbus_agent import PairingAgent
 from .dbus_client import BleClient
 from .dbus_common import BLUEZ_SERVICE_PATH, BLUEZ_SERVICE_NAME, DBUS_PROP_IFACE, GATT_MANAGER_IFACE, LE_ADVERTISING_MANAGER_IFACE, AGENT_MANAGER_IFACE, ADAPTER_IFACE
-from .dbus_gatt import Application, Profile, find_adapter
+from .dbus_gatt import Application, find_adapter
 from .gatt_services import TIME_SERVICE_UUID, WIFI_SERVICE_UUID, TimeService, TopicBridgeService, WifiService
 
 
@@ -21,80 +20,27 @@ class GlibMainLoopThread:
     def __init__(self):
         self._mainloop = None
         self._thread = None
-        self._thread_ident = None
-        self._started = threading.Event()
 
     def start(self):
         if self._mainloop is not None:
             return
         self._mainloop = GLib.MainLoop()
-        self._started.clear()
-
-        def _run_mainloop():
-            self._thread_ident = threading.get_ident()
-            self._started.set()
-            self._mainloop.run()
-
-        self._thread = threading.Thread(target=_run_mainloop, daemon=True, name="glib-mainloop")
+        self._thread = threading.Thread(target=self._mainloop.run, daemon=True, name="glib-mainloop")
         self._thread.start()
-        if not self._started.wait(timeout=2.0):
-            raise RuntimeError("GLib main loop did not start")
 
     def stop(self):
         if self._mainloop is not None and self._mainloop.is_running():
-            try:
-                self.invoke(self._mainloop.quit)
-            except RuntimeError:
-                self._mainloop.quit()
+            self._mainloop.quit()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         self._mainloop = None
         self._thread = None
-        self._thread_ident = None
-        self._started.clear()
-
-    def invoke(self, callback: Callable[[], None]):
-        if self._mainloop is None:
-            raise RuntimeError("GLib main loop is not running")
-
-        def _run_once():
-            callback()
-            return False
-
-        GLib.idle_add(_run_once)
-
-    def call(self, callback: Callable[[], Any], timeout: float = 30.0):
-        if self._mainloop is None:
-            raise RuntimeError("GLib main loop is not running")
-        if threading.get_ident() == self._thread_ident:
-            return callback()
-
-        completed = threading.Event()
-        result = {}
-
-        def _run_once():
-            try:
-                result["value"] = callback()
-            except Exception as exc:
-                result["error"] = exc
-            finally:
-                completed.set()
-            return False
-
-        GLib.idle_add(_run_once)
-        wait_timeout = None if timeout is None or timeout <= 0 else float(timeout)
-        if not completed.wait(wait_timeout):
-            raise TimeoutError("Timed out waiting for GLib D-Bus call")
-        if "error" in result:
-            raise result["error"]
-        return result.get("value")
 
 
 class BluetoothDbusRuntime:
     _LEGACY_ADV_MAX_BYTES = 31
     _ADV_FLAGS_BYTES = 3
     _ADV_TX_POWER_BYTES = 3
-    _GATT_APPLICATION_SETTLE_S = 0.2
 
     def __init__(
         self,
@@ -118,7 +64,6 @@ class BluetoothDbusRuntime:
         self._wifi_service = None
         self._time_service = None
         self._pairing_agent_registered = False
-        self._server_generation = 0
 
     @property
     def adapter_path(self) -> str:
@@ -153,30 +98,27 @@ class BluetoothDbusRuntime:
             return
         DBusGMainLoop(set_as_default=True)
         self._bus = dbus.SystemBus()
-        self._glib.start()
         self._adapter_path = find_adapter(self._bus)
         if not self._adapter_path:
             raise RuntimeError("No Bluetooth adapter with GattManager1 found")
         self._logger.info(f"Using adapter {self._adapter_path}")
+        self._glib.start()
         self.set_adapter_props(powered=True)
-        self._client = BleClient(self._bus, self._adapter_path, call_sync=self._glib.call)
+        self._client = BleClient(self._bus, self._adapter_path)
 
     def ensure_pairing_agent(self, *, auto_accept: bool, auto_trust: bool, capability: str):
         self._require_setup()
         if self._pairing_agent_registered:
             return
-        self._agent = self._glib.call(
-            lambda: PairingAgent(
-                self._bus,
-                auto_accept=auto_accept,
-                auto_trust=auto_trust,
-                on_event=self._on_pairing_event,
-            ),
-            timeout=10.0,
+        self._agent = PairingAgent(
+            self._bus,
+            auto_accept=auto_accept,
+            auto_trust=auto_trust,
+            on_event=self._on_pairing_event,
         )
         agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), AGENT_MANAGER_IFACE)
-        self._call_dbus_method(agent_mgr.RegisterAgent, "register pairing agent", PairingAgent.AGENT_PATH, capability, timeout=10.0)
-        self._call_dbus_method(agent_mgr.RequestDefaultAgent, "request default pairing agent", PairingAgent.AGENT_PATH, timeout=10.0)
+        agent_mgr.RegisterAgent(PairingAgent.AGENT_PATH, capability)
+        agent_mgr.RequestDefaultAgent(PairingAgent.AGENT_PATH)
         self._pairing_agent_registered = True
         self._logger.info(f"Pairing agent registered (capability={capability})")
 
@@ -184,7 +126,6 @@ class BluetoothDbusRuntime:
         self,
         topic_exports: Dict[str, TopicExportBridgeState],
         *,
-        client_profile_uuids,
         enable_wifi_service: bool,
         enable_time_service: bool,
         advertise_mode: str,
@@ -197,12 +138,9 @@ class BluetoothDbusRuntime:
     ):
         self._require_setup()
         self.unregister_server_objects(topic_exports)
-        self._server_generation += 1
-        generation = self._server_generation
 
         app = Application(self._bus)
         service_index = 0
-        profile_index = 0
         if enable_wifi_service:
             self._wifi_service = WifiService(
                 self._bus,
@@ -233,9 +171,9 @@ class BluetoothDbusRuntime:
             app.add_service(state.service)
             service_index += 1
 
-        profile_uuids = [str(uuid) for uuid in client_profile_uuids if str(uuid).strip()]
-        if profile_uuids:
-            app.add_profile(Profile(self._bus, profile_index, profile_uuids))
+        gatt_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), GATT_MANAGER_IFACE)
+        advertisement = Advertisement(self._bus, 0, advertise_mode)
+        advertisement.local_name = self._local_name
 
         service_uuids = []
         if self._time_service is not None:
@@ -253,53 +191,66 @@ class BluetoothDbusRuntime:
             pairable=True,
         )
 
-        self._app = app
-        self._advertisement = Advertisement(self._bus, 0, advertise_mode)
-        self._advertisement.local_name = self._local_name
-        gatt_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), GATT_MANAGER_IFACE)
-
-        def _register_app_reply():
-            if generation != self._server_generation or self._app is not app:
-                return
-            self._logger.info(
-                f"GATT application registered ({service_index} services, {len(profile_uuids)} client profile UUIDs)"
+        ad_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), LE_ADVERTISING_MANAGER_IFACE)
+        app_registered = False
+        advertisement_registered = False
+        try:
+            self._logger.info(f"Registering GATT application ({service_index} services)")
+            self._call_dbus_method_async(
+                gatt_mgr.RegisterApplication,
+                "register the GATT application",
+                app.get_path(),
+                {},
             )
-            GLib.timeout_add(
-                max(1, int(self._GATT_APPLICATION_SETTLE_S * 1000)),
-                lambda: self._register_advertisement(service_uuids, generation),
-            )
+            app_registered = True
+            self._app = app
+            self._logger.info(f"GATT application registered ({service_index} services)")
 
-        def _register_app_error(error):
-            self._logger.error(f"Failed to register GATT application: {error}")
-            self._cleanup_failed_server_build(app, topic_exports, generation)
-
-        self._logger.info(
-            f"Registering GATT application ({service_index} services, {len(profile_uuids)} client profile UUIDs)"
-        )
-        self._call_dbus_method(
-            gatt_mgr.RegisterApplication,
-            "register gatt application",
-            app.get_path(),
-            {},
-            timeout=10.0,
-            reply_handler=_register_app_reply,
-            error_handler=_register_app_error,
-        )
+            advertisement_registered = self._register_advertisement(ad_mgr, advertisement, service_uuids)
+            if advertisement_registered:
+                self._advertisement = advertisement
+        except Exception:
+            if advertisement_registered:
+                try:
+                    self._call_dbus_method_async(
+                        ad_mgr.UnregisterAdvertisement,
+                        "unregister the BLE advertisement",
+                        advertisement.get_path(),
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            if app_registered:
+                try:
+                    self._call_dbus_method_async(
+                        gatt_mgr.UnregisterApplication,
+                        "unregister the GATT application",
+                        app.get_path(),
+                        timeout=10.0,
+                    )
+                except Exception:
+                    pass
+            advertisement.destroy()
+            app.destroy()
+            self._advertisement = None
+            self._app = None
+            self._wifi_service = None
+            self._time_service = None
+            for state in topic_exports.values():
+                state.service = None
+            raise
 
     def unregister_server_objects(self, topic_exports: Dict[str, TopicExportBridgeState]):
-        self._server_generation += 1
         for state in topic_exports.values():
             state.service = None
         if self._advertisement is not None:
             try:
                 ad_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), LE_ADVERTISING_MANAGER_IFACE)
-                self._call_dbus_method(
+                self._call_dbus_method_async(
                     ad_mgr.UnregisterAdvertisement,
-                    "unregister advertisement",
+                    "unregister the BLE advertisement",
                     self._advertisement.get_path(),
                     timeout=10.0,
-                    reply_handler=lambda: None,
-                    error_handler=lambda error: self._log_verbose(f"Ignore advertisement unregister error: {error}"),
                 )
             except Exception:
                 pass
@@ -308,13 +259,11 @@ class BluetoothDbusRuntime:
         if self._app is not None:
             try:
                 gatt_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), GATT_MANAGER_IFACE)
-                self._call_dbus_method(
+                self._call_dbus_method_async(
                     gatt_mgr.UnregisterApplication,
-                    "unregister gatt application",
+                    "unregister the GATT application",
                     self._app.get_path(),
                     timeout=10.0,
-                    reply_handler=lambda: None,
-                    error_handler=lambda error: self._log_verbose(f"Ignore GATT app unregister error: {error}"),
                 )
             except Exception:
                 pass
@@ -326,63 +275,20 @@ class BluetoothDbusRuntime:
     def set_adapter_props(self, powered=None, discoverable=None, pairable=None, alias=None, discoverable_timeout=None):
         self._require_setup()
         props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), DBUS_PROP_IFACE)
+        iface = ADAPTER_IFACE
         if powered is not None:
-            self._set_adapter_property(
-                props,
-                "Powered",
-                dbus.Boolean(powered, variant_level=1),
-                ignore_busy=False,
-            )
+            props.Set(iface, "Powered", dbus.Boolean(powered, variant_level=1))
         if alias is not None:
-            self._set_adapter_property(
-                props,
-                "Alias",
-                dbus.String(alias, variant_level=1),
-                ignore_busy=True,
-            )
+            props.Set(iface, "Alias", dbus.String(alias, variant_level=1))
         if discoverable_timeout is not None:
-            self._set_adapter_property(
-                props,
-                "DiscoverableTimeout",
-                dbus.UInt32(discoverable_timeout, variant_level=1),
-                ignore_busy=True,
-            )
+            props.Set(iface, "DiscoverableTimeout", dbus.UInt32(discoverable_timeout, variant_level=1))
         if discoverable is not None:
-            self._set_adapter_property(
-                props,
-                "Discoverable",
-                dbus.Boolean(discoverable, variant_level=1),
-                ignore_busy=True,
-            )
+            props.Set(iface, "Discoverable", dbus.Boolean(discoverable, variant_level=1))
         if pairable is not None:
-            self._set_adapter_property(
-                props,
-                "Pairable",
-                dbus.Boolean(pairable, variant_level=1),
-                ignore_busy=True,
-            )
+            props.Set(iface, "Pairable", dbus.Boolean(pairable, variant_level=1))
 
-    def _set_adapter_property(self, props, prop_name: str, value, *, ignore_busy: bool):
-        try:
-            self._call_dbus_method(props.Set, f"set adapter property {prop_name}", ADAPTER_IFACE, prop_name, value, timeout=10.0)
-        except dbus.DBusException as exc:
-            if ignore_busy and self._is_bluez_busy_error(exc):
-                self._logger.warning(f"BlueZ busy while setting adapter {prop_name}; continuing")
-                self._log_verbose(f"Adapter property deferred prop={prop_name} error={exc}")
-                return
-            raise
-
-    def _is_bluez_busy_error(self, exc: Exception) -> bool:
-        if not isinstance(exc, dbus.DBusException):
-            return False
-        name = str(exc.get_dbus_name() or "")
-        message = str(exc)
-        return name == "org.bluez.Error.Busy" or "org.bluez.Error.Busy" in message or "Busy" in message
-
-    def _register_advertisement(self, service_uuids, generation: int):
-        advertisement = self._advertisement
-        if advertisement is None or generation != self._server_generation:
-            return False
+    def _register_advertisement(self, ad_mgr, advertisement: Advertisement, service_uuids) -> bool:
+        last_error = None
         adv_capabilities = self._get_advertising_capabilities()
         max_tx_power = adv_capabilities.get("max_tx_power")
         if max_tx_power is not None:
@@ -411,63 +317,47 @@ class BluetoothDbusRuntime:
             )
         attempts.append((False, []))
 
-        ad_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), LE_ADVERTISING_MANAGER_IFACE)
         attempted_configs = set()
-        filtered_attempts = []
         for include_tx_power, advertised_uuids in attempts:
             config_key = (include_tx_power, tuple(advertised_uuids))
             if config_key in attempted_configs:
                 continue
             attempted_configs.add(config_key)
+
+            advertisement.include_tx_power = include_tx_power
+            advertisement.service_uuids = list(advertised_uuids)
+
             if len(advertised_uuids) != len(service_uuids):
                 self._logger.warning(
                     "BLE advertisement trimmed from "
                     f"{len(service_uuids)} to {len(advertised_uuids)} service UUIDs to fit controller limits"
                 )
-            filtered_attempts.append((include_tx_power, advertised_uuids))
 
-        def _attempt(index: int):
-            if self._advertisement is not advertisement or generation != self._server_generation:
-                return
-            if index >= len(filtered_attempts):
-                self._logger.error("BLE advertisement unavailable; continuing without advertising")
-                advertisement.destroy()
-                if self._advertisement is advertisement:
-                    self._advertisement = None
-                return
-            include_tx_power, advertised_uuids = filtered_attempts[index]
-            advertisement.include_tx_power = include_tx_power
-            advertisement.service_uuids = list(advertised_uuids)
-            self._logger.info(
-                f"Registering BLE advertisement (name={self._local_name}, uuids={len(advertised_uuids)}, "
-                f"tx_power={'ON' if include_tx_power else 'OFF'})"
-            )
-
-            def _reply_handler():
-                if self._advertisement is not advertisement or generation != self._server_generation:
-                    return
+            try:
+                self._logger.info(
+                    f"Registering BLE advertisement (name={self._local_name}, uuids={len(advertised_uuids)}, "
+                    f"tx_power={'ON' if include_tx_power else 'OFF'})"
+                )
+                self._call_dbus_method_async(
+                    ad_mgr.RegisterAdvertisement,
+                    "register the BLE advertisement",
+                    advertisement.get_path(),
+                    {},
+                )
                 self._logger.info(
                     f"BLE advertisement registered (name={self._local_name}, uuids={len(advertised_uuids)}, "
                     f"tx_power={'ON' if include_tx_power else 'OFF'})"
                 )
-
-            def _error_handler(error):
+                return True
+            except Exception as exc:
+                last_error = exc
                 self._logger.warning(
                     f"BLE advertisement registration attempt failed (uuids={len(advertised_uuids)}, "
-                    f"tx_power={'ON' if include_tx_power else 'OFF'}): {error}"
+                    f"tx_power={'ON' if include_tx_power else 'OFF'}): {exc}"
                 )
-                _attempt(index + 1)
 
-            self._call_dbus_method(
-                ad_mgr.RegisterAdvertisement,
-                "register advertisement",
-                advertisement.get_path(),
-                {},
-                reply_handler=_reply_handler,
-                error_handler=_error_handler,
-            )
-
-        _attempt(0)
+        self._logger.error(f"BLE advertisement unavailable; continuing without advertising: {last_error}")
+        advertisement.destroy()
         return False
 
     def _get_advertising_capabilities(self):
@@ -477,12 +367,7 @@ class BluetoothDbusRuntime:
 
         props = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, self._adapter_path), DBUS_PROP_IFACE)
         try:
-            adv_props = self._call_dbus_method(
-                props.GetAll,
-                "read advertising capabilities",
-                LE_ADVERTISING_MANAGER_IFACE,
-                timeout=10.0,
-            )
+            adv_props = props.GetAll(LE_ADVERTISING_MANAGER_IFACE)
         except Exception as exc:
             self._logger.warning(f"Unable to query LEAdvertisingManager1 capabilities: {exc}")
             return {
@@ -562,7 +447,7 @@ class BluetoothDbusRuntime:
         if self._pairing_agent_registered:
             try:
                 agent_mgr = dbus.Interface(self._bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), AGENT_MANAGER_IFACE)
-                self._call_dbus_method(agent_mgr.UnregisterAgent, "unregister pairing agent", PairingAgent.AGENT_PATH, timeout=10.0)
+                agent_mgr.UnregisterAgent(PairingAgent.AGENT_PATH)
             except Exception:
                 pass
             self._pairing_agent_registered = False
@@ -576,42 +461,30 @@ class BluetoothDbusRuntime:
         self._adapter_path = ""
         self._agent = None
 
-    def _call_dbus_method(self, method, operation: str, *args, timeout: float = 30.0, **kwargs):
-        del operation
+    def _call_dbus_method_async(self, method, operation: str, *args, timeout: float = 30.0):
+        completed = threading.Event()
+        result = {}
 
-        def _invoke():
-            call_kwargs = dict(kwargs)
-            if timeout is not None:
-                call_kwargs.setdefault("timeout", timeout)
-            return method(*args, **call_kwargs)
+        def reply_handler(*reply_args):
+            result["reply"] = reply_args
+            completed.set()
 
-        wait_timeout = None if timeout is None else max(1.0, float(timeout)) + 1.0
-        return self._glib.call(_invoke, timeout=wait_timeout)
+        def error_handler(error):
+            result["error"] = error
+            completed.set()
 
-    def _cleanup_failed_server_build(
-        self,
-        app: Application,
-        topic_exports: Dict[str, TopicExportBridgeState],
-        generation: int,
-    ):
-        if generation != self._server_generation:
-            return
-        if self._advertisement is not None:
-            try:
-                self._advertisement.destroy()
-            except Exception:
-                pass
-            self._advertisement = None
-        try:
-            app.destroy()
-        except Exception:
-            pass
-        if self._app is app:
-            self._app = None
-        self._wifi_service = None
-        self._time_service = None
-        for state in topic_exports.values():
-            state.service = None
+        method(
+            *args,
+            reply_handler=reply_handler,
+            error_handler=error_handler,
+            timeout=timeout,
+        )
+        if not completed.wait(timeout + 1.0):
+            raise TimeoutError(f"Timed out while waiting to {operation}")
+        error = result.get("error")
+        if error is not None:
+            raise error
+        return result.get("reply", ())
 
     def _require_setup(self):
         if self._bus is None or not self._adapter_path:

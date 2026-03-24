@@ -1,7 +1,5 @@
 """Reusable server-side BLE GATT primitives."""
 
-import inspect
-
 import dbus
 
 from .dbus_common import GATT_CHRC_IFACE, dbus_byte_array
@@ -55,14 +53,11 @@ class NotifyingCharacteristic(Characteristic):
         return dbus_byte_array(self.value)
 
     def WriteValue(self, value, options):
+        del options
         data = bytes(value)
         self.set_value(data, emit=True)
         if self._write_cb is not None:
-            callback_params = inspect.signature(self._write_cb).parameters
-            if len(callback_params) >= 2:
-                self._write_cb(data, options)
-            else:
-                self._write_cb(data)
+            self._write_cb(data)
 
     def StartNotify(self):
         if self.notifying:

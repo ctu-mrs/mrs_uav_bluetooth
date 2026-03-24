@@ -98,19 +98,16 @@ netplan_scripts_dir: /etc/ctu-mrs/uav-bluetooth/netplan-scripts
 #   segment such as /uavXX/..., that first segment is ignored when deriving the
 #   shared BLE key and the imported topic suffix.
 # - name: Optional human-readable label for logging only.
+# - key: Optional override for the derived logical key.
 # - import_topic_suffix: Optional override for the derived imported suffix.
 #   By default, a topic like /uavXX/mavros/odometry/local appears on a peer as
 #   /uavYY/ble/peers/uavXX/mavros/odometry/local.
 # - message_type: ROS interface type, for example nav_msgs/msg/Odometry.
 # - rate_hz: Publish/poll rate. 0 means send on every received sample.
-# - transport_endpoint: characteristic.
+# - transport_endpoint: characteristic | descriptor.
 # - members: Ordered packet layout for the compact BLE payload. Each member is
 #   packed little-endian and must use a fixed-width scalar type.
 #   Keep the total payload size at most 244 bytes (BLE message limit).
-#
-# Bridge UUIDs are derived from the full hostname-scoped topic path, for example
-# /uav33/mavros/odometry/local. All peers are expected to share the same config
-# and derive the expected characteristic UUID from that path.
 #
 # Supported member types: bool, int8, uint8, int16, uint16, int32, uint32,
 # int64, uint64, float32, float64, time_ns.

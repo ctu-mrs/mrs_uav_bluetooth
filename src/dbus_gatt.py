@@ -11,7 +11,6 @@ from .dbus_common import (
     GATT_CHRC_IFACE,
     GATT_DESC_IFACE,
     GATT_MANAGER_IFACE,
-    GATT_PROFILE_IFACE,
     GATT_SERVICE_IFACE,
     InvalidArgsException,
     NotSupportedException,
@@ -25,7 +24,6 @@ class Application(dbus.service.Object):
     def __init__(self, bus, path=None):
         self.path = path or self.PATH
         self.services = []
-        self.profiles = []
         dbus.service.Object.__init__(self, bus, self.path)
 
     def get_path(self):
@@ -34,14 +32,9 @@ class Application(dbus.service.Object):
     def add_service(self, service):
         self.services.append(service)
 
-    def add_profile(self, profile):
-        self.profiles.append(profile)
-
     def destroy(self):
         for service in self.services:
             service.destroy()
-        for profile in self.profiles:
-            profile.destroy()
         self.remove_from_connection()
 
     @dbus.service.method(DBUS_OM_IFACE, out_signature="a{oa{sa{sv}}}")
@@ -53,42 +46,7 @@ class Application(dbus.service.Object):
                 response[characteristic.get_path()] = characteristic.get_properties()
                 for descriptor in characteristic.get_descriptors():
                     response[descriptor.get_path()] = descriptor.get_properties()
-        for profile in self.profiles:
-            response[profile.get_path()] = profile.get_properties()
         return response
-
-
-class Profile(dbus.service.Object):
-    PATH_BASE = BLUEZ_SERVICE_PATH + "/app/profile"
-
-    def __init__(self, bus, index, uuids):
-        self.path = self.PATH_BASE + str(index)
-        self.bus = bus
-        self.uuids = [str(uuid) for uuid in uuids]
-        dbus.service.Object.__init__(self, bus, self.path)
-
-    def get_path(self):
-        return dbus.ObjectPath(self.path)
-
-    def get_properties(self):
-        return {
-            GATT_PROFILE_IFACE: {
-                "UUIDs": dbus.Array(self.uuids, signature="s"),
-            }
-        }
-
-    def destroy(self):
-        self.remove_from_connection()
-
-    @dbus.service.method(GATT_PROFILE_IFACE)
-    def Release(self):
-        return
-
-    @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
-    def GetAll(self, interface):
-        if interface != GATT_PROFILE_IFACE:
-            raise InvalidArgsException()
-        return self.get_properties()[GATT_PROFILE_IFACE]
 
 
 class Service(dbus.service.Object):

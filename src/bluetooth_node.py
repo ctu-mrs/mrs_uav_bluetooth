@@ -1,14 +1,16 @@
 """ROS 2 BLE node providing MRS UAV Bluetooth server and client control."""
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import threading
+import time
 from typing import Dict, Optional, Sequence, Set, Tuple
 
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from .bluetooth_bridge_state import PeerRuntimeStatus, PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
+from .bluetooth_bridge_state import PeerTimeBridgeState, TopicExportBridgeState, TopicImportBridgeState
 from .bluetooth_dbus_runtime import BluetoothDbusRuntime
 from .bluetooth_node_config_mixin import BluetoothNodeConfigMixin, SharedTopicConfig
 from .bluetooth_node_runtime_mixin import BluetoothNodeRuntimeMixin
@@ -25,6 +27,7 @@ class BluetoothNode(
     BluetoothNodeConfigMixin,
     Node,
 ):
+
     def __init__(self):
         super().__init__("mrs_uav_bluetooth")
         self._declare_parameters()
@@ -32,22 +35,18 @@ class BluetoothNode(
         self._local_name = system_hostname() or "mrs-uav"
         self._pending_wifi_password = ""
         self._auto_connect_attempts: Dict[str, float] = {}
-        self._peer_connect_started_at: Dict[str, float] = {}
-        self._peer_setup_started_at: Dict[str, float] = {}
-        self._peer_pair_requested_at: Dict[str, float] = {}
-        self._peer_empty_gatt_since: Dict[str, float] = {}
-        self._peer_repair_reasons: Dict[str, str] = {}
-        self._pending_peer_repairs: Dict[str, str] = {}
+        self._peer_security_attempts: Dict[str, float] = {}
+        self._peer_repair_attempts: Dict[str, float] = {}
+        self._peer_inactive_since: Dict[str, float] = {}
+        self._peer_connected_since: Dict[str, float] = {}
+        self._peer_service_retry_at: Dict[str, float] = {}
         self._notification_path_to_mac: Dict[str, str] = {}
         self._last_gatt_warning_at: Dict[Tuple[str, str], float] = {}
         self._last_dbus_warning_at: Dict[str, float] = {}
         self._scan_transport = self.get_parameter("scan_mode").get_parameter_value().string_value
-        self._idle_scan_started_at = 0.0
-        self._idle_scan_next_allowed_at = 0.0
         self._topic_exports: Dict[str, TopicExportBridgeState] = {}
         self._notification_bridges: Dict[str, TopicImportBridgeState] = {}
         self._peer_time_bridges: Dict[str, PeerTimeBridgeState] = {}
-        self._peer_status: Dict[str, PeerRuntimeStatus] = {}
         self._shared_topic_configs: Dict[str, SharedTopicConfig] = {}
         self._active_overlay_path = ""
         self._overlay_connected_baseline: Set[str] = set()
@@ -56,11 +55,14 @@ class BluetoothNode(
         self._active_config_source = self._default_config_path
         self._node_topics_prefix = self._format_node_topics_prefix("/{hostname}/ble")
         self._shutting_down = False
+        self._background_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="ble-bg")
+        self._background_lock = threading.RLock()
+        self._background_inflight: Set[str] = set()
+        self._background_error_at: Dict[str, float] = {}
         self._peer_writeback_lock = threading.RLock()
         self._peer_writeback_pending: Dict[str, bytes] = {}
         self._peer_writeback_inflight: Set[str] = set()
         self._peer_writeback_last_sent: Dict[str, bytes] = {}
-        self._peer_writeback_retry_at: Dict[str, float] = {}
         self._pairing_repair_attempts: Dict[str, float] = {}
 
         self.devices_pub = None
@@ -90,6 +92,39 @@ class BluetoothNode(
             f"scan={'ON' if bool(self.get_parameter('enable_scan').value) else 'OFF'}, "
             f"hostname={self._local_name}, prefix={self._node_topics_prefix}"
         )
+
+    def _run_background_once(self, key: str, fn, *args, **kwargs) -> bool:
+        with self._background_lock:
+            if self._shutting_down or key in self._background_inflight:
+                return False
+            self._background_inflight.add(key)
+        future = self._background_executor.submit(fn, *args, **kwargs)
+        future.add_done_callback(lambda fut, task_key=key: self._on_background_done(task_key, fut))
+        return True
+
+    def _on_background_done(self, key: str, future):
+        with self._background_lock:
+            self._background_inflight.discard(key)
+        exc = future.exception()
+        if exc is None:
+            return
+        now = time.monotonic()
+        last = self._background_error_at.get(key, 0.0)
+        if now - last < 5.0:
+            return
+        self._background_error_at[key] = now
+        self.get_logger().warning(f"Background BLE task {key} failed: {exc}")
+        self._log_verbose(f"Background BLE task {key} failed: {exc}")
+
+    def _shutdown_background_executor(self):
+        with self._background_lock:
+            inflight = len(self._background_inflight)
+        if inflight:
+            self._log_verbose(f"Waiting for {inflight} background BLE task(s) to finish")
+        try:
+            self._background_executor.shutdown(wait=True, cancel_futures=False)
+        except Exception as exc:
+            self._log_verbose(f"Background executor shutdown warning: {exc}")
 
     @property
     def _adapter_path(self) -> str:
