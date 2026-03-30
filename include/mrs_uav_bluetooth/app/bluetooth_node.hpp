@@ -40,7 +40,11 @@
 #include <std_srvs/srv/trigger.hpp>
 
 #include <chrono>
+#include <future>
+#include <atomic>
+#include <mutex>
 #include <set>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -86,6 +90,10 @@ private:
                                  const bluez::DeviceInfo& device,
                                  peer::PeerConnectionSession& session);
     void publish_peer_time_status(peer::PeerTimeBridge& bridge) const;
+    bool run_peer_task_once(const std::string& mac,
+                            const std::string& label,
+                            std::function<void()> task);
+    void wait_for_peer_tasks();
 
     mrs_uav_bluetooth::msg::BleDevice to_device_msg(const bluez::DeviceInfo& device) const;
     mrs_uav_bluetooth::msg::BleGattService to_service_msg(const bluez::GattServiceInfo& item) const;
@@ -134,6 +142,7 @@ private:
     config::NodeConfig active_config_;
 
     std::unique_ptr<bluez::DbusConnection> dbus_;
+    std::unique_ptr<bluez::DbusConnection> server_dbus_;
     std::unique_ptr<bluez::ObjectManagerCache> cache_;
     std::unique_ptr<bluez::AdapterController> adapter_;
     std::unique_ptr<bluez::BluezClient> client_;
@@ -157,12 +166,23 @@ private:
     std::vector<rclcpp::ServiceBase::SharedPtr> services_;
     int cache_observer_token_{0};
     int gatt_event_token_{0};
+    rclcpp::CallbackGroup::SharedPtr service_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr timer_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr peer_callback_group_;
     rclcpp::TimerBase::SharedPtr status_timer_;
     rclcpp::TimerBase::SharedPtr lease_timer_;
     rclcpp::TimerBase::SharedPtr peer_timer_;
     rclcpp::TimerBase::SharedPtr time_service_timer_;
     rclcpp::TimerBase::SharedPtr wifi_service_timer_;
     std::chrono::steady_clock::time_point peer_reconcile_deadline_{};
+    std::atomic_bool shutting_down_{false};
+    mutable std::mutex peer_task_mutex_;
+    std::map<std::string, std::shared_future<void>> peer_tasks_;
+    mutable std::mutex log_state_mutex_;
+    std::string last_status_log_summary_;
+    std::chrono::steady_clock::time_point last_status_log_time_{};
+    std::map<std::string, std::string> last_peer_status_log_;
+    std::chrono::steady_clock::time_point last_peer_status_log_time_{};
 };
 
 }  // namespace mrs_uav_bluetooth::app

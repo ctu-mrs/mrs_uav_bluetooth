@@ -4,31 +4,111 @@
 
 #include <algorithm>
 #include <chrono>
-#include <future>
+#include <thread>
 
 namespace mrs_uav_bluetooth::bluez {
 
-struct BluezClient::PendingOperation {
-    uint64_t id{0};
-    std::function<bool()> is_complete;
-    std::function<bool(CacheEvent, const std::string&)> event_filter;
-    OperationResultCallback callback;
-    std::string timeout_detail;
-    rclcpp::TimerBase::SharedPtr timeout_timer;
-    std::mutex mutex;
-    bool resolved{false};
-};
+namespace {
+
+using ManagedObjectMap = std::map<sdbus::ObjectPath,
+                                  std::map<std::string, std::map<std::string, sdbus::Variant>>>;
+
+constexpr auto kConnectPollInterval = std::chrono::milliseconds(300);
+constexpr auto kPairPollInterval = std::chrono::milliseconds(500);
+
+std::unique_ptr<sdbus::IConnection> create_blocking_system_bus() {
+    return sdbus::createSystemBusConnection();
+}
+
+std::unique_ptr<sdbus::IProxy> create_bluez_proxy(sdbus::IConnection& connection,
+                                                  const std::string& object_path) {
+    return sdbus::createProxy(connection,
+                              sdbus::ServiceName{std::string(kBluezServiceName)},
+                              sdbus::ObjectPath{object_path});
+}
+
+template<typename T>
+T get_variant_or(const std::map<std::string, sdbus::Variant>& values,
+                 const std::string& key,
+                 T fallback) {
+    auto it = values.find(key);
+    if (it == values.end()) {
+        return fallback;
+    }
+    try {
+        return it->second.get<T>();
+    } catch (...) {
+        return fallback;
+    }
+}
+
+bool message_contains(const std::string& message,
+                      std::initializer_list<const char*> needles) {
+    for (const char* needle : needles) {
+        if (message.find(needle) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<std::map<std::string, sdbus::Variant>> read_device_properties(
+    sdbus::IConnection& connection,
+    const std::string& device_path) {
+    auto proxy = create_bluez_proxy(connection, device_path);
+    std::map<std::string, sdbus::Variant> properties;
+    proxy->callMethod("GetAll")
+        .onInterface(std::string(kDbusPropertiesIface))
+        .withArguments(std::string{kDeviceIface})
+        .storeResultsTo(properties);
+    return properties;
+}
+
+bool device_has_resolved_characteristics(sdbus::IConnection& connection,
+                                         const std::string& device_path) {
+    auto proxy = create_bluez_proxy(connection, "/");
+    ManagedObjectMap objects;
+    proxy->callMethod("GetManagedObjects")
+        .onInterface(std::string(kDbusObjectManagerIface))
+        .storeResultsTo(objects);
+
+    for (const auto& [path, interfaces] : objects) {
+        const auto path_string = static_cast<std::string>(path);
+        if (path_string.find(device_path + "/") != 0) {
+            continue;
+        }
+        if (interfaces.count(std::string(kGattCharacteristicIface)) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template<typename Predicate>
+bool poll_until(double timeout_s,
+                std::chrono::milliseconds interval,
+                Predicate&& predicate) {
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(static_cast<int64_t>(std::max(0.0, timeout_s) * 1000.0));
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (predicate()) {
+            return true;
+        }
+        std::this_thread::sleep_for(interval);
+    }
+    return predicate();
+}
+
+}  // namespace
 
 BluezClient::BluezClient(DbusConnection& dbus,
                          ObjectManagerCache& cache,
                          const std::string& adapter_path,
-                         rclcpp::Logger logger,
-                         OperationTimeoutScheduler timeout_scheduler)
+                         rclcpp::Logger logger)
     : dbus_(dbus),
       cache_(cache),
       adapter_path_(adapter_path),
-      logger_(logger),
-      timeout_scheduler_(std::move(timeout_scheduler)) {
+      logger_(logger) {
     cache_observer_token_ = cache_.add_observer(
         [this](CacheEvent event, const std::string& object_path) {
             on_cache_event(event, object_path);
@@ -36,24 +116,6 @@ BluezClient::BluezClient(DbusConnection& dbus,
 }
 
 BluezClient::~BluezClient() {
-    std::vector<std::shared_ptr<PendingOperation>> pending;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [_, operation] : pending_operations_) {
-            pending.push_back(operation);
-        }
-        pending_operations_.clear();
-    }
-
-    for (const auto& operation : pending) {
-        if (!operation) {
-            continue;
-        }
-        std::lock_guard<std::mutex> operation_lock(operation->mutex);
-        operation->resolved = true;
-        operation->timeout_timer.reset();
-    }
-
     if (cache_observer_token_ != 0) {
         cache_.remove_observer(cache_observer_token_);
         cache_observer_token_ = 0;
@@ -151,100 +213,34 @@ bool BluezClient::connect(const std::string& mac, double timeout_s) {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return false;
     if (dev->connected) return true;
-    auto promise = std::make_shared<std::promise<bool>>();
-    auto future = promise->get_future();
-    connect_async(mac,
-                  [promise](bool success, const std::string&) mutable {
-                      promise->set_value(success);
-                  },
-                  timeout_s);
-    return future.wait_for(std::chrono::milliseconds(
-               static_cast<int64_t>(std::max(1.0, timeout_s + 1.0) * 1000.0))) == std::future_status::ready &&
-           future.get();
-}
-
-bool BluezClient::connect_async(const std::string& mac) {
-    auto path = device_path_for_mac(mac);
-    if (path.empty()) return false;
-    try {
-        auto proxy = sdbus::createProxy(dbus_.connection(),
-                                        sdbus::ServiceName{std::string(kBluezServiceName)},
-                                        sdbus::ObjectPath{path});
-        proxy->callMethodAsync("Connect")
-            .onInterface(std::string(kDeviceIface))
-            .uponReplyInvoke([](std::optional<sdbus::Error>) {});
-        return true;
-    } catch (const sdbus::Error& e) {
-        std::string msg = e.getMessage();
-        if (msg.find("AlreadyConnected") != std::string::npos ||
-            msg.find("InProgress") != std::string::npos) {
-            return true;
-        }
-        return false;
-    }
-}
-
-void BluezClient::connect_async(const std::string& mac,
-                                OperationResultCallback cb,
-                                double timeout_s) {
-    auto dev = cache_.device_by_mac(mac);
-    if (!dev) {
-        RCLCPP_WARN(logger_, "[client] connect_async(%s): device not found in cache", mac.c_str());
-        cb(false, "device not found");
-        return;
-    }
-    if (dev->connected) {
-        RCLCPP_DEBUG(logger_, "[client] connect_async(%s): already connected", mac.c_str());
-        cb(true, "already connected");
-        return;
-    }
-
-    RCLCPP_INFO(logger_, "[client] connect_async(%s) path=%s timeout=%.1fs",
-                mac.c_str(), dev->object_path.c_str(), timeout_s);
-
     const auto path = dev->object_path;
+    RCLCPP_INFO(logger_, "[client] connect(%s) path=%s timeout=%.1fs",
+                mac.c_str(), path.c_str(), timeout_s);
 
-    auto operation = start_pending_operation(
-        [this, mac]() {
-            auto current = cache_.device_by_mac(mac);
-            return current && current->connected;
-        },
-        [path](CacheEvent event, const std::string& object_path) {
-            return object_path == path &&
-                   (event == CacheEvent::DevicePropertyChanged ||
-                    event == CacheEvent::DeviceRemoved);
-        },
-        std::move(cb),
-        std::chrono::milliseconds(static_cast<int64_t>(std::max(1.0, timeout_s) * 1000.0)),
-        "connect timeout");
-
+    auto connection = create_blocking_system_bus();
     try {
-        auto proxy = sdbus::createProxy(dbus_.connection(),
-                                        sdbus::ServiceName{std::string(kBluezServiceName)},
-                                        sdbus::ObjectPath{path});
-        proxy->callMethodAsync("Connect")
-            .onInterface(std::string(kDeviceIface))
-            .uponReplyInvoke([this, operation, mac](std::optional<sdbus::Error> err) {
-                if (!err) {
-                    RCLCPP_INFO(logger_, "[client] Connect(%s) D-Bus reply: success", mac.c_str());
-                    evaluate_pending_operations();
-                    return;
-                }
-                const auto message = err->getMessage();
-                RCLCPP_INFO(logger_, "[client] Connect(%s) D-Bus reply: %s", mac.c_str(), message.c_str());
-                if (message.find("AlreadyConnected") != std::string::npos) {
-                    resolve_pending_operation(operation, true, message);
-                    return;
-                }
-                if (message.find("InProgress") != std::string::npos) {
-                    return;
-                }
-                RCLCPP_WARN(logger_, "connect(%s) failed: %s", mac.c_str(), message.c_str());
-                resolve_pending_operation(operation, false, message);
-            });
-    } catch (const sdbus::Error& e) {
-        resolve_pending_operation(operation, false, e.getMessage());
+        auto proxy = create_bluez_proxy(*connection, path);
+        proxy->callMethod("Connect")
+            .onInterface(std::string(kDeviceIface));
+    } catch (const sdbus::Error& error) {
+        const auto message = error.getMessage();
+        if (!message_contains(message, {"Already Connected", "AlreadyConnected", "InProgress"})) {
+            RCLCPP_WARN(logger_, "connect(%s) failed: %s", mac.c_str(), message.c_str());
+            return false;
+        }
     }
+
+    return poll_until(timeout_s, kConnectPollInterval, [&]() {
+        try {
+            const auto properties = read_device_properties(*connection, path);
+            return properties && get_variant_or<bool>(*properties, "Connected", false);
+        } catch (const sdbus::Error& error) {
+            if (message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"})) {
+                return false;
+            }
+            throw;
+        }
+    });
 }
 
 bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
@@ -252,76 +248,31 @@ bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
     if (path.empty()) return true;
     auto dev = cache_.device_by_mac(mac);
     if (!dev || !dev->connected) return true;
-    auto promise = std::make_shared<std::promise<bool>>();
-    auto future = promise->get_future();
-    disconnect_async(mac,
-                     [promise](bool success, const std::string&) mutable {
-                         promise->set_value(success);
-                     },
-                     timeout_s);
-    return future.wait_for(std::chrono::milliseconds(
-               static_cast<int64_t>(std::max(1.0, timeout_s + 1.0) * 1000.0))) == std::future_status::ready &&
-           future.get();
-}
-
-void BluezClient::disconnect_async(const std::string& mac,
-                                   OperationResultCallback cb,
-                                   double timeout_s) {
-    const auto path = device_path_for_mac(mac);
-    if (path.empty()) {
-        RCLCPP_DEBUG(logger_, "[client] disconnect_async(%s): device not present", mac.c_str());
-        cb(true, "device not present");
-        return;
-    }
-    auto dev = cache_.device_by_mac(mac);
-    if (!dev || !dev->connected) {
-        RCLCPP_DEBUG(logger_, "[client] disconnect_async(%s): already disconnected", mac.c_str());
-        cb(true, "already disconnected");
-        return;
-    }
-
-    RCLCPP_INFO(logger_, "[client] disconnect_async(%s) path=%s timeout=%.1fs",
+    RCLCPP_INFO(logger_, "[client] disconnect(%s) path=%s timeout=%.1fs",
                 mac.c_str(), path.c_str(), timeout_s);
 
-    auto operation = start_pending_operation(
-        [this, mac]() {
-            auto current = cache_.device_by_mac(mac);
-            return !current || !current->connected;
-        },
-        [path](CacheEvent event, const std::string& object_path) {
-            return object_path == path &&
-                   (event == CacheEvent::DevicePropertyChanged ||
-                    event == CacheEvent::DeviceRemoved);
-        },
-        std::move(cb),
-        std::chrono::milliseconds(static_cast<int64_t>(std::max(1.0, timeout_s) * 1000.0)),
-        "disconnect timeout");
-
+    auto connection = create_blocking_system_bus();
     try {
-        auto proxy = sdbus::createProxy(dbus_.connection(),
-                                        sdbus::ServiceName{std::string(kBluezServiceName)},
-                                        sdbus::ObjectPath{path});
-        proxy->callMethodAsync("Disconnect")
-            .onInterface(std::string(kDeviceIface))
-            .uponReplyInvoke([this, operation, mac](std::optional<sdbus::Error> err) {
-                if (!err) {
-                    RCLCPP_INFO(logger_, "[client] Disconnect(%s) D-Bus reply: success", mac.c_str());
-                    evaluate_pending_operations();
-                    return;
-                }
-                const auto message = err->getMessage();
-                RCLCPP_INFO(logger_, "[client] Disconnect(%s) D-Bus reply: %s", mac.c_str(), message.c_str());
-                if (message.find("NotConnected") != std::string::npos ||
-                    message.find("NoSuchObject") != std::string::npos) {
-                    resolve_pending_operation(operation, true, message);
-                    return;
-                }
-                RCLCPP_WARN(logger_, "disconnect(%s) failed: %s", mac.c_str(), message.c_str());
-                resolve_pending_operation(operation, false, message);
-            });
-    } catch (const sdbus::Error& e) {
-        resolve_pending_operation(operation, false, e.getMessage());
+        auto proxy = create_bluez_proxy(*connection, path);
+        proxy->callMethod("Disconnect")
+            .onInterface(std::string(kDeviceIface));
+    } catch (const sdbus::Error& error) {
+        const auto message = error.getMessage();
+        if (!message_contains(message, {"NotConnected", "NoSuchObject", "UnknownObject"})) {
+            RCLCPP_WARN(logger_, "disconnect(%s) failed: %s", mac.c_str(), message.c_str());
+            return false;
+        }
+        return true;
     }
+
+    return poll_until(timeout_s, kConnectPollInterval, [&]() {
+        try {
+            const auto properties = read_device_properties(*connection, path);
+            return !properties || !get_variant_or<bool>(*properties, "Connected", false);
+        } catch (const sdbus::Error& error) {
+            return message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"});
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -332,102 +283,34 @@ bool BluezClient::pair(const std::string& mac, double timeout_s) {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return false;
     if (dev->paired) return true;
-    auto promise = std::make_shared<std::promise<bool>>();
-    auto future = promise->get_future();
-    pair_async(mac,
-               [promise](bool success, const std::string&) mutable {
-                   promise->set_value(success);
-               },
-               timeout_s);
-    return future.wait_for(std::chrono::milliseconds(
-               static_cast<int64_t>(std::max(1.0, timeout_s + 1.0) * 1000.0))) == std::future_status::ready &&
-           future.get();
-}
-
-bool BluezClient::pair_async(const std::string& mac) {
-    auto path = device_path_for_mac(mac);
-    if (path.empty()) return false;
-    try {
-        auto proxy = sdbus::createProxy(dbus_.connection(),
-                                        sdbus::ServiceName{std::string(kBluezServiceName)},
-                                        sdbus::ObjectPath{path});
-        proxy->callMethodAsync("Pair")
-            .onInterface(std::string(kDeviceIface))
-            .uponReplyInvoke([](std::optional<sdbus::Error>) {});
-        return true;
-    } catch (const sdbus::Error& e) {
-        std::string msg = e.getMessage();
-        if (msg.find("AlreadyExists") != std::string::npos ||
-            msg.find("AlreadyPaired") != std::string::npos ||
-            msg.find("InProgress") != std::string::npos) {
-            return true;
-        }
-        return false;
-    }
-}
-
-void BluezClient::pair_async(const std::string& mac,
-                             OperationResultCallback cb,
-                             double timeout_s) {
-    auto dev = cache_.device_by_mac(mac);
-    if (!dev) {
-        RCLCPP_WARN(logger_, "[client] pair_async(%s): device not found", mac.c_str());
-        cb(false, "device not found");
-        return;
-    }
-    if (dev->paired) {
-        RCLCPP_DEBUG(logger_, "[client] pair_async(%s): already paired", mac.c_str());
-        cb(true, "already paired");
-        return;
-    }
-
-    RCLCPP_INFO(logger_, "[client] pair_async(%s) path=%s timeout=%.1fs",
-                mac.c_str(), dev->object_path.c_str(), timeout_s);
-
     const auto path = dev->object_path;
+    RCLCPP_INFO(logger_, "[client] pair(%s) path=%s timeout=%.1fs",
+                mac.c_str(), path.c_str(), timeout_s);
 
-    auto operation = start_pending_operation(
-        [this, mac]() {
-            auto current = cache_.device_by_mac(mac);
-            return current && current->paired;
-        },
-        [path](CacheEvent event, const std::string& object_path) {
-            return object_path == path &&
-                   (event == CacheEvent::DevicePropertyChanged ||
-                    event == CacheEvent::DeviceRemoved);
-        },
-        std::move(cb),
-        std::chrono::milliseconds(static_cast<int64_t>(std::max(1.0, timeout_s) * 1000.0)),
-        "pair timeout");
-
+    auto connection = create_blocking_system_bus();
     try {
-        auto proxy = sdbus::createProxy(dbus_.connection(),
-                                        sdbus::ServiceName{std::string(kBluezServiceName)},
-                                        sdbus::ObjectPath{path});
-        proxy->callMethodAsync("Pair")
-            .onInterface(std::string(kDeviceIface))
-            .uponReplyInvoke([this, operation, mac](std::optional<sdbus::Error> err) {
-                if (!err) {
-                    RCLCPP_INFO(logger_, "[client] Pair(%s) D-Bus reply: success", mac.c_str());
-                    evaluate_pending_operations();
-                    return;
-                }
-                const auto message = err->getMessage();
-                RCLCPP_INFO(logger_, "[client] Pair(%s) D-Bus reply: %s", mac.c_str(), message.c_str());
-                if (message.find("AlreadyExists") != std::string::npos ||
-                    message.find("AlreadyPaired") != std::string::npos) {
-                    resolve_pending_operation(operation, true, message);
-                    return;
-                }
-                if (message.find("InProgress") != std::string::npos) {
-                    return;
-                }
-                RCLCPP_WARN(logger_, "pair(%s) failed: %s", mac.c_str(), message.c_str());
-                resolve_pending_operation(operation, false, message);
-            });
-    } catch (const sdbus::Error& e) {
-        resolve_pending_operation(operation, false, e.getMessage());
+        auto proxy = create_bluez_proxy(*connection, path);
+        proxy->callMethod("Pair")
+            .onInterface(std::string(kDeviceIface));
+    } catch (const sdbus::Error& error) {
+        const auto message = error.getMessage();
+        if (!message_contains(message, {"AlreadyExists", "Already Paired", "AlreadyPaired", "InProgress"})) {
+            RCLCPP_WARN(logger_, "pair(%s) failed: %s", mac.c_str(), message.c_str());
+            return false;
+        }
     }
+
+    return poll_until(timeout_s, kPairPollInterval, [&]() {
+        try {
+            const auto properties = read_device_properties(*connection, path);
+            return properties && get_variant_or<bool>(*properties, "Paired", false);
+        } catch (const sdbus::Error& error) {
+            if (message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"})) {
+                return false;
+            }
+            throw;
+        }
+    });
 }
 
 bool BluezClient::trust(const std::string& mac) {
@@ -478,57 +361,30 @@ bool BluezClient::remove(const std::string& mac) {
 // ---------------------------------------------------------------------------
 
 bool BluezClient::wait_services_resolved(const std::string& mac, double timeout_s) {
-    auto promise = std::make_shared<std::promise<bool>>();
-    auto future = promise->get_future();
-    wait_services_resolved_async(mac,
-                                 [promise](bool success, const std::string&) mutable {
-                                     promise->set_value(success);
-                                 },
-                                 timeout_s);
-    return future.wait_for(std::chrono::milliseconds(
-               static_cast<int64_t>(std::max(1.0, timeout_s + 1.0) * 1000.0))) == std::future_status::ready &&
-           future.get();
-}
-
-void BluezClient::wait_services_resolved_async(const std::string& mac,
-                                               OperationResultCallback cb,
-                                               double timeout_s) {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) {
-        cb(false, "device not found");
-        return;
+        return false;
     }
 
-    start_pending_operation(
-        [this, mac]() {
-            auto current = cache_.device_by_mac(mac);
-            if (current && current->services_resolved) {
+    const auto path = dev->object_path;
+    auto connection = create_blocking_system_bus();
+    return poll_until(timeout_s, kConnectPollInterval, [&]() {
+        try {
+            const auto properties = read_device_properties(*connection, path);
+            if (!properties) {
+                return false;
+            }
+            if (get_variant_or<bool>(*properties, "ServicesResolved", false)) {
                 return true;
             }
-            if (current && !current->object_path.empty()) {
-                auto services = cache_.services_for_device(current->object_path);
-                for (const auto& service : services) {
-                    auto characteristics = cache_.characteristics_for_service(service.object_path);
-                    if (!characteristics.empty()) {
-                        return true;
-                    }
-                }
+            return device_has_resolved_characteristics(*connection, path);
+        } catch (const sdbus::Error& error) {
+            if (message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"})) {
+                return false;
             }
-            return false;
-        },
-        [device_path = dev->object_path](CacheEvent event, const std::string& object_path) {
-            if (object_path == device_path && event == CacheEvent::DevicePropertyChanged) {
-                return true;
-            }
-            const bool child_event = event == CacheEvent::GattServiceAdded ||
-                                     event == CacheEvent::GattCharacteristicAdded ||
-                                     event == CacheEvent::GattServiceRemoved ||
-                                     event == CacheEvent::GattCharacteristicRemoved;
-            return child_event && object_path.find(device_path + "/") == 0;
-        },
-        std::move(cb),
-        std::chrono::milliseconds(static_cast<int64_t>(std::max(1.0, timeout_s) * 1000.0)),
-        "services unresolved");
+            throw;
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +581,7 @@ bool BluezClient::write_descriptor_async(const std::string& desc_path,
 // ---------------------------------------------------------------------------
 
 bool BluezClient::start_notify(const std::string& chrc_path) {
-    RCLCPP_INFO(logger_, "[client] start_notify path=%s", chrc_path.c_str());
+    RCLCPP_DEBUG(logger_, "[client] start_notify path=%s", chrc_path.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -751,7 +607,7 @@ bool BluezClient::start_notify(const std::string& chrc_path) {
 }
 
 bool BluezClient::stop_notify(const std::string& chrc_path) {
-    RCLCPP_INFO(logger_, "[client] stop_notify path=%s", chrc_path.c_str());
+    RCLCPP_DEBUG(logger_, "[client] stop_notify path=%s", chrc_path.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -826,7 +682,6 @@ void BluezClient::on_cache_event(CacheEvent event, const std::string& object_pat
             }
         }
     }
-    evaluate_pending_operations(event, object_path);
 }
 
 std::string BluezClient::device_path_for_mac(const std::string& mac) const {
@@ -837,9 +692,8 @@ std::string BluezClient::device_path_for_mac(const std::string& mac) const {
 void BluezClient::set_device_property(const std::string& device_path,
                                       const std::string& prop,
                                       const sdbus::Variant& value) {
-    auto proxy = sdbus::createProxy(dbus_.connection(),
-                                    sdbus::ServiceName{std::string(kBluezServiceName)},
-                                    sdbus::ObjectPath{device_path});
+    auto connection = create_blocking_system_bus();
+    auto proxy = create_bluez_proxy(*connection, device_path);
     proxy->callMethod("Set")
         .onInterface(std::string(kDbusPropertiesIface))
         .withArguments(std::string{kDeviceIface}, prop, value);
@@ -860,128 +714,6 @@ void BluezClient::emit_gatt(const std::string& event,
         try {
             cb(event, path, detail);
         } catch (...) {}
-    }
-}
-
-std::shared_ptr<BluezClient::PendingOperation> BluezClient::start_pending_operation(
-    std::function<bool()> predicate,
-    std::function<bool(CacheEvent, const std::string&)> event_filter,
-    OperationResultCallback cb,
-    std::chrono::milliseconds timeout,
-    std::string timeout_detail) {
-    auto operation = std::make_shared<PendingOperation>();
-    operation->is_complete = std::move(predicate);
-    operation->event_filter = std::move(event_filter);
-    operation->callback = std::move(cb);
-    operation->timeout_detail = std::move(timeout_detail);
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        operation->id = next_pending_operation_id_++;
-        pending_operations_[operation->id] = operation;
-    }
-
-    if (timeout_scheduler_ && timeout.count() > 0) {
-        std::weak_ptr<PendingOperation> weak_operation = operation;
-        operation->timeout_timer = timeout_scheduler_(timeout, [this, weak_operation]() {
-            auto operation = weak_operation.lock();
-            if (!operation) {
-                return;
-            }
-            resolve_pending_operation(operation, false, operation->timeout_detail);
-        });
-    }
-
-    evaluate_pending_operations();
-
-    return operation;
-}
-
-void BluezClient::resolve_pending_operation(const std::shared_ptr<PendingOperation>& operation,
-                                            bool success,
-                                            const std::string& detail) {
-    if (!operation) {
-        return;
-    }
-
-    OperationResultCallback callback;
-    rclcpp::TimerBase::SharedPtr timeout_timer;
-    {
-        std::lock_guard<std::mutex> operation_lock(operation->mutex);
-        if (operation->resolved) {
-            return;
-        }
-        operation->resolved = true;
-        callback = operation->callback;
-        timeout_timer = operation->timeout_timer;
-        operation->timeout_timer.reset();
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pending_operations_.erase(operation->id);
-    }
-
-    timeout_timer.reset();
-
-    if (callback) {
-        try {
-            callback(success, detail);
-        } catch (...) {
-        }
-    }
-}
-
-void BluezClient::evaluate_pending_operations() {
-    std::vector<std::shared_ptr<PendingOperation>> ready;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ready.reserve(pending_operations_.size());
-        for (const auto& [_, operation] : pending_operations_) {
-            ready.push_back(operation);
-        }
-    }
-
-    for (const auto& operation : ready) {
-        bool matched = false;
-        {
-            std::lock_guard<std::mutex> operation_lock(operation->mutex);
-            if (operation->resolved) {
-                continue;
-            }
-            matched = operation->is_complete && operation->is_complete();
-        }
-        if (matched) {
-            resolve_pending_operation(operation, true, "ok");
-        }
-    }
-}
-
-void BluezClient::evaluate_pending_operations(CacheEvent event, const std::string& object_path) {
-    std::vector<std::shared_ptr<PendingOperation>> ready;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        ready.reserve(pending_operations_.size());
-        for (const auto& [_, operation] : pending_operations_) {
-            ready.push_back(operation);
-        }
-    }
-
-    for (const auto& operation : ready) {
-        bool matched = false;
-        {
-            std::lock_guard<std::mutex> operation_lock(operation->mutex);
-            if (operation->resolved) {
-                continue;
-            }
-            if (operation->event_filter && !operation->event_filter(event, object_path)) {
-                continue;
-            }
-            matched = operation->is_complete && operation->is_complete();
-        }
-        if (matched) {
-            resolve_pending_operation(operation, true, "ok");
-        }
     }
 }
 

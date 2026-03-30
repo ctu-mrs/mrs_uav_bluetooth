@@ -185,9 +185,10 @@ void GattCharacteristic::set_value(const std::vector<uint8_t>& val, bool emit) {
         value_ = val;
     }
     if (emit && exported_) {
-        RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
-                    "[gatt] emit Value changed: %s (%zu bytes)",
-                    path_.c_str(), val.size());
+        static rclcpp::Clock throttle_clock{RCL_STEADY_TIME};
+        RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("mrs_uav_bluetooth"), throttle_clock, 5000,
+                              "[server] value changed path=%s bytes=%zu",
+                              path_.c_str(), val.size());
         exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                               std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
     }
@@ -225,7 +226,7 @@ void GattCharacteristic::on_start_notify() {
     if (notifying_) return;
     notifying_ = true;
     RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
-                "[gatt] StartNotify called on %s", path_.c_str());
+                "[server] notify enabled path=%s", path_.c_str());
     if (exported_) {
         exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                               std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
@@ -237,7 +238,7 @@ void GattCharacteristic::on_stop_notify() {
     if (!notifying_) return;
     notifying_ = false;
     RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
-                "[gatt] StopNotify called on %s", path_.c_str());
+                "[server] notify disabled path=%s", path_.c_str());
     if (exported_) {
         exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                               std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});

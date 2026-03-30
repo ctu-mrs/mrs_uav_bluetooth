@@ -6,19 +6,20 @@
 
 namespace mrs_uav_bluetooth::bluez {
 
-DbusConnection::DbusConnection(rclcpp::Logger logger)
-    : logger_(logger)
+DbusConnection::DbusConnection(rclcpp::Logger logger, std::string role)
+    : logger_(logger),
+      role_(std::move(role))
 {
-    RCLCPP_INFO(logger_, "Opening system D-Bus connection");
+    RCLCPP_INFO(logger_, "Opening system D-Bus connection (%s)", role_.c_str());
     connection_ = sdbus::createSystemBusConnection();
     // Start the event loop on a background thread.
     connection_->enterEventLoopAsync();
-    RCLCPP_INFO(logger_, "D-Bus event loop started");
+    RCLCPP_INFO(logger_, "D-Bus event loop started (%s)", role_.c_str());
 }
 
 DbusConnection::~DbusConnection() {
     if (connection_) {
-        RCLCPP_INFO(logger_, "Leaving D-Bus event loop");
+        RCLCPP_INFO(logger_, "Leaving D-Bus event loop (%s)", role_.c_str());
         connection_->leaveEventLoop();
     }
 }

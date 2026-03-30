@@ -24,6 +24,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -73,12 +74,22 @@ public:
     explicit ServiceServers(rclcpp::Node& node);
 
     std::vector<rclcpp::ServiceBase::SharedPtr> register_all(rclcpp::Node& owner,
-                                                             const Handlers& handlers);
+                                                             const Handlers& handlers,
+                                                             const rclcpp::CallbackGroup::SharedPtr& callback_group = nullptr);
 
     template<typename ServiceT, typename CallbackT>
     typename rclcpp::Service<ServiceT>::SharedPtr create(rclcpp::Node& owner,
                                                          const std::string& name,
-                                                         CallbackT&& cb) {
+                                                         CallbackT&& cb,
+                                                         const rclcpp::CallbackGroup::SharedPtr& callback_group = nullptr) {
+        if (callback_group) {
+            auto services_qos = rclcpp::ServicesQoS();
+            return owner.create_service<ServiceT>(
+                name,
+                std::forward<CallbackT>(cb),
+                services_qos,
+                callback_group);
+        }
         return owner.create_service<ServiceT>(name, std::forward<CallbackT>(cb));
     }
 

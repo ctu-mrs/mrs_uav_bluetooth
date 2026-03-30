@@ -211,6 +211,7 @@ private:
     std::string adapter_path_;
     rclcpp::Logger logger_;
     std::unique_ptr<sdbus::IObject> exported_;
+    std::optional<sdbus::Slot> object_manager_slot_;
     std::vector<std::shared_ptr<GattService>> services_;
     bool registered_{false};
 };

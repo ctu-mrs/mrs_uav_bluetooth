@@ -111,6 +111,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     if (!session.desired) {
         session.connected_since_monotonic = 0.0;
         session.services_wait_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
         if (whitelist_enabled && session.peer_candidate && !session.explicit_target) {
             set_session_phase(session, "policy_blocked", "peer not present in whitelist");
         } else if (!session.peer_candidate) {
@@ -131,6 +133,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     if (!device.connected) {
         session.connected_since_monotonic = 0.0;
         session.services_wait_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
 
         if ((device.paired || device.bonded) && !device.trusted) {
             set_session_phase(session, "securing", "repairing trust before reconnect");
@@ -162,6 +166,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     }
 
     if (!device.services_resolved) {
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
         if (session.services_wait_started_monotonic <= 0.0) {
             session.services_wait_started_monotonic = now;
         }
@@ -177,6 +183,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
 
     set_session_phase(session, "ready", "connected and services resolved");
     session.services_wait_started_monotonic = 0.0;
+    session.bridge_wait_started_monotonic = 0.0;
+    session.bridge_wait_reason.clear();
 }
 
 void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
@@ -189,6 +197,8 @@ void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
     }
     it->second.connected_since_monotonic = 0.0;
     it->second.services_wait_started_monotonic = 0.0;
+    it->second.bridge_wait_started_monotonic = 0.0;
+    it->second.bridge_wait_reason.clear();
     set_session_phase(it->second, "stale", "device missing from cache");
 }
 
