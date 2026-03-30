@@ -28,6 +28,7 @@ constexpr double kPeerRepairCooldownMin = 8.0;
 constexpr double kBridgeGraceMin = 8.0;
 constexpr double kPolicyConfigSettleGraceMin = 5.0;
 constexpr double kGattCacheRepairGraceMin = 2.0;
+constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kGattReadWriteLogInterval = std::chrono::seconds(10);
@@ -777,6 +778,12 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     }
 
     rebuild_server_objects();
+    {
+        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+        local_server_rebuild_monotonic_ = peers_ ? peers_->now_monotonic()
+                                                 : std::chrono::duration<double>(
+                                                       std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     local_gatt_layout_signature_ = new_gatt_layout_signature;
 
     if (time_service_timer_) {
@@ -1676,6 +1683,17 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         return false;
     }
 
+    const auto now = peers_->now_monotonic();
+    const double retry_period_s = std::max(0.5, active_config_.auto_connect_period);
+    const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
+    if (local_server_rebuild_monotonic_ > 0.0 &&
+        (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s) {
+        log_warn_coalesced("pairing-rejected-reconfigure:" + device->mac + ":" + event_type,
+                           "[node] rejecting pairing request for " + device->mac +
+                               " while local GATT/server rebuild is still settling");
+        return false;
+    }
+
     return true;
 }
 
@@ -2248,6 +2266,9 @@ void ServiceNode::reconcile_peers() {
     double next_deadline_s = retry_period_s;
     const double repair_cooldown_s = std::max(kPeerRepairCooldownMin, retry_period_s * 2.0);
     const double bridge_grace_s = std::max(kBridgeGraceMin, retry_period_s * 4.0);
+    const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
+    const bool local_reconfigure_recent = local_server_rebuild_monotonic_ > 0.0 &&
+        (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s;
     // BlueZ can report ServicesResolved=true even when remote GATT discovery
     // completed with an error, so keep this repair grace short and independent
     // of the normal reconnect period.
@@ -2337,6 +2358,36 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
+        const bool allow_pair_repair = local_initiates_link || session.pairing_reset_pending;
+        const bool needs_local_connect = local_initiates_link && !is_connected;
+        const bool needs_local_pair = is_connected && device && allow_pair_repair &&
+            !device->blocked && !(device->paired || device->bonded);
+        const bool needs_local_trust = is_connected && device && !device->blocked &&
+            (device->paired || device->bonded) && !device->trusted;
+        const bool needs_local_stale_pair_repair = device && session.stale_pairing_detected;
+
+        if (local_reconfigure_recent &&
+            (needs_local_connect || needs_local_pair || needs_local_trust || needs_local_stale_pair_repair)) {
+            if (needs_local_connect) {
+                session.phase = "connect_pending";
+                session.detail = "waiting for local GATT rebuild to settle before connecting";
+            } else if (needs_local_pair) {
+                session.phase = "securing";
+                session.detail = "waiting for local GATT rebuild to settle before pairing";
+            } else if (needs_local_trust) {
+                session.phase = "securing";
+                session.detail = "waiting for local GATT rebuild to settle before trust repair";
+            } else {
+                session.phase = "recovering";
+                session.detail = "waiting for local GATT rebuild to settle before stale pairing repair";
+            }
+            pending_deadline = true;
+            next_deadline_s = std::min(
+                next_deadline_s,
+                std::max(0.1, local_server_rebuild_monotonic_ + local_reconfigure_grace_s - now));
+            continue;
+        }
+
         if (device && peers_->should_attempt_trust(session, *device, now, retry_period_s)) {
             if (run_peer_task_once(mac, "trust", [this, mac]() {
                     (void)client_->trust(mac);
@@ -2406,7 +2457,6 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        const bool allow_pair_repair = local_initiates_link || session.pairing_reset_pending;
         if (device && allow_pair_repair && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
             if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
                     (void)client_->pair(mac, retry_period_s);

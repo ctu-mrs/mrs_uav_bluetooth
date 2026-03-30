@@ -198,6 +198,7 @@ private:
     mutable std::mutex repeated_log_mutex_;
     std::map<std::string, RepeatedLogEntry> repeated_log_entries_;
     double config_applied_monotonic_{0.0};
+    double local_server_rebuild_monotonic_{0.0};
     std::string local_gatt_layout_signature_;
 };
 
