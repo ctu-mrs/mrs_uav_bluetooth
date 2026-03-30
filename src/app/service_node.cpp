@@ -2374,6 +2374,16 @@ void ServiceNode::reconcile_peers() {
     const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
     const bool local_reconfigure_recent = local_server_rebuild_monotonic_ > 0.0 &&
         (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s;
+    const auto bridge_wait_remaining_s = [&](const peer::PeerConnectionSession& session) {
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            return retry_period_s;
+        }
+
+        const double grace_s = session.bridge_wait_reason == "gatt-cache"
+            ? kRemoteGattDiscoveryRepairGraceMin
+            : bridge_grace_s;
+        return std::max(0.1, session.bridge_wait_started_monotonic + grace_s - now);
+    };
 
     for (auto& [mac, session] : peers_->sessions()) {
         const auto device = client_->get_device(mac);
@@ -2676,7 +2686,7 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
             if (!bridge_ready) {
                 pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+                next_deadline_s = std::min(next_deadline_s, bridge_wait_remaining_s(session));
             }
             continue;
         }
@@ -2693,6 +2703,8 @@ void ServiceNode::reconcile_peers() {
             const auto remaining = std::max(0.1,
                 session.services_wait_started_monotonic + session.services_wait_grace_s - now);
             next_deadline_s = std::min(next_deadline_s, remaining);
+        } else if (session.bridge_wait_started_monotonic > 0.0) {
+            next_deadline_s = std::min(next_deadline_s, bridge_wait_remaining_s(session));
         } else {
             next_deadline_s = std::min(next_deadline_s, retry_period_s);
         }

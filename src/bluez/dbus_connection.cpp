@@ -18,7 +18,21 @@ DbusConnection::DbusConnection(rclcpp::Logger logger,
     if (!requested_name_.empty()) {
         RCLCPP_INFO(logger_, "Requesting system D-Bus name %s (%s)",
                     requested_name_.c_str(), role_.c_str());
-        connection_->requestName(sdbus::ServiceName{requested_name_});
+        try {
+            connection_->requestName(sdbus::ServiceName{requested_name_});
+        } catch (const sdbus::Error& error) {
+            const auto message = error.getMessage();
+            if (message.find("AccessDenied") != std::string::npos ||
+                message.find("Permission denied") != std::string::npos) {
+                RCLCPP_WARN(
+                    logger_,
+                    "Failed to request system D-Bus name %s (%s): %s. Install the mrs-uav-bluetooth-service package to add the required D-Bus policy file under /etc/dbus-1/system.d.",
+                    requested_name_.c_str(), role_.c_str(), message.c_str());
+            } else {
+                RCLCPP_WARN(logger_, "Failed to request system D-Bus name %s (%s): %s",
+                            requested_name_.c_str(), role_.c_str(), message.c_str());
+            }
+        }
     }
     // Start the event loop on a background thread.
     connection_->enterEventLoopAsync();
