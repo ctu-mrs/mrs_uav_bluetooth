@@ -31,6 +31,7 @@ struct PeerConnectionSession {
     int connect_repair_count{0};
     int pairing_failures{0};
     bool stale_pairing_detected{false};
+    bool pairing_reset_pending{false};
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};
     std::map<std::string, double> import_bridge_missing_since;

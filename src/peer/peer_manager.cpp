@@ -236,6 +236,9 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         return;
     }
 
+    session.pairing_reset_pending = false;
+    session.stale_pairing_detected = false;
+
     if (!device.services_resolved) {
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();

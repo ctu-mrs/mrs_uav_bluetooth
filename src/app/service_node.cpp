@@ -758,6 +758,15 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                     "Local GATT layout changed, resetting %zu peer cache(s) before rebuilding the server",
                     gatt_cache_reset_macs.size());
         for (const auto& mac : gatt_cache_reset_macs) {
+            {
+                std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+                if (peers_) {
+                    auto session_it = peers_->sessions().find(mac);
+                    if (session_it != peers_->sessions().end()) {
+                        session_it->second.pairing_reset_pending = true;
+                    }
+                }
+            }
             clear_peer_runtime(mac);
             (void)client_->disconnect(mac, 5.0);
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -2362,6 +2371,7 @@ void ServiceNode::reconcile_peers() {
                 state_lock.lock();
                 session.phase = "recovering";
                 session.detail = "repairing stale pairing";
+                session.pairing_reset_pending = true;
                 session.stale_pairing_detected = false;
                 session.last_repair_monotonic = now;
                 session.last_connect_attempt_monotonic = 0.0;
@@ -2393,14 +2403,20 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (device && local_initiates_link && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
+        const bool allow_pair_repair = local_initiates_link || session.pairing_reset_pending;
+        if (device && allow_pair_repair && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
             if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
                     (void)client_->pair(mac, retry_period_s);
                 })) {
-                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair (phase=%s)",
-                            device_label.c_str(), session.phase.c_str());
+                RCLCPP_INFO(get_logger(),
+                            "[reconcile] %s: attempting pair (phase=%s%s)",
+                            device_label.c_str(),
+                            session.phase.c_str(),
+                            local_initiates_link ? "" : ", local reset repair");
                 session.phase = "securing";
-                session.detail = "auto-pair requested";
+                session.detail = session.pairing_reset_pending
+                    ? "local bond reset, re-pair requested"
+                    : "auto-pair requested";
                 session.last_security_attempt_monotonic = now;
                 pending_deadline = true;
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
@@ -2441,6 +2457,7 @@ void ServiceNode::reconcile_peers() {
             state_lock.unlock();
             clear_peer_runtime(mac);
             state_lock.lock();
+            session.pairing_reset_pending = true;
             session.phase = "recovering";
             session.detail = services_stuck ? "repairing unresolved services via re-pair"
                                             : "repairing missing bridge via re-pair";
@@ -2503,6 +2520,7 @@ void ServiceNode::reconcile_peers() {
                     state_lock.unlock();
                     clear_peer_runtime(mac);
                     state_lock.lock();
+                    session.pairing_reset_pending = true;
                     session.phase = "recovering";
                     session.detail = "repairing stale remote GATT cache";
                     session.last_repair_monotonic = now;
