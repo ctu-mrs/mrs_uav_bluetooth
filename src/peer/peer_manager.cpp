@@ -171,8 +171,12 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
-        if (whitelist_enabled && session.peer_candidate && !session.explicit_target) {
-            set_session_phase(session, "policy_blocked", "peer not present in whitelist");
+        if (session.peer_candidate) {
+            set_session_phase(session,
+                              "policy_blocked",
+                              whitelist_enabled && !session.explicit_target
+                                  ? "peer not present in whitelist"
+                                  : "peer not allowed by current config");
         } else if (!session.peer_candidate) {
             set_session_phase(session, "idle",
                               session.peer_name.empty() ? "device does not match peer policy"
@@ -239,10 +243,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         return;
     }
 
-    set_session_phase(session, "ready", "connected and services resolved");
+    set_session_phase(session, "connected_unready", "connected, services resolved, awaiting peer time bridge");
     session.services_wait_started_monotonic = 0.0;
-    session.bridge_wait_started_monotonic = 0.0;
-    session.bridge_wait_reason.clear();
 }
 
 void PeerManager::note_missing_device(const std::string& mac, double now_mono) {

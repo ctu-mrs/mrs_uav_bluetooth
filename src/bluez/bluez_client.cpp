@@ -124,7 +124,7 @@ BluezClient::~BluezClient() {
     // Release per-characteristic notify match slots.
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        notify_match_slots_.clear();
+        notify_paths_.clear();
     }
 }
 
@@ -520,70 +520,15 @@ void BluezClient::emit_gatt(const std::string& event,
 
 void BluezClient::ensure_notify_match(const std::string& chrc_path) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (notify_match_slots_.count(chrc_path)) {
+    if (!notify_paths_.insert(chrc_path).second) {
         return;
     }
-    try {
-        auto& conn = dbus_.connection();
-        std::string rule = "type='signal',"
-                           "sender='org.bluez',"
-                           "interface='org.freedesktop.DBus.Properties',"
-                           "member='PropertiesChanged',"
-                           "path='" + chrc_path + "'";
-        auto slot = conn.addMatch(
-            rule,
-            [this, chrc_path](sdbus::Message msg) {
-                std::string interface;
-                std::map<std::string, sdbus::Variant> changed;
-                std::vector<std::string> invalidated;
-                msg >> interface >> changed >> invalidated;
-                if (interface != std::string(kGattCharacteristicIface)) {
-                    return;
-                }
-                auto value_it = changed.find("Value");
-                if (value_it == changed.end()) {
-                    return;
-                }
-                std::vector<uint8_t> data;
-                try {
-                    data = value_it->second.get<std::vector<uint8_t>>();
-                } catch (...) {
-                    return;
-                }
-                // Resolve UUID from cache.
-                std::string uuid;
-                if (auto chrc = cache_.characteristic(chrc_path)) {
-                    uuid = chrc->uuid;
-                }
-                RCLCPP_DEBUG(logger_, "[client] per-path notify from %s uuid=%s %zu bytes",
-                             chrc_path.c_str(), uuid.c_str(), data.size());
-                std::vector<NotificationCallback> cbs;
-                {
-                    std::lock_guard<std::mutex> cb_lock(mutex_);
-                    cbs.reserve(notification_cbs_.size());
-                    for (auto& [_, cb] : notification_cbs_) {
-                        cbs.push_back(cb);
-                    }
-                }
-                for (auto& cb : cbs) {
-                    try {
-                        cb(data, uuid, chrc_path);
-                    } catch (...) {
-                    }
-                }
-            },
-            sdbus::return_slot);
-        notify_match_slots_[chrc_path] = std::move(slot);
-        RCLCPP_DEBUG(logger_, "[client] added per-path notify match for %s", chrc_path.c_str());
-    } catch (const sdbus::Error& e) {
-        RCLCPP_WARN(logger_, "[client] failed to add per-path notify match for %s: %s",
-                    chrc_path.c_str(), e.getMessage().c_str());
-    }
+    RCLCPP_DEBUG(logger_, "[client] tracking notify path via cache observer for %s", chrc_path.c_str());
 }
 
 void BluezClient::remove_notify_match(const std::string& chrc_path) {
     std::lock_guard<std::mutex> lock(mutex_);
-    notify_match_slots_.erase(chrc_path);
+    notify_paths_.erase(chrc_path);
 }
 
 }  // namespace mrs_uav_bluetooth::bluez

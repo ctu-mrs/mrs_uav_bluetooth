@@ -12,6 +12,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -121,8 +122,8 @@ private:
     int next_gatt_token_{1};
     std::map<int, GattEventCallback> gatt_event_cbs_;
 
-    /// Per-characteristic PropertiesChanged match slots (mirrors Python _ensure_notify_match).
-    std::map<std::string, sdbus::Slot> notify_match_slots_;
+    /// Tracks characteristics for which notifications are enabled through the cache observer path.
+    std::set<std::string> notify_paths_;
     void ensure_notify_match(const std::string& chrc_path);
     void remove_notify_match(const std::string& chrc_path);
 };

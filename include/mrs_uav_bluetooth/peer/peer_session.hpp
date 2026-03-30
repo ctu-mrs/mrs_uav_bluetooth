@@ -20,6 +20,7 @@ struct PeerConnectionSession {
     double connect_started_monotonic{0.0};
     double connected_since_monotonic{0.0};
     double last_security_attempt_monotonic{0.0};
+    double last_policy_action_monotonic{0.0};
     double last_repair_monotonic{0.0};
     double last_service_retry_monotonic{0.0};
     double missing_since_monotonic{0.0};

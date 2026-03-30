@@ -1841,18 +1841,33 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
     const auto writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
     const auto peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
-    auto& bridge = peers_->time_bridges()[mac];
     const auto characteristic_path = client_->find_characteristic(mac, time_characteristic_uuid);
     const auto cached_characteristic = (!characteristic_path.empty() && cache_)
         ? cache_->characteristic(characteristic_path)
         : std::optional<bluez::GattCharacteristicInfo>{};
+    auto bridge_it = peers_->time_bridges().find(mac);
+
+    const auto clear_time_bridge = [this, &mac, &bridge_it]() {
+        if (bridge_it == peers_->time_bridges().end()) {
+            return;
+        }
+        const auto old_characteristic_path = bridge_it->second.characteristic_path;
+        peers_->remove_time_bridge(mac);
+        bridge_it = peers_->time_bridges().end();
+        if (!old_characteristic_path.empty()) {
+            client_->stop_notify(old_characteristic_path);
+        }
+    };
 
     if (!characteristic_path.empty() &&
-        bridge.characteristic_path == characteristic_path &&
-        bridge.status == "ready" &&
+        bridge_it != peers_->time_bridges().end() &&
+        bridge_it->second.characteristic_path == characteristic_path &&
         cached_characteristic && cached_characteristic->notifying) {
+        auto& bridge = bridge_it->second;
         bridge.mac = mac;
         bridge.peer_name = peer_name;
+        bridge.status = "ready";
+        bridge.detail = "peer time bridge active";
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
         session.phase = "ready";
@@ -1867,8 +1882,11 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): %zu services, %zu characteristics, %zu descriptors resolved",
                 mac.c_str(), services.size(), characteristics.size(), descriptors.size());
     if (characteristic_path.empty()) {
-        RCLCPP_INFO(get_logger(), "[node] update_peer_time_bridge(%s): time characteristic uuid=%s not found among %zu characteristics",
-                    mac.c_str(), time_characteristic_uuid.c_str(), characteristics.size());
+        clear_time_bridge();
+        log_info_coalesced("peer-time-bridge-missing:" + mac + ":" + std::to_string(characteristics.size()),
+                           "[node] update_peer_time_bridge(" + mac + "): time characteristic uuid=" +
+                               time_characteristic_uuid + " not found among " +
+                               std::to_string(characteristics.size()) + " characteristics");
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
@@ -1877,6 +1895,17 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.detail = "peer time characteristic not available";
         return false;
     }
+
+    if (bridge_it != peers_->time_bridges().end() &&
+        !bridge_it->second.characteristic_path.empty() &&
+        bridge_it->second.characteristic_path != characteristic_path) {
+        clear_time_bridge();
+    }
+
+    auto [created_bridge_it, inserted_bridge] = peers_->time_bridges().try_emplace(mac);
+    (void)inserted_bridge;
+    bridge_it = created_bridge_it;
+    auto& bridge = bridge_it->second;
 
     const auto topic_name = peer_status_topic(mac, peer_name);
     if (!bridge.publisher || bridge.status_topic_name != topic_name) {
@@ -1890,6 +1919,27 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     bridge.mac = mac;
     bridge.peer_name = peer_name;
     bridge.characteristic_path = characteristic_path;
+
+    if (bridge.status == "subscribing") {
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = peers_->now_monotonic();
+        }
+        session.bridge_wait_reason = "notify";
+        session.phase = "connected_unready";
+        session.detail = "awaiting peer time notifications";
+        return false;
+    }
+
+    if (bridge.status == "notify_failed") {
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = peers_->now_monotonic();
+        }
+        session.bridge_wait_reason = "notify";
+        session.phase = "connected_unready";
+        session.detail = "failed to enable peer time notifications";
+        return false;
+    }
+
     // Descriptors are optional — many devices (phones, etc.) don't resolve them.
     // The writeback descriptor is a nice-to-have for RTT measurement.
     const auto wb_path = client_->find_descriptor(mac, writeback_descriptor_uuid, characteristic_path);
@@ -1901,25 +1951,30 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                      mac.c_str());
     }
     bridge.writeback_descriptor_path = wb_path;
-    bridge.status = "connected";
-    bridge.detail = characteristic_path;
+    bridge.status = "subscribing";
+    bridge.detail = "enabling peer time notifications";
     bridge.services_wait_grace_s = session.services_wait_grace_s;
     bridge.pairing_failures = session.pairing_failures;
 
     if (client_->start_notify(characteristic_path)) {
-        RCLCPP_INFO(get_logger(), "[node] update_peer_time_bridge(%s): notifications enabled on %s (writeback=%s)",
-                    mac.c_str(), characteristic_path.c_str(),
-                    wb_path.empty() ? "none" : wb_path.c_str());
-        session.bridge_wait_started_monotonic = 0.0;
-        session.bridge_wait_reason.clear();
+        log_info_coalesced("peer-time-bridge-notify-start:" + mac + ":" + characteristic_path,
+                           "[node] update_peer_time_bridge(" + mac + "): notifications requested on " +
+                               characteristic_path + " (writeback=" +
+                               (wb_path.empty() ? std::string{"none"} : wb_path) + ")");
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = peers_->now_monotonic();
+        }
+        session.bridge_wait_reason = "notify";
         session.connect_repair_count = 0;
-        session.phase = "ready";
-        session.detail = "peer time bridge active";
-        return true;
+        session.phase = "connected_unready";
+        session.detail = "awaiting peer time notifications";
+        return false;
     }
 
     RCLCPP_WARN(get_logger(), "[node] update_peer_time_bridge(%s): failed to enable notifications on %s",
                 mac.c_str(), characteristic_path.c_str());
+    bridge.status = "notify_failed";
+    bridge.detail = "failed to enable peer time notifications";
     if (session.bridge_wait_started_monotonic <= 0.0) {
         session.bridge_wait_started_monotonic = peers_->now_monotonic();
     }
@@ -1968,17 +2023,31 @@ void ServiceNode::reconcile_peers() {
             refresh_import_bridges_for_device(*device);
         }
 
-        // Policy enforcement: Only auto-disconnect devices that are peer candidates
-        // blocked by whitelist policy. Never disconnect non-peer devices (phones, etc.)
-        // that happen to be connected — they are not managed by auto-connect.
-        if (is_connected && !session.desired && session.peer_candidate && whitelist_enabled) {
-            RCLCPP_INFO(get_logger(), "[reconcile] %s: peer_candidate blocked by whitelist, disconnecting",
-                        device_label.c_str());
-            if (run_peer_task_once(mac, "policy disconnect", [this, mac, retry_period_s]() {
-                    (void)client_->disconnect(mac, retry_period_s);
+        // Policy enforcement: peers not allowed by the current config must not
+        // remain connected or bonded, even if the connection was initiated remotely.
+        const bool policy_violation = !session.desired && session.peer_candidate &&
+            device && (device->connected || device->paired || device->bonded || device->trusted);
+        if (policy_violation &&
+            (session.last_policy_action_monotonic <= 0.0 || now - session.last_policy_action_monotonic >= retry_period_s)) {
+            RCLCPP_INFO(get_logger(),
+                        "[reconcile] %s: peer blocked by current config, disconnecting%s",
+                        device_label.c_str(),
+                        (device->paired || device->bonded || device->trusted) ? " and removing bond" : "");
+            if (run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
+                                                            paired = device->paired, bonded = device->bonded,
+                                                            trusted = device->trusted]() {
+                    if (connected) {
+                        (void)client_->disconnect(mac, retry_period_s);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    }
+                    if (paired || bonded || trusted) {
+                        (void)client_->remove(mac);
+                    }
                 })) {
                 session.phase = "policy_blocked";
-                session.detail = "peer not present in whitelist";
+                session.detail = whitelist_enabled ? "peer not present in whitelist"
+                                                  : "peer not allowed by current config";
+                session.last_policy_action_monotonic = now;
                 pending_deadline = true;
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
             }

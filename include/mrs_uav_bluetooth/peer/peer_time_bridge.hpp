@@ -19,7 +19,7 @@ struct PeerTimeBridge {
     double current_hz{0.0};
     uint64_t last_time_value_ns{0};
     double last_rtt_s{0.0};
-    std::string status{"connected"};
+    std::string status;
     std::string detail;
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};
