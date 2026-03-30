@@ -148,6 +148,8 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
     }
 
     bool changed = false;
+    std::vector<std::string> stop_notify_paths;
+    std::vector<std::pair<std::string, std::string>> start_notify_requests;
     for (auto& [bridge_key, state] : registry_->imports()) {
         if (state.mac != mac || state.bridge_uuid.empty()) {
             continue;
@@ -164,15 +166,15 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
             continue;
         }
 
-        if (!previous_path.empty()) {
-            client.stop_notify(previous_path);
-        }
-
         state.path = resolved_path;
         state.pending_payload.clear();
         state.last_payload.clear();
         state.last_publish_monotonic = 0.0;
         state.current_hz = 0.0;
+
+        if (!previous_path.empty()) {
+            stop_notify_paths.push_back(previous_path);
+        }
 
         if (state.rate_hz > 0.0) {
             configure_import_poll_timer(bridge_key, state, client);
@@ -182,13 +184,21 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
         }
 
         if (!state.path.empty()) {
-            if (!client.start_notify(state.path)) {
-                RCLCPP_WARN(logger_, "Failed to enable notifications for import bridge %s on %s",
-                            bridge_key.c_str(), state.path.c_str());
-            }
+            start_notify_requests.emplace_back(bridge_key, state.path);
         }
 
         changed = true;
+    }
+
+    for (const auto& path : stop_notify_paths) {
+        client.stop_notify(path);
+    }
+
+    for (const auto& [bridge_key, path] : start_notify_requests) {
+        if (!client.start_notify(path)) {
+            RCLCPP_WARN(logger_, "Failed to enable notifications for import bridge %s on %s",
+                        bridge_key.c_str(), path.c_str());
+        }
     }
 
     return changed;
@@ -201,13 +211,14 @@ bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
     }
 
     bool changed = false;
+    std::vector<std::string> stop_notify_paths;
     for (auto& [_, state] : registry_->imports()) {
         if (state.mac != mac) {
             continue;
         }
 
         if (!state.path.empty()) {
-            client.stop_notify(state.path);
+            stop_notify_paths.push_back(state.path);
         }
         if (state.poll_timer) {
             state.poll_timer->cancel();
@@ -221,6 +232,10 @@ bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
         state.last_payload.clear();
         state.last_publish_monotonic = 0.0;
         state.current_hz = 0.0;
+    }
+
+    for (const auto& path : stop_notify_paths) {
+        client.stop_notify(path);
     }
 
     return changed;
