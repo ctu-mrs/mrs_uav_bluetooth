@@ -11,6 +11,7 @@ namespace {
 
 constexpr double kConnectAttemptGraceMin = 8.0;
 constexpr double kConnectAttemptGraceMultiplier = 2.0;
+constexpr double kDesiredConnectGraceMin = 3.0;
 constexpr double kServicesWaitGraceMin = 8.0;
 constexpr double kPairCooldownMin = 5.0;
 
@@ -151,6 +152,7 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
                               const std::string& peer_name) {
     auto& session = get_or_create_session(device.mac, peer_name);
     const auto now = now_monotonic();
+    const bool was_desired = session.desired;
 
     session.missing_since_monotonic = 0.0;
 
@@ -164,6 +166,13 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     // When whitelist is empty, any matching peer candidate is desired (if auto_connect is on).
     session.desired = session.explicit_target ||
                       (config.auto_connect_enable && session.peer_candidate && !whitelist_enabled);
+    if (session.desired) {
+        if (!was_desired || session.desired_since_monotonic <= 0.0) {
+            session.desired_since_monotonic = now;
+        }
+    } else {
+        session.desired_since_monotonic = 0.0;
+    }
     session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
 
     if (!session.desired) {
@@ -318,6 +327,11 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
         return false;
     }
     if (is_phase(session, {"ready", "connected_unready", "securing", "blocked", "policy_blocked"})) {
+        return false;
+    }
+
+    if (session.desired_since_monotonic > 0.0 &&
+        now_mono - session.desired_since_monotonic < kDesiredConnectGraceMin) {
         return false;
     }
 

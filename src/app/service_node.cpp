@@ -1538,9 +1538,6 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
     peers_->sync_device(*device, active_config_, peer_name);
 
     if (!session.desired) {
-        if (client_) {
-            (void)client_->block(device->mac);
-        }
         log_warn_coalesced("pairing-rejected-policy:" + device->mac + ":" + event_type,
                            "[node] rejecting pairing request for " + device->mac +
                                " due to current config");
@@ -2123,7 +2120,6 @@ void ServiceNode::reconcile_peers() {
             if (run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
                                                             paired = device->paired, bonded = device->bonded,
                                                             trusted = device->trusted]() {
-                    (void)client_->block(mac);
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
                         std::this_thread::sleep_for(std::chrono::milliseconds(300));

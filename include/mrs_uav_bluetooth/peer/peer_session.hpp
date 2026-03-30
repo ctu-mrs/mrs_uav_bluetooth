@@ -16,6 +16,7 @@ struct PeerConnectionSession {
     std::string detail;
     double first_seen_monotonic{0.0};
     double last_seen_monotonic{0.0};
+    double desired_since_monotonic{0.0};
     double last_connect_attempt_monotonic{0.0};
     double connect_started_monotonic{0.0};
     double connected_since_monotonic{0.0};
