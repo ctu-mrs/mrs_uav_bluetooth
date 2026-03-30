@@ -14,6 +14,7 @@ constexpr double kConnectAttemptGraceMultiplier = 5.0;
 constexpr double kDesiredConnectGraceMin = 8.0;
 constexpr double kServicesWaitGraceMin = 15.0;
 constexpr double kPairCooldownMin = 10.0;
+constexpr double kTrustCooldownMin = 0.5;
 constexpr double kSecurePreReadyDisconnectMin = 3.0;
 constexpr int kSecurePreReadyDisconnectRepairThreshold = 2;
 
@@ -340,8 +341,8 @@ bool PeerManager::should_attempt_trust(const PeerConnectionSession& session,
     if (!(device.paired || device.bonded) || device.trusted) {
         return false;
     }
-    return session.last_security_attempt_monotonic <= 0.0 ||
-           now_mono - session.last_security_attempt_monotonic >= std::max(kPairCooldownMin, retry_period_s);
+        return session.last_security_attempt_monotonic <= 0.0 ||
+            now_mono - session.last_security_attempt_monotonic >= std::max(kTrustCooldownMin, retry_period_s * 0.25);
 }
 
 bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,

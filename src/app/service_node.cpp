@@ -147,16 +147,6 @@ std::string peer_topic_token(const std::string& peer_name, const std::string& ma
     return token;
 }
 
-bool local_peer_should_initiate_link(const std::string& local_hostname,
-                                     const std::string& peer_name) {
-    const auto local = lower_trim(local_hostname);
-    const auto peer = lower_trim(peer_name);
-    if (local.empty() || peer.empty()) {
-        return true;
-    }
-    return local < peer;
-}
-
 std::string trim_topic_segment(const std::string& value) {
     const auto start = value.find_first_not_of(" \t\r\n/");
     if (start == std::string::npos) {
@@ -1021,7 +1011,7 @@ void ServiceNode::publish_periodic_status() {
         client_ && client_->is_scanning(),
         client_ != nullptr && !adapter_path_.empty());
     std::vector<std::pair<std::string, std::string>> peer_snapshots;
-    size_t passive_peers = 0;
+    size_t suppressed_peers = 0;
     if (peers_) {
         for (const auto& [mac, session] : peers_->sessions()) {
             auto dev_it = devices_map.find(mac);
@@ -1039,7 +1029,7 @@ void ServiceNode::publish_periodic_status() {
                 }
             }
             if (!is_interesting_peer_status(session, conn, svc, bridge_status)) {
-                passive_peers += 1;
+                suppressed_peers += 1;
                 continue;
             }
             peer_snapshots.emplace_back(mac,
@@ -1052,7 +1042,7 @@ void ServiceNode::publish_periodic_status() {
         " connected=" + std::to_string(static_cast<size_t>(connected_count)) +
         " sessions=" + std::to_string(peers_ ? peers_->sessions().size() : 0u) +
         " interesting_peers=" + std::to_string(peer_snapshots.size()) +
-        " passive_peers=" + std::to_string(passive_peers) +
+        " suppressed_peers=" + std::to_string(suppressed_peers) +
         " time_bridges=" + std::to_string(peers_ ? peers_->time_bridges().size() : 0u) +
         " server=" + std::string(gatt_app_ ? "active" : "off") +
         " adv=" + std::string(advertisement_ ? "active" : "off") +
@@ -2395,7 +2385,6 @@ void ServiceNode::reconcile_peers() {
         const auto device = client_->get_device(mac);
         const auto device_label = mac + " (" + session.peer_name + ")";
         const bool is_connected = device && device->connected;
-        const bool local_initiates_link = local_peer_should_initiate_link(hostname_, session.peer_name);
 
         if (!session.desired || !is_connected) {
             state_lock.unlock();
@@ -2455,14 +2444,6 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (!is_connected && !local_initiates_link) {
-            session.phase = "connect_pending";
-            session.detail = "awaiting remote connection";
-            pending_deadline = true;
-            next_deadline_s = std::min(next_deadline_s, retry_period_s);
-            continue;
-        }
-
         if (device && device->blocked) {
             if (run_peer_task_once(mac, "unblock", [this, mac]() {
                     (void)client_->unblock(mac);
@@ -2475,8 +2456,8 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        const bool allow_pair_repair = local_initiates_link || session.pairing_reset_pending;
-        const bool needs_local_connect = local_initiates_link && !is_connected;
+        const bool allow_pair_repair = true;
+        const bool needs_local_connect = !is_connected;
         const bool needs_local_pair = is_connected && device && allow_pair_repair &&
             !device->blocked && !(device->paired || device->bonded);
         const bool needs_local_stale_pair_repair = device && session.stale_pairing_detected;
@@ -2558,7 +2539,7 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (local_initiates_link && peers_->should_attempt_connect(session, now, retry_period_s)) {
+        if (peers_->should_attempt_connect(session, now, retry_period_s)) {
             if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
                     (void)client_->connect(mac, retry_period_s);
                 })) {
@@ -2581,10 +2562,9 @@ void ServiceNode::reconcile_peers() {
                     note_pair_attempt_result(mac, pair_ok, pair_error);
                 })) {
                 RCLCPP_INFO(get_logger(),
-                            "[reconcile] %s: attempting pair (phase=%s%s)",
+                            "[reconcile] %s: attempting pair (phase=%s)",
                             device_label.c_str(),
-                            session.phase.c_str(),
-                            local_initiates_link ? "" : ", local reset repair");
+                            session.phase.c_str());
                 session.phase = "securing";
                 session.detail = session.pairing_reset_pending
                     ? "local bond reset, re-pair requested"
