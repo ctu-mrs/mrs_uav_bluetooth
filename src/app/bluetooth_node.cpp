@@ -28,6 +28,8 @@ constexpr double kBridgeGraceMin = 8.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kGattReadWriteLogInterval = std::chrono::seconds(10);
+constexpr size_t kLegacyAdvMaxBytes = 31;
+constexpr size_t kAdvFlagsBytes = 3;
 
 std::string lower_trim(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -178,6 +180,48 @@ bool is_interesting_peer_status(const mrs_uav_bluetooth::peer::PeerConnectionSes
                                 const std::string& bridge_status) {
     return session.desired || connected || services_resolved || bridge_status != "none" ||
            !phase_matches(session.phase, {"idle"});
+}
+
+size_t advertising_uuid_size(const std::string& uuid) {
+    std::string compact;
+    compact.reserve(uuid.size());
+    for (const char ch : uuid) {
+        if (ch != '-') {
+            compact.push_back(ch);
+        }
+    }
+    if (compact.size() == 4) {
+        return 2;
+    }
+    if (compact.size() == 8) {
+        return 4;
+    }
+    return 16;
+}
+
+std::vector<std::string> select_advertised_service_uuids(
+    const std::vector<std::string>& service_uuids,
+    const std::string& local_name) {
+    int remaining_bytes = static_cast<int>(kLegacyAdvMaxBytes - kAdvFlagsBytes);
+    if (!local_name.empty()) {
+        remaining_bytes -= static_cast<int>(2 + local_name.size());
+    }
+    if (remaining_bytes <= 2) {
+        return {};
+    }
+
+    std::vector<std::string> advertised;
+    advertised.reserve(service_uuids.size());
+    int used_bytes = 2;
+    for (const auto& uuid : service_uuids) {
+        const int uuid_size = static_cast<int>(advertising_uuid_size(uuid));
+        if (used_bytes + uuid_size > remaining_bytes) {
+            break;
+        }
+        advertised.push_back(uuid);
+        used_bytes += uuid_size;
+    }
+    return advertised;
 }
 
 std::string peer_status_snapshot(const std::string& mac,
@@ -730,13 +774,50 @@ void BluetoothNode::rebuild_server_objects() {
     advertisement_->set_discoverable_timeout(
         static_cast<uint16_t>(std::min<uint32_t>(active_config_.discoverable_timeout,
                                                  std::numeric_limits<uint16_t>::max())));
-    if (wifi_service_) {
-        advertisement_->add_service_uuid(wifi_service_->uuid());
+
+    std::vector<std::string> service_uuids;
+    service_uuids.reserve(gatt_app_->services().size());
+    for (const auto& service : gatt_app_->services()) {
+        service_uuids.push_back(service->uuid());
     }
-    if (time_service_) {
-        advertisement_->add_service_uuid(time_service_->uuid());
+
+    const auto advertised_service_uuids = select_advertised_service_uuids(service_uuids, hostname_);
+    if (advertised_service_uuids.size() != service_uuids.size()) {
+        RCLCPP_WARN(get_logger(),
+                    "BLE advertisement trimmed from %zu to %zu service UUIDs to fit legacy controller limits",
+                    service_uuids.size(), advertised_service_uuids.size());
     }
-    advertisement_->register_advertisement(adapter_path_);
+
+    std::vector<std::vector<std::string>> attempts;
+    attempts.push_back(advertised_service_uuids);
+    if (!advertised_service_uuids.empty()) {
+        attempts.push_back({});
+    }
+
+    bool advertisement_registered = false;
+    std::string last_error_message;
+    for (const auto& advertised_uuids : attempts) {
+        advertisement_->set_service_uuids(advertised_uuids);
+        try {
+            RCLCPP_INFO(get_logger(),
+                        "Registering BLE advertisement (name=%s, uuids=%zu)",
+                        hostname_.c_str(), advertised_uuids.size());
+            advertisement_->register_advertisement(adapter_path_);
+            advertisement_registered = true;
+            break;
+        } catch (const sdbus::Error& error) {
+            last_error_message = error.what();
+            RCLCPP_WARN(get_logger(),
+                        "BLE advertisement registration attempt failed (uuids=%zu): %s",
+                        advertised_uuids.size(), error.what());
+        }
+    }
+
+    if (!advertisement_registered) {
+        throw std::runtime_error(last_error_message.empty() ?
+                                     "Failed to register advertisement" :
+                                     last_error_message);
+    }
 }
 
 void BluetoothNode::publish_periodic_status() {
