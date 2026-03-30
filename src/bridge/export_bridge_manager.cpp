@@ -20,6 +20,10 @@ void ExportBridgeManager::configure_export_bridge(const std::string& bridge_key,
         state.topic_name,
         [this, bridge_key, runtime](std::shared_ptr<rclcpp::SerializedMessage> message) {
             try {
+                std::unique_lock<std::recursive_mutex> state_lock;
+                if (state_mutex_ != nullptr) {
+                    state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+                }
                 if (!registry_) {
                     return;
                 }
@@ -45,9 +49,17 @@ void ExportBridgeManager::set_registry(BridgeRegistry* registry) {
     registry_ = registry;
 }
 
+void ExportBridgeManager::set_state_mutex(std::recursive_mutex* mutex) {
+    state_mutex_ = mutex;
+}
+
 void ExportBridgeManager::rebuild_gatt_services(gatt::GattApplication& app,
                                                 bluez::DbusConnection& dbus,
                                                 const std::string& app_base_path) {
+    std::unique_lock<std::recursive_mutex> state_lock;
+    if (state_mutex_ != nullptr) {
+        state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+    }
     if (!registry_) {
         return;
     }
@@ -73,6 +85,10 @@ void ExportBridgeManager::rebuild_gatt_services(gatt::GattApplication& app,
 
 void ExportBridgeManager::publish_export_payload(const std::string& bridge_key,
                                                  const std::vector<uint8_t>& payload) {
+    std::unique_lock<std::recursive_mutex> state_lock;
+    if (state_mutex_ != nullptr) {
+        state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+    }
     if (!registry_) {
         return;
     }
@@ -108,6 +124,10 @@ void ExportBridgeManager::configure_export_rate_timer(const std::string& bridge_
     state.publish_timer = node_.create_wall_timer(
         std::chrono::duration<double>(1.0 / state.rate_hz),
         [this, bridge_key]() {
+            std::unique_lock<std::recursive_mutex> state_lock;
+            if (state_mutex_ != nullptr) {
+                state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+            }
             if (!registry_) {
                 return;
             }

@@ -6,6 +6,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -16,6 +17,7 @@ public:
     explicit ImportBridgeManager(rclcpp::Node& node, rclcpp::Logger logger);
 
     void set_registry(BridgeRegistry* registry);
+    void set_state_mutex(std::recursive_mutex* mutex);
     void destroy_import_bridge(TopicImportBridgeState& state);
     void configure_import_bridge(const std::string& bridge_key,
                                  TopicImportBridgeState& state,
@@ -38,6 +40,7 @@ private:
     rclcpp::Node& node_;
     rclcpp::Logger logger_;
     BridgeRegistry* registry_{nullptr};
+    std::recursive_mutex* state_mutex_{nullptr};
 };
 
 }  // namespace mrs_uav_bluetooth::bridge

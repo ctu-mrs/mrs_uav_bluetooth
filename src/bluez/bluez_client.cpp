@@ -404,8 +404,8 @@ bool BluezClient::wait_services_resolved(const std::string& mac, double timeout_
             if (!properties) {
                 return false;
             }
-            if (get_variant_or<bool>(*properties, "ServicesResolved", false)) {
-                return true;
+            if (!get_variant_or<bool>(*properties, "Connected", false)) {
+                return false;
             }
             return device_has_resolved_characteristics(*connection, path);
         } catch (const sdbus::Error& error) {

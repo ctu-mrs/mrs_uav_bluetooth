@@ -7,6 +7,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <mutex>
 #include <string>
 
 namespace mrs_uav_bluetooth::bridge {
@@ -16,6 +17,7 @@ public:
     explicit ExportBridgeManager(rclcpp::Node& node, rclcpp::Logger logger);
 
     void set_registry(BridgeRegistry* registry);
+    void set_state_mutex(std::recursive_mutex* mutex);
     void configure_export_bridge(const std::string& bridge_key,
                                  TopicExportBridgeState& state);
     void rebuild_gatt_services(gatt::GattApplication& app,
@@ -33,6 +35,7 @@ private:
     rclcpp::Node& node_;
     rclcpp::Logger logger_;
     BridgeRegistry* registry_{nullptr};
+    std::recursive_mutex* state_mutex_{nullptr};
 };
 
 }  // namespace mrs_uav_bluetooth::bridge

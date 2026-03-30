@@ -543,8 +543,10 @@ void ServiceNode::build_runtime() {
 
     export_bridges_ = std::make_unique<bridge::ExportBridgeManager>(*this, get_logger());
     export_bridges_->set_registry(&bridge_registry_);
+    export_bridges_->set_state_mutex(&state_mutex_);
     import_bridges_ = std::make_unique<bridge::ImportBridgeManager>(*this, get_logger());
     import_bridges_->set_registry(&bridge_registry_);
+    import_bridges_->set_state_mutex(&state_mutex_);
     peers_ = std::make_unique<peer::PeerManager>(*this, get_logger());
     ros_ = std::make_unique<ros::RosInterfaceManager>(*this);
     create_services();
@@ -631,42 +633,45 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             timer_callback_group_);
     }
 
-    for (auto it = bridge_registry_.exports().begin(); it != bridge_registry_.exports().end();) {
-        if (it->second.auto_managed) {
-            export_bridges_->destroy_export_bridge(it->second);
-            it = bridge_registry_.exports().erase(it);
-        } else {
-            ++it;
+    {
+        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+        for (auto it = bridge_registry_.exports().begin(); it != bridge_registry_.exports().end();) {
+            if (it->second.auto_managed) {
+                export_bridges_->destroy_export_bridge(it->second);
+                it = bridge_registry_.exports().erase(it);
+            } else {
+                ++it;
+            }
         }
-    }
-    for (auto it = bridge_registry_.imports().begin(); it != bridge_registry_.imports().end();) {
-        if (it->second.auto_managed) {
-            import_bridges_->destroy_import_bridge(it->second);
-            it = bridge_registry_.imports().erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    for (const auto& shared_topic : cfg.shared_topics) {
-        if (shared_topic.mode == "export" || shared_topic.mode == "both") {
-            bridge::TopicExportBridgeState state;
-            state.topic_name = shared_topic.export_topic;
-            state.message_type = shared_topic.message_type;
-            state.bridge_name = shared_topic.bridge_name;
-            state.bridge_key = shared_topic.bridge_key;
-            state.bridge_uuid = util::named_characteristic_uuid(
-                bridge_characteristic_name_for_service(shared_topic.bridge_name));
-            state.member_specs = shared_topic.member_specs;
-            state.rate_hz = shared_topic.rate_hz;
-            state.payload_format = shared_topic.payload_format;
-            state.auto_managed = true;
-            auto [it, inserted] = bridge_registry_.exports().insert_or_assign(shared_topic.bridge_key, std::move(state));
-            (void)inserted;
-            export_bridges_->configure_export_bridge(shared_topic.bridge_key, it->second);
-            export_bridges_->configure_export_rate_timer(shared_topic.bridge_key, it->second);
+        for (auto it = bridge_registry_.imports().begin(); it != bridge_registry_.imports().end();) {
+            if (it->second.auto_managed) {
+                import_bridges_->destroy_import_bridge(it->second);
+                it = bridge_registry_.imports().erase(it);
+            } else {
+                ++it;
+            }
         }
 
+        for (const auto& shared_topic : cfg.shared_topics) {
+            if (shared_topic.mode == "export" || shared_topic.mode == "both") {
+                bridge::TopicExportBridgeState state;
+                state.topic_name = shared_topic.export_topic;
+                state.message_type = shared_topic.message_type;
+                state.bridge_name = shared_topic.bridge_name;
+                state.bridge_key = shared_topic.bridge_key;
+                state.bridge_uuid = util::named_characteristic_uuid(
+                    bridge_characteristic_name_for_service(shared_topic.bridge_name));
+                state.member_specs = shared_topic.member_specs;
+                state.rate_hz = shared_topic.rate_hz;
+                state.payload_format = shared_topic.payload_format;
+                state.auto_managed = true;
+                auto [it, inserted] = bridge_registry_.exports().insert_or_assign(shared_topic.bridge_key, std::move(state));
+                (void)inserted;
+                export_bridges_->configure_export_bridge(shared_topic.bridge_key, it->second);
+                export_bridges_->configure_export_rate_timer(shared_topic.bridge_key, it->second);
+            }
+
+        }
     }
 
     netplan_->set_allowed_networks(cfg.allowed_wifi_networks);
@@ -677,6 +682,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     }
 
     if (peers_ && client_) {
+        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
         for (const auto& device : client_->get_devices()) {
             peers_->sync_device(device, active_config_, device_hostname_guess(device));
             refresh_import_bridges_for_device(device);
@@ -845,6 +851,7 @@ void ServiceNode::rebuild_server_objects() {
 }
 
 void ServiceNode::publish_periodic_status() {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     std::map<std::string, bluez::DeviceInfo> devices_map;
     if (client_) {
         for (const auto& device : client_->get_devices()) {
@@ -1299,6 +1306,7 @@ std::string ServiceNode::build_detailed_status_report(
 }
 
 void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& object_path) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !cache_) {
         return;
     }
@@ -1466,6 +1474,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
 void ServiceNode::on_gatt_event(const std::string& event_type,
                                   const std::string& object_path,
                                   const std::string& detail) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (event_type == "client_notify_enabled") {
         log_info_coalesced("gatt:notify-enabled:" + object_path,
                            "[client] notify enabled path=" + object_path);
@@ -1513,6 +1522,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
 }
 
 void ServiceNode::on_pairing_event(const std::string& event_type, const std::string& device_path) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     RCLCPP_INFO(get_logger(), "[node] on_pairing_event: type=%s device=%s",
                 event_type.c_str(), device_path.c_str());
     if (!peers_ || !cache_) {
@@ -1524,6 +1534,7 @@ void ServiceNode::on_pairing_event(const std::string& event_type, const std::str
 
 bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
                                                const std::string& device_path) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !cache_) {
         return false;
     }
@@ -1646,6 +1657,7 @@ void ServiceNode::wait_for_peer_tasks() {
 }
 
 void ServiceNode::clear_peer_runtime(const std::string& mac) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !client_ || !import_bridges_) {
         return;
     }
@@ -1662,6 +1674,7 @@ void ServiceNode::clear_peer_runtime(const std::string& mac) {
 }
 
 void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& device) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!import_bridges_ || !client_ || !peers_) {
         return;
     }
@@ -1733,6 +1746,7 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
                                                  const std::set<std::string>& desired_keys,
                                                  double now_mono,
                                                  double missing_path_grace_s) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !import_bridges_ || !client_) {
         return;
     }
@@ -1824,6 +1838,7 @@ void ServiceNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const {
 void ServiceNode::on_notification(const std::vector<uint8_t>& data,
                                     const std::string& uuid,
                                     const std::string& characteristic_path) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     RCLCPP_DEBUG(get_logger(), "[node] on_notification: uuid=%s path=%s %zu bytes",
                 uuid.c_str(), characteristic_path.c_str(), data.size());
     if (!cache_ || !ros_) {
@@ -1876,6 +1891,7 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
 void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
                                           const std::string& device_path,
                                           uint64_t received_time_ns) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || payload.size() < sizeof(uint64_t)) {
         return;
     }
@@ -1923,6 +1939,7 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
 bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                                             const bluez::DeviceInfo& device,
                                             peer::PeerConnectionSession& session) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
     const auto writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
     const auto peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
@@ -2070,6 +2087,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
 }
 
 void ServiceNode::reconcile_peers() {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !client_) {
         return;
     }
@@ -2296,6 +2314,25 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device->trusted && (device->paired || device->bonded) && device->services_resolved) {
+            const auto resolved_characteristics = client_->list_characteristics(mac);
+            if (resolved_characteristics.empty()) {
+                if ((session.last_service_retry_monotonic <= 0.0 ||
+                     now - session.last_service_retry_monotonic >= retry_period_s) &&
+                    run_peer_task_once(mac, "wait gatt cache", [this, mac, retry_period_s]() {
+                        (void)client_->wait_services_resolved(mac, std::max(8.0, retry_period_s * 4.0));
+                    })) {
+                    session.last_service_retry_monotonic = now;
+                }
+                if (session.bridge_wait_started_monotonic <= 0.0) {
+                    session.bridge_wait_started_monotonic = now;
+                }
+                session.bridge_wait_reason = "gatt-cache";
+                session.phase = "connected_unready";
+                session.detail = "waiting for remote GATT cache";
+                pending_deadline = true;
+                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+                continue;
+            }
             if (!update_peer_time_bridge(mac, *device, session)) {
                 pending_deadline = true;
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
@@ -2401,6 +2438,7 @@ mrs_uav_bluetooth::msg::BleGattDescriptor ServiceNode::to_descriptor_msg(const b
 
 void ServiceNode::handle_configure_notification_bridge(const std::shared_ptr<mrs_uav_bluetooth::srv::ConfigureNotificationBridge::Request> request,
                                                          std::shared_ptr<mrs_uav_bluetooth::srv::ConfigureNotificationBridge::Response> response) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     try {
         const auto direction = normalize_direction(request->direction);
         const auto message_type = lower_trim(request->message_type);

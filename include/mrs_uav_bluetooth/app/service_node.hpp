@@ -187,6 +187,7 @@ private:
     rclcpp::TimerBase::SharedPtr wifi_service_timer_;
     std::chrono::steady_clock::time_point peer_reconcile_deadline_{};
     std::atomic_bool shutting_down_{false};
+    mutable std::recursive_mutex state_mutex_;
     mutable std::mutex peer_task_mutex_;
     std::map<std::string, std::shared_future<void>> peer_tasks_;
     mutable std::mutex log_state_mutex_;

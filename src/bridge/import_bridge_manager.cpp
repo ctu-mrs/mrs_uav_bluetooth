@@ -67,6 +67,10 @@ void ImportBridgeManager::set_registry(BridgeRegistry* registry) {
     registry_ = registry;
 }
 
+void ImportBridgeManager::set_state_mutex(std::recursive_mutex* mutex) {
+    state_mutex_ = mutex;
+}
+
 void ImportBridgeManager::destroy_import_bridge(TopicImportBridgeState& state) {
     if (state.poll_timer) {
         state.poll_timer->cancel();
@@ -99,6 +103,10 @@ void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_
         std::chrono::duration<double>(period_s),
         [this, &client, bridge_key]() {
             (void)client;
+            std::unique_lock<std::recursive_mutex> state_lock;
+            if (state_mutex_ != nullptr) {
+                state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+            }
             if (!registry_) {
                 return;
             }
@@ -124,6 +132,10 @@ void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_
 bool ImportBridgeManager::buffer_notification_payload(const std::string& mac,
                                                       const std::string& characteristic_path,
                                                       const std::vector<uint8_t>& payload) {
+    std::unique_lock<std::recursive_mutex> state_lock;
+    if (state_mutex_ != nullptr) {
+        state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+    }
     if (!registry_ || characteristic_path.empty()) {
         return false;
     }
@@ -149,6 +161,10 @@ bool ImportBridgeManager::buffer_notification_payload(const std::string& mac,
 
 bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
                                                        bluez::BluezClient& client) {
+    std::unique_lock<std::recursive_mutex> state_lock;
+    if (state_mutex_ != nullptr) {
+        state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+    }
     if (!registry_ || mac.empty()) {
         return false;
     }
@@ -212,6 +228,10 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
 
 bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
                                                      bluez::BluezClient& client) {
+    std::unique_lock<std::recursive_mutex> state_lock;
+    if (state_mutex_ != nullptr) {
+        state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
+    }
     if (!registry_ || mac.empty()) {
         return false;
     }
