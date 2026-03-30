@@ -55,8 +55,8 @@ void ServiceNode::handle_disconnect_device(const std::shared_ptr<mrs_uav_bluetoo
 void ServiceNode::handle_pair_device(const std::shared_ptr<mrs_uav_bluetooth::srv::PairDevice::Request> request,
                                      std::shared_ptr<mrs_uav_bluetooth::srv::PairDevice::Response> response) {
     std::string detail;
-    bool success = client_->pair(request->mac, std::max(1.0f, request->timeout));
-    detail = success ? "ok" : "failed to pair";
+    bool success = client_->pair(request->mac, std::max(1.0f, request->timeout), &detail);
+    detail = success ? "ok" : (detail.empty() ? "failed to pair" : detail);
     if (success && request->trust_after_pair) {
         success = client_->trust(request->mac);
         if (!success) {

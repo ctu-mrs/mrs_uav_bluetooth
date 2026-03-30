@@ -305,7 +305,10 @@ bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
 // Pairing/trust
 // ---------------------------------------------------------------------------
 
-bool BluezClient::pair(const std::string& mac, double timeout_s) {
+bool BluezClient::pair(const std::string& mac, double timeout_s, std::string* error_detail) {
+    if (error_detail != nullptr) {
+        error_detail->clear();
+    }
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return false;
     if (dev->paired) return true;
@@ -322,12 +325,15 @@ bool BluezClient::pair(const std::string& mac, double timeout_s) {
         const auto message = error.getMessage();
         if (!message_contains(message, {"AlreadyExists", "Already Paired", "AlreadyPaired", "InProgress",
                                         "In Progress", "Operation already in progress"})) {
+            if (error_detail != nullptr) {
+                *error_detail = message;
+            }
             RCLCPP_WARN(logger_, "pair(%s) failed: %s", mac.c_str(), message.c_str());
             return false;
         }
     }
 
-    return poll_until(timeout_s, kPairPollInterval, [&]() {
+    const bool paired = poll_until(timeout_s, kPairPollInterval, [&]() {
         try {
             const auto properties = read_device_properties(*connection, path);
             return properties && get_variant_or<bool>(*properties, "Paired", false);
@@ -338,6 +344,10 @@ bool BluezClient::pair(const std::string& mac, double timeout_s) {
             throw;
         }
     });
+    if (!paired && error_detail != nullptr && error_detail->empty()) {
+        *error_detail = "timed out waiting for Paired=true";
+    }
+    return paired;
 }
 
 bool BluezClient::trust(const std::string& mac) {

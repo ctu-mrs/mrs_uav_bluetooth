@@ -15,7 +15,9 @@ namespace mrs_uav_bluetooth::bluez {
 class DbusConnection {
 public:
     /// Open a system bus connection and start the async event loop.
-    explicit DbusConnection(rclcpp::Logger logger, std::string role = "main");
+    explicit DbusConnection(rclcpp::Logger logger,
+                            std::string role = "main",
+                            std::string requested_name = {});
 
     /// Gracefully leave the event loop and release the connection.
     ~DbusConnection();
@@ -33,6 +35,7 @@ public:
 private:
     rclcpp::Logger logger_;
     std::string role_;
+    std::string requested_name_;
     std::unique_ptr<sdbus::IConnection> connection_;
 };
 

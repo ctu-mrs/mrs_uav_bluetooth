@@ -81,6 +81,9 @@ private:
                                const std::string& device_path,
                                uint64_t received_time_ns);
     void on_pairing_event(const std::string& event_type, const std::string& device_path);
+    void note_pair_attempt_result(const std::string& mac,
+                                  bool success,
+                                  const std::string& error_detail);
     bool should_allow_pairing_request(const std::string& event_type,
                                       const std::string& device_path);
     void reconcile_peers();

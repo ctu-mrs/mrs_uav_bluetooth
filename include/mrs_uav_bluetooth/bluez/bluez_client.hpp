@@ -56,7 +56,9 @@ public:
     bool disconnect(const std::string& mac, double timeout_s = 10.0);
 
     // ---- Pairing/trust ----
-    bool pair(const std::string& mac, double timeout_s = 30.0);
+    bool pair(const std::string& mac,
+              double timeout_s = 30.0,
+              std::string* error_detail = nullptr);
     bool trust(const std::string& mac);
     bool untrust(const std::string& mac);
     bool block(const std::string& mac);

@@ -8,6 +8,8 @@ namespace mrs_uav_bluetooth::bluez {
 // ---- BlueZ well-known names ----
 inline constexpr std::string_view kBluezServiceName  = "org.bluez";
 inline constexpr std::string_view kBluezServicePath  = "/org/bluez";
+inline constexpr std::string_view kLocalClientServiceName = "cz.cvut.mrs.uav.ble.client";
+inline constexpr std::string_view kLocalServerServiceName = "cz.cvut.mrs.uav.ble.server";
 
 // ---- BlueZ interface names ----
 inline constexpr std::string_view kAdapterIface            = "org.bluez.Adapter1";

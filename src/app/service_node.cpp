@@ -497,7 +497,6 @@ ServiceNode::~ServiceNode() {
         wifi_service_timer_->cancel();
         wifi_service_timer_.reset();
     }
-    wait_for_peer_tasks();
     if (client_ && gatt_event_token_ != 0) {
         client_->remove_gatt_event_handler(gatt_event_token_);
         gatt_event_token_ = 0;
@@ -506,6 +505,7 @@ ServiceNode::~ServiceNode() {
         cache_->remove_observer(cache_observer_token_);
         cache_observer_token_ = 0;
     }
+    wait_for_peer_tasks();
     if (advertisement_ && !adapter_path_.empty()) {
         try {
             advertisement_->unregister_advertisement(adapter_path_);
@@ -543,8 +543,14 @@ void ServiceNode::build_runtime() {
     timer_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     peer_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
-    dbus_ = std::make_unique<bluez::DbusConnection>(get_logger(), "client");
-    server_dbus_ = std::make_unique<bluez::DbusConnection>(get_logger(), "server");
+    dbus_ = std::make_unique<bluez::DbusConnection>(
+        get_logger(),
+        "client",
+        std::string(bluez::kLocalClientServiceName));
+    server_dbus_ = std::make_unique<bluez::DbusConnection>(
+        get_logger(),
+        "server",
+        std::string(bluez::kLocalServerServiceName));
     adapter_path_ = dbus_->find_adapter_path();
 
     cache_ = std::make_unique<bluez::ObjectManagerCache>(*dbus_, get_logger());
@@ -1700,6 +1706,47 @@ void ServiceNode::on_pairing_event(const std::string& event_type, const std::str
     schedule_peer_reconcile();
 }
 
+void ServiceNode::note_pair_attempt_result(const std::string& mac,
+                                           bool success,
+                                           const std::string& error_detail) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_) {
+        return;
+    }
+
+    auto session_it = peers_->sessions().find(mac);
+    if (session_it == peers_->sessions().end()) {
+        return;
+    }
+
+    auto& session = session_it->second;
+    session.last_security_attempt_monotonic = peers_->now_monotonic();
+    if (success) {
+        session.pairing_failures = 0;
+        return;
+    }
+
+    session.pairing_failures += 1;
+    const auto normalized_error = lower_trim(error_detail);
+    const bool authentication_failed = normalized_error.find("authentication failed") != std::string::npos ||
+        normalized_error.find("authentication rejected") != std::string::npos ||
+        normalized_error.find("authentication canceled") != std::string::npos;
+
+    if (authentication_failed) {
+        session.stale_pairing_detected = true;
+        session.phase = "recovering";
+        session.detail = "pair auth failed, resetting stale security";
+        session.last_repair_monotonic = 0.0;
+        session.services_wait_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        return;
+    }
+
+    session.phase = "recovering";
+    session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
+}
+
 bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
                                                const std::string& device_path) {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
@@ -2513,7 +2560,9 @@ void ServiceNode::reconcile_peers() {
 
         if (device && allow_pair_repair && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
             if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
-                    (void)client_->pair(mac, retry_period_s);
+                    std::string pair_error;
+                    const bool pair_ok = client_->pair(mac, retry_period_s, &pair_error);
+                    note_pair_attempt_result(mac, pair_ok, pair_error);
                 })) {
                 RCLCPP_INFO(get_logger(),
                             "[reconcile] %s: attempting pair (phase=%s%s)",
