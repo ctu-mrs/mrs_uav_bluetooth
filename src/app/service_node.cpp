@@ -24,7 +24,6 @@
 
 namespace {
 
-constexpr double kPolicyConfigSettleGraceMin = 5.0;
 constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
@@ -192,6 +191,10 @@ bool is_interesting_peer_status(const mrs_uav_bluetooth::peer::PeerConnectionSes
 
 bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
     return device.paired || device.bonded || device.trusted;
+}
+
+bool device_needs_forget(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.connected || device.services_resolved || device_has_local_security(device);
 }
 
 bool device_is_secure_peer(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
@@ -719,9 +722,6 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
 
     {
         std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
-        config_applied_monotonic_ = peers_ ? peers_->now_monotonic()
-                                           : std::chrono::duration<double>(
-                                                 std::chrono::steady_clock::now().time_since_epoch()).count();
         for (auto it = bridge_registry_.exports().begin(); it != bridge_registry_.exports().end();) {
             if (it->second.auto_managed) {
                 export_bridges_->destroy_export_bridge(it->second);
@@ -1710,6 +1710,7 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
         session.pairing_failures = 0;
         session.pairing_reset_pending = false;
         session.stale_pairing_detected = false;
+        session.forget_pending = false;
         session.secure_pre_ready_disconnects = 0;
         return;
     }
@@ -1725,6 +1726,7 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
         if (device && device_has_local_security(*device)) {
             session.stale_pairing_detected = true;
             session.pairing_reset_pending = true;
+            session.forget_pending = false;
             session.phase = "recovering";
             session.detail = "pair auth failed, resetting stale security";
             session.last_repair_monotonic = 0.0;
@@ -2408,17 +2410,6 @@ void ServiceNode::reconcile_peers() {
 
     peers_->prune_sessions(current_macs, now, std::max(5.0, active_config_.peer_connection_timeout));
 
-    bool pending_deadline = false;
-    double next_deadline_s = retry_period_s;
-    const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
-    const bool local_reconfigure_recent = local_server_rebuild_monotonic_ > 0.0 &&
-        (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s;
-    const auto note_pending = [&](double delay_s = -1.0) {
-        pending_deadline = true;
-        const auto bounded_delay = std::max(0.1, delay_s > 0.0 ? delay_s : retry_period_s);
-        next_deadline_s = std::min(next_deadline_s, bounded_delay);
-    };
-
     for (auto& [mac, session] : peers_->sessions()) {
         const auto device = client_->get_device(mac);
         const auto device_label = mac + " (" + session.peer_name + ")";
@@ -2438,27 +2429,14 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
         }
 
-        // Policy enforcement: peers not allowed by the current config must not
-        // remain active, but avoid destructive cleanup while a new config is
-        // still settling because overlays often activate shortly after startup.
-        const bool policy_violation = !session.desired && session.peer_candidate &&
-            device && (device->connected || device->paired || device->bonded || device->trusted);
-        const double config_settle_grace_s = std::max(kPolicyConfigSettleGraceMin, retry_period_s * 2.0);
-        const bool config_recently_changed = config_applied_monotonic_ > 0.0 &&
-            (now - config_applied_monotonic_) < config_settle_grace_s;
-        if (policy_violation && config_recently_changed) {
-            session.phase = "policy_blocked";
-            session.detail = "peer blocked by current config, waiting for config settle";
-            note_pending(config_applied_monotonic_ + config_settle_grace_s - now);
-            continue;
-        }
-        if (policy_violation &&
-            (session.last_policy_action_monotonic <= 0.0 || now - session.last_policy_action_monotonic >= retry_period_s)) {
-            RCLCPP_INFO(get_logger(),
-                        "[reconcile] %s: peer blocked by current config, disconnecting%s",
-                        device_label.c_str(),
-                        device->trusted ? " and clearing trust" : "");
-            if (run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
+        if (!session.desired) {
+            const bool policy_violation = session.peer_candidate && device && device_needs_forget(*device);
+            if (!policy_violation) {
+                session.forget_pending = false;
+                continue;
+            }
+            if (!session.forget_pending &&
+                run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
                                                             trusted = device->trusted]() {
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
@@ -2469,19 +2447,19 @@ void ServiceNode::reconcile_peers() {
                     }
                     (void)client_->remove(mac);
                 })) {
+                RCLCPP_INFO(get_logger(),
+                            "[reconcile] %s: forgetting peer blocked by current config",
+                            device_label.c_str());
+                session.forget_pending = true;
                 session.phase = "policy_blocked";
                 session.detail = whitelist_enabled ? "peer not present in whitelist"
                                                   : "peer not allowed by current config";
                 session.last_policy_action_monotonic = now;
-                note_pending();
             }
             continue;
         }
 
-        // Skip non-desired sessions entirely — they are not managed by us.
-        if (!session.desired) {
-            continue;
-        }
+        session.forget_pending = false;
 
         if (device && device->blocked) {
             if (run_peer_task_once(mac, "unblock", [this, mac]() {
@@ -2489,35 +2467,13 @@ void ServiceNode::reconcile_peers() {
                 })) {
                 session.phase = "discovered";
                 session.detail = "unblocking desired peer";
-                note_pending();
             }
             continue;
         }
 
-        const bool needs_local_connect = !is_connected;
-        const bool needs_local_pair = is_connected && device && !(device->paired || device->bonded);
-        const bool needs_local_trust = is_connected && device &&
-            (device->paired || device->bonded) && !device->trusted;
-
-        if (local_reconfigure_recent && (needs_local_connect || needs_local_pair || needs_local_trust)) {
-            if (needs_local_connect) {
-                session.phase = "connect_pending";
-                session.detail = "waiting for local GATT rebuild to settle before connecting";
-            } else if (needs_local_pair) {
-                session.phase = "securing";
-                session.detail = "waiting for local GATT rebuild to settle before pairing";
-            } else if (needs_local_trust) {
-                session.phase = "securing";
-                session.detail = "waiting for local GATT rebuild to settle before trust repair";
-            }
-            note_pending(local_server_rebuild_monotonic_ + local_reconfigure_grace_s - now);
-            continue;
-        }
-
-        const bool stale_pairing_repair_due = session.stale_pairing_detected &&
-            (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= retry_period_s);
-        if (stale_pairing_repair_due) {
-            if (run_peer_task_once(mac, "reset stale pairing", [this, mac, retry_period_s, connected = is_connected]() {
+        if (session.stale_pairing_detected) {
+            if (!session.forget_pending &&
+                run_peer_task_once(mac, "reset stale pairing", [this, mac, retry_period_s, connected = is_connected]() {
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
                         std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -2527,6 +2483,7 @@ void ServiceNode::reconcile_peers() {
                     (void)client_->unblock(mac);
                 })) {
                 RCLCPP_WARN(get_logger(), "[reconcile] %s: resetting stale pairing state", device_label.c_str());
+                session.forget_pending = true;
                 state_lock.unlock();
                 clear_peer_runtime(mac);
                 state_lock.lock();
@@ -2542,7 +2499,6 @@ void ServiceNode::reconcile_peers() {
                 session.services_wait_started_monotonic = 0.0;
                 session.bridge_wait_started_monotonic = 0.0;
                 session.bridge_wait_reason.clear();
-                note_pending();
             }
             continue;
         }
@@ -2560,7 +2516,6 @@ void ServiceNode::reconcile_peers() {
                     session.connect_started_monotonic = now;
                 }
             }
-            note_pending();
             continue;
         }
 
@@ -2582,7 +2537,6 @@ void ServiceNode::reconcile_peers() {
                     session.last_security_attempt_monotonic = now;
                 }
             }
-            note_pending();
             continue;
         }
 
@@ -2599,7 +2553,6 @@ void ServiceNode::reconcile_peers() {
                 session.detail = "trust requested";
                 session.last_security_attempt_monotonic = now;
             }
-            note_pending();
             continue;
         }
 
@@ -2613,34 +2566,23 @@ void ServiceNode::reconcile_peers() {
             }
             session.phase = "connected_unready";
             session.detail = "connected, waiting for services";
-            note_pending();
             continue;
         }
 
         if (is_connected && device->trusted && (device->paired || device->bonded) && device->services_resolved) {
             const auto device_copy = *device;
             state_lock.unlock();
-            const bool bridge_ready = update_peer_time_bridge(mac, device_copy, session);
+            (void)update_peer_time_bridge(mac, device_copy, session);
             state_lock.lock();
-            if (!bridge_ready) {
-                note_pending();
-            }
             continue;
         }
 
-        // Desired but not yet fully ready — reschedule
         RCLCPP_DEBUG(get_logger(), "[reconcile] %s: desired but pending (phase=%s conn=%s paired=%s trusted=%s svc_resolved=%s)",
                      device_label.c_str(), session.phase.c_str(),
                      is_connected ? "Y" : "N",
                      device ? (device->paired ? "Y" : "N") : "?",
                      device ? (device->trusted ? "Y" : "N") : "?",
                      device ? (device->services_resolved ? "Y" : "N") : "?");
-        note_pending();
-    }
-
-    if (pending_deadline) {
-        schedule_peer_reconcile(std::chrono::milliseconds(
-            static_cast<int64_t>(std::max(0.1, next_deadline_s) * 1000.0)));
     }
 }
 

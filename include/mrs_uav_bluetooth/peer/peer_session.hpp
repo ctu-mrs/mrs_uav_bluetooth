@@ -32,6 +32,7 @@ struct PeerConnectionSession {
     int pairing_failures{0};
     bool stale_pairing_detected{false};
     bool pairing_reset_pending{false};
+    bool forget_pending{false};
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};
     int secure_pre_ready_disconnects{0};

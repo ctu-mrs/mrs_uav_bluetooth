@@ -11,7 +11,6 @@ namespace {
 
 constexpr double kConnectAttemptGraceMin = 15.0;
 constexpr double kConnectAttemptGraceMultiplier = 5.0;
-constexpr double kDesiredConnectGraceMin = 8.0;
 constexpr double kServicesWaitGraceMin = 15.0;
 constexpr double kPairCooldownMin = 10.0;
 constexpr double kTrustCooldownMin = 0.5;
@@ -100,6 +99,10 @@ bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& devic
     return device.paired || device.bonded || device.trusted;
 }
 
+bool device_needs_forget(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.connected || device.services_resolved || device_has_local_security(device);
+}
+
 }  // namespace
 
 namespace mrs_uav_bluetooth::peer {
@@ -179,14 +182,29 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     }
     session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
 
+    if (!device.connected && !device_has_local_security(device) && !device.services_resolved) {
+        session.forget_pending = false;
+    }
+
+    if (session.desired && !was_desired && device_needs_forget(device)) {
+        session.stale_pairing_detected = true;
+        session.pairing_reset_pending = true;
+        session.forget_pending = false;
+        session.connected_since_monotonic = 0.0;
+        session.services_wait_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        set_session_phase(session, "recovering", "resetting cached security before use");
+        return;
+    }
+
     if (!session.desired) {
         session.connected_since_monotonic = 0.0;
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
         session.secure_pre_ready_disconnects = 0;
-        session.pairing_reset_pending = false;
-        session.stale_pairing_detected = false;
+        session.forget_pending = false;
         if (session.peer_candidate) {
             set_session_phase(session,
                               "policy_blocked",
@@ -262,6 +280,7 @@ void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
     if (it->second.missing_since_monotonic <= 0.0) {
         it->second.missing_since_monotonic = now_mono;
     }
+    it->second.forget_pending = false;
     it->second.connected_since_monotonic = 0.0;
     it->second.services_wait_started_monotonic = 0.0;
     it->second.bridge_wait_started_monotonic = 0.0;
@@ -287,6 +306,7 @@ void PeerManager::note_pairing_event(const std::string& device_path,
         if (device_has_local_security(*device)) {
             session.stale_pairing_detected = true;
             session.pairing_reset_pending = true;
+            session.forget_pending = false;
             set_session_phase(session, "recovering", "stale pairing detected");
             return;
         }
@@ -326,11 +346,6 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
         return false;
     }
     if (is_phase(session, {"ready", "connected_unready", "securing", "blocked", "policy_blocked"})) {
-        return false;
-    }
-
-    if (session.desired_since_monotonic > 0.0 &&
-        now_mono - session.desired_since_monotonic < kDesiredConnectGraceMin) {
         return false;
     }
 
