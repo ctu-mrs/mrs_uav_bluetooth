@@ -190,6 +190,18 @@ bool is_interesting_peer_status(const mrs_uav_bluetooth::peer::PeerConnectionSes
            !phase_matches(session.phase, {"idle"});
 }
 
+bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.paired || device.bonded || device.trusted;
+}
+
+bool device_is_secure_peer(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.connected && device.trusted && (device.paired || device.bonded);
+}
+
+bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device_is_secure_peer(device) && device.services_resolved;
+}
+
 size_t advertising_uuid_size(const std::string& uuid) {
     std::string compact;
     compact.reserve(uuid.size());
@@ -1709,14 +1721,20 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
         normalized_error.find("authentication canceled") != std::string::npos;
 
     if (authentication_failed) {
-        session.stale_pairing_detected = true;
-        session.pairing_reset_pending = true;
-        session.phase = "recovering";
-        session.detail = "pair auth failed, resetting stale security";
-        session.last_repair_monotonic = 0.0;
-        session.services_wait_started_monotonic = 0.0;
-        session.bridge_wait_started_monotonic = 0.0;
-        session.bridge_wait_reason.clear();
+        const auto device = client_ ? client_->get_device(mac) : std::optional<bluez::DeviceInfo>{};
+        if (device && device_has_local_security(*device)) {
+            session.stale_pairing_detected = true;
+            session.pairing_reset_pending = true;
+            session.phase = "recovering";
+            session.detail = "pair auth failed, resetting stale security";
+            session.last_repair_monotonic = 0.0;
+            session.services_wait_started_monotonic = 0.0;
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+        } else {
+            session.phase = "securing";
+            session.detail = "pair auth failed, waiting for peer stale security reset";
+        }
         return;
     }
 
@@ -1896,8 +1914,7 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
     const bool desired_peer = session_it != peers_->sessions().end() && session_it->second.desired;
     const auto peer_name = device_hostname_guess(device);
     const bool local_peer = !peer_name.empty() && lower_trim(peer_name) == lower_trim(hostname_);
-    const bool secure_peer = device.connected && desired_peer && !local_peer &&
-        device.trusted && (device.paired || device.bonded) && device.services_resolved;
+    const bool secure_peer = desired_peer && !local_peer && device_can_host_peer_bridge(device);
     const auto now_mono = peers_->now_monotonic();
     const auto retry_period_s = std::max(1.0, active_config_.auto_connect_period);
     const auto missing_path_grace_s = std::max(8.0, retry_period_s * 4.0);
@@ -2057,7 +2074,7 @@ void ServiceNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const {
 void ServiceNode::on_notification(const std::vector<uint8_t>& data,
                                     const std::string& uuid,
                                     const std::string& characteristic_path) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     RCLCPP_DEBUG(get_logger(), "[node] on_notification: uuid=%s path=%s %zu bytes",
                 uuid.c_str(), characteristic_path.c_str(), data.size());
     if (!cache_ || !ros_) {
@@ -2065,6 +2082,7 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
     }
 
     std::string mac;
+    std::optional<std::string> clear_runtime_mac;
     if (const auto characteristic = cache_->characteristic(characteristic_path)) {
         if (const auto service = cache_->service(characteristic->service_path)) {
             if (const auto device = cache_->device(service->device_path)) {
@@ -2074,6 +2092,19 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
     }
 
     ros_->status_publisher().publish_notification(mac, characteristic_path, uuid, data, hostname_);
+
+    if (!mac.empty()) {
+        const auto device = cache_->device_by_mac(mac);
+        if (!device || !device_is_secure_peer(*device)) {
+            clear_runtime_mac = mac;
+        }
+    }
+
+    if (clear_runtime_mac) {
+        state_lock.unlock();
+        clear_peer_runtime(*clear_runtime_mac);
+        return;
+    }
 
     if (import_bridges_) {
         import_bridges_->buffer_notification_payload(mac, characteristic_path, data);
@@ -2110,12 +2141,13 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
 void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
                                           const std::string& device_path,
                                           uint64_t received_time_ns) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || payload.size() < sizeof(uint64_t)) {
         return;
     }
 
     std::string mac;
+    std::optional<std::string> clear_runtime_mac;
     if (!device_path.empty() && cache_) {
         if (const auto device = cache_->device(device_path)) {
             mac = device->mac;
@@ -2133,6 +2165,19 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
     }
 
     if (mac.empty()) {
+        return;
+    }
+
+    if (cache_) {
+        const auto device = cache_->device_by_mac(mac);
+        if (!device || !device_is_secure_peer(*device)) {
+            clear_runtime_mac = mac;
+        }
+    }
+
+    if (clear_runtime_mac) {
+        state_lock.unlock();
+        clear_peer_runtime(*clear_runtime_mac);
         return;
     }
 
@@ -2180,6 +2225,22 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
             stop_notify_path = old_characteristic_path;
         }
     };
+
+    if (!device_is_secure_peer(device)) {
+        clear_time_bridge();
+        state_lock.unlock();
+        if (!stop_notify_path.empty()) {
+            client_->stop_notify(stop_notify_path);
+        }
+        state_lock.lock();
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.phase = "securing";
+        session.detail = device_has_local_security(device)
+            ? "connected, repairing trust"
+            : "connected, waiting for pairing";
+        return false;
+    }
 
     if (!characteristic_path.empty() &&
         bridge_it != peers_->time_bridges().end() &&
@@ -2362,12 +2423,15 @@ void ServiceNode::reconcile_peers() {
         const auto device = client_->get_device(mac);
         const auto device_label = mac + " (" + session.peer_name + ")";
         const bool is_connected = device && device->connected;
+        const bool secure_bridge_peer = device && device_can_host_peer_bridge(*device);
 
-        if (!session.desired || !is_connected) {
+        if (!session.desired || !secure_bridge_peer) {
             state_lock.unlock();
             clear_peer_runtime(mac);
             state_lock.lock();
-        } else if (is_connected) {
+        }
+
+        if (secure_bridge_peer) {
             const auto device_copy = *device;
             state_lock.unlock();
             refresh_import_bridges_for_device(device_copy);

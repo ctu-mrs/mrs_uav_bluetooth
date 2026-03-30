@@ -96,6 +96,10 @@ bool whitelist_contains(const std::vector<std::string>& whitelist,
     return false;
 }
 
+bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.paired || device.bonded || device.trusted;
+}
+
 }  // namespace
 
 namespace mrs_uav_bluetooth::peer {
@@ -280,8 +284,9 @@ void PeerManager::note_pairing_event(const std::string& device_path,
     if (event == "request_confirmation" || event == "request_authorization" ||
         event == "request_passkey" || event == "request_pin") {
         session.last_pairing_request_monotonic = now;
-        if (device->paired || device->bonded) {
+        if (device_has_local_security(*device)) {
             session.stale_pairing_detected = true;
+            session.pairing_reset_pending = true;
             set_session_phase(session, "recovering", "stale pairing detected");
             return;
         }
