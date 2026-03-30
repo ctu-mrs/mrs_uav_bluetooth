@@ -26,6 +26,7 @@ namespace {
 
 constexpr double kPeerRepairCooldownMin = 8.0;
 constexpr double kBridgeGraceMin = 8.0;
+constexpr double kPolicyConfigSettleGraceMin = 5.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kGattReadWriteLogInterval = std::chrono::seconds(10);
@@ -635,6 +636,9 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
 
     {
         std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+        config_applied_monotonic_ = peers_ ? peers_->now_monotonic()
+                                           : std::chrono::duration<double>(
+                                                 std::chrono::steady_clock::now().time_since_epoch()).count();
         for (auto it = bridge_registry_.exports().begin(); it != bridge_registry_.exports().end();) {
             if (it->second.auto_managed) {
                 export_bridges_->destroy_export_bridge(it->second);
@@ -682,9 +686,11 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     }
 
     if (peers_ && client_) {
-        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
         for (const auto& device : client_->get_devices()) {
-            peers_->sync_device(device, active_config_, device_hostname_guess(device));
+            {
+                std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+                peers_->sync_device(device, active_config_, device_hostname_guess(device));
+            }
             refresh_import_bridges_for_device(device);
         }
     }
@@ -2178,17 +2184,28 @@ void ServiceNode::reconcile_peers() {
         }
 
         // Policy enforcement: peers not allowed by the current config must not
-        // remain connected or bonded, even if the connection was initiated remotely.
+        // remain active, but avoid destructive cleanup while a new config is
+        // still settling because overlays often activate shortly after startup.
         const bool policy_violation = !session.desired && session.peer_candidate &&
             device && (device->connected || device->paired || device->bonded || device->trusted);
+        const double config_settle_grace_s = std::max(kPolicyConfigSettleGraceMin, retry_period_s * 2.0);
+        const bool config_recently_changed = config_applied_monotonic_ > 0.0 &&
+            (now - config_applied_monotonic_) < config_settle_grace_s;
+        if (policy_violation && config_recently_changed) {
+            session.phase = "policy_blocked";
+            session.detail = "peer blocked by current config, waiting for config settle";
+            pending_deadline = true;
+            next_deadline_s = std::min(next_deadline_s,
+                                       std::max(0.1, config_applied_monotonic_ + config_settle_grace_s - now));
+            continue;
+        }
         if (policy_violation &&
             (session.last_policy_action_monotonic <= 0.0 || now - session.last_policy_action_monotonic >= retry_period_s)) {
             RCLCPP_INFO(get_logger(),
                         "[reconcile] %s: peer blocked by current config, disconnecting%s",
                         device_label.c_str(),
-                        (device->paired || device->bonded || device->trusted) ? " and removing bond" : "");
+                        device->trusted ? " and clearing trust" : "");
             if (run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
-                                                            paired = device->paired, bonded = device->bonded,
                                                             trusted = device->trusted]() {
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
@@ -2196,9 +2213,6 @@ void ServiceNode::reconcile_peers() {
                     }
                     if (trusted) {
                         (void)client_->untrust(mac);
-                    }
-                    if (paired || bonded || trusted) {
-                        (void)client_->remove(mac);
                     }
                 })) {
                 session.phase = "policy_blocked";
