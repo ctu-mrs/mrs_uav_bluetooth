@@ -21,7 +21,8 @@ wifi_refresh_period: 2.0
 # Retry interval used by the automatic peer connector.
 auto_connect_period: 3.0
 
-# When non-zero, make the adapter discoverable for this many seconds.
+# When the BLE server is enabled, the adapter is made explicitly discoverable.
+# This timeout controls how long it stays discoverable. 0 means indefinitely.
 discoverable_timeout: 0
 
 # BlueZ pairing agent behaviour.

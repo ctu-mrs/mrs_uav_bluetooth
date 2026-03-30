@@ -71,6 +71,7 @@ struct AdapterInfo {
     std::string name;
     std::string alias;
     bool powered{false};
+    bool connectable{false};
     bool discoverable{false};
     uint32_t discoverable_timeout{0};
     bool pairable{false};

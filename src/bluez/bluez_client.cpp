@@ -132,8 +132,10 @@ BluezClient::~BluezClient() {
 // Discovery
 // ---------------------------------------------------------------------------
 
-bool BluezClient::start_scan(const std::string& transport) {
-    RCLCPP_INFO(logger_, "[client] start_scan transport=%s", transport.c_str());
+bool BluezClient::start_scan(const std::string& transport,
+                             bool make_discoverable_while_scanning) {
+    RCLCPP_INFO(logger_, "[client] start_scan transport=%s discoverable=%s",
+                transport.c_str(), make_discoverable_while_scanning ? "true" : "false");
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -141,6 +143,7 @@ bool BluezClient::start_scan(const std::string& transport) {
         // Set discovery filter.
         std::map<std::string, sdbus::Variant> filter;
         filter["Transport"] = sdbus::Variant{transport};
+        filter["Discoverable"] = sdbus::Variant{make_discoverable_while_scanning};
         proxy->callMethod("SetDiscoveryFilter")
             .onInterface(std::string(kAdapterIface))
             .withArguments(filter);

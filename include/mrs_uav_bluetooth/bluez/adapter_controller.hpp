@@ -20,8 +20,17 @@ public:
     /// Set the Discoverable property and timeout.
     void set_discoverable(bool discoverable, uint32_t timeout = 0);
 
+    /// Set the Connectable property.
+    void set_connectable(bool connectable);
+
     /// Set the Pairable property.
     void set_pairable(bool pairable);
+
+    /// Set the PairableTimeout property.
+    void set_pairable_timeout(uint32_t timeout);
+
+    /// Set the adapter Alias property.
+    void set_alias(const std::string& alias);
 
     /// Start LE discovery with an optional transport filter (le, bredr, auto).
     void start_discovery(const std::string& transport = "le");

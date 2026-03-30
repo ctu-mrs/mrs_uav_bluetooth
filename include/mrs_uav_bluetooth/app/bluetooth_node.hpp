@@ -61,6 +61,7 @@ private:
     void build_runtime();
     void create_services();
     void apply_config(const config::NodeConfig& cfg);
+    void apply_adapter_state(const config::NodeConfig& cfg);
     void rebuild_server_objects();
     void publish_periodic_status();
     std::string build_detailed_status_report(const std::map<std::string, bluez::DeviceInfo>& devices_map) const;

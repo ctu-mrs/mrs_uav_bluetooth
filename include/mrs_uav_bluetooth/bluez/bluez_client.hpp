@@ -39,7 +39,8 @@ public:
     ~BluezClient();
 
     // ---- Discovery ----
-    bool start_scan(const std::string& transport = "le");
+    bool start_scan(const std::string& transport = "le",
+                    bool make_discoverable_while_scanning = false);
     bool stop_scan();
     bool is_scanning() const;
 

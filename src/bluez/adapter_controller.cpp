@@ -28,8 +28,23 @@ void AdapterController::set_discoverable(bool discoverable, uint32_t timeout) {
                 discoverable ? "true" : "false", timeout);
 }
 
+void AdapterController::set_connectable(bool connectable) {
+    set_adapter_property("Connectable", sdbus::Variant{connectable});
+    RCLCPP_INFO(logger_, "Adapter connectable=%s", connectable ? "true" : "false");
+}
+
 void AdapterController::set_pairable(bool pairable) {
     set_adapter_property("Pairable", sdbus::Variant{pairable});
+}
+
+void AdapterController::set_pairable_timeout(uint32_t timeout) {
+    set_adapter_property("PairableTimeout", sdbus::Variant{timeout});
+    RCLCPP_INFO(logger_, "Adapter pairable timeout=%u", timeout);
+}
+
+void AdapterController::set_alias(const std::string& alias) {
+    set_adapter_property("Alias", sdbus::Variant{alias});
+    RCLCPP_INFO(logger_, "Adapter alias=%s", alias.c_str());
 }
 
 void AdapterController::start_discovery(const std::string& transport) {

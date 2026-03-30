@@ -652,6 +652,7 @@ AdapterInfo ObjectManagerCache::parse_adapter(
     a.name = get_string(props, "Name");
     a.alias = get_string(props, "Alias");
     a.powered = get_or<bool>(props, "Powered", false);
+    a.connectable = get_or<bool>(props, "Connectable", false);
     a.discoverable = get_or<bool>(props, "Discoverable", false);
     a.discoverable_timeout = get_or<uint32_t>(props, "DiscoverableTimeout", 0);
     a.pairable = get_or<bool>(props, "Pairable", false);

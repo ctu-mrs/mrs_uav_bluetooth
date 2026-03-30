@@ -16,6 +16,7 @@
 #include <ctime>
 #include <future>
 #include <iomanip>
+#include <limits>
 #include <rclcpp/create_timer.hpp>
 #include <stdexcept>
 #include <sstream>
@@ -424,6 +425,7 @@ void BluetoothNode::build_runtime() {
         *cache_,
         adapter_path_,
         get_logger());
+    apply_adapter_state(active_config_);
     pairing_agent_ = std::make_unique<bluez::BluezPairingAgent>(
         *dbus_, get_logger(),
         get_parameter("auto_accept_pairing").as_bool(),
@@ -481,6 +483,35 @@ void BluetoothNode::build_runtime() {
     overlay_config_->load_initial();
 }
 
+void BluetoothNode::apply_adapter_state(const config::NodeConfig& cfg) {
+    if (!adapter_) {
+        return;
+    }
+
+    const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
+    const bool should_be_discoverable = cfg.enable_server;
+
+    if (!adapter_info || !adapter_info->powered) {
+        adapter_->power_on();
+    }
+    if (!adapter_info || !adapter_info->connectable) {
+        adapter_->set_connectable(true);
+    }
+    if (!adapter_info || adapter_info->alias != hostname_) {
+        adapter_->set_alias(hostname_);
+    }
+    if (!adapter_info || !adapter_info->pairable) {
+        adapter_->set_pairable(true);
+    }
+    adapter_->set_pairable_timeout(0);
+
+    if (!adapter_info ||
+        adapter_info->discoverable != should_be_discoverable ||
+        (should_be_discoverable && adapter_info->discoverable_timeout != cfg.discoverable_timeout)) {
+        adapter_->set_discoverable(should_be_discoverable, cfg.discoverable_timeout);
+    }
+}
+
 void BluetoothNode::create_services() {
     ros::ServiceServers::Handlers handlers;
     handlers.list_devices = [this](auto request, auto response) { handle_list_devices(request, response); };
@@ -510,6 +541,7 @@ void BluetoothNode::create_services() {
 void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
     active_config_ = cfg;
     ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
+    apply_adapter_state(cfg);
 
     if (status_timer_) {
         status_timer_->cancel();
@@ -566,7 +598,7 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
 
     netplan_->set_allowed_networks(cfg.allowed_wifi_networks);
     if (cfg.enable_scan) {
-        client_->start_scan(cfg.scan_mode);
+        client_->start_scan(cfg.scan_mode, cfg.enable_server);
     } else {
         client_->stop_scan();
     }
@@ -697,6 +729,10 @@ void BluetoothNode::rebuild_server_objects() {
     advertisement_ = std::make_unique<gatt::Advertisement>(
         *server_dbus_, "/org/bluez/advertisement0", "peripheral");
     advertisement_->set_local_name(hostname_);
+    advertisement_->set_discoverable(active_config_.enable_server);
+    advertisement_->set_discoverable_timeout(
+        static_cast<uint16_t>(std::min<uint32_t>(active_config_.discoverable_timeout,
+                                                 std::numeric_limits<uint16_t>::max())));
     if (wifi_service_) {
         advertisement_->add_service_uuid(wifi_service_->uuid());
     }
@@ -891,6 +927,16 @@ std::string BluetoothNode::build_detailed_status_report(
     lines.push_back("  hostname:   " + hostname_);
     lines.push_back("  prefix:     " + active_config_.node_topics_prefix);
     lines.push_back("  config:     " + (overlay_config_ ? overlay_config_->active_source() : std::string{}));
+    if (cache_) {
+        if (const auto adapter = cache_->adapter(adapter_path_)) {
+            lines.push_back("  alias:      " + (adapter->alias.empty() ? adapter->name : adapter->alias));
+            lines.push_back("  powered:    " + std::string(bool_text(adapter->powered)));
+            lines.push_back("  connectable:" + std::string(adapter->connectable ? " True" : " False"));
+            lines.push_back("  pairable:   " + std::string(bool_text(adapter->pairable)));
+            lines.push_back("  discoverable: " + std::string(bool_text(adapter->discoverable)) +
+                            " timeout=" + std::to_string(adapter->discoverable_timeout));
+        }
+    }
     lines.push_back("  scanning:   " + std::string(bool_text(client_ && client_->is_scanning())));
     lines.push_back("  server:     " + std::string(upper_state(static_cast<bool>(gatt_app_))));
     lines.push_back("  advertise:  " + std::string(upper_state(static_cast<bool>(advertisement_))));
@@ -1229,6 +1275,22 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
         }
     } else {
         RCLCPP_DEBUG(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+        if (event == bluez::CacheEvent::AdapterChanged && object_path == adapter_path_) {
+            if (const auto adapter = cache_->adapter(object_path)) {
+                const bool should_be_discoverable = active_config_.enable_server;
+                const bool drifted = !adapter->powered ||
+                    !adapter->connectable ||
+                    !adapter->pairable ||
+                    adapter->alias != hostname_ ||
+                    adapter->discoverable != should_be_discoverable ||
+                    (should_be_discoverable && adapter->discoverable_timeout != active_config_.discoverable_timeout);
+                if (drifted) {
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                         "[node] adapter state drift detected, reapplying powered/connectable/pairable/discoverable/alias settings");
+                    apply_adapter_state(active_config_);
+                }
+            }
+        }
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
                 peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
