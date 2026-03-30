@@ -3,6 +3,6 @@
 
 namespace mrs_uav_bluetooth::peer {
 
-// State-only translation unit for now. Behavior lives in PeerManager/BluetoothNode.
+// State-only translation unit for now. Behavior lives in PeerManager/ServiceNode.
 
 }  // namespace mrs_uav_bluetooth::peer

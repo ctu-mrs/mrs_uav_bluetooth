@@ -15,13 +15,13 @@ bool is_uuid(std::string_view value);
 /// If already a UUID, return lowered; otherwise derive via uuid_from_name.
 std::string resolve_uuid(std::string_view value);
 
-/// Convenience: uuid_from_name("svc:<name>").
+/// Convenience wrapper kept for call-site readability.
 std::string named_service_uuid(std::string_view name);
 
-/// Convenience: uuid_from_name("chr:<name>").
+/// Convenience wrapper kept for call-site readability.
 std::string named_characteristic_uuid(std::string_view name);
 
-/// Convenience: uuid_from_name("dsc:<name>").
+/// Convenience wrapper kept for call-site readability.
 std::string named_descriptor_uuid(std::string_view name);
 
 }  // namespace mrs_uav_bluetooth::util

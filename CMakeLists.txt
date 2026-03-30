@@ -138,6 +138,7 @@ add_library(${PROJECT_NAME}_bluez STATIC
   src/bluez/adapter_controller.cpp
   src/bluez/object_manager_cache.cpp
   src/bluez/bluez_client.cpp
+  src/bluez/bluez_client_gatt.cpp
   src/bluez/bluez_pairing_agent.cpp
 )
 target_include_directories(${PROJECT_NAME}_bluez PUBLIC
@@ -288,7 +289,8 @@ target_link_libraries(${PROJECT_NAME}_bridge_mgr ${cpp_typesupport_target})
 
 add_executable(service_node
   src/app/main_service_node.cpp
-  src/app/bluetooth_node.cpp
+  src/app/service_node.cpp
+  src/app/service_node_services.cpp
 )
 target_include_directories(service_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

@@ -2,7 +2,7 @@
 <package format="3">
   <name>mrs_uav_bluetooth</name>
   <version>0.2.0</version>
-  <description>ROS 2 Bluetooth node for MRS UAV BLE server and client control.</description>
+  <description>ROS 2 BLE service node for MRS UAV server and client control.</description>
   <maintainer email="vojtech.vrba@fel.cvut.cz">Vojtech Vrba</maintainer>
   <license>MIT</license>
 
@@ -21,9 +21,9 @@
   <depend>rcl_interfaces</depend>
 
   <build_depend>yaml-cpp</build_depend>
-  <build_depend>sdbus-c++</build_depend>
+  <build_depend>mrs-libsdbus-c++</build_depend>
   <exec_depend>yaml-cpp</exec_depend>
-  <exec_depend>sdbus-c++</exec_depend>
+  <exec_depend>mrs-libsdbus-c++</exec_depend>
 
   <depend>launch</depend>
   <depend>launch_ros</depend>

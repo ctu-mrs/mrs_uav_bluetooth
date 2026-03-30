@@ -8,6 +8,7 @@
 #include <std_msgs/msg/string.hpp>
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 namespace mrs_uav_bluetooth::app {
@@ -38,6 +39,8 @@ private:
     double deactivate_service_wait_timeout_sec_{2.0};
     double keepalive_publish_period_sec_{1.0};
     double min_keepalive_publish_period_sec_{0.2};
+    std::mutex print_mutex_;
+    std::string last_print_payload_;
     rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr keepalive_pub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr print_sub_;
     rclcpp::TimerBase::SharedPtr keepalive_timer_;

@@ -28,17 +28,14 @@ public:
     std::shared_ptr<GattService> service() const { return service_; }
     std::string characteristic_uuid() const;
     std::string characteristic_path() const;
-    std::string data_descriptor_path() const;
 
-    /// Return the D-Bus path used for a given transport endpoint.
-    std::string transport_path(const std::string& endpoint) const;
+    std::string transport_path() const;
 
     void publish(const std::vector<uint8_t>& payload);
 
 private:
     std::shared_ptr<GattService> service_;
     std::shared_ptr<GattCharacteristic> characteristic_;
-    std::shared_ptr<GattDescriptor> data_descriptor_;
     std::vector<uint8_t> payload_;
 };
 

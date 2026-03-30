@@ -23,7 +23,6 @@ struct TopicExportBridgeState {
     std::string bridge_uuid;
     std::vector<config::BridgeMemberSpec> member_specs;
     double rate_hz{0.0};
-    std::string transport_endpoint{"characteristic"};
     std::string payload_format{"struct"};
     bool auto_managed{false};
     rclcpp::SubscriptionBase::SharedPtr subscription;
@@ -43,7 +42,6 @@ struct TopicImportBridgeState {
     std::string bridge_uuid;
     std::vector<config::BridgeMemberSpec> member_specs;
     double rate_hz{0.0};
-    std::string transport_endpoint{"characteristic"};
     std::string payload_format{"struct"};
     std::string path;
     bool auto_managed{false};

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-#include "mrs_uav_bluetooth/app/bluetooth_node.hpp"
+#include "mrs_uav_bluetooth/app/service_node.hpp"
 
 #include "mrs_uav_bluetooth/config/shared_topic_config.hpp"
 
@@ -20,6 +20,7 @@
 #include <rclcpp/create_timer.hpp>
 #include <stdexcept>
 #include <sstream>
+#include <string_view>
 
 namespace {
 
@@ -28,6 +29,7 @@ constexpr double kBridgeGraceMin = 8.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kGattReadWriteLogInterval = std::chrono::seconds(10);
+constexpr auto kRepeatedLogWindow = std::chrono::seconds(5);
 constexpr size_t kLegacyAdvMaxBytes = 31;
 constexpr size_t kAdvFlagsBytes = 3;
 
@@ -54,17 +56,6 @@ std::string normalize_direction(const std::string& raw_direction) {
         return direction;
     }
     throw std::runtime_error("direction must be import, export, or both");
-}
-
-std::string normalize_transport_endpoint(std::string endpoint) {
-    endpoint = lower_trim(std::move(endpoint));
-    if (endpoint.empty()) {
-        return "characteristic";
-    }
-    if (endpoint != "characteristic" && endpoint != "descriptor") {
-        throw std::runtime_error("transport_endpoint must be 'characteristic' or 'descriptor'");
-    }
-    return endpoint;
 }
 
 std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec> parse_member_specs(
@@ -102,11 +93,10 @@ std::string manual_bridge_key(const std::string& direction,
                               const std::string& topic_name,
                               const std::string& message_type,
                               const std::string& characteristic,
-                              const std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec>& member_specs,
-                              const std::string& transport_endpoint) {
+                  const std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec>& member_specs) {
     std::ostringstream source;
     source << direction << '|' << mac << '|' << topic_name << '|' << message_type << '|'
-           << characteristic << '|' << transport_endpoint;
+        << characteristic;
     for (const auto& spec : member_specs) {
         source << '|' << spec.path << ':' << spec.value_type;
     }
@@ -123,6 +113,24 @@ std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& de
         return device.alias;
     }
     return {};
+}
+
+std::string bridge_characteristic_name_for_service(const std::string& bridge_name) {
+    constexpr std::string_view prefix{"bridge:"};
+    if (bridge_name.rfind(prefix.data(), 0) == 0) {
+        return bridge_name.substr(prefix.size());
+    }
+    return bridge_name + "/value";
+}
+
+std::string bridge_characteristic_name_for_host(const std::string& host,
+                                                const std::string& bridge_topic_path) {
+    return "/" + mrs_uav_bluetooth::util::sanitize_topic_suffix(host) + bridge_topic_path;
+}
+
+std::string bridge_service_name_for_host(const std::string& host,
+                                         const std::string& bridge_topic_path) {
+    return "bridge:" + bridge_characteristic_name_for_host(host, bridge_topic_path);
 }
 
 std::string peer_topic_token(const std::string& peer_name, const std::string& mac) {
@@ -222,6 +230,15 @@ std::vector<std::string> select_advertised_service_uuids(
         used_bytes += uuid_size;
     }
     return advertised;
+}
+
+std::pair<double, double> update_publish_rate(double last_publish_monotonic) {
+    const auto now = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
+        return {now, 1.0 / (now - last_publish_monotonic)};
+    }
+    return {now, 0.0};
 }
 
 std::string peer_status_snapshot(const std::string& mac,
@@ -400,13 +417,13 @@ std::optional<std::string> device_path_for_gatt_object(
 
 namespace mrs_uav_bluetooth::app {
 
-BluetoothNode::BluetoothNode()
+ServiceNode::ServiceNode()
     : rclcpp::Node("mrs_uav_bluetooth") {
     configure_parameters();
     build_runtime();
 }
 
-BluetoothNode::~BluetoothNode() {
+ServiceNode::~ServiceNode() {
     shutting_down_.store(true);
     wait_for_peer_tasks();
     if (client_ && gatt_event_token_ != 0) {
@@ -431,7 +448,7 @@ BluetoothNode::~BluetoothNode() {
     }
 }
 
-void BluetoothNode::configure_parameters() {
+void ServiceNode::configure_parameters() {
     const auto share_dir = ament_index_cpp::get_package_share_directory("mrs_uav_bluetooth");
     const auto default_config_path = share_dir + "/config/default.yaml";
 
@@ -448,7 +465,7 @@ void BluetoothNode::configure_parameters() {
     declare_parameter<int>("discoverable_timeout", 0);
 }
 
-void BluetoothNode::build_runtime() {
+void ServiceNode::build_runtime() {
     hostname_ = util::system_hostname();
     service_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     timer_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -523,7 +540,7 @@ void BluetoothNode::build_runtime() {
     overlay_config_->load_initial();
 }
 
-void BluetoothNode::apply_adapter_state(const config::NodeConfig& cfg) {
+void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
     if (!adapter_) {
         return;
     }
@@ -549,7 +566,7 @@ void BluetoothNode::apply_adapter_state(const config::NodeConfig& cfg) {
     }
 }
 
-void BluetoothNode::create_services() {
+void ServiceNode::create_services() {
     ros::ServiceServers::Handlers handlers;
     handlers.list_devices = [this](auto request, auto response) { handle_list_devices(request, response); };
     handlers.get_device = [this](auto request, auto response) { handle_get_device(request, response); };
@@ -575,7 +592,7 @@ void BluetoothNode::create_services() {
     services_ = ros_->service_servers().register_all(*this, handlers, service_callback_group_);
 }
 
-void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
+void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     active_config_ = cfg;
     ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
     apply_adapter_state(cfg);
@@ -619,10 +636,10 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
             state.message_type = shared_topic.message_type;
             state.bridge_name = shared_topic.bridge_name;
             state.bridge_key = shared_topic.bridge_key;
-            state.bridge_uuid = util::named_characteristic_uuid(shared_topic.bridge_name);
+            state.bridge_uuid = util::named_characteristic_uuid(
+                bridge_characteristic_name_for_service(shared_topic.bridge_name));
             state.member_specs = shared_topic.member_specs;
             state.rate_hz = shared_topic.rate_hz;
-            state.transport_endpoint = shared_topic.transport_endpoint;
             state.payload_format = shared_topic.payload_format;
             state.auto_managed = true;
             auto [it, inserted] = bridge_registry_.exports().insert_or_assign(shared_topic.bridge_key, std::move(state));
@@ -686,7 +703,7 @@ void BluetoothNode::apply_config(const config::NodeConfig& cfg) {
     schedule_peer_reconcile();
 }
 
-void BluetoothNode::rebuild_server_objects() {
+void ServiceNode::rebuild_server_objects() {
     RCLCPP_INFO(get_logger(), "[node] rebuild_server_objects: server=%s adv=%s",
                 gatt_app_ ? "active" : "null", advertisement_ ? "active" : "null");
     if (advertisement_ && !adapter_path_.empty()) {
@@ -725,14 +742,6 @@ void BluetoothNode::rebuild_server_objects() {
                 netplan_->set_current_network(netplan_->get_current_ssid(), password);
             },
             [this]() { return netplan_->get_configured_password(); });
-        // Wire server-side notify observability for the wifi characteristic.
-        for (const auto& chrc : wifi_service_->service()->characteristics()) {
-            chrc->set_force_emit_value(true);
-            chrc->set_notify_callback([this, uuid = chrc->uuid()](bool enabled) {
-                RCLCPP_INFO(get_logger(), "[server] wifi characteristic %s: client %s notifications",
-                            uuid.c_str(), enabled ? "started" : "stopped");
-            });
-        }
         gatt_app_->add_service(wifi_service_->service());
     } else {
         wifi_service_.reset();
@@ -816,7 +825,7 @@ void BluetoothNode::rebuild_server_objects() {
     }
 }
 
-void BluetoothNode::publish_periodic_status() {
+void ServiceNode::publish_periodic_status() {
     std::map<std::string, bluez::DeviceInfo> devices_map;
     if (client_) {
         for (const auto& device : client_->get_devices()) {
@@ -917,7 +926,55 @@ void BluetoothNode::publish_periodic_status() {
     ros_->status_publisher().publish_devices(devices_map);
 }
 
-std::string BluetoothNode::build_detailed_status_report(
+void ServiceNode::log_info_coalesced(const std::string& key, const std::string& message) {
+    size_t suppressed_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(repeated_log_mutex_);
+        auto& entry = repeated_log_entries_["info:" + key];
+        const auto now = std::chrono::steady_clock::now();
+        if (entry.last_emit_time != std::chrono::steady_clock::time_point{} &&
+            (now - entry.last_emit_time) < kRepeatedLogWindow) {
+            ++entry.suppressed_count;
+            return;
+        }
+        suppressed_count = entry.suppressed_count;
+        entry.suppressed_count = 0;
+        entry.last_emit_time = now;
+    }
+
+    if (suppressed_count > 0) {
+        RCLCPP_INFO(get_logger(), "%s (and %zu same messages received)",
+                    message.c_str(), suppressed_count);
+    } else {
+        RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    }
+}
+
+void ServiceNode::log_warn_coalesced(const std::string& key, const std::string& message) {
+    size_t suppressed_count = 0;
+    {
+        std::lock_guard<std::mutex> lock(repeated_log_mutex_);
+        auto& entry = repeated_log_entries_["warn:" + key];
+        const auto now = std::chrono::steady_clock::now();
+        if (entry.last_emit_time != std::chrono::steady_clock::time_point{} &&
+            (now - entry.last_emit_time) < kRepeatedLogWindow) {
+            ++entry.suppressed_count;
+            return;
+        }
+        suppressed_count = entry.suppressed_count;
+        entry.suppressed_count = 0;
+        entry.last_emit_time = now;
+    }
+
+    if (suppressed_count > 0) {
+        RCLCPP_WARN(get_logger(), "%s (and %zu same messages received)",
+                    message.c_str(), suppressed_count);
+    } else {
+        RCLCPP_WARN(get_logger(), "%s", message.c_str());
+    }
+}
+
+std::string ServiceNode::build_detailed_status_report(
     const std::map<std::string, bluez::DeviceInfo>& devices_map) const {
     std::vector<std::string> lines;
 
@@ -945,10 +1002,9 @@ std::string BluetoothNode::build_detailed_status_report(
 
     const auto wifi_service_uuid = util::named_service_uuid("wifi");
     const auto time_service_uuid = util::named_service_uuid("time");
-    const auto wifi_characteristic_uuid = util::named_characteristic_uuid("wifi/ssid");
+    const auto wifi_ssid_characteristic_uuid = util::named_characteristic_uuid("wifi/ssid");
+    const auto wifi_password_characteristic_uuid = util::named_characteristic_uuid("wifi/password");
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
-    const auto wifi_ssid_descriptor_uuid = util::named_descriptor_uuid("wifi/ssid/config");
-    const auto wifi_password_descriptor_uuid = util::named_descriptor_uuid("wifi/password/config");
     const auto time_value_descriptor_uuid = util::named_descriptor_uuid("time/ns/value");
     const auto time_writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
 
@@ -962,14 +1018,6 @@ std::string BluetoothNode::build_detailed_status_report(
     const auto descriptor_name_for = [&](const std::string& service_uuid,
                                          const bridge::TopicExportBridgeState* export_state,
                                          const std::string& descriptor_uuid) {
-        if (service_uuid == wifi_service_uuid) {
-            if (descriptor_uuid == wifi_ssid_descriptor_uuid) {
-                return std::string{"wifi/ssid/config"};
-            }
-            if (descriptor_uuid == wifi_password_descriptor_uuid) {
-                return std::string{"wifi/password/config"};
-            }
-        }
         if (service_uuid == time_service_uuid) {
             if (descriptor_uuid == time_value_descriptor_uuid) {
                 return std::string{"time/ns/value"};
@@ -979,24 +1027,21 @@ std::string BluetoothNode::build_detailed_status_report(
             }
         }
         if (export_state != nullptr) {
-            const auto& bridge_name = export_state->bridge_name;
-            const std::vector<std::pair<std::string, std::string>> bridge_descriptors{{"/data", "data"},
-                                                                                      {"/topic", "topic"},
-                                                                                      {"/type", "type"},
+            const auto characteristic_name = bridge_characteristic_name_for_service(export_state->bridge_name);
+            const std::vector<std::pair<std::string, std::string>> bridge_descriptors{{"/type", "type"},
                                                                                       {"/format", "format"},
                                                                                       {"/members", "members"},
-                                                                                      {"/rate_hz", "rate_hz"},
-                                                                                      {"/key", "key"}};
+                                                                                      {"/rate_hz", "rate_hz"}};
             for (const auto& [suffix, label] : bridge_descriptors) {
-                if (descriptor_uuid == util::named_descriptor_uuid(bridge_name + suffix)) {
-                    return bridge_name + "/" + label;
+                if (descriptor_uuid == util::named_descriptor_uuid(characteristic_name + suffix)) {
+                    return characteristic_name + "/" + label;
                 }
             }
         }
         return descriptor_uuid;
     };
 
-    lines.push_back("--- Bluetooth Node Status @ " + ts.str() + " ---");
+    lines.push_back("--- Service Node Status @ " + ts.str() + " ---");
     lines.push_back("  adapter:    " + adapter_path_);
     lines.push_back("  hostname:   " + hostname_);
     lines.push_back("  prefix:     " + active_config_.node_topics_prefix);
@@ -1043,17 +1088,19 @@ std::string BluetoothNode::build_detailed_status_report(
             } else if (service->uuid() == time_service_uuid) {
                 service_name = "time";
             } else if (export_state != nullptr) {
-                service_name = "bridge:" + export_state->bridge_name;
+                service_name = export_state->bridge_name;
             }
             lines.push_back("    service '" + service_name + "' UUID=" + service->uuid());
             for (const auto& characteristic : service->characteristics()) {
                 std::string characteristic_name = characteristic->uuid();
-                if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_characteristic_uuid) {
+                if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_ssid_characteristic_uuid) {
                     characteristic_name = "wifi/ssid";
+                } else if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_password_characteristic_uuid) {
+                    characteristic_name = "wifi/password";
                 } else if (service->uuid() == time_service_uuid && characteristic->uuid() == time_characteristic_uuid) {
                     characteristic_name = "time/ns";
-                } else if (export_state != nullptr && characteristic->uuid() == util::named_characteristic_uuid(export_state->bridge_name)) {
-                    characteristic_name = export_state->bridge_name;
+                } else if (export_state != nullptr && characteristic->uuid() == export_state->bridge_uuid) {
+                    characteristic_name = bridge_characteristic_name_for_service(export_state->bridge_name);
                 }
                 lines.push_back("      chrc '" + characteristic_name + "' UUID=" + characteristic->uuid());
                 for (const auto& descriptor : characteristic->descriptors()) {
@@ -1163,7 +1210,7 @@ std::string BluetoothNode::build_detailed_status_report(
     if (!bridge_registry_.exports().empty()) {
         lines.push_back("  export bridges (" + std::to_string(bridge_registry_.exports().size()) + "):");
         for (const auto& [_, state] : bridge_registry_.exports()) {
-            const auto path = state.service ? state.service->transport_path(state.transport_endpoint) : std::string{"?"};
+            const auto path = state.service ? state.service->transport_path() : std::string{"?"};
             lines.push_back("    " + state.topic_name + " -> " + state.bridge_key + " [" + path + "]");
         }
     }
@@ -1220,7 +1267,7 @@ std::string BluetoothNode::build_detailed_status_report(
     return report.str();
 }
 
-void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& object_path) {
+void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& object_path) {
     if (!peers_ || !cache_) {
         return;
     }
@@ -1255,12 +1302,15 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
     if (event == bluez::CacheEvent::DeviceAdded) {
         auto device = cache_->device(object_path);
         if (!device) {
-            RCLCPP_WARN(get_logger(), "[node] on_cache_event: DeviceAdded path=%s but device not in cache", object_path.c_str());
+            log_warn_coalesced("cache:DeviceAdded-missing:" + object_path,
+                               "[node] on_cache_event: DeviceAdded path=" + object_path + " but device not in cache");
             return;
         }
         const auto peer_name = device_hostname_guess(*device);
-        RCLCPP_INFO(get_logger(), "[node] on_cache_event: DeviceAdded mac=%s name='%s' peer_name='%s' path=%s",
-                    device->mac.c_str(), device->name.c_str(), peer_name.c_str(), object_path.c_str());
+        log_info_coalesced("cache:DeviceAdded:" + device->mac,
+                           "[node] on_cache_event: DeviceAdded mac=" + device->mac +
+                               " name='" + device->name + "' peer_name='" + peer_name +
+                               "' path=" + object_path);
         peers_->sync_device(*device, active_config_, peer_name);
         refresh_import_bridges_for_device(*device);
     } else if (event == bluez::CacheEvent::DevicePropertyChanged) {
@@ -1303,8 +1353,9 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
         }
 
         if (!removed_mac.empty()) {
-            RCLCPP_INFO(get_logger(), "[node] on_cache_event: DeviceRemoved mac=%s path=%s",
-                        removed_mac.c_str(), object_path.c_str());
+            log_info_coalesced("cache:DeviceRemoved:" + removed_mac,
+                               "[node] on_cache_event: DeviceRemoved mac=" + removed_mac +
+                                   " path=" + object_path);
             if (peers_->sessions().count(removed_mac)) {
                 peers_->note_missing_device(removed_mac, peers_->now_monotonic());
                 clear_peer_runtime(removed_mac);
@@ -1314,7 +1365,8 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
                          object_path.c_str());
         }
     } else if (event == bluez::CacheEvent::GattServiceAdded || event == bluez::CacheEvent::GattServiceRemoved) {
-        RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+        log_info_coalesced(std::string{"cache:"} + event_name + ":" + object_path,
+                           std::string{"[node] on_cache_event: "} + event_name + " path=" + object_path);
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
                 peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
@@ -1323,10 +1375,12 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
         }
     } else if (event == bluez::CacheEvent::GattCharacteristicAdded || event == bluez::CacheEvent::GattCharacteristicRemoved) {
         if (const auto chrc = cache_->characteristic(object_path)) {
-            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s uuid=%s path=%s",
-                        event_name, chrc->uuid.c_str(), object_path.c_str());
+            log_info_coalesced(std::string{"cache:"} + event_name + ":" + object_path,
+                               std::string{"[node] on_cache_event: "} + event_name +
+                                   " uuid=" + chrc->uuid + " path=" + object_path);
         } else {
-            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+            log_info_coalesced(std::string{"cache:"} + event_name + ":" + object_path,
+                               std::string{"[node] on_cache_event: "} + event_name + " path=" + object_path);
         }
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
@@ -1336,10 +1390,13 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
         }
     } else if (event == bluez::CacheEvent::GattDescriptorAdded || event == bluez::CacheEvent::GattDescriptorRemoved) {
         if (const auto desc = cache_->descriptor(object_path)) {
-            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s uuid=%s chrc=%s path=%s",
-                        event_name, desc->uuid.c_str(), desc->characteristic_path.c_str(), object_path.c_str());
+            log_info_coalesced(std::string{"cache:"} + event_name + ":" + object_path,
+                               std::string{"[node] on_cache_event: "} + event_name +
+                                   " uuid=" + desc->uuid + " chrc=" + desc->characteristic_path +
+                                   " path=" + object_path);
         } else {
-            RCLCPP_INFO(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
+            log_info_coalesced(std::string{"cache:"} + event_name + ":" + object_path,
+                               std::string{"[node] on_cache_event: "} + event_name + " path=" + object_path);
         }
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
@@ -1375,26 +1432,26 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
     schedule_peer_reconcile();
 }
 
-void BluetoothNode::on_gatt_event(const std::string& event_type,
+void ServiceNode::on_gatt_event(const std::string& event_type,
                                   const std::string& object_path,
                                   const std::string& detail) {
     if (event_type == "client_notify_enabled") {
-        RCLCPP_INFO(get_logger(), "[client] notify enabled path=%s",
-                    object_path.c_str());
+        log_info_coalesced("gatt:notify-enabled:" + object_path,
+                           "[client] notify enabled path=" + object_path);
     } else if (event_type == "client_notify_disabled") {
-        RCLCPP_INFO(get_logger(), "[client] notify disabled path=%s",
-                    object_path.c_str());
+        log_info_coalesced("gatt:notify-disabled:" + object_path,
+                           "[client] notify disabled path=" + object_path);
     } else if (is_failed_gatt_event(event_type)) {
-        RCLCPP_WARN(get_logger(), "[client] %s path=%s detail=%s",
-                    event_type.c_str(), object_path.c_str(), detail.c_str());
+        log_warn_coalesced("gatt:" + event_type + ":" + object_path + ":" + detail,
+                           "[client] " + event_type + " path=" + object_path + " detail=" + detail);
     } else if (is_read_write_gatt_event(event_type)) {
         RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(),
                               std::chrono::duration_cast<std::chrono::milliseconds>(kGattReadWriteLogInterval).count(),
                               "[client] %s path=%s",
                               event_type.c_str(), object_path.c_str());
     } else {
-        RCLCPP_INFO(get_logger(), "[client] %s path=%s detail=%s",
-                    event_type.c_str(), object_path.c_str(), detail.c_str());
+        log_info_coalesced("gatt:" + event_type + ":" + object_path + ":" + detail,
+                           "[client] " + event_type + " path=" + object_path + " detail=" + detail);
     }
 
     if (!cache_ || !client_) {
@@ -1420,7 +1477,7 @@ void BluetoothNode::on_gatt_event(const std::string& event_type,
     }
 }
 
-void BluetoothNode::on_pairing_event(const std::string& event_type, const std::string& device_path) {
+void ServiceNode::on_pairing_event(const std::string& event_type, const std::string& device_path) {
     RCLCPP_INFO(get_logger(), "[node] on_pairing_event: type=%s device=%s",
                 event_type.c_str(), device_path.c_str());
     if (!peers_ || !cache_) {
@@ -1430,7 +1487,7 @@ void BluetoothNode::on_pairing_event(const std::string& event_type, const std::s
     schedule_peer_reconcile();
 }
 
-void BluetoothNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
+void ServiceNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
     if (!peers_ || !client_) {
         return;
     }
@@ -1460,7 +1517,7 @@ void BluetoothNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
     }, peer_callback_group_);
 }
 
-bool BluetoothNode::run_peer_task_once(const std::string& mac,
+bool ServiceNode::run_peer_task_once(const std::string& mac,
                                        const std::string& label,
                                        std::function<void()> task) {
     if (shutting_down_.load()) {
@@ -1500,7 +1557,7 @@ bool BluetoothNode::run_peer_task_once(const std::string& mac,
     return true;
 }
 
-void BluetoothNode::wait_for_peer_tasks() {
+void ServiceNode::wait_for_peer_tasks() {
     std::vector<std::shared_future<void>> tasks;
     {
         std::lock_guard<std::mutex> lock(peer_task_mutex_);
@@ -1517,7 +1574,7 @@ void BluetoothNode::wait_for_peer_tasks() {
     }
 }
 
-void BluetoothNode::clear_peer_runtime(const std::string& mac) {
+void ServiceNode::clear_peer_runtime(const std::string& mac) {
     if (!peers_ || !client_ || !import_bridges_) {
         return;
     }
@@ -1525,14 +1582,15 @@ void BluetoothNode::clear_peer_runtime(const std::string& mac) {
     import_bridges_->clear_import_paths_for_mac(mac, *client_);
 
     if (auto bridge = peers_->time_bridges().find(mac); bridge != peers_->time_bridges().end()) {
-        if (!bridge->second.characteristic_path.empty()) {
-            client_->stop_notify(bridge->second.characteristic_path);
-        }
+        const auto characteristic_path = bridge->second.characteristic_path;
         peers_->remove_time_bridge(mac);
+        if (!characteristic_path.empty()) {
+            client_->stop_notify(characteristic_path);
+        }
     }
 }
 
-void BluetoothNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& device) {
+void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& device) {
     if (!import_bridges_ || !client_ || !peers_) {
         return;
     }
@@ -1560,12 +1618,12 @@ void BluetoothNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& d
             state.requested_topic_name = shared_topic.import_topic_suffix;
             state.resolved_topic_name = peer_bridge_topic(device.mac, peer_name, shared_topic.import_topic_suffix);
             state.message_type = shared_topic.message_type;
-            state.bridge_name = shared_topic.bridge_name;
+            state.bridge_name = bridge_service_name_for_host(peer_name, shared_topic.bridge_topic_path);
             state.bridge_key = shared_topic.bridge_key;
-            state.bridge_uuid = util::named_characteristic_uuid(shared_topic.bridge_name);
+            state.bridge_uuid = util::named_characteristic_uuid(
+                bridge_characteristic_name_for_host(peer_name, shared_topic.bridge_topic_path));
             state.member_specs = shared_topic.member_specs;
             state.rate_hz = shared_topic.rate_hz;
-            state.transport_endpoint = shared_topic.transport_endpoint;
             state.payload_format = shared_topic.payload_format;
             state.auto_managed = true;
 
@@ -1598,7 +1656,7 @@ void BluetoothNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& d
     }
 }
 
-void BluetoothNode::prune_missing_import_bridges(const std::string& mac,
+void ServiceNode::prune_missing_import_bridges(const std::string& mac,
                                                  const std::set<std::string>& desired_keys,
                                                  double now_mono,
                                                  double missing_path_grace_s) {
@@ -1646,12 +1704,12 @@ void BluetoothNode::prune_missing_import_bridges(const std::string& mac,
     }
 }
 
-std::string BluetoothNode::peer_status_topic(const std::string& mac, const std::string& peer_name) const {
+std::string ServiceNode::peer_status_topic(const std::string& mac, const std::string& peer_name) const {
     return util::normalize_ros_topic(active_config_.node_topics_prefix + "/peers/" +
                                      peer_topic_token(peer_name, mac) + "/time_status");
 }
 
-std::string BluetoothNode::peer_bridge_topic(const std::string& mac,
+std::string ServiceNode::peer_bridge_topic(const std::string& mac,
                                              const std::string& peer_name,
                                              const std::string& requested_topic_suffix) const {
     std::string topic = active_config_.node_topics_prefix + "/peers/" + peer_topic_token(peer_name, mac);
@@ -1662,7 +1720,7 @@ std::string BluetoothNode::peer_bridge_topic(const std::string& mac,
     return util::normalize_ros_topic(topic);
 }
 
-void BluetoothNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const {
+void ServiceNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const {
     auto publisher = std::dynamic_pointer_cast<rclcpp::Publisher<mrs_uav_bluetooth::msg::BlePeerTimeStatus>>(bridge.publisher);
     if (!publisher) {
         return;
@@ -1679,7 +1737,7 @@ void BluetoothNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const
     publisher->publish(msg);
 }
 
-void BluetoothNode::on_notification(const std::vector<uint8_t>& data,
+void ServiceNode::on_notification(const std::vector<uint8_t>& data,
                                     const std::string& uuid,
                                     const std::string& characteristic_path) {
     RCLCPP_DEBUG(get_logger(), "[node] on_notification: uuid=%s path=%s %zu bytes",
@@ -1719,6 +1777,8 @@ void BluetoothNode::on_notification(const std::vector<uint8_t>& data,
     auto& bridge = bridge_it->second;
     bridge.last_activity_monotonic = peers_->now_monotonic();
     bridge.last_time_value_ns = peer_time_ns;
+    std::tie(bridge.last_publish_monotonic, bridge.current_hz) =
+        update_publish_rate(bridge.last_publish_monotonic);
     bridge.status = "ready";
     bridge.detail = "time notification";
     publish_peer_time_status(bridge);
@@ -1728,7 +1788,7 @@ void BluetoothNode::on_notification(const std::vector<uint8_t>& data,
     }
 }
 
-void BluetoothNode::handle_time_writeback(const std::vector<uint8_t>& payload,
+void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
                                           const std::string& device_path,
                                           uint64_t received_time_ns) {
     if (!peers_ || payload.size() < sizeof(uint64_t)) {
@@ -1775,7 +1835,7 @@ void BluetoothNode::handle_time_writeback(const std::vector<uint8_t>& payload,
     publish_peer_time_status(bridge);
 }
 
-bool BluetoothNode::update_peer_time_bridge(const std::string& mac,
+bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                                             const bluez::DeviceInfo& device,
                                             peer::PeerConnectionSession& session) {
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
@@ -1869,7 +1929,7 @@ bool BluetoothNode::update_peer_time_bridge(const std::string& mac,
     return false;
 }
 
-void BluetoothNode::reconcile_peers() {
+void ServiceNode::reconcile_peers() {
     if (!peers_ || !client_) {
         return;
     }
@@ -2051,7 +2111,7 @@ void BluetoothNode::reconcile_peers() {
     }
 }
 
-mrs_uav_bluetooth::msg::BleDevice BluetoothNode::to_device_msg(const bluez::DeviceInfo& device) const {
+mrs_uav_bluetooth::msg::BleDevice ServiceNode::to_device_msg(const bluez::DeviceInfo& device) const {
     mrs_uav_bluetooth::msg::BleDevice msg;
     msg.mac = device.mac;
     msg.path = device.object_path;
@@ -2094,7 +2154,7 @@ mrs_uav_bluetooth::msg::BleDevice BluetoothNode::to_device_msg(const bluez::Devi
     return msg;
 }
 
-mrs_uav_bluetooth::msg::BleGattService BluetoothNode::to_service_msg(const bluez::GattServiceInfo& item) const {
+mrs_uav_bluetooth::msg::BleGattService ServiceNode::to_service_msg(const bluez::GattServiceInfo& item) const {
     mrs_uav_bluetooth::msg::BleGattService msg;
     msg.path = item.object_path;
     msg.uuid = item.uuid;
@@ -2104,7 +2164,7 @@ mrs_uav_bluetooth::msg::BleGattService BluetoothNode::to_service_msg(const bluez
     return msg;
 }
 
-mrs_uav_bluetooth::msg::BleGattCharacteristic BluetoothNode::to_characteristic_msg(const bluez::GattCharacteristicInfo& item) const {
+mrs_uav_bluetooth::msg::BleGattCharacteristic ServiceNode::to_characteristic_msg(const bluez::GattCharacteristicInfo& item) const {
     mrs_uav_bluetooth::msg::BleGattCharacteristic msg;
     msg.path = item.object_path;
     msg.service_path = item.service_path;
@@ -2115,7 +2175,7 @@ mrs_uav_bluetooth::msg::BleGattCharacteristic BluetoothNode::to_characteristic_m
     return msg;
 }
 
-mrs_uav_bluetooth::msg::BleGattDescriptor BluetoothNode::to_descriptor_msg(const bluez::GattDescriptorInfo& item) const {
+mrs_uav_bluetooth::msg::BleGattDescriptor ServiceNode::to_descriptor_msg(const bluez::GattDescriptorInfo& item) const {
     mrs_uav_bluetooth::msg::BleGattDescriptor msg;
     msg.path = item.object_path;
     msg.characteristic_path = item.characteristic_path;
@@ -2124,153 +2184,10 @@ mrs_uav_bluetooth::msg::BleGattDescriptor BluetoothNode::to_descriptor_msg(const
     return msg;
 }
 
-void BluetoothNode::handle_list_devices(const std::shared_ptr<mrs_uav_bluetooth::srv::ListDevices::Request> request,
-                                        std::shared_ptr<mrs_uav_bluetooth::srv::ListDevices::Response> response) {
-    auto devices = request->connected_only ? client_->get_connected_devices() : client_->get_devices();
-    response->success = true;
-    response->message = "ok";
-    for (const auto& device : devices) {
-        response->devices.push_back(to_device_msg(device));
-    }
-}
-
-void BluetoothNode::handle_get_device(const std::shared_ptr<mrs_uav_bluetooth::srv::GetDevice::Request> request,
-                                      std::shared_ptr<mrs_uav_bluetooth::srv::GetDevice::Response> response) {
-    auto device = client_->get_device(request->mac);
-    if (!device) {
-        response->success = false;
-        response->message = "device not found";
-        return;
-    }
-    response->success = true;
-    response->message = "ok";
-    response->device = to_device_msg(*device);
-}
-
-void BluetoothNode::handle_connect_device(const std::shared_ptr<mrs_uav_bluetooth::srv::ConnectDevice::Request> request,
-                                          std::shared_ptr<mrs_uav_bluetooth::srv::ConnectDevice::Response> response) {
-    const double timeout_s = std::max(1.0f, request->timeout);
-    bool success = client_->connect(request->mac, timeout_s);
-    std::string detail = success ? "ok" : "failed to connect";
-    if (success && request->wait_for_services) {
-        success = client_->wait_services_resolved(request->mac, timeout_s);
-        detail = success ? "ok" : "services unresolved";
-    }
-    auto device = client_->get_device(request->mac);
-    response->success = success;
-    response->message = success ? (detail.empty() ? "ok" : detail) : (detail.empty() ? "failed" : detail);
-    response->resolved_mac = device ? device->mac : request->mac;
-    response->device_path = device ? device->object_path : std::string{};
-}
-
-void BluetoothNode::handle_disconnect_device(const std::shared_ptr<mrs_uav_bluetooth::srv::DisconnectDevice::Request> request,
-                                             std::shared_ptr<mrs_uav_bluetooth::srv::DisconnectDevice::Response> response) {
-    response->success = client_->disconnect(request->mac, std::max(1.0f, request->timeout));
-    response->message = response->success ? "ok" : "failed to disconnect";
-}
-
-void BluetoothNode::handle_pair_device(const std::shared_ptr<mrs_uav_bluetooth::srv::PairDevice::Request> request,
-                                       std::shared_ptr<mrs_uav_bluetooth::srv::PairDevice::Response> response) {
-    std::string detail;
-    bool success = client_->pair(request->mac, std::max(1.0f, request->timeout));
-    detail = success ? "ok" : "failed to pair";
-    if (success && request->trust_after_pair) {
-        success = client_->trust(request->mac);
-        if (!success) {
-            detail = "trust_after_pair failed";
-        }
-    }
-    response->success = success;
-    response->message = success ? (detail.empty() ? "ok" : detail) : (detail.empty() ? "failed" : detail);
-}
-
-void BluetoothNode::handle_set_device_trust(const std::shared_ptr<mrs_uav_bluetooth::srv::SetDeviceTrust::Request> request,
-                                            std::shared_ptr<mrs_uav_bluetooth::srv::SetDeviceTrust::Response> response) {
-    response->success = request->trusted ? client_->trust(request->mac) : client_->untrust(request->mac);
-    response->message = response->success ? "ok" : "failed";
-}
-
-void BluetoothNode::handle_remove_device(const std::shared_ptr<mrs_uav_bluetooth::srv::RemoveDevice::Request> request,
-                                         std::shared_ptr<mrs_uav_bluetooth::srv::RemoveDevice::Response> response) {
-    response->success = client_->remove(request->mac);
-    response->message = response->success ? "ok" : "failed";
-}
-
-void BluetoothNode::handle_list_gatt_services(const std::shared_ptr<mrs_uav_bluetooth::srv::ListGattServices::Request> request,
-                                              std::shared_ptr<mrs_uav_bluetooth::srv::ListGattServices::Response> response) {
-    response->success = true;
-    response->message = "ok";
-    for (const auto& item : client_->list_services(request->mac)) {
-        response->services.push_back(to_service_msg(item));
-    }
-}
-
-void BluetoothNode::handle_list_gatt_characteristics(const std::shared_ptr<mrs_uav_bluetooth::srv::ListGattCharacteristics::Request> request,
-                                                     std::shared_ptr<mrs_uav_bluetooth::srv::ListGattCharacteristics::Response> response) {
-    response->success = true;
-    response->message = "ok";
-    for (const auto& item : client_->list_characteristics(request->mac)) {
-        response->characteristics.push_back(to_characteristic_msg(item));
-    }
-}
-
-void BluetoothNode::handle_list_gatt_descriptors(const std::shared_ptr<mrs_uav_bluetooth::srv::ListGattDescriptors::Request> request,
-                                                 std::shared_ptr<mrs_uav_bluetooth::srv::ListGattDescriptors::Response> response) {
-    response->success = true;
-    response->message = "ok";
-    for (const auto& item : client_->list_descriptors(request->mac, request->characteristic_path)) {
-        response->descriptors.push_back(to_descriptor_msg(item));
-    }
-}
-
-void BluetoothNode::handle_find_gatt_path(const std::shared_ptr<mrs_uav_bluetooth::srv::FindGattPath::Request> request,
-                                          std::shared_ptr<mrs_uav_bluetooth::srv::FindGattPath::Response> response) {
-    const auto uuid = util::resolve_uuid(request->uuid);
-    std::string path = request->descriptor
-        ? client_->find_descriptor(request->mac, uuid, request->characteristic_path)
-        : client_->find_characteristic(request->mac, uuid);
-    response->success = !path.empty();
-    response->message = response->success ? "ok" : "not found";
-    response->path = path;
-}
-
-void BluetoothNode::handle_read_gatt_value(const std::shared_ptr<mrs_uav_bluetooth::srv::ReadGattValue::Request> request,
-                                           std::shared_ptr<mrs_uav_bluetooth::srv::ReadGattValue::Response> response) {
-    auto data = request->descriptor ? client_->read_descriptor(request->path) : client_->read_characteristic(request->path);
-    response->success = true;
-    response->message = "ok";
-    response->value = data;
-}
-
-void BluetoothNode::handle_write_gatt_value(const std::shared_ptr<mrs_uav_bluetooth::srv::WriteGattValue::Request> request,
-                                            std::shared_ptr<mrs_uav_bluetooth::srv::WriteGattValue::Response> response) {
-    bool success = request->descriptor
-        ? client_->write_descriptor(request->path, request->value)
-        : client_->write_characteristic(request->path, request->value, request->with_response);
-    response->success = success;
-    response->message = success ? "ok" : "failed";
-}
-
-void BluetoothNode::handle_set_notify(const std::shared_ptr<mrs_uav_bluetooth::srv::SetNotify::Request> request,
-                                      std::shared_ptr<mrs_uav_bluetooth::srv::SetNotify::Response> response) {
-    response->success = request->enable ? client_->start_notify(request->path) : client_->stop_notify(request->path);
-    response->message = response->success ? "ok" : "failed";
-}
-
-void BluetoothNode::handle_set_scan_enabled(const std::shared_ptr<mrs_uav_bluetooth::srv::SetScanEnabled::Request> request,
-                                            std::shared_ptr<mrs_uav_bluetooth::srv::SetScanEnabled::Response> response) {
-    bool success = request->enabled ? client_->start_scan(request->transport.empty() ? active_config_.scan_mode : request->transport)
-                                    : client_->stop_scan();
-    response->success = success;
-    response->message = success ? "ok" : "failed";
-    response->scanning = client_->is_scanning();
-}
-
-void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<mrs_uav_bluetooth::srv::ConfigureNotificationBridge::Request> request,
+void ServiceNode::handle_configure_notification_bridge(const std::shared_ptr<mrs_uav_bluetooth::srv::ConfigureNotificationBridge::Request> request,
                                                          std::shared_ptr<mrs_uav_bluetooth::srv::ConfigureNotificationBridge::Response> response) {
     try {
         const auto direction = normalize_direction(request->direction);
-        const auto transport_endpoint = normalize_transport_endpoint(request->transport_endpoint);
         const auto message_type = lower_trim(request->message_type);
         const auto resolved_topic = util::normalize_ros_topic(request->topic_name);
         const auto member_specs = parse_member_specs(request->member_paths);
@@ -2292,10 +2209,10 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
 
         const auto export_key = manual_bridge_key(
             "export", request->mac, resolved_topic, message_type,
-            request->characteristic, member_specs, transport_endpoint);
+            request->characteristic, member_specs);
         const auto import_key = manual_bridge_key(
             "import", request->mac, resolved_topic, message_type,
-            request->characteristic, member_specs, transport_endpoint);
+            request->characteristic, member_specs);
 
         bool changed_exports = false;
         bool changed_imports = false;
@@ -2328,7 +2245,6 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
             response->resolved_message_type = message_type;
             response->resolved_member_paths = request->member_paths;
             response->resolved_rate_hz = request->rate_hz;
-            response->resolved_transport_endpoint = transport_endpoint;
             return;
         }
 
@@ -2341,10 +2257,9 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
             state.message_type = message_type;
             state.bridge_name = export_key;
             state.bridge_key = export_key;
-            state.bridge_uuid = util::named_characteristic_uuid(export_key);
+            state.bridge_uuid = util::named_characteristic_uuid(export_key + "/value");
             state.member_specs = member_specs;
             state.rate_hz = std::max(0.0f, request->rate_hz);
-            state.transport_endpoint = transport_endpoint;
             state.payload_format = "struct";
             state.auto_managed = false;
             auto [export_it, inserted] = bridge_registry_.exports().insert_or_assign(export_key, std::move(state));
@@ -2360,9 +2275,7 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
                 throw std::runtime_error("BlueZ client is not initialized");
             }
 
-            resolved_path = transport_endpoint == "descriptor"
-                ? client_->find_descriptor(request->mac, request_uuid)
-                : client_->find_characteristic(request->mac, request_uuid);
+            resolved_path = client_->find_characteristic(request->mac, request_uuid);
             if (resolved_path.empty()) {
                 throw std::runtime_error("requested remote bridge path was not found");
             }
@@ -2377,7 +2290,6 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
             state.bridge_uuid = request_uuid;
             state.member_specs = member_specs;
             state.rate_hz = std::max(0.0f, request->rate_hz);
-            state.transport_endpoint = transport_endpoint;
             state.payload_format = "struct";
             state.path = resolved_path;
             state.auto_managed = false;
@@ -2392,7 +2304,7 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
             rebuild_server_objects();
             auto export_it = bridge_registry_.exports().find(export_key);
             if (export_it != bridge_registry_.exports().end() && export_it->second.service) {
-                resolved_path = export_it->second.service->transport_path(transport_endpoint);
+                resolved_path = export_it->second.service->transport_path();
                 resolved_uuid = export_it->second.bridge_uuid;
             }
         }
@@ -2406,7 +2318,6 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
         response->resolved_topic = resolved_topic;
         response->resolved_message_type = message_type;
         response->resolved_rate_hz = std::max(0.0f, request->rate_hz);
-        response->resolved_transport_endpoint = transport_endpoint;
         for (const auto& spec : member_specs) {
             response->resolved_member_paths.push_back(spec.path + ":" + spec.value_type);
         }
@@ -2414,28 +2325,6 @@ void BluetoothNode::handle_configure_notification_bridge(const std::shared_ptr<m
         response->success = false;
         response->message = e.what();
     }
-}
-
-void BluetoothNode::handle_reload_config(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-                                         std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
-    (void)request;
-    auto [success, message] = overlay_config_->reload();
-    response->success = success;
-    response->message = message;
-}
-
-void BluetoothNode::handle_set_active_config(const std::shared_ptr<mrs_uav_bluetooth::srv::SetActiveConfig::Request> request,
-                                             std::shared_ptr<mrs_uav_bluetooth::srv::SetActiveConfig::Response> response) {
-    std::pair<bool, std::string> result;
-    if (request->config_path.empty()) {
-        result = overlay_config_->revert_to_default();
-    } else {
-        result = overlay_config_->activate_overlay(request->config_path);
-    }
-    response->success = result.first;
-    response->message = result.second;
-    response->active_config_path = overlay_config_->active_source();
-    response->overlay_active = overlay_config_->overlay_active();
 }
 
 }  // namespace mrs_uav_bluetooth::app

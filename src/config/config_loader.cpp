@@ -26,21 +26,12 @@ std::string expand_hostname(const std::string& value, const std::string& hostnam
     return result;
 }
 
-/// Normalize the transport_endpoint string.
-std::string normalize_transport_endpoint(const std::string& ep) {
-    std::string candidate = ep;
-    std::transform(candidate.begin(), candidate.end(), candidate.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    // Trim whitespace.
-    auto start = candidate.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return "characteristic";
-    auto end = candidate.find_last_not_of(" \t\r\n");
-    candidate = candidate.substr(start, end - start + 1);
-    if (candidate.empty()) return "characteristic";
-    if (candidate != "characteristic" && candidate != "descriptor") {
-        throw std::runtime_error("transport_endpoint must be 'characteristic' or 'descriptor'");
+std::string bridge_topic_path(const std::string& canonical_topic) {
+    const auto normalized_canonical = util::normalize_ros_topic(canonical_topic);
+    if (normalized_canonical == "/") {
+        return std::string{"/"};
     }
-    return candidate;
+    return normalized_canonical;
 }
 
 /// Strip UAV hostname prefix from a canonical topic.
@@ -246,20 +237,17 @@ NodeConfig parse_node_config(const YAML::Node& doc,
             if (key_source.empty()) {
                 throw std::runtime_error("shared_topics[" + std::to_string(index) + "] produced an empty bridge key");
             }
-            stc.bridge_key = util::uuid_from_name(key_source).substr(0, 32);
-            // Actually the Python uses hashlib.md5 hex for bridge_key.
-            // uuid_from_name produces formatted GUID. Let's match Python exactly:
-            // bridge_key = md5(key_source).hexdigest() which is 32 hex chars.
-            // For now, use the same md5 logic (uuid_from_name strips dashes):
+            const auto sanitized_hostname = util::sanitize_topic_suffix(hostname);
+            stc.bridge_topic_path = bridge_topic_path(canonical);
+            stc.bridge_name = "bridge:/" + sanitized_hostname + stc.bridge_topic_path;
             {
-                std::string full_uuid = util::uuid_from_name(key_source);
+                std::string full_uuid = util::uuid_from_name(stc.bridge_name);
                 std::string hex;
                 for (char c : full_uuid) {
                     if (c != '-') hex.push_back(c);
                 }
                 stc.bridge_key = hex;
             }
-            stc.bridge_name = stc.bridge_key;
 
             stc.message_type = raw["message_type"]
                 ? raw["message_type"].as<std::string>("") : "";
@@ -286,10 +274,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
                 stc.import_topic_suffix = stc.import_topic_suffix.substr(1);
             }
 
-            stc.transport_endpoint = normalize_transport_endpoint(
-                raw["transport_endpoint"]
-                    ? raw["transport_endpoint"].as<std::string>("characteristic")
-                    : "characteristic");
             stc.rate_hz = std::max(0.0,
                 raw["rate_hz"] ? raw["rate_hz"].as<double>(0.0) : 0.0);
             stc.name = raw["name"]

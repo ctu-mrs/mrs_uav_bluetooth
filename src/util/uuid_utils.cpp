@@ -315,17 +315,17 @@ std::string resolve_uuid(std::string_view value) {
 
 std::string named_service_uuid(std::string_view name) {
     auto trimmed = trim(name);
-    return uuid_from_name("svc:" + trimmed);
+    return uuid_from_name(trimmed);
 }
 
 std::string named_characteristic_uuid(std::string_view name) {
     auto trimmed = trim(name);
-    return uuid_from_name("chr:" + trimmed);
+    return uuid_from_name(trimmed);
 }
 
 std::string named_descriptor_uuid(std::string_view name) {
     auto trimmed = trim(name);
-    return uuid_from_name("dsc:" + trimmed);
+    return uuid_from_name(trimmed);
 }
 
 }  // namespace mrs_uav_bluetooth::util

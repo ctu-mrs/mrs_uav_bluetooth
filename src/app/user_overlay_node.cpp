@@ -151,6 +151,16 @@ UserOverlayNode::call_config_service(const std::string& config_path) {
 }
 
 void UserOverlayNode::handle_print(const std_msgs::msg::String::SharedPtr message) {
+    if (print_source_ == "status") {
+        std::lock_guard<std::mutex> lock(print_mutex_);
+        if (message->data == last_print_payload_) {
+            return;
+        }
+        last_print_payload_ = message->data;
+        RCLCPP_INFO(get_logger(), "\n%s", message->data.c_str());
+        return;
+    }
+
     std::istringstream stream(message->data);
     std::string line;
     while (std::getline(stream, line)) {

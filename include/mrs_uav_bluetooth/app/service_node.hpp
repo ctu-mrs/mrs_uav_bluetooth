@@ -51,12 +51,17 @@
 
 namespace mrs_uav_bluetooth::app {
 
-class BluetoothNode : public rclcpp::Node {
+class ServiceNode : public rclcpp::Node {
 public:
-    BluetoothNode();
-    ~BluetoothNode() override;
+    ServiceNode();
+    ~ServiceNode() override;
 
 private:
+    struct RepeatedLogEntry {
+        std::chrono::steady_clock::time_point last_emit_time{};
+        size_t suppressed_count{0};
+    };
+
     void configure_parameters();
     void build_runtime();
     void create_services();
@@ -96,6 +101,8 @@ private:
                             const std::string& label,
                             std::function<void()> task);
     void wait_for_peer_tasks();
+    void log_info_coalesced(const std::string& key, const std::string& message);
+    void log_warn_coalesced(const std::string& key, const std::string& message);
 
     mrs_uav_bluetooth::msg::BleDevice to_device_msg(const bluez::DeviceInfo& device) const;
     mrs_uav_bluetooth::msg::BleGattService to_service_msg(const bluez::GattServiceInfo& item) const;
@@ -185,6 +192,8 @@ private:
     std::chrono::steady_clock::time_point last_status_log_time_{};
     std::map<std::string, std::string> last_peer_status_log_;
     std::chrono::steady_clock::time_point last_peer_status_log_time_{};
+    mutable std::mutex repeated_log_mutex_;
+    std::map<std::string, RepeatedLogEntry> repeated_log_entries_;
 };
 
 }  // namespace mrs_uav_bluetooth::app

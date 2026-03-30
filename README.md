@@ -54,7 +54,6 @@ Each `shared_topics` entry may define:
 - `export_topic`: local ROS topic used as the logical identity of the bridge.
 - `message_type`: ROS message type, for example `nav_msgs/msg/Odometry`.
 - `rate_hz`: bridge publish or poll rate. `0` means unthrottled.
-- `transport_endpoint`: `characteristic` or `descriptor`.
 - `members`: ordered fixed-width field mapping packed into the BLE payload.
 - `name`, `key`, `import_topic_suffix`: optional overrides for logging and imported topic naming.
 
@@ -84,7 +83,7 @@ Core published topics:
 
 ### UAV Wi-Fi configuration
 
-When `enable_wifi_service` is enabled, the service node exposes the current Wi-Fi SSID over BLE and accepts Wi-Fi updates from a connected peer. The node applies changes through the configured netplan backend.
+When `enable_wifi_service` is enabled, the service node exposes two BLE characteristics for Wi-Fi SSID and password. Both are readable and writable, and the node applies changes through the configured netplan backend.
 
 - Only SSIDs listed in `allowed_wifi_networks` are accepted.
 - The service writes the system netplan Wi-Fi configuration and then runs `netplan apply`.
@@ -104,11 +103,11 @@ When `enable_time_service` is enabled, the service publishes the local system ti
 
 Topic sharing is configured declaratively in `shared_topics`. Each bridge packs selected scalar members from a ROS message into a compact BLE payload and recreates a ROS message on the receiving side.
 
-- `mode: export` subscribes to a local ROS topic and writes BLE payloads to a peer.
-- `mode: import` reads a peer BLE endpoint and republishes decoded ROS messages locally.
+- `mode: export` subscribes to a local ROS topic and writes BLE payloads to a peer characteristic.
+- `mode: import` reads a peer BLE characteristic and republishes decoded ROS messages locally.
 - `mode: both` configures both directions for the same logical bridge.
-- `transport_endpoint: characteristic` uses notifications or characteristic writes.
-- `transport_endpoint: descriptor` uses a descriptor as the data endpoint when that layout is more convenient.
+- Each exported bridge uses a service named `bridge:/{hostname}/...` and a single read/notify characteristic named `/{hostname}/...`.
+- Bridge payloads live directly in the characteristic value; metadata stays in a small descriptor set.
 
 By default, imported topics are published under the peer namespace rooted at `/{hostname}/ble/peers/<peer>/...`. The rest of the topic name remains the same as on the origin device unless `import_topic_suffix` overrides it.
 
@@ -141,7 +140,7 @@ The node exposes the following service interfaces.
 | `/ble/write_gatt_value` | `mrs_uav_bluetooth/srv/WriteGattValue` | `path: string`, `descriptor: bool`, `value: uint8[]`, `with_response: bool` | `success: bool`, `message: string` | Write a characteristic or descriptor payload. |
 | `/ble/set_notify` | `mrs_uav_bluetooth/srv/SetNotify` | `path: string`, `enable: bool` | `success: bool`, `message: string` | Start or stop notifications on a characteristic path. |
 | `/ble/set_scan_enabled` | `mrs_uav_bluetooth/srv/SetScanEnabled` | `enabled: bool`, `transport: string` | `success: bool`, `message: string`, `scanning: bool` | Start or stop scanning with the selected transport, usually `le`. |
-| `/ble/configure_notification_bridge` | `mrs_uav_bluetooth/srv/ConfigureNotificationBridge` | `direction: string`, `mac: string`, `characteristic: string`, `topic_name: string`, `message_type: string`, `member_paths: string[]`, `rate_hz: float32`, `transport_endpoint: string`, `enable: bool` | `success: bool`, `message: string`, `resolved_uuid: string`, `resolved_path: string`, `resolved_topic: string`, `resolved_message_type: string`, `resolved_member_paths: string[]`, `resolved_rate_hz: float32`, `resolved_transport_endpoint: string` | Create, update, or remove an import or export bridge without editing YAML. |
+| `/ble/configure_notification_bridge` | `mrs_uav_bluetooth/srv/ConfigureNotificationBridge` | `direction: string`, `mac: string`, `characteristic: string`, `topic_name: string`, `message_type: string`, `member_paths: string[]`, `rate_hz: float32`, `enable: bool` | `success: bool`, `message: string`, `resolved_uuid: string`, `resolved_path: string`, `resolved_topic: string`, `resolved_message_type: string`, `resolved_member_paths: string[]`, `resolved_rate_hz: float32` | Create, update, or remove an import or export bridge without editing YAML. |
 | `/ble/reload_config` | `std_srvs/srv/Trigger` | none | `success: bool`, `message: string` | Reload the currently active configuration source. |
 | `/ble/set_active_config` | `mrs_uav_bluetooth/srv/SetActiveConfig` | `config_path: string`, `hold_seconds: float32` | `success: bool`, `message: string`, `active_config_path: string`, `overlay_active: bool` | Activate or clear an overlay config lease. |
 

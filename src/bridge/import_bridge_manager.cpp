@@ -3,6 +3,21 @@
 
 #include "mrs_uav_bluetooth/bridge/generic_message_bridge.hpp"
 
+#include <chrono>
+
+namespace {
+
+std::pair<double, double> update_publish_rate(double last_publish_monotonic) {
+    const auto now = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
+        return {now, 1.0 / (now - last_publish_monotonic)};
+    }
+    return {now, 0.0};
+}
+
+}  // namespace
+
 namespace mrs_uav_bluetooth::bridge {
 
 std::shared_ptr<GenericMessageBridge> ImportBridgeManager::runtime_for(TopicImportBridgeState& state) {
@@ -29,6 +44,8 @@ bool ImportBridgeManager::publish_payload(TopicImportBridgeState& state,
         publisher->publish(serialized);
         state.last_payload = payload;
         state.pending_payload.clear();
+        std::tie(state.last_publish_monotonic, state.current_hz) =
+            update_publish_rate(state.last_publish_monotonic);
         return true;
     } catch (const std::exception& e) {
         RCLCPP_WARN(logger_, "Failed to decode import bridge %s: %s",
@@ -68,28 +85,14 @@ void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_
         state.poll_timer->cancel();
         state.poll_timer.reset();
     }
-    if (state.transport_endpoint != "descriptor" && state.rate_hz <= 0.0) {
+    if (state.rate_hz <= 0.0) {
         return;
     }
     double period_s = state.rate_hz > 0.0 ? 1.0 / state.rate_hz : 1.0;
     state.poll_timer = node_.create_wall_timer(
         std::chrono::duration<double>(period_s),
         [this, &client, bridge_key, &state]() {
-            if (state.transport_endpoint == "descriptor") {
-                if (state.path.empty()) {
-                    return;
-                }
-                auto payload = client.read_descriptor(state.path);
-                if (payload.empty()) {
-                    return;
-                }
-                if (state.rate_hz > 0.0) {
-                    state.pending_payload = std::move(payload);
-                } else {
-                    publish_payload(state, payload);
-                }
-            }
-
+            (void)client;
             if (state.rate_hz <= 0.0 || state.pending_payload.empty()) {
                 return;
             }
@@ -111,9 +114,6 @@ bool ImportBridgeManager::buffer_notification_payload(const std::string& mac,
 
     bool updated = false;
     for (auto& [_, state] : registry_->imports()) {
-        if (state.transport_endpoint != "characteristic") {
-            continue;
-        }
         if (state.path != characteristic_path) {
             continue;
         }
@@ -144,34 +144,34 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
         }
 
         const auto previous_path = state.path;
-        const auto resolved_path = state.transport_endpoint == "descriptor"
-            ? client.find_descriptor(mac, state.bridge_uuid)
-            : client.find_characteristic(mac, state.bridge_uuid);
+        const auto resolved_path = client.find_characteristic(mac, state.bridge_uuid);
 
         if (resolved_path == previous_path) {
-            if (!resolved_path.empty() && state.transport_endpoint == "descriptor" && !state.poll_timer) {
+            if (!resolved_path.empty() && state.rate_hz > 0.0 && !state.poll_timer) {
                 configure_import_poll_timer(bridge_key, state, client);
                 changed = true;
             }
             continue;
         }
 
-        if (!previous_path.empty() && state.transport_endpoint == "characteristic") {
+        if (!previous_path.empty()) {
             client.stop_notify(previous_path);
         }
 
         state.path = resolved_path;
         state.pending_payload.clear();
         state.last_payload.clear();
+        state.last_publish_monotonic = 0.0;
+        state.current_hz = 0.0;
 
-        if (state.transport_endpoint == "descriptor") {
+        if (state.rate_hz > 0.0) {
             configure_import_poll_timer(bridge_key, state, client);
         } else if (state.poll_timer) {
             state.poll_timer->cancel();
             state.poll_timer.reset();
         }
 
-        if (!state.path.empty() && state.transport_endpoint == "characteristic") {
+        if (!state.path.empty()) {
             if (!client.start_notify(state.path)) {
                 RCLCPP_WARN(logger_, "Failed to enable notifications for import bridge %s on %s",
                             bridge_key.c_str(), state.path.c_str());
@@ -196,7 +196,7 @@ bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
             continue;
         }
 
-        if (!state.path.empty() && state.transport_endpoint == "characteristic") {
+        if (!state.path.empty()) {
             client.stop_notify(state.path);
         }
         if (state.poll_timer) {
@@ -209,6 +209,8 @@ bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
         state.path.clear();
         state.pending_payload.clear();
         state.last_payload.clear();
+        state.last_publish_monotonic = 0.0;
+        state.current_hz = 0.0;
     }
 
     return changed;

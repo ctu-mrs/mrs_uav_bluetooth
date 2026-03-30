@@ -103,7 +103,6 @@ scan_mode: le
 #   /uavYY/ble/peers/uavXX/mavros/odometry/local.
 # - message_type: ROS interface type, for example nav_msgs/msg/Odometry.
 # - rate_hz: Publish/poll rate. 0 means send on every received sample.
-# - transport_endpoint: characteristic | descriptor.
 # - members: Ordered packet layout for the compact BLE payload. Each member is
 #   packed little-endian and must use a fixed-width scalar type.
 #   Keep the total payload size at most 244 bytes (BLE message limit).

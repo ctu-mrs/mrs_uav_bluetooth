@@ -23,11 +23,11 @@ struct SharedTopicConfig {
     std::string mode;                // "export", "import", "both"
     std::string bridge_key;          // MD5 hex of the canonical key source
     std::string bridge_name;
+    std::string bridge_topic_path;
     std::string export_topic;
     std::string import_topic_suffix;
     std::string message_type;        // e.g. "nav_msgs/msg/Odometry"
     double rate_hz{0.0};
-    std::string transport_endpoint;  // "characteristic" or "descriptor"
     std::string payload_format;      // "struct" or "ros2"
     std::vector<BridgeMemberSpec> member_specs;
 };

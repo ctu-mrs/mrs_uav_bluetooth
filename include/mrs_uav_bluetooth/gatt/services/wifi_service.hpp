@@ -30,9 +30,8 @@ public:
 
 private:
     std::shared_ptr<GattService> service_;
-    std::shared_ptr<GattCharacteristic> characteristic_;
-    std::shared_ptr<GattDescriptor> ssid_descriptor_;
-    std::shared_ptr<GattDescriptor> password_descriptor_;
+    std::shared_ptr<GattCharacteristic> ssid_characteristic_;
+    std::shared_ptr<GattCharacteristic> password_characteristic_;
 };
 
 }  // namespace mrs_uav_bluetooth::gatt::services
