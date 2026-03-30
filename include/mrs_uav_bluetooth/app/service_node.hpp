@@ -105,6 +105,7 @@ private:
     void wait_for_peer_tasks();
     void log_info_coalesced(const std::string& key, const std::string& message);
     void log_warn_coalesced(const std::string& key, const std::string& message);
+    bool can_run_callbacks() const;
 
     mrs_uav_bluetooth::msg::BleDevice to_device_msg(const bluez::DeviceInfo& device) const;
     mrs_uav_bluetooth::msg::BleGattService to_service_msg(const bluez::GattServiceInfo& item) const;
