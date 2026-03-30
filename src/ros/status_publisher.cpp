@@ -14,9 +14,11 @@ StatusPublisher::StatusPublisher(rclcpp::Node& node)
 void StatusPublisher::configure_topics(const std::string& node_topics_prefix) {
     node_topics_prefix_ = util::normalize_ros_topic(node_topics_prefix);
     auto status_topic = util::normalize_ros_topic(node_topics_prefix_ + "/status");
+    auto log_topic = util::normalize_ros_topic(node_topics_prefix_ + "/log");
     auto devices_topic = util::normalize_ros_topic(node_topics_prefix_ + "/devices");
     auto notifications_topic = util::normalize_ros_topic(node_topics_prefix_ + "/notifications");
     status_pub_ = node_.create_publisher<std_msgs::msg::String>(status_topic, 50);
+    log_pub_ = node_.create_publisher<std_msgs::msg::String>(log_topic, 10);
     devices_pub_ = node_.create_publisher<mrs_uav_bluetooth::msg::BleDeviceArray>(devices_topic, 10);
     notifications_pub_ = node_.create_publisher<mrs_uav_bluetooth::msg::BleNotification>(notifications_topic, 50);
 }
@@ -25,6 +27,12 @@ void StatusPublisher::publish_report(const std::string& report) {
     std_msgs::msg::String msg;
     msg.data = report;
     status_pub_->publish(msg);
+}
+
+void StatusPublisher::publish_log(const std::string& report) {
+    std_msgs::msg::String msg;
+    msg.data = report;
+    log_pub_->publish(msg);
 }
 
 void StatusPublisher::publish_devices(const std::map<std::string, bluez::DeviceInfo>& devices) {

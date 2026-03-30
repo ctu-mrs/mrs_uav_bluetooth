@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <ctime>
 #include <future>
+#include <iomanip>
 #include <rclcpp/create_timer.hpp>
 #include <stdexcept>
 #include <sstream>
@@ -801,7 +803,301 @@ void BluetoothNode::publish_periodic_status() {
     }
 
     ros_->status_publisher().publish_report(status_word);
+    ros_->status_publisher().publish_log(build_detailed_status_report(devices_map));
     ros_->status_publisher().publish_devices(devices_map);
+}
+
+std::string BluetoothNode::build_detailed_status_report(
+    const std::map<std::string, bluez::DeviceInfo>& devices_map) const {
+    std::vector<std::string> lines;
+
+    const auto now_wall = std::time(nullptr);
+    std::tm local_tm{};
+    localtime_r(&now_wall, &local_tm);
+    std::ostringstream ts;
+    ts << std::put_time(&local_tm, "%Y-%m-%d %H:%M:%S");
+
+    const auto bool_text = [](bool value) {
+        return value ? "True" : "False";
+    };
+    const auto upper_state = [](bool value) {
+        return value ? "ACTIVE" : "OFF";
+    };
+    const auto display_name_for_device = [](const bluez::DeviceInfo& device) {
+        if (!device.alias.empty()) {
+            return device.alias;
+        }
+        if (!device.name.empty()) {
+            return device.name;
+        }
+        return std::string{"?"};
+    };
+
+    const auto wifi_service_uuid = util::named_service_uuid("wifi");
+    const auto time_service_uuid = util::named_service_uuid("time");
+    const auto wifi_characteristic_uuid = util::named_characteristic_uuid("wifi/ssid");
+    const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
+    const auto wifi_ssid_descriptor_uuid = util::named_descriptor_uuid("wifi/ssid/config");
+    const auto wifi_password_descriptor_uuid = util::named_descriptor_uuid("wifi/password/config");
+    const auto time_value_descriptor_uuid = util::named_descriptor_uuid("time/ns/value");
+    const auto time_writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
+
+    std::map<std::string, const bridge::TopicExportBridgeState*> exports_by_service_path;
+    for (const auto& [_, state] : bridge_registry_.exports()) {
+        if (state.service && state.service->service()) {
+            exports_by_service_path[state.service->service()->path()] = &state;
+        }
+    }
+
+    const auto descriptor_name_for = [&](const std::string& service_uuid,
+                                         const bridge::TopicExportBridgeState* export_state,
+                                         const std::string& descriptor_uuid) {
+        if (service_uuid == wifi_service_uuid) {
+            if (descriptor_uuid == wifi_ssid_descriptor_uuid) {
+                return std::string{"wifi/ssid/config"};
+            }
+            if (descriptor_uuid == wifi_password_descriptor_uuid) {
+                return std::string{"wifi/password/config"};
+            }
+        }
+        if (service_uuid == time_service_uuid) {
+            if (descriptor_uuid == time_value_descriptor_uuid) {
+                return std::string{"time/ns/value"};
+            }
+            if (descriptor_uuid == time_writeback_descriptor_uuid) {
+                return std::string{"time/ns/writeback"};
+            }
+        }
+        if (export_state != nullptr) {
+            const auto& bridge_name = export_state->bridge_name;
+            const std::vector<std::pair<std::string, std::string>> bridge_descriptors{{"/data", "data"},
+                                                                                      {"/topic", "topic"},
+                                                                                      {"/type", "type"},
+                                                                                      {"/format", "format"},
+                                                                                      {"/members", "members"},
+                                                                                      {"/rate_hz", "rate_hz"},
+                                                                                      {"/key", "key"}};
+            for (const auto& [suffix, label] : bridge_descriptors) {
+                if (descriptor_uuid == util::named_descriptor_uuid(bridge_name + suffix)) {
+                    return bridge_name + "/" + label;
+                }
+            }
+        }
+        return descriptor_uuid;
+    };
+
+    lines.push_back("--- Bluetooth Node Status @ " + ts.str() + " ---");
+    lines.push_back("  adapter:    " + adapter_path_);
+    lines.push_back("  hostname:   " + hostname_);
+    lines.push_back("  prefix:     " + active_config_.node_topics_prefix);
+    lines.push_back("  config:     " + (overlay_config_ ? overlay_config_->active_source() : std::string{}));
+    lines.push_back("  scanning:   " + std::string(bool_text(client_ && client_->is_scanning())));
+    lines.push_back("  server:     " + std::string(upper_state(static_cast<bool>(gatt_app_))));
+    lines.push_back("  advertise:  " + std::string(upper_state(static_cast<bool>(advertisement_))));
+    if (wifi_service_) {
+        lines.push_back("  wifi-svc:   enabled");
+    }
+    if (time_service_) {
+        lines.push_back("  time-svc:   enabled");
+    }
+
+    if (gatt_app_) {
+        const auto& local_services = gatt_app_->services();
+        size_t local_characteristics = 0;
+        size_t local_descriptors = 0;
+        for (const auto& service : local_services) {
+            local_characteristics += service->characteristics().size();
+            for (const auto& characteristic : service->characteristics()) {
+                local_descriptors += characteristic->descriptors().size();
+            }
+        }
+        lines.push_back("  local gatt: services=" + std::to_string(local_services.size()) +
+                        " characteristics=" + std::to_string(local_characteristics) +
+                        " descriptors=" + std::to_string(local_descriptors));
+        for (const auto& service : local_services) {
+            const auto export_it = exports_by_service_path.find(service->path());
+            const auto* export_state = export_it != exports_by_service_path.end() ? export_it->second : nullptr;
+            std::string service_name = service->uuid();
+            if (service->uuid() == wifi_service_uuid) {
+                service_name = "wifi";
+            } else if (service->uuid() == time_service_uuid) {
+                service_name = "time";
+            } else if (export_state != nullptr) {
+                service_name = "bridge:" + export_state->bridge_name;
+            }
+            lines.push_back("    service '" + service_name + "' UUID=" + service->uuid());
+            for (const auto& characteristic : service->characteristics()) {
+                std::string characteristic_name = characteristic->uuid();
+                if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_characteristic_uuid) {
+                    characteristic_name = "wifi/ssid";
+                } else if (service->uuid() == time_service_uuid && characteristic->uuid() == time_characteristic_uuid) {
+                    characteristic_name = "time/ns";
+                } else if (export_state != nullptr && characteristic->uuid() == util::named_characteristic_uuid(export_state->bridge_name)) {
+                    characteristic_name = export_state->bridge_name;
+                }
+                lines.push_back("      chrc '" + characteristic_name + "' UUID=" + characteristic->uuid());
+                for (const auto& descriptor : characteristic->descriptors()) {
+                    lines.push_back("        desc '" +
+                                    descriptor_name_for(service->uuid(), export_state, descriptor->uuid()) +
+                                    "' UUID=" + descriptor->uuid());
+                }
+            }
+        }
+    }
+
+    const auto now_mono = peers_ ? peers_->now_monotonic() : 0.0;
+    std::vector<const bluez::DeviceInfo*> connected_peers;
+    std::vector<const bluez::DeviceInfo*> other_connected;
+    for (const auto& [_, device] : devices_map) {
+        if (!device.connected) {
+            continue;
+        }
+        const auto guessed_name = device_hostname_guess(device);
+        if (!guessed_name.empty() && util::is_uav_hostname(guessed_name, active_config_.auto_connect_pattern)) {
+            connected_peers.push_back(&device);
+        } else {
+            other_connected.push_back(&device);
+        }
+    }
+
+    lines.push_back("  discovered: " + std::to_string(devices_map.size()) + " devices");
+    lines.push_back("  connected:  " + std::to_string(connected_peers.size() + other_connected.size()) + " devices");
+    for (const auto* device : connected_peers) {
+        const peer::PeerTimeBridge* bridge = nullptr;
+        const peer::PeerConnectionSession* session = nullptr;
+        if (peers_) {
+            const auto bridge_it = peers_->time_bridges().find(device->mac);
+            if (bridge_it != peers_->time_bridges().end()) {
+                bridge = &bridge_it->second;
+            }
+            const auto session_it = peers_->sessions().find(device->mac);
+            if (session_it != peers_->sessions().end()) {
+                session = &session_it->second;
+            }
+        }
+
+        double inactivity = -1.0;
+        if (bridge != nullptr && bridge->last_activity_monotonic > 0.0) {
+            inactivity = std::max(0.0, now_mono - bridge->last_activity_monotonic);
+        }
+
+        std::vector<std::string> status_parts;
+        if (device->paired && device->trusted && device->bonded && bridge != nullptr && bridge->status == "ready") {
+            status_parts.push_back("fully-paired");
+            status_parts.push_back("time-bridge-ready");
+        } else {
+            status_parts.push_back(device->paired || device->bonded ? "paired" : "pairing-pending");
+            status_parts.push_back(device->trusted ? "trusted" : "trust-pending");
+            status_parts.push_back(device->services_resolved ? "services-resolved" : "services-resolving");
+            if (bridge != nullptr) {
+                if (!bridge->status.empty()) {
+                    status_parts.push_back("bridge=" + bridge->status);
+                }
+                if (bridge->services_wait_started_monotonic > 0.0 && bridge->services_wait_grace_s > 0.0) {
+                    const auto waited = std::max(0.0, now_mono - bridge->services_wait_started_monotonic);
+                    std::ostringstream wait_stream;
+                    wait_stream << std::fixed << std::setprecision(1)
+                                << "wait=" << waited << "/" << bridge->services_wait_grace_s << "s";
+                    status_parts.push_back(wait_stream.str());
+                }
+                if (bridge->pairing_failures > 0) {
+                    status_parts.push_back("pair_failures=" + std::to_string(bridge->pairing_failures));
+                }
+                if (!bridge->detail.empty()) {
+                    status_parts.push_back(bridge->detail);
+                }
+            } else if (session != nullptr && !session->detail.empty()) {
+                status_parts.push_back(session->detail);
+            }
+        }
+
+        std::ostringstream inactivity_stream;
+        inactivity_stream << std::fixed << std::setprecision(1) << inactivity;
+        std::ostringstream status_stream;
+        for (size_t index = 0; index < status_parts.size(); ++index) {
+            if (index != 0) {
+                status_stream << ',';
+            }
+            status_stream << status_parts[index];
+        }
+
+        lines.push_back("    peer: " + device->mac + " " + display_name_for_device(*device) +
+                        " RSSI=" + std::to_string(device->rssi) +
+                        " paired=" + std::string(bool_text(device->paired && device->trusted && device->bonded)) +
+                        " inactive_s=" + inactivity_stream.str() +
+                        " status=" + status_stream.str());
+    }
+    if (connected_peers.empty()) {
+        lines.push_back("    peers: (none)");
+    }
+    if (other_connected.empty()) {
+        lines.push_back("    other: (none)");
+    } else {
+        lines.push_back("    other:");
+        for (const auto* device : other_connected) {
+            lines.push_back("      " + device->mac + " " + display_name_for_device(*device) +
+                            " RSSI=" + std::to_string(device->rssi));
+        }
+    }
+
+    if (!bridge_registry_.exports().empty()) {
+        lines.push_back("  export bridges (" + std::to_string(bridge_registry_.exports().size()) + "):");
+        for (const auto& [_, state] : bridge_registry_.exports()) {
+            const auto path = state.service ? state.service->transport_path(state.transport_endpoint) : std::string{"?"};
+            lines.push_back("    " + state.topic_name + " -> " + state.bridge_key + " [" + path + "]");
+        }
+    }
+    if (!bridge_registry_.imports().empty()) {
+        lines.push_back("  import bridges (" + std::to_string(bridge_registry_.imports().size()) + "):");
+        for (const auto& [_, state] : bridge_registry_.imports()) {
+            lines.push_back("    " + state.mac + " " + state.bridge_key + " -> " + state.resolved_topic_name);
+        }
+    }
+
+    std::map<std::string, std::vector<std::string>> peer_topics;
+    if (peers_) {
+        for (const auto& [mac, state] : peers_->time_bridges()) {
+            std::ostringstream hz_stream;
+            hz_stream << std::fixed << std::setprecision(2) << state.current_hz;
+            peer_topics[mac].push_back(state.status_topic_name + " @ " + hz_stream.str() + " Hz");
+        }
+    }
+    for (const auto& [_, state] : bridge_registry_.imports()) {
+        std::ostringstream hz_stream;
+        hz_stream << std::fixed << std::setprecision(2) << state.current_hz;
+        peer_topics[state.mac].push_back(state.resolved_topic_name + " @ " + hz_stream.str() + " Hz");
+    }
+    if (!peer_topics.empty()) {
+        lines.push_back("  peer topics:");
+        for (const auto& [mac, topics] : peer_topics) {
+            std::string peer_name = mac;
+            if (peers_) {
+                const auto session_it = peers_->sessions().find(mac);
+                if (session_it != peers_->sessions().end() && !session_it->second.peer_name.empty()) {
+                    peer_name = session_it->second.peer_name;
+                }
+            }
+            std::ostringstream topics_stream;
+            for (size_t index = 0; index < topics.size(); ++index) {
+                if (index != 0) {
+                    topics_stream << ", ";
+                }
+                topics_stream << topics[index];
+            }
+            lines.push_back("    " + peer_name + " (" + mac + "): " + topics_stream.str());
+        }
+    }
+
+    lines.push_back("---");
+
+    std::ostringstream report;
+    for (size_t index = 0; index < lines.size(); ++index) {
+        if (index != 0) {
+            report << '\n';
+        }
+        report << lines[index];
+    }
+    return report.str();
 }
 
 void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& object_path) {

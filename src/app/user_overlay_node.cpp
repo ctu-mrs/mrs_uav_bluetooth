@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <sstream>
 
 using namespace std::chrono_literals;
 
@@ -38,7 +39,7 @@ UserOverlayNode::~UserOverlayNode() {
 
 void UserOverlayNode::configure_parameters() {
     declare_parameter<std::string>("config_path", "");
-    declare_parameter<std::string>("print_source", "status");
+    declare_parameter<std::string>("print_source", "log");
     declare_parameter<double>("service_wait_timeout_sec", 10.0);
     declare_parameter<double>("service_call_timeout_sec", 5.0);
     declare_parameter<double>("deactivate_service_wait_timeout_sec", 2.0);
@@ -150,7 +151,11 @@ UserOverlayNode::call_config_service(const std::string& config_path) {
 }
 
 void UserOverlayNode::handle_print(const std_msgs::msg::String::SharedPtr message) {
-    RCLCPP_INFO(get_logger(), "%s", message->data.c_str());
+    std::istringstream stream(message->data);
+    std::string line;
+    while (std::getline(stream, line)) {
+        RCLCPP_INFO(get_logger(), "%s", line.c_str());
+    }
 }
 
 }  // namespace mrs_uav_bluetooth::app

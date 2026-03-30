@@ -63,6 +63,7 @@ private:
     void apply_config(const config::NodeConfig& cfg);
     void rebuild_server_objects();
     void publish_periodic_status();
+    std::string build_detailed_status_report(const std::map<std::string, bluez::DeviceInfo>& devices_map) const;
     void on_cache_event(bluez::CacheEvent event, const std::string& object_path);
     void on_gatt_event(const std::string& event_type,
                        const std::string& object_path,

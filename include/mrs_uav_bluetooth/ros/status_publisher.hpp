@@ -20,6 +20,7 @@ public:
     void configure_topics(const std::string& node_topics_prefix);
 
     void publish_report(const std::string& report);
+    void publish_log(const std::string& report);
     void publish_devices(const std::map<std::string, bluez::DeviceInfo>& devices);
     void publish_notification(const std::string& mac,
                               const std::string& path,
@@ -35,6 +36,7 @@ private:
     rclcpp::Node& node_;
     std::string node_topics_prefix_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr log_pub_;
     rclcpp::Publisher<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr devices_pub_;
     rclcpp::Publisher<mrs_uav_bluetooth::msg::BleNotification>::SharedPtr notifications_pub_;
 };

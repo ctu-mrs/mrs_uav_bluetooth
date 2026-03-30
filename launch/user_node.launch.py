@@ -15,7 +15,7 @@ def generate_launch_description():
         DeclareLaunchArgument("sentinel_topic_suffix", default_value="overlay_keepalive", description="Suffix for the sentinel topic to publish to while the overlay is active."),
         DeclareLaunchArgument("sentinel_publish_period_sec", default_value="1.0", description="Period in seconds to publish sentinel messages while the overlay is active."),
         DeclareLaunchArgument("min_sentinel_publish_period_sec", default_value="0.2", description="Minimum period in seconds to publish sentinel messages while the overlay is active. If the service call timeout is shorter than the sentinel publish period, this should be set to a value shorter than the service call timeout to ensure that sentinel messages are published at least as frequently as the service call timeout."),
-        DeclareLaunchArgument("print_source", default_value="status", description="Service text source topic suffix to print: status or log."),
+        DeclareLaunchArgument("print_source", default_value="log", description="Service text source topic suffix to print: status or log."),
         Node(
             package="mrs_uav_bluetooth",
             executable="user_node",
