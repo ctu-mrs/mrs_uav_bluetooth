@@ -227,7 +227,8 @@ bool BluezClient::connect(const std::string& mac, double timeout_s) {
             .onInterface(std::string(kDeviceIface));
     } catch (const sdbus::Error& error) {
         const auto message = error.getMessage();
-        if (!message_contains(message, {"Already Connected", "AlreadyConnected", "InProgress"})) {
+        if (!message_contains(message, {"Already Connected", "AlreadyConnected", "InProgress",
+                                        "In Progress", "Operation already in progress"})) {
             RCLCPP_WARN(logger_, "connect(%s) failed: %s", mac.c_str(), message.c_str());
             return false;
         }
@@ -297,7 +298,8 @@ bool BluezClient::pair(const std::string& mac, double timeout_s) {
             .onInterface(std::string(kDeviceIface));
     } catch (const sdbus::Error& error) {
         const auto message = error.getMessage();
-        if (!message_contains(message, {"AlreadyExists", "Already Paired", "AlreadyPaired", "InProgress"})) {
+        if (!message_contains(message, {"AlreadyExists", "Already Paired", "AlreadyPaired", "InProgress",
+                                        "In Progress", "Operation already in progress"})) {
             RCLCPP_WARN(logger_, "pair(%s) failed: %s", mac.c_str(), message.c_str());
             return false;
         }
@@ -337,6 +339,30 @@ bool BluezClient::untrust(const std::string& mac) {
         return true;
     } catch (const sdbus::Error& e) {
         RCLCPP_WARN(logger_, "untrust(%s) failed: %s", mac.c_str(), e.getMessage().c_str());
+        return false;
+    }
+}
+
+bool BluezClient::block(const std::string& mac) {
+    auto path = device_path_for_mac(mac);
+    if (path.empty()) return false;
+    try {
+        set_device_property(path, "Blocked", sdbus::Variant{true});
+        return true;
+    } catch (const sdbus::Error& e) {
+        RCLCPP_WARN(logger_, "block(%s) failed: %s", mac.c_str(), e.getMessage().c_str());
+        return false;
+    }
+}
+
+bool BluezClient::unblock(const std::string& mac) {
+    auto path = device_path_for_mac(mac);
+    if (path.empty()) return false;
+    try {
+        set_device_property(path, "Blocked", sdbus::Variant{false});
+        return true;
+    } catch (const sdbus::Error& e) {
+        RCLCPP_WARN(logger_, "unblock(%s) failed: %s", mac.c_str(), e.getMessage().c_str());
         return false;
     }
 }

@@ -91,8 +91,18 @@ void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_
     double period_s = state.rate_hz > 0.0 ? 1.0 / state.rate_hz : 1.0;
     state.poll_timer = node_.create_wall_timer(
         std::chrono::duration<double>(period_s),
-        [this, &client, bridge_key, &state]() {
+        [this, &client, bridge_key]() {
             (void)client;
+            if (!registry_) {
+                return;
+            }
+
+            auto it = registry_->imports().find(bridge_key);
+            if (it == registry_->imports().end()) {
+                return;
+            }
+
+            auto& state = it->second;
             if (state.rate_hz <= 0.0 || state.pending_payload.empty()) {
                 return;
             }

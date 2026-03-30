@@ -1214,9 +1214,18 @@ std::string ServiceNode::build_detailed_status_report(
             lines.push_back("    " + state.topic_name + " -> " + state.bridge_key + " [" + path + "]");
         }
     }
-    if (!bridge_registry_.imports().empty()) {
-        lines.push_back("  import bridges (" + std::to_string(bridge_registry_.imports().size()) + "):");
+    size_t active_import_bridges = 0;
+    for (const auto& [_, state] : bridge_registry_.imports()) {
+        if (!state.path.empty()) {
+            active_import_bridges += 1;
+        }
+    }
+    if (active_import_bridges > 0) {
+        lines.push_back("  import bridges (" + std::to_string(active_import_bridges) + "):");
         for (const auto& [_, state] : bridge_registry_.imports()) {
+            if (state.path.empty()) {
+                continue;
+            }
             lines.push_back("    " + state.mac + " " + state.bridge_key + " -> " + state.resolved_topic_name);
         }
     }
@@ -1230,6 +1239,9 @@ std::string ServiceNode::build_detailed_status_report(
         }
     }
     for (const auto& [_, state] : bridge_registry_.imports()) {
+        if (state.path.empty()) {
+            continue;
+        }
         std::ostringstream hz_stream;
         hz_stream << std::fixed << std::setprecision(2) << state.current_hz;
         peer_topics[state.mac].push_back(state.resolved_topic_name + " @ " + hz_stream.str() + " Hz");
@@ -2015,9 +2027,7 @@ void ServiceNode::reconcile_peers() {
         const auto device_label = mac + " (" + session.peer_name + ")";
         const bool is_connected = device && device->connected;
 
-        // Only clear runtime state for desired peers that disconnected.
-        // Don't clear runtime for non-desired devices (e.g. phones) — they were never managed.
-        if (session.desired && !is_connected) {
+        if (!session.desired || !is_connected) {
             clear_peer_runtime(mac);
         } else if (is_connected) {
             refresh_import_bridges_for_device(*device);
@@ -2036,9 +2046,13 @@ void ServiceNode::reconcile_peers() {
             if (run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
                                                             paired = device->paired, bonded = device->bonded,
                                                             trusted = device->trusted]() {
+                    (void)client_->block(mac);
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
                         std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    }
+                    if (trusted) {
+                        (void)client_->untrust(mac);
                     }
                     if (paired || bonded || trusted) {
                         (void)client_->remove(mac);
@@ -2059,15 +2073,27 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
+        if (device && device->blocked) {
+            if (run_peer_task_once(mac, "unblock", [this, mac]() {
+                    (void)client_->unblock(mac);
+                })) {
+                session.phase = "discovered";
+                session.detail = "unblocking desired peer";
+                pending_deadline = true;
+                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+            }
+            continue;
+        }
+
         if (device && peers_->should_attempt_trust(session, *device, now, retry_period_s)) {
-            RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting trust (paired=%s bonded=%s trusted=%s)",
-                        device_label.c_str(),
-                        device->paired ? "Y" : "N",
-                        device->bonded ? "Y" : "N",
-                        device->trusted ? "Y" : "N");
             if (run_peer_task_once(mac, "trust", [this, mac]() {
                     (void)client_->trust(mac);
                 })) {
+                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting trust (paired=%s bonded=%s trusted=%s)",
+                            device_label.c_str(),
+                            device->paired ? "Y" : "N",
+                            device->bonded ? "Y" : "N",
+                            device->trusted ? "Y" : "N");
                 session.phase = "securing";
                 session.detail = "trust repair requested";
                 session.last_security_attempt_monotonic = now;
@@ -2078,11 +2104,11 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (peers_->should_attempt_connect(session, now, retry_period_s)) {
-            RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
-                        device_label.c_str(), session.phase.c_str());
             if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
                     (void)client_->connect(mac, retry_period_s);
                 })) {
+                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
+                            device_label.c_str(), session.phase.c_str());
                 session.phase = "connecting";
                 session.detail = "auto-connect requested";
                 session.last_connect_attempt_monotonic = now;
@@ -2094,11 +2120,11 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (peers_->should_attempt_pair(session, now, retry_period_s)) {
-            RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair (phase=%s)",
-                        device_label.c_str(), session.phase.c_str());
             if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
                     (void)client_->pair(mac, retry_period_s);
                 })) {
+                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair (phase=%s)",
+                            device_label.c_str(), session.phase.c_str());
                 session.phase = "securing";
                 session.detail = "auto-pair requested";
                 session.last_security_attempt_monotonic = now;

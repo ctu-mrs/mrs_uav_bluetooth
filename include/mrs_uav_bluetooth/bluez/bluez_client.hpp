@@ -58,6 +58,8 @@ public:
     bool pair(const std::string& mac, double timeout_s = 30.0);
     bool trust(const std::string& mac);
     bool untrust(const std::string& mac);
+    bool block(const std::string& mac);
+    bool unblock(const std::string& mac);
     bool remove(const std::string& mac);
 
     // ---- Services resolved waiter ----

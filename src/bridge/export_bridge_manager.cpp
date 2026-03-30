@@ -18,8 +18,16 @@ void ExportBridgeManager::configure_export_bridge(const std::string& bridge_key,
     state.subscription = runtime->create_subscription(
         node_,
         state.topic_name,
-        [this, bridge_key, runtime, &state](std::shared_ptr<rclcpp::SerializedMessage> message) {
+        [this, bridge_key, runtime](std::shared_ptr<rclcpp::SerializedMessage> message) {
             try {
+                if (!registry_) {
+                    return;
+                }
+                auto it = registry_->exports().find(bridge_key);
+                if (it == registry_->exports().end()) {
+                    return;
+                }
+                auto& state = it->second;
                 auto payload = runtime->encode_payload(*message, state.member_specs, state.payload_format);
                 publish_export_payload(bridge_key, payload);
             } catch (const std::exception& e) {
