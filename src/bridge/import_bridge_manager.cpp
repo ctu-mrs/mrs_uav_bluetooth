@@ -7,7 +7,12 @@
 
 namespace {
 
-std::pair<double, double> update_publish_rate(double last_publish_monotonic) {
+struct PublishRateSample {
+    double monotonic_now;
+    double hz;
+};
+
+PublishRateSample update_publish_rate(double last_publish_monotonic) {
     const auto now = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
@@ -44,8 +49,9 @@ bool ImportBridgeManager::publish_payload(TopicImportBridgeState& state,
         publisher->publish(serialized);
         state.last_payload = payload;
         state.pending_payload.clear();
-        std::tie(state.last_publish_monotonic, state.current_hz) =
-            update_publish_rate(state.last_publish_monotonic);
+        const auto publish_rate = update_publish_rate(state.last_publish_monotonic);
+        state.last_publish_monotonic = publish_rate.monotonic_now;
+        state.current_hz = publish_rate.hz;
         return true;
     } catch (const std::exception& e) {
         RCLCPP_WARN(logger_, "Failed to decode import bridge %s: %s",

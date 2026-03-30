@@ -242,7 +242,12 @@ std::vector<std::string> select_advertised_service_uuids(
     return advertised;
 }
 
-std::pair<double, double> update_publish_rate(double last_publish_monotonic) {
+struct PublishRateSample {
+    double monotonic_now;
+    double hz;
+};
+
+PublishRateSample update_publish_rate(double last_publish_monotonic) {
     const auto now = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
@@ -1859,8 +1864,9 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
     auto& bridge = bridge_it->second;
     bridge.last_activity_monotonic = peers_->now_monotonic();
     bridge.last_time_value_ns = peer_time_ns;
-    std::tie(bridge.last_publish_monotonic, bridge.current_hz) =
-        update_publish_rate(bridge.last_publish_monotonic);
+    const auto publish_rate = update_publish_rate(bridge.last_publish_monotonic);
+    bridge.last_publish_monotonic = publish_rate.monotonic_now;
+    bridge.current_hz = publish_rate.hz;
     bridge.status = "ready";
     bridge.detail = "time notification";
     publish_peer_time_status(bridge);
