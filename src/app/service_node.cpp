@@ -2481,7 +2481,10 @@ void ServiceNode::reconcile_peers() {
                 ? util::named_characteristic_uuid("time/ns")
                 : std::string{};
             const bool missing_time_characteristic = !time_characteristic_uuid.empty() &&
-                client_->find_characteristic(mac, time_characteristic_uuid).empty();
+                std::none_of(resolved_characteristics.begin(), resolved_characteristics.end(),
+                             [&time_characteristic_uuid](const auto& characteristic) {
+                                 return characteristic.uuid == time_characteristic_uuid;
+                             });
             const bool stale_gatt_cache = resolved_characteristics.empty() || missing_time_characteristic;
 
             if (stale_gatt_cache) {

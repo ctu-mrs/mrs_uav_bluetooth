@@ -8,6 +8,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sdbus-c++/sdbus-c++.h>
 
+#include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
@@ -103,6 +104,7 @@ public:
 private:
     void on_cache_event(CacheEvent event, const std::string& object_path);
     std::string device_path_for_mac(const std::string& mac) const;
+    bool refresh_device_gatt_cache(const std::string& device_path) const;
     void set_device_property(const std::string& device_path,
                              const std::string& prop,
                              const sdbus::Variant& value);
@@ -117,6 +119,7 @@ private:
     mutable std::mutex mutex_;
     int cache_observer_token_{0};
     bool scan_running_{false};
+    mutable std::map<std::string, std::chrono::steady_clock::time_point> gatt_refresh_backoff_until_;
 
     int next_ntf_token_{1};
     std::map<int, NotificationCallback> notification_cbs_;

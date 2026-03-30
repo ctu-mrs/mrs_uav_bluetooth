@@ -15,6 +15,7 @@ using ManagedObjectMap = std::map<sdbus::ObjectPath,
 
 constexpr auto kConnectPollInterval = std::chrono::milliseconds(300);
 constexpr auto kPairPollInterval = std::chrono::milliseconds(500);
+constexpr auto kGattRefreshRetryBackoff = std::chrono::milliseconds(1000);
 
 std::unique_ptr<sdbus::IConnection> create_blocking_system_bus() {
     return sdbus::createSystemBusConnection();
@@ -50,6 +51,26 @@ bool message_contains(const std::string& message,
         }
     }
     return false;
+}
+
+bool is_missing_object_error(const std::string& message) {
+    if (message_contains(message, {"NoSuchObject", "UnknownObject"})) {
+        return true;
+    }
+    return message.find("GetAll") != std::string::npos &&
+           message.find("doesn't exist") != std::string::npos;
+}
+
+std::string device_root_path(const std::string& object_path) {
+    const auto device_pos = object_path.find("/dev_");
+    if (device_pos == std::string::npos) {
+        return {};
+    }
+    const auto suffix_pos = object_path.find('/', device_pos + 1);
+    if (suffix_pos == std::string::npos) {
+        return object_path;
+    }
+    return object_path.substr(0, suffix_pos);
 }
 
 std::optional<std::map<std::string, sdbus::Variant>> read_device_properties(
@@ -240,7 +261,7 @@ bool BluezClient::connect(const std::string& mac, double timeout_s) {
             const auto properties = read_device_properties(*connection, path);
             return properties && get_variant_or<bool>(*properties, "Connected", false);
         } catch (const sdbus::Error& error) {
-            if (message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"})) {
+            if (is_missing_object_error(error.getMessage())) {
                 return false;
             }
             throw;
@@ -275,7 +296,7 @@ bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
             const auto properties = read_device_properties(*connection, path);
             return !properties || !get_variant_or<bool>(*properties, "Connected", false);
         } catch (const sdbus::Error& error) {
-            return message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"});
+            return is_missing_object_error(error.getMessage());
         }
     });
 }
@@ -311,7 +332,7 @@ bool BluezClient::pair(const std::string& mac, double timeout_s) {
             const auto properties = read_device_properties(*connection, path);
             return properties && get_variant_or<bool>(*properties, "Paired", false);
         } catch (const sdbus::Error& error) {
-            if (message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"})) {
+            if (is_missing_object_error(error.getMessage())) {
                 return false;
             }
             throw;
@@ -409,7 +430,7 @@ bool BluezClient::wait_services_resolved(const std::string& mac, double timeout_
             }
             return device_has_resolved_characteristics(*connection, path);
         } catch (const sdbus::Error& error) {
-            if (message_contains(error.getMessage(), {"NoSuchObject", "UnknownObject"})) {
+            if (is_missing_object_error(error.getMessage())) {
                 return false;
             }
             throw;
@@ -426,8 +447,7 @@ std::vector<GattServiceInfo> BluezClient::list_services(const std::string& mac) 
     if (!dev) return {};
     auto services = cache_.services_for_device(dev->object_path);
     if (services.empty() && dev->services_resolved) {
-        auto& cache = const_cast<ObjectManagerCache&>(cache_);
-        if (cache.refresh_device_subtree(dev->object_path)) {
+        if (refresh_device_gatt_cache(dev->object_path)) {
             services = cache_.services_for_device(dev->object_path);
         }
     }
@@ -440,8 +460,7 @@ std::vector<GattCharacteristicInfo> BluezClient::list_characteristics(const std:
     std::vector<GattCharacteristicInfo> result;
     auto services = cache_.services_for_device(dev->object_path);
     if (services.empty() && dev->services_resolved) {
-        auto& cache = const_cast<ObjectManagerCache&>(cache_);
-        if (cache.refresh_device_subtree(dev->object_path)) {
+        if (refresh_device_gatt_cache(dev->object_path)) {
             services = cache_.services_for_device(dev->object_path);
         }
     }
@@ -493,7 +512,38 @@ void BluezClient::remove_gatt_event_handler(int token) {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+bool BluezClient::refresh_device_gatt_cache(const std::string& device_path) const {
+    if (device_path.empty()) {
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = gatt_refresh_backoff_until_.find(device_path);
+        if (it != gatt_refresh_backoff_until_.end() && now < it->second) {
+            return false;
+        }
+        gatt_refresh_backoff_until_[device_path] = now + kGattRefreshRetryBackoff;
+    }
+
+    auto& cache = const_cast<ObjectManagerCache&>(cache_);
+    const bool refreshed = cache.refresh_device_subtree(device_path);
+
+    if (refreshed) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        gatt_refresh_backoff_until_.erase(device_path);
+    }
+
+    return refreshed;
+}
+
 void BluezClient::on_cache_event(CacheEvent event, const std::string& object_path) {
+    if (const auto device_path = device_root_path(object_path); !device_path.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        gatt_refresh_backoff_until_.erase(device_path);
+    }
+
     if (event == CacheEvent::AdapterChanged && object_path == adapter_path_) {
         if (auto adapter = cache_.adapter(adapter_path_)) {
             std::lock_guard<std::mutex> lock(mutex_);
