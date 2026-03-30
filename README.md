@@ -44,7 +44,7 @@ Important configuration keys in `config/default.yaml`:
 - `enable_scan`, `scan_mode`, `scan_publish_period`: BLE discovery behavior.
 - `enable_server`, `enable_time_service`, `enable_wifi_service`: built-in BLE server features.
 - `auto_connect_enable`, `auto_connect_whitelist`, `auto_connect_pattern`, `peer_connection_timeout`: automatic peer management.
-- `allowed_wifi_networks`, `netplan_config_file`, `netplan_scripts_dir`: Wi-Fi control policy and backend integration.
+- `allowed_wifi_networks`: Wi-Fi SSIDs that may be selected over BLE.
 - `status_report_period`, `log_topic_enable`, `verbose_log_file`: observability and logging.
 - `shared_topics`: declarative topic bridge definitions.
 
@@ -87,7 +87,7 @@ Core published topics:
 When `enable_wifi_service` is enabled, the service node exposes the current Wi-Fi SSID over BLE and accepts Wi-Fi updates from a connected peer. The node applies changes through the configured netplan backend.
 
 - Only SSIDs listed in `allowed_wifi_networks` are accepted.
-- `netplan_config_file` and `netplan_scripts_dir` control how the system network configuration is updated.
+- The service writes the system netplan Wi-Fi configuration and then runs `netplan apply`.
 - The Wi-Fi service value is refreshed periodically according to `wifi_refresh_period`.
 - This feature is intended for BLE-side provisioning; there is no separate ROS topic API for Wi-Fi credentials.
 

@@ -3,8 +3,9 @@
 
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 
-#include <chrono>
 #include <algorithm>
+#include <chrono>
+#include <cctype>
 
 namespace {
 
@@ -17,6 +18,77 @@ bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
               std::initializer_list<const char*> values) {
     for (const char* value : values) {
         if (session.phase == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string trim_copy(std::string value) {
+    const auto start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return {};
+    }
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
+std::string lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool looks_like_mac_address(std::string_view value) {
+    if (value.size() != 17) {
+        return false;
+    }
+    for (size_t index = 0; index < value.size(); ++index) {
+        const unsigned char ch = static_cast<unsigned char>(value[index]);
+        if (index % 3 == 2) {
+            if (ch != ':') {
+                return false;
+            }
+            continue;
+        }
+        if (std::isxdigit(ch) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string normalize_mac(std::string value) {
+    value = trim_copy(std::move(value));
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return value;
+}
+
+std::string normalize_whitelist_token(std::string value) {
+    value = trim_copy(std::move(value));
+    if (looks_like_mac_address(value)) {
+        return normalize_mac(std::move(value));
+    }
+    return lower_copy(std::move(value));
+}
+
+bool whitelist_contains(const std::vector<std::string>& whitelist,
+                        const std::string& mac,
+                        const std::string& peer_name) {
+    const auto normalized_mac = normalize_mac(mac);
+    const auto normalized_peer_name = lower_copy(trim_copy(peer_name));
+    for (const auto& entry : whitelist) {
+        const auto normalized_entry = normalize_whitelist_token(entry);
+        if (normalized_entry.empty()) {
+            continue;
+        }
+        if (normalized_entry == normalized_mac) {
+            return true;
+        }
+        if (!normalized_peer_name.empty() && normalized_entry == normalized_peer_name) {
             return true;
         }
     }
@@ -61,27 +133,10 @@ PeerConnectionSession& PeerManager::get_or_create_session(const std::string& mac
 bool PeerManager::matches_auto_connect_policy(const bluez::DeviceInfo& device,
                                               const config::NodeConfig& config,
                                               const std::string& peer_name) const {
-    if (!config.auto_connect_enable) {
-        return false;
-    }
-
-    if (!config.auto_connect_whitelist.empty()) {
-        const bool whitelisted = std::find(config.auto_connect_whitelist.begin(),
-                                           config.auto_connect_whitelist.end(),
-                                           device.mac) != config.auto_connect_whitelist.end() ||
-                                 (!peer_name.empty() &&
-                                  std::find(config.auto_connect_whitelist.begin(),
-                                            config.auto_connect_whitelist.end(),
-                                            peer_name) != config.auto_connect_whitelist.end());
-        if (!whitelisted) {
-            return false;
-        }
-    }
-
-    if (!peer_name.empty()) {
-        return util::is_uav_hostname(peer_name, config.auto_connect_pattern);
-    }
-    return false;
+    (void)device;
+    const auto normalized_peer_name = lower_copy(trim_copy(peer_name));
+    return !normalized_peer_name.empty() &&
+           util::is_uav_hostname(normalized_peer_name, config.auto_connect_pattern);
 }
 
 void PeerManager::set_session_phase(PeerConnectionSession& session,
@@ -100,12 +155,15 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     session.missing_since_monotonic = 0.0;
 
     const bool whitelist_enabled = !config.auto_connect_whitelist.empty();
+    session.explicit_target = whitelist_contains(config.auto_connect_whitelist,
+                                                 device.mac,
+                                                 session.peer_name);
     session.peer_candidate = matches_auto_connect_policy(device, config, session.peer_name);
 
     // When whitelist is enabled, only explicit targets are desired among peer candidates.
     // When whitelist is empty, any matching peer candidate is desired (if auto_connect is on).
     session.desired = session.explicit_target ||
-                      (session.peer_candidate && !whitelist_enabled);
+                      (config.auto_connect_enable && session.peer_candidate && !whitelist_enabled);
     session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
 
     if (!session.desired) {

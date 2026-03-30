@@ -86,8 +86,6 @@ pairing_agent: NoInputNoOutput
 enable_server: true
 enable_scan: true
 scan_mode: le
-netplan_config_file: /etc/netplan/01-netcfg.yaml
-netplan_scripts_dir: /etc/ctu-mrs/uav-bluetooth/netplan-scripts
 
 # Declarative bridge setup.
 # Each entry defines one BLE bridge that the node may export, import, or both.

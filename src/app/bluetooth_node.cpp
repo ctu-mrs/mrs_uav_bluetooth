@@ -446,8 +446,6 @@ void BluetoothNode::configure_parameters() {
     declare_parameter<std::string>("pairing_agent", "NoInputNoOutput");
     declare_parameter<std::string>("scan_mode", "le");
     declare_parameter<int>("discoverable_timeout", 0);
-    declare_parameter<std::string>("netplan_config_file", "/etc/netplan/01-network-manager-all.yaml");
-    declare_parameter<std::string>("netplan_scripts_dir", "/etc/mrs_uav_bluetooth/netplan");
 }
 
 void BluetoothNode::build_runtime() {
@@ -505,9 +503,7 @@ void BluetoothNode::build_runtime() {
         apply_config(cfg);
     });
 
-    netplan_ = std::make_unique<network::NetplanManager>(
-        get_parameter("netplan_config_file").as_string(),
-        get_parameter("netplan_scripts_dir").as_string());
+    netplan_ = std::make_unique<network::NetplanManager>();
 
     export_bridges_ = std::make_unique<bridge::ExportBridgeManager>(*this, get_logger());
     export_bridges_->set_registry(&bridge_registry_);

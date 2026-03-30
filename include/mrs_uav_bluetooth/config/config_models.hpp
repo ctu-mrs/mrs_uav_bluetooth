@@ -61,8 +61,6 @@ struct NodeConfig {
     bool enable_server{true};
     bool enable_scan{true};
     std::string scan_mode = "le";
-    std::string netplan_config_file = "/etc/netplan/01-netcfg.yaml";
-    std::string netplan_scripts_dir = "/etc/ctu-mrs/uav-bluetooth/netplan-scripts";
 
     std::vector<SharedTopicConfig> shared_topics;
 };

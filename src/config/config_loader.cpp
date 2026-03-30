@@ -208,8 +208,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.enable_server = b("enable_server", cfg.enable_server);
     cfg.enable_scan = b("enable_scan", cfg.enable_scan);
     cfg.scan_mode = str("scan_mode", cfg.scan_mode);
-    cfg.netplan_config_file = str("netplan_config_file", cfg.netplan_config_file);
-    cfg.netplan_scripts_dir = str("netplan_scripts_dir", cfg.netplan_scripts_dir);
 
     // Use the config's auto_connect_pattern for canonical topic derivation.
     std::string pattern = cfg.auto_connect_pattern.empty()

@@ -183,7 +183,6 @@ ament_target_dependencies(${PROJECT_NAME}_gatt
 # =====================================================================
 
 add_library(${PROJECT_NAME}_network STATIC
-  src/network/nmcli_wrapper.cpp
   src/network/netplan_manager.cpp
 )
 target_include_directories(${PROJECT_NAME}_network PUBLIC

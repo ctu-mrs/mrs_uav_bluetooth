@@ -3,17 +3,55 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <sstream>
 
 namespace mrs_uav_bluetooth::network {
 
-NetplanManager::NetplanManager(std::string netplan_config_file,
-                               std::string autoscripts_dir,
-                               std::vector<std::string> allowed_networks)
-    : netplan_config_file_(std::move(netplan_config_file)),
-      autoscripts_dir_(std::move(autoscripts_dir)),
+namespace {
+
+constexpr const char* kPreferredNetplanConfigFile = "/etc/netplan/01-netcfg.yaml";
+constexpr const char* kNetplanConfigDirectory = "/etc/netplan";
+
+std::string resolve_netplan_config_file() {
+    namespace fs = std::filesystem;
+
+    const fs::path preferred{kPreferredNetplanConfigFile};
+    if (fs::exists(preferred)) {
+        return preferred.string();
+    }
+
+    const fs::path config_dir{kNetplanConfigDirectory};
+    if (fs::is_directory(config_dir)) {
+        std::vector<fs::path> candidates;
+        for (const auto& entry : fs::directory_iterator(config_dir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            const auto extension = entry.path().extension().string();
+            if (extension == ".yaml" || extension == ".yml") {
+                candidates.push_back(entry.path());
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        if (!candidates.empty()) {
+            return candidates.front().string();
+        }
+    }
+
+    return preferred.string();
+}
+
+bool contains_value(const std::vector<std::string>& values, const std::string& candidate) {
+    return std::find(values.begin(), values.end(), candidate) != values.end();
+}
+
+}  // namespace
+
+NetplanManager::NetplanManager(std::vector<std::string> allowed_networks)
+    : netplan_config_file_(resolve_netplan_config_file()),
       allowed_networks_(std::move(allowed_networks)) {}
 
 bool NetplanManager::busy() {
@@ -28,11 +66,6 @@ void NetplanManager::set_allowed_networks(std::vector<std::string> value) {
 
 std::string NetplanManager::get_current_ssid() {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto ssid = nmcli_.get_current_ssid();
-    if (!ssid.empty()) {
-        return ssid;
-    }
-
     try {
         YAML::Node config = YAML::LoadFile(netplan_config_file_);
         auto aps = config["network"]["wifis"];
@@ -82,55 +115,11 @@ std::vector<std::string> NetplanManager::list_known_ssids() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> result;
     for (const auto& ssid : allowed_networks_) {
-        if (!ssid.empty() && std::find(result.begin(), result.end(), ssid) == result.end()) {
-            result.push_back(ssid);
-        }
-    }
-    if (std::filesystem::is_directory(autoscripts_dir_)) {
-        for (const auto& entry : std::filesystem::directory_iterator(autoscripts_dir_)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-            auto path = entry.path();
-            if (path.extension() != ".sh") {
-                continue;
-            }
-            auto name = path.stem().string();
-            if (!name.empty() && std::find(result.begin(), result.end(), name) == result.end()) {
-                result.push_back(name);
-            }
-        }
-    }
-    for (const auto& ssid : nmcli_.list_visible_ssids()) {
-        if (std::find(result.begin(), result.end(), ssid) == result.end()) {
+        if (!ssid.empty() && !contains_value(result, ssid)) {
             result.push_back(ssid);
         }
     }
     return result;
-}
-
-std::pair<std::optional<std::string>, std::string> NetplanManager::resolve_script(
-    const std::string& target) const {
-    auto trimmed = target;
-    if (trimmed.empty()) {
-        return {std::nullopt, "empty target SSID"};
-    }
-    auto direct = std::filesystem::path(autoscripts_dir_) / (trimmed + ".sh");
-    if (std::filesystem::exists(direct)) {
-        return {direct.string(), {}};
-    }
-    return {std::nullopt, "no netplan script for '" + trimmed + "'"};
-}
-
-std::pair<bool, std::string> NetplanManager::apply_script(const std::string& script_path) {
-    busy_ = true;
-    std::string cmd = "bash \"" + script_path + "\"";
-    int rc = std::system(cmd.c_str());
-    busy_ = false;
-    if (rc == 0) {
-        return {true, script_path};
-    }
-    return {false, "script failed with code " + std::to_string(rc)};
 }
 
 std::pair<bool, std::string> NetplanManager::write_netplan(const std::string& ssid,
@@ -194,15 +183,8 @@ std::pair<bool, std::string> NetplanManager::set_current_network(const std::stri
     if (target.empty()) {
         return {false, "empty target SSID"};
     }
-    auto [script_path, _] = resolve_script(target);
-    if (script_path.has_value() && password.empty()) {
-        return apply_script(*script_path);
-    }
-    if (nmcli_.available()) {
-        auto [ok, detail] = nmcli_.connect(target, password);
-        if (ok) {
-            return {true, "nmcli:" + target};
-        }
+    if (!allowed_networks_.empty() && !contains_value(allowed_networks_, target)) {
+        return {false, "SSID not present in allowed_wifi_networks"};
     }
     return write_netplan(target, password);
 }
