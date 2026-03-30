@@ -497,6 +497,10 @@ void ServiceNode::build_runtime() {
         [this](const std::string& event_type, const std::string& device_path) {
             on_pairing_event(event_type, device_path);
         });
+    pairing_agent_->set_request_policy_callback(
+        [this](const std::string& event_type, const std::string& device_path) {
+            return should_allow_pairing_request(event_type, device_path);
+        });
     pairing_agent_->register_agent(get_parameter("pairing_agent").as_string());
     client_->add_notification_handler(
         [this](const std::vector<uint8_t>& data,
@@ -1471,12 +1475,16 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
     }
 
     if (event_type == "client_notify_disabled" || event_type == "client_notify_failed") {
+        std::string affected_mac;
         for (const auto& [mac, bridge] : peers_->time_bridges()) {
             if (bridge.characteristic_path == object_path) {
-                clear_peer_runtime(mac);
-                schedule_peer_reconcile();
+                affected_mac = mac;
                 break;
             }
+        }
+        if (!affected_mac.empty()) {
+            clear_peer_runtime(affected_mac);
+            schedule_peer_reconcile();
         }
     }
 
@@ -1497,6 +1505,45 @@ void ServiceNode::on_pairing_event(const std::string& event_type, const std::str
     }
     peers_->note_pairing_event(device_path, event_type, *cache_);
     schedule_peer_reconcile();
+}
+
+bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
+                                               const std::string& device_path) {
+    if (!peers_ || !cache_) {
+        return false;
+    }
+
+    const auto device = cache_->device(device_path);
+    if (!device) {
+        return false;
+    }
+
+    const auto peer_name = device_hostname_guess(*device);
+    auto& session = peers_->get_or_create_session(device->mac, peer_name);
+    peers_->sync_device(*device, active_config_, peer_name);
+
+    if (!session.desired) {
+        if (client_) {
+            (void)client_->block(device->mac);
+        }
+        log_warn_coalesced("pairing-rejected-policy:" + device->mac + ":" + event_type,
+                           "[node] rejecting pairing request for " + device->mac +
+                               " due to current config");
+        return false;
+    }
+
+    if (session.stale_pairing_detected) {
+        log_warn_coalesced("pairing-rejected-stale:" + device->mac + ":" + event_type,
+                           "[node] rejecting pairing request for " + device->mac +
+                               " because local bond is stale and will be repaired");
+        return false;
+    }
+
+    if (device->blocked) {
+        return false;
+    }
+
+    return true;
 }
 
 void ServiceNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
@@ -2103,6 +2150,38 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
+        const bool stale_pairing_repair_due = device && session.stale_pairing_detected &&
+            (session.last_repair_monotonic <= 0.0 ||
+             session.last_pairing_request_monotonic > session.last_repair_monotonic ||
+             now - session.last_repair_monotonic >= std::max(1.0, retry_period_s));
+        if (stale_pairing_repair_due) {
+            if (run_peer_task_once(mac, "repair stale pairing", [this, mac, retry_period_s]() {
+                    (void)client_->disconnect(mac, retry_period_s);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    (void)client_->untrust(mac);
+                    (void)client_->remove(mac);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    (void)client_->unblock(mac);
+                })) {
+                RCLCPP_WARN(get_logger(), "[reconcile] %s: repairing stale one-sided pairing", device_label.c_str());
+                clear_peer_runtime(mac);
+                session.phase = "recovering";
+                session.detail = "repairing stale pairing";
+                session.stale_pairing_detected = false;
+                session.last_repair_monotonic = now;
+                session.last_connect_attempt_monotonic = 0.0;
+                session.connect_started_monotonic = 0.0;
+                session.connected_since_monotonic = 0.0;
+                session.last_security_attempt_monotonic = 0.0;
+                session.services_wait_started_monotonic = 0.0;
+                session.bridge_wait_started_monotonic = 0.0;
+                session.bridge_wait_reason.clear();
+                pending_deadline = true;
+                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+            }
+            continue;
+        }
+
         if (peers_->should_attempt_connect(session, now, retry_period_s)) {
             if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
                     (void)client_->connect(mac, retry_period_s);
@@ -2119,7 +2198,7 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (peers_->should_attempt_pair(session, now, retry_period_s)) {
+        if (device && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
             if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
                     (void)client_->pair(mac, retry_period_s);
                 })) {
@@ -2158,16 +2237,23 @@ void ServiceNode::reconcile_peers() {
             run_peer_task_once(mac, "repair", [this, mac]() {
                 (void)client_->disconnect(mac, 5.0);
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                (void)client_->untrust(mac);
+                (void)client_->remove(mac);
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                (void)client_->unblock(mac);
                 (void)client_->connect(mac, 10.0);
-                (void)client_->wait_services_resolved(mac, 10.0);
             })) {
+            clear_peer_runtime(mac);
             session.phase = "recovering";
-            session.detail = services_stuck ? "repairing unresolved services" : "repairing missing bridge";
+            session.detail = services_stuck ? "repairing unresolved services via re-pair"
+                                            : "repairing missing bridge via re-pair";
             session.last_repair_monotonic = now;
             session.connect_repair_count += 1;
-            session.last_connect_attempt_monotonic = now;
-            session.connect_started_monotonic = now;
-            session.last_service_retry_monotonic = now;
+            session.last_connect_attempt_monotonic = 0.0;
+            session.connect_started_monotonic = 0.0;
+            session.connected_since_monotonic = 0.0;
+            session.last_security_attempt_monotonic = 0.0;
+            session.last_service_retry_monotonic = 0.0;
             session.bridge_wait_started_monotonic = 0.0;
             session.bridge_wait_reason.clear();
             pending_deadline = true;

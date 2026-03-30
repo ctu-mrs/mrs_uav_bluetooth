@@ -17,6 +17,9 @@ namespace mrs_uav_bluetooth::bluez {
 using AgentEventCallback = std::function<void(const std::string& event_type,
                                               const std::string& device_path)>;
 
+using AgentRequestPolicyCallback = std::function<bool(const std::string& event_type,
+                                                      const std::string& device_path)>;
+
 /// D-Bus exported BlueZ pairing agent (org.bluez.Agent1).
 /// Supports auto-accept and auto-trust modes.
 class BluezPairingAgent {
@@ -39,15 +42,21 @@ public:
     /// Set the event callback.
     void set_event_callback(AgentEventCallback cb);
 
+    /// Set the per-request policy callback. Return true to allow the request.
+    void set_request_policy_callback(AgentRequestPolicyCallback cb);
+
 private:
     void set_trusted(const std::string& device_path);
     void emit(const std::string& event, const std::string& device_path = "");
+    bool should_allow_request(const std::string& event,
+                              const std::string& device_path) const;
 
     DbusConnection& dbus_;
     rclcpp::Logger logger_;
     bool auto_accept_;
     bool auto_trust_;
     AgentEventCallback on_event_;
+    AgentRequestPolicyCallback request_policy_;
 
     std::unique_ptr<sdbus::IObject> exported_object_;
     bool registered_{false};

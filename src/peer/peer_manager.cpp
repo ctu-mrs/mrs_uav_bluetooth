@@ -276,6 +276,12 @@ void PeerManager::note_pairing_event(const std::string& device_path,
 
     if (event == "request_confirmation" || event == "request_authorization" ||
         event == "request_passkey" || event == "request_pin") {
+        session.last_pairing_request_monotonic = now;
+        if (device->paired || device->bonded) {
+            session.stale_pairing_detected = true;
+            set_session_phase(session, "recovering", "stale pairing detected");
+            return;
+        }
         set_session_phase(session, "securing", event);
         return;
     }
@@ -327,6 +333,7 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
 }
 
 bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
+                                      const bluez::DeviceInfo& device,
                                       double now_mono,
                                       double retry_period_s) const {
     if (!session.desired) {
@@ -336,6 +343,12 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
         return false;
     }
     if (session.connected_since_monotonic <= 0.0) {
+        return false;
+    }
+    if (device.blocked) {
+        return false;
+    }
+    if (device.paired || device.bonded) {
         return false;
     }
     const double cooldown = std::max(kPairCooldownMin,

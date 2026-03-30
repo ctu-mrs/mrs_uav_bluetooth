@@ -37,6 +37,7 @@ public:
                                 double now_mono,
                                 double retry_period_s) const;
     bool should_attempt_pair(const PeerConnectionSession& session,
+                             const bluez::DeviceInfo& device,
                              double now_mono,
                              double retry_period_s) const;
     void prune_sessions(const std::set<std::string>& current_macs, double now_mono, double ttl_s);

@@ -178,6 +178,8 @@ bool BluezClient::start_notify(const std::string& chrc_path) {
     } catch (const sdbus::Error& e) {
         const auto msg = e.getMessage();
         if (msg.find("InProgress") == std::string::npos &&
+            msg.find("In Progress") == std::string::npos &&
+            msg.find("Operation already in progress") == std::string::npos &&
             msg.find("Already notifying") == std::string::npos &&
             msg.find("AlreadyNotifying") == std::string::npos) {
             emit_gatt("client_notify_failed", chrc_path, msg);

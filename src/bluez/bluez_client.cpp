@@ -228,7 +228,8 @@ bool BluezClient::connect(const std::string& mac, double timeout_s) {
     } catch (const sdbus::Error& error) {
         const auto message = error.getMessage();
         if (!message_contains(message, {"Already Connected", "AlreadyConnected", "InProgress",
-                                        "In Progress", "Operation already in progress"})) {
+                                        "In Progress", "Operation already in progress",
+                                        "No more profiles to connect to", "br-connection-already-connected"})) {
             RCLCPP_WARN(logger_, "connect(%s) failed: %s", mac.c_str(), message.c_str());
             return false;
         }
