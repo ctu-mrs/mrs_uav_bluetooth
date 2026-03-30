@@ -2248,7 +2248,10 @@ void ServiceNode::reconcile_peers() {
     double next_deadline_s = retry_period_s;
     const double repair_cooldown_s = std::max(kPeerRepairCooldownMin, retry_period_s * 2.0);
     const double bridge_grace_s = std::max(kBridgeGraceMin, retry_period_s * 4.0);
-    const double gatt_cache_repair_grace_s = std::max(kGattCacheRepairGraceMin, retry_period_s);
+    // BlueZ can report ServicesResolved=true even when remote GATT discovery
+    // completed with an error, so keep this repair grace short and independent
+    // of the normal reconnect period.
+    const double gatt_cache_repair_grace_s = kGattCacheRepairGraceMin;
 
     for (auto& [mac, session] : peers_->sessions()) {
         const auto device = client_->get_device(mac);
@@ -2506,8 +2509,9 @@ void ServiceNode::reconcile_peers() {
                     ? "waiting for remote GATT cache"
                     : "remote GATT missing expected time characteristic";
 
+                const double stale_gatt_wait_s = now - session.bridge_wait_started_monotonic;
                 const bool cache_repair_due =
-                    (now - session.bridge_wait_started_monotonic) >= gatt_cache_repair_grace_s;
+                    stale_gatt_wait_s >= gatt_cache_repair_grace_s;
                 if (cache_repair_due &&
                     (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= repair_cooldown_s) &&
                     run_peer_task_once(mac, "repair gatt cache", [this, mac]() {
@@ -2542,7 +2546,9 @@ void ServiceNode::reconcile_peers() {
                 }
 
                 pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+                next_deadline_s = std::min(
+                    next_deadline_s,
+                    std::max(0.1, gatt_cache_repair_grace_s - stale_gatt_wait_s));
                 continue;
             }
             const auto device_copy = *device;
