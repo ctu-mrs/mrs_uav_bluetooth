@@ -2513,6 +2513,7 @@ void ServiceNode::reconcile_peers() {
                     run_peer_task_once(mac, "repair gatt cache", [this, mac]() {
                         (void)client_->disconnect(mac, 5.0);
                         std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                        (void)client_->untrust(mac);
                         (void)client_->remove(mac);
                         std::this_thread::sleep_for(std::chrono::milliseconds(300));
                         (void)client_->unblock(mac);
