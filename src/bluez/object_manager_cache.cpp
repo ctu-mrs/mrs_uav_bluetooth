@@ -9,6 +9,9 @@ namespace mrs_uav_bluetooth::bluez {
 
 namespace {
 
+using ManagedObjectMap = std::map<sdbus::ObjectPath,
+                                  std::map<std::string, std::map<std::string, sdbus::Variant>>>;
+
 void dispatch_notifications(const std::vector<std::pair<CacheEvent, std::string>>& notifications,
                            const std::function<void(CacheEvent, const std::string&)>& notify) {
     for (const auto& [event, path] : notifications) {
@@ -250,6 +253,52 @@ std::optional<GattDescriptorInfo> ObjectManagerCache::find_descriptor_by_uuid(
         if (desc_uuid == lower_uuid) return desc;
     }
     return std::nullopt;
+}
+
+bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) {
+    if (device_path.empty()) {
+        return false;
+    }
+
+    ManagedObjectMap objects;
+    try {
+        auto connection = sdbus::createSystemBusConnection();
+        auto proxy = sdbus::createProxy(*connection,
+                                        sdbus::ServiceName{std::string(kBluezServiceName)},
+                                        sdbus::ObjectPath{"/"});
+        proxy->callMethod("GetManagedObjects")
+            .onInterface(std::string(kDbusObjectManagerIface))
+            .storeResultsTo(objects);
+    } catch (const sdbus::Error& e) {
+        RCLCPP_WARN(logger_, "GetManagedObjects refresh for %s failed: %s",
+                    device_path.c_str(), e.getMessage().c_str());
+        return false;
+    }
+
+    PendingNotifications notifications;
+    size_t refreshed_count = 0;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [path, ifaces] : objects) {
+            const auto path_string = static_cast<std::string>(path);
+            if (path_string != device_path && !is_child_path(device_path, path_string)) {
+                continue;
+            }
+            process_object(path_string, ifaces, &notifications);
+            refreshed_count += 1;
+        }
+    }
+
+    if (refreshed_count == 0) {
+        return false;
+    }
+
+    RCLCPP_INFO(logger_, "[cache] refreshed %zu object(s) for %s from GetManagedObjects",
+                refreshed_count, device_path.c_str());
+    dispatch_notifications(notifications, [this](CacheEvent event, const std::string& object_path) {
+        notify(event, object_path);
+    });
+    return true;
 }
 
 // ---- Signal handlers ----

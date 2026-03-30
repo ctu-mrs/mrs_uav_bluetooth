@@ -424,14 +424,28 @@ bool BluezClient::wait_services_resolved(const std::string& mac, double timeout_
 std::vector<GattServiceInfo> BluezClient::list_services(const std::string& mac) const {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return {};
-    return cache_.services_for_device(dev->object_path);
+    auto services = cache_.services_for_device(dev->object_path);
+    if (services.empty() && dev->services_resolved) {
+        auto& cache = const_cast<ObjectManagerCache&>(cache_);
+        if (cache.refresh_device_subtree(dev->object_path)) {
+            services = cache_.services_for_device(dev->object_path);
+        }
+    }
+    return services;
 }
 
 std::vector<GattCharacteristicInfo> BluezClient::list_characteristics(const std::string& mac) const {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return {};
     std::vector<GattCharacteristicInfo> result;
-    for (const auto& svc : cache_.services_for_device(dev->object_path)) {
+    auto services = cache_.services_for_device(dev->object_path);
+    if (services.empty() && dev->services_resolved) {
+        auto& cache = const_cast<ObjectManagerCache&>(cache_);
+        if (cache.refresh_device_subtree(dev->object_path)) {
+            services = cache_.services_for_device(dev->object_path);
+        }
+    }
+    for (const auto& svc : services) {
         auto chars = cache_.characteristics_for_service(svc.object_path);
         result.insert(result.end(), chars.begin(), chars.end());
     }

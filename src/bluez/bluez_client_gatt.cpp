@@ -33,7 +33,13 @@ std::string BluezClient::find_characteristic(const std::string& mac,
     if (!dev) {
         return {};
     }
-    const auto result = cache_.find_characteristic_by_uuid(dev->object_path, uuid);
+    auto result = cache_.find_characteristic_by_uuid(dev->object_path, uuid);
+    if (!result && dev->services_resolved) {
+        auto& cache = const_cast<ObjectManagerCache&>(cache_);
+        if (cache.refresh_device_subtree(dev->object_path)) {
+            result = cache_.find_characteristic_by_uuid(dev->object_path, uuid);
+        }
+    }
     return result ? result->object_path : std::string{};
 }
 
@@ -41,7 +47,16 @@ std::string BluezClient::find_descriptor(const std::string& mac,
                                          const std::string& uuid,
                                          const std::string& chrc_path) const {
     if (!chrc_path.empty()) {
-        const auto result = cache_.find_descriptor_by_uuid(chrc_path, uuid);
+        auto result = cache_.find_descriptor_by_uuid(chrc_path, uuid);
+        if (!result) {
+            const auto dev = cache_.device_by_mac(mac);
+            if (dev && dev->services_resolved) {
+                auto& cache = const_cast<ObjectManagerCache&>(cache_);
+                if (cache.refresh_device_subtree(dev->object_path)) {
+                    result = cache_.find_descriptor_by_uuid(chrc_path, uuid);
+                }
+            }
+        }
         return result ? result->object_path : std::string{};
     }
     for (const auto& ch : list_characteristics(mac)) {

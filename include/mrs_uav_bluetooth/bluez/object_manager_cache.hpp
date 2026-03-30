@@ -81,6 +81,11 @@ public:
     std::optional<GattDescriptorInfo> find_descriptor_by_uuid(
         const std::string& chrc_path, const std::string& uuid) const;
 
+    /// Refresh a device subtree from a fresh GetManagedObjects snapshot when
+    /// BlueZ has already resolved services but the signal-driven cache missed
+    /// the remote GATT objects.
+    bool refresh_device_subtree(const std::string& device_path);
+
 private:
     using InterfaceMap = std::map<std::string, std::map<std::string, sdbus::Variant>>;
     using PendingNotifications = std::vector<std::pair<CacheEvent, std::string>>;
