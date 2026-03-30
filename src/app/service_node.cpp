@@ -1306,10 +1306,13 @@ std::string ServiceNode::build_detailed_status_report(
 }
 
 void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& object_path) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !cache_) {
         return;
     }
+
+    std::optional<bluez::DeviceInfo> refresh_device;
+    std::optional<std::string> clear_runtime_mac;
 
     // Skip high-frequency value changes
     if (event == bluez::CacheEvent::GattCharacteristicValueChanged ||
@@ -1351,7 +1354,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                                " name='" + device->name + "' peer_name='" + peer_name +
                                "' path=" + object_path);
         peers_->sync_device(*device, active_config_, peer_name);
-        refresh_import_bridges_for_device(*device);
+        refresh_device = *device;
     } else if (event == bluez::CacheEvent::DevicePropertyChanged) {
         auto device = cache_->device(object_path);
         if (!device) {
@@ -1365,7 +1368,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                      device->services_resolved ? "Y" : "N",
                      object_path.c_str());
         peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-        refresh_import_bridges_for_device(*device);
+        refresh_device = *device;
     } else if (event == bluez::CacheEvent::DeviceRemoved) {
         // Extract MAC from the removed object_path since the device is no longer in cache.
         // Only mark the specific device as missing, not all sessions.
@@ -1397,7 +1400,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                                    " path=" + object_path);
             if (peers_->sessions().count(removed_mac)) {
                 peers_->note_missing_device(removed_mac, peers_->now_monotonic());
-                clear_peer_runtime(removed_mac);
+                clear_runtime_mac = removed_mac;
             }
         } else {
             RCLCPP_DEBUG(get_logger(), "[node] on_cache_event: DeviceRemoved path=%s (no matching session)",
@@ -1409,7 +1412,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
                 peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-                refresh_import_bridges_for_device(*device);
+                refresh_device = *device;
             }
         }
     } else if (event == bluez::CacheEvent::GattCharacteristicAdded || event == bluez::CacheEvent::GattCharacteristicRemoved) {
@@ -1424,7 +1427,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
                 peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-                refresh_import_bridges_for_device(*device);
+                refresh_device = *device;
             }
         }
     } else if (event == bluez::CacheEvent::GattDescriptorAdded || event == bluez::CacheEvent::GattDescriptorRemoved) {
@@ -1440,7 +1443,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
                 peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-                refresh_import_bridges_for_device(*device);
+                refresh_device = *device;
             }
         }
     } else {
@@ -1463,9 +1466,17 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
                 peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-                refresh_import_bridges_for_device(*device);
+                refresh_device = *device;
             }
         }
+    }
+
+    state_lock.unlock();
+    if (clear_runtime_mac) {
+        clear_peer_runtime(*clear_runtime_mac);
+    }
+    if (refresh_device) {
+        refresh_import_bridges_for_device(*refresh_device);
     }
 
     schedule_peer_reconcile();
@@ -1474,7 +1485,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
 void ServiceNode::on_gatt_event(const std::string& event_type,
                                   const std::string& object_path,
                                   const std::string& detail) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (event_type == "client_notify_enabled") {
         log_info_coalesced("gatt:notify-enabled:" + object_path,
                            "[client] notify enabled path=" + object_path);
@@ -1498,6 +1509,9 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
         return;
     }
 
+    std::optional<std::string> clear_runtime_mac;
+    std::optional<bluez::DeviceInfo> refresh_device;
+
     if (event_type == "client_notify_disabled" || event_type == "client_notify_failed") {
         std::string affected_mac;
         for (const auto& [mac, bridge] : peers_->time_bridges()) {
@@ -1507,18 +1521,25 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
             }
         }
         if (!affected_mac.empty()) {
-            clear_peer_runtime(affected_mac);
-            schedule_peer_reconcile();
+            clear_runtime_mac = affected_mac;
         }
     }
 
     if (const auto device_path = device_path_for_gatt_object(*cache_, object_path)) {
         if (const auto device = cache_->device(*device_path)) {
-            refresh_import_bridges_for_device(*device);
             peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-            schedule_peer_reconcile();
+            refresh_device = *device;
         }
     }
+
+    state_lock.unlock();
+    if (clear_runtime_mac) {
+        clear_peer_runtime(*clear_runtime_mac);
+    }
+    if (refresh_device) {
+        refresh_import_bridges_for_device(*refresh_device);
+    }
+    schedule_peer_reconcile();
 }
 
 void ServiceNode::on_pairing_event(const std::string& event_type, const std::string& device_path) {
@@ -1657,24 +1678,29 @@ void ServiceNode::wait_for_peer_tasks() {
 }
 
 void ServiceNode::clear_peer_runtime(const std::string& mac) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !client_ || !import_bridges_) {
         return;
     }
 
-    import_bridges_->clear_import_paths_for_mac(mac, *client_);
+    std::string characteristic_path;
 
     if (auto bridge = peers_->time_bridges().find(mac); bridge != peers_->time_bridges().end()) {
-        const auto characteristic_path = bridge->second.characteristic_path;
+        characteristic_path = bridge->second.characteristic_path;
         peers_->remove_time_bridge(mac);
-        if (!characteristic_path.empty()) {
-            client_->stop_notify(characteristic_path);
-        }
+    }
+
+    state_lock.unlock();
+
+    import_bridges_->clear_import_paths_for_mac(mac, *client_);
+
+    if (!characteristic_path.empty()) {
+        client_->stop_notify(characteristic_path);
     }
 }
 
 void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& device) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!import_bridges_ || !client_ || !peers_) {
         return;
     }
@@ -1731,7 +1757,11 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
             (void)inserted;
             import_bridges_->configure_import_bridge(registry_key, it->second, *client_);
         }
+    }
 
+    state_lock.unlock();
+
+    if (secure_peer) {
         import_bridges_->refresh_import_paths_for_mac(device.mac, *client_);
     }
 
@@ -1746,7 +1776,7 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
                                                  const std::set<std::string>& desired_keys,
                                                  double now_mono,
                                                  double missing_path_grace_s) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !import_bridges_ || !client_) {
         return;
     }
@@ -1796,6 +1826,8 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
         import_bridges_->destroy_import_bridge(it->second);
         it = bridge_registry_.imports().erase(it);
     }
+
+    state_lock.unlock();
 
     for (const auto& path : removed_paths) {
         client_->stop_notify(path);
@@ -1939,7 +1971,7 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
 bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                                             const bluez::DeviceInfo& device,
                                             peer::PeerConnectionSession& session) {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
     const auto writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
     const auto peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
@@ -1948,8 +1980,9 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         ? cache_->characteristic(characteristic_path)
         : std::optional<bluez::GattCharacteristicInfo>{};
     auto bridge_it = peers_->time_bridges().find(mac);
+    std::string stop_notify_path;
 
-    const auto clear_time_bridge = [this, &mac, &bridge_it]() {
+    const auto clear_time_bridge = [this, &mac, &bridge_it, &stop_notify_path]() {
         if (bridge_it == peers_->time_bridges().end()) {
             return;
         }
@@ -1957,7 +1990,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         peers_->remove_time_bridge(mac);
         bridge_it = peers_->time_bridges().end();
         if (!old_characteristic_path.empty()) {
-            client_->stop_notify(old_characteristic_path);
+            stop_notify_path = old_characteristic_path;
         }
     };
 
@@ -1985,10 +2018,15 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                 mac.c_str(), services.size(), characteristics.size(), descriptors.size());
     if (characteristic_path.empty()) {
         clear_time_bridge();
+        state_lock.unlock();
+        if (!stop_notify_path.empty()) {
+            client_->stop_notify(stop_notify_path);
+        }
         log_info_coalesced("peer-time-bridge-missing:" + mac + ":" + std::to_string(characteristics.size()),
                            "[node] update_peer_time_bridge(" + mac + "): time characteristic uuid=" +
                                time_characteristic_uuid + " not found among " +
                                std::to_string(characteristics.size()) + " characteristics");
+        state_lock.lock();
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
@@ -2058,11 +2096,19 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     bridge.services_wait_grace_s = session.services_wait_grace_s;
     bridge.pairing_failures = session.pairing_failures;
 
+    const auto notify_start_log = "[node] update_peer_time_bridge(" + mac + "): notifications requested on " +
+        characteristic_path + " (writeback=" +
+        (wb_path.empty() ? std::string{"none"} : wb_path) + ")";
+
+    state_lock.unlock();
+    if (!stop_notify_path.empty()) {
+        client_->stop_notify(stop_notify_path);
+    }
+
     if (client_->start_notify(characteristic_path)) {
         log_info_coalesced("peer-time-bridge-notify-start:" + mac + ":" + characteristic_path,
-                           "[node] update_peer_time_bridge(" + mac + "): notifications requested on " +
-                               characteristic_path + " (writeback=" +
-                               (wb_path.empty() ? std::string{"none"} : wb_path) + ")");
+                           notify_start_log);
+        state_lock.lock();
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
@@ -2073,6 +2119,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         return false;
     }
 
+    state_lock.lock();
     RCLCPP_WARN(get_logger(), "[node] update_peer_time_bridge(%s): failed to enable notifications on %s",
                 mac.c_str(), characteristic_path.c_str());
     bridge.status = "notify_failed";
@@ -2087,7 +2134,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
 }
 
 void ServiceNode::reconcile_peers() {
-    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !client_) {
         return;
     }
@@ -2120,9 +2167,14 @@ void ServiceNode::reconcile_peers() {
         const bool local_initiates_link = local_peer_should_initiate_link(hostname_, session.peer_name);
 
         if (!session.desired || !is_connected) {
+            state_lock.unlock();
             clear_peer_runtime(mac);
+            state_lock.lock();
         } else if (is_connected) {
-            refresh_import_bridges_for_device(*device);
+            const auto device_copy = *device;
+            state_lock.unlock();
+            refresh_import_bridges_for_device(device_copy);
+            state_lock.lock();
         }
 
         // Policy enforcement: peers not allowed by the current config must not
@@ -2216,7 +2268,9 @@ void ServiceNode::reconcile_peers() {
                     (void)client_->unblock(mac);
                 })) {
                 RCLCPP_WARN(get_logger(), "[reconcile] %s: repairing stale one-sided pairing", device_label.c_str());
+                state_lock.unlock();
                 clear_peer_runtime(mac);
+                state_lock.lock();
                 session.phase = "recovering";
                 session.detail = "repairing stale pairing";
                 session.stale_pairing_detected = false;
@@ -2295,7 +2349,9 @@ void ServiceNode::reconcile_peers() {
                 (void)client_->unblock(mac);
                 (void)client_->connect(mac, 10.0);
             })) {
+            state_lock.unlock();
             clear_peer_runtime(mac);
+            state_lock.lock();
             session.phase = "recovering";
             session.detail = services_stuck ? "repairing unresolved services via re-pair"
                                             : "repairing missing bridge via re-pair";
@@ -2333,7 +2389,11 @@ void ServiceNode::reconcile_peers() {
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
                 continue;
             }
-            if (!update_peer_time_bridge(mac, *device, session)) {
+            const auto device_copy = *device;
+            state_lock.unlock();
+            const bool bridge_ready = update_peer_time_bridge(mac, device_copy, session);
+            state_lock.lock();
+            if (!bridge_ready) {
                 pending_deadline = true;
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
             }

@@ -212,6 +212,10 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
         changed = true;
     }
 
+    if (state_lock.owns_lock()) {
+        state_lock.unlock();
+    }
+
     for (const auto& path : stop_notify_paths) {
         client.stop_notify(path);
     }
@@ -258,6 +262,10 @@ bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
         state.last_payload.clear();
         state.last_publish_monotonic = 0.0;
         state.current_hz = 0.0;
+    }
+
+    if (state_lock.owns_lock()) {
+        state_lock.unlock();
     }
 
     for (const auto& path : stop_notify_paths) {
