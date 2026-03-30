@@ -1723,6 +1723,9 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
     session.last_security_attempt_monotonic = peers_->now_monotonic();
     if (success) {
         session.pairing_failures = 0;
+        session.pairing_reset_pending = false;
+        session.stale_pairing_detected = false;
+        session.secure_pre_ready_disconnects = 0;
         return;
     }
 
@@ -2213,6 +2216,9 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         bridge.peer_name = peer_name;
         bridge.status = "ready";
         bridge.detail = "peer time bridge active";
+        session.pairing_reset_pending = false;
+        session.stale_pairing_detected = false;
+        session.secure_pre_ready_disconnects = 0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
         session.phase = "ready";
@@ -2473,9 +2479,9 @@ void ServiceNode::reconcile_peers() {
         const bool needs_local_connect = local_initiates_link && !is_connected;
         const bool needs_local_pair = is_connected && device && allow_pair_repair &&
             !device->blocked && !(device->paired || device->bonded);
+        const bool needs_local_stale_pair_repair = device && session.stale_pairing_detected;
         const bool needs_local_trust = is_connected && device && !device->blocked &&
             (device->paired || device->bonded) && !device->trusted;
-        const bool needs_local_stale_pair_repair = device && session.stale_pairing_detected;
 
         if (local_reconfigure_recent &&
             (needs_local_connect || needs_local_pair || needs_local_trust || needs_local_stale_pair_repair)) {
@@ -2485,35 +2491,17 @@ void ServiceNode::reconcile_peers() {
             } else if (needs_local_pair) {
                 session.phase = "securing";
                 session.detail = "waiting for local GATT rebuild to settle before pairing";
+            } else if (needs_local_stale_pair_repair) {
+                session.phase = "recovering";
+                session.detail = "waiting for local GATT rebuild to settle before stale pairing repair";
             } else if (needs_local_trust) {
                 session.phase = "securing";
                 session.detail = "waiting for local GATT rebuild to settle before trust repair";
-            } else {
-                session.phase = "recovering";
-                session.detail = "waiting for local GATT rebuild to settle before stale pairing repair";
             }
             pending_deadline = true;
             next_deadline_s = std::min(
                 next_deadline_s,
                 std::max(0.1, local_server_rebuild_monotonic_ + local_reconfigure_grace_s - now));
-            continue;
-        }
-
-        if (device && peers_->should_attempt_trust(session, *device, now, retry_period_s)) {
-            if (run_peer_task_once(mac, "trust", [this, mac]() {
-                    (void)client_->trust(mac);
-                })) {
-                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting trust (paired=%s bonded=%s trusted=%s)",
-                            device_label.c_str(),
-                            device->paired ? "Y" : "N",
-                            device->bonded ? "Y" : "N",
-                            device->trusted ? "Y" : "N");
-                session.phase = "securing";
-                session.detail = "trust repair requested";
-                session.last_security_attempt_monotonic = now;
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
-            }
             continue;
         }
 
@@ -2546,6 +2534,24 @@ void ServiceNode::reconcile_peers() {
                 session.services_wait_started_monotonic = 0.0;
                 session.bridge_wait_started_monotonic = 0.0;
                 session.bridge_wait_reason.clear();
+                pending_deadline = true;
+                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+            }
+            continue;
+        }
+
+        if (device && peers_->should_attempt_trust(session, *device, now, retry_period_s)) {
+            if (run_peer_task_once(mac, "trust", [this, mac]() {
+                    (void)client_->trust(mac);
+                })) {
+                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting trust (paired=%s bonded=%s trusted=%s)",
+                            device_label.c_str(),
+                            device->paired ? "Y" : "N",
+                            device->bonded ? "Y" : "N",
+                            device->trusted ? "Y" : "N");
+                session.phase = "securing";
+                session.detail = "trust repair requested";
+                session.last_security_attempt_monotonic = now;
                 pending_deadline = true;
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
             }
