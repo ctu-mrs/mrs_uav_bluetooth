@@ -15,9 +15,6 @@ constexpr double kDesiredConnectGraceMin = 8.0;
 constexpr double kServicesWaitGraceMin = 15.0;
 constexpr double kPairCooldownMin = 10.0;
 constexpr double kTrustCooldownMin = 0.5;
-constexpr double kSecurePreReadyDisconnectMin = 3.0;
-constexpr int kSecurePreReadyDisconnectRepairThreshold = 2;
-
 bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
               std::initializer_list<const char*> values) {
     for (const char* value : values) {
@@ -208,34 +205,11 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     }
 
     if (!device.connected) {
-        const bool secure_disconnect_before_ready = session.connected_since_monotonic > 0.0 &&
-            (device.paired || device.bonded || device.trusted) &&
-            (session.services_wait_started_monotonic > 0.0 || session.bridge_wait_started_monotonic > 0.0) &&
-            (now - session.connected_since_monotonic) >= kSecurePreReadyDisconnectMin;
-        if (secure_disconnect_before_ready) {
-            session.secure_pre_ready_disconnects += 1;
-            if (session.secure_pre_ready_disconnects >= kSecurePreReadyDisconnectRepairThreshold) {
-                session.stale_pairing_detected = true;
-                session.pairing_reset_pending = true;
-            }
-        } else if (!(device.paired || device.bonded || device.trusted)) {
-            session.secure_pre_ready_disconnects = 0;
-        }
-
+        session.secure_pre_ready_disconnects = 0;
         session.connected_since_monotonic = 0.0;
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
-
-        if (session.stale_pairing_detected) {
-            set_session_phase(session, "recovering", "secured link dropped before ready, resetting stale security");
-            return;
-        }
-
-        if ((device.paired || device.bonded) && !device.trusted) {
-            set_session_phase(session, "securing", "repairing trust before reconnect");
-            return;
-        }
 
         if (is_phase(session, {"connecting", "connect_pending"})) {
             set_session_phase(session, "connect_pending", "awaiting connection");
@@ -266,11 +240,6 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.bridge_wait_reason.clear();
         if (session.services_wait_started_monotonic <= 0.0) {
             session.services_wait_started_monotonic = now;
-        }
-
-        if (now - session.services_wait_started_monotonic > session.services_wait_grace_s) {
-            set_session_phase(session, "recovering", "services unresolved beyond grace");
-            return;
         }
 
         set_session_phase(session, "connected_unready", "connected, waiting for services");

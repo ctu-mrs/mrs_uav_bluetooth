@@ -24,11 +24,8 @@
 
 namespace {
 
-constexpr double kPeerRepairCooldownMin = 8.0;
-constexpr double kBridgeGraceMin = 8.0;
 constexpr double kPolicyConfigSettleGraceMin = 5.0;
 constexpr double kLocalReconfigureGraceMin = 5.0;
-constexpr double kRemoteGattDiscoveryRepairGraceMin = 2.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kGattReadWriteLogInterval = std::chrono::seconds(10);
@@ -789,24 +786,10 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
 
     if (gatt_layout_changed && !gatt_cache_reset_macs.empty()) {
         RCLCPP_WARN(get_logger(),
-                    "Local GATT layout changed, resetting %zu peer cache(s) before rebuilding the server",
+                    "Local GATT layout changed, clearing %zu peer runtime(s) before rebuilding the server",
                     gatt_cache_reset_macs.size());
         for (const auto& mac : gatt_cache_reset_macs) {
-            {
-                std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
-                if (peers_) {
-                    auto session_it = peers_->sessions().find(mac);
-                    if (session_it != peers_->sessions().end()) {
-                        session_it->second.pairing_reset_pending = true;
-                    }
-                }
-            }
             clear_peer_runtime(mac);
-            (void)client_->disconnect(mac, 5.0);
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            (void)client_->remove(mac);
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            (void)client_->unblock(mac);
         }
     }
 
@@ -1727,6 +1710,7 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
 
     if (authentication_failed) {
         session.stale_pairing_detected = true;
+        session.pairing_reset_pending = true;
         session.phase = "recovering";
         session.detail = "pair auth failed, resetting stale security";
         session.last_repair_monotonic = 0.0;
@@ -2365,20 +2349,13 @@ void ServiceNode::reconcile_peers() {
 
     bool pending_deadline = false;
     double next_deadline_s = retry_period_s;
-    const double repair_cooldown_s = std::max(kPeerRepairCooldownMin, retry_period_s * 2.0);
-    const double bridge_grace_s = std::max(kBridgeGraceMin, retry_period_s * 4.0);
     const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
     const bool local_reconfigure_recent = local_server_rebuild_monotonic_ > 0.0 &&
         (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s;
-    const auto bridge_wait_remaining_s = [&](const peer::PeerConnectionSession& session) {
-        if (session.bridge_wait_started_monotonic <= 0.0) {
-            return retry_period_s;
-        }
-
-        const double grace_s = session.bridge_wait_reason == "gatt-cache"
-            ? kRemoteGattDiscoveryRepairGraceMin
-            : bridge_grace_s;
-        return std::max(0.1, session.bridge_wait_started_monotonic + grace_s - now);
+    const auto note_pending = [&](double delay_s = -1.0) {
+        pending_deadline = true;
+        const auto bounded_delay = std::max(0.1, delay_s > 0.0 ? delay_s : retry_period_s);
+        next_deadline_s = std::min(next_deadline_s, bounded_delay);
     };
 
     for (auto& [mac, session] : peers_->sessions()) {
@@ -2408,9 +2385,7 @@ void ServiceNode::reconcile_peers() {
         if (policy_violation && config_recently_changed) {
             session.phase = "policy_blocked";
             session.detail = "peer blocked by current config, waiting for config settle";
-            pending_deadline = true;
-            next_deadline_s = std::min(next_deadline_s,
-                                       std::max(0.1, config_applied_monotonic_ + config_settle_grace_s - now));
+            note_pending(config_applied_monotonic_ + config_settle_grace_s - now);
             continue;
         }
         if (policy_violation &&
@@ -2428,13 +2403,13 @@ void ServiceNode::reconcile_peers() {
                     if (trusted) {
                         (void)client_->untrust(mac);
                     }
+                    (void)client_->remove(mac);
                 })) {
                 session.phase = "policy_blocked";
                 session.detail = whitelist_enabled ? "peer not present in whitelist"
                                                   : "peer not allowed by current config";
                 session.last_policy_action_monotonic = now;
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+                note_pending();
             }
             continue;
         }
@@ -2450,61 +2425,49 @@ void ServiceNode::reconcile_peers() {
                 })) {
                 session.phase = "discovered";
                 session.detail = "unblocking desired peer";
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+                note_pending();
             }
             continue;
         }
 
-        const bool allow_pair_repair = true;
         const bool needs_local_connect = !is_connected;
-        const bool needs_local_pair = is_connected && device && allow_pair_repair &&
-            !device->blocked && !(device->paired || device->bonded);
-        const bool needs_local_stale_pair_repair = device && session.stale_pairing_detected;
-        const bool needs_local_trust = is_connected && device && !device->blocked &&
+        const bool needs_local_pair = is_connected && device && !(device->paired || device->bonded);
+        const bool needs_local_trust = is_connected && device &&
             (device->paired || device->bonded) && !device->trusted;
 
-        if (local_reconfigure_recent &&
-            (needs_local_connect || needs_local_pair || needs_local_trust || needs_local_stale_pair_repair)) {
+        if (local_reconfigure_recent && (needs_local_connect || needs_local_pair || needs_local_trust)) {
             if (needs_local_connect) {
                 session.phase = "connect_pending";
                 session.detail = "waiting for local GATT rebuild to settle before connecting";
             } else if (needs_local_pair) {
                 session.phase = "securing";
                 session.detail = "waiting for local GATT rebuild to settle before pairing";
-            } else if (needs_local_stale_pair_repair) {
-                session.phase = "recovering";
-                session.detail = "waiting for local GATT rebuild to settle before stale pairing repair";
             } else if (needs_local_trust) {
                 session.phase = "securing";
                 session.detail = "waiting for local GATT rebuild to settle before trust repair";
             }
-            pending_deadline = true;
-            next_deadline_s = std::min(
-                next_deadline_s,
-                std::max(0.1, local_server_rebuild_monotonic_ + local_reconfigure_grace_s - now));
+            note_pending(local_server_rebuild_monotonic_ + local_reconfigure_grace_s - now);
             continue;
         }
 
-        const bool stale_pairing_repair_due = device && session.stale_pairing_detected &&
-            (session.last_repair_monotonic <= 0.0 ||
-             session.last_pairing_request_monotonic > session.last_repair_monotonic ||
-             now - session.last_repair_monotonic >= std::max(1.0, retry_period_s));
+        const bool stale_pairing_repair_due = session.stale_pairing_detected &&
+            (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= retry_period_s);
         if (stale_pairing_repair_due) {
-            if (run_peer_task_once(mac, "repair stale pairing", [this, mac, retry_period_s]() {
-                    (void)client_->disconnect(mac, retry_period_s);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                    (void)client_->untrust(mac);
+            if (run_peer_task_once(mac, "reset stale pairing", [this, mac, retry_period_s, connected = is_connected]() {
+                    if (connected) {
+                        (void)client_->disconnect(mac, retry_period_s);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    }
                     (void)client_->remove(mac);
                     std::this_thread::sleep_for(std::chrono::milliseconds(300));
                     (void)client_->unblock(mac);
                 })) {
-                RCLCPP_WARN(get_logger(), "[reconcile] %s: repairing stale one-sided pairing", device_label.c_str());
+                RCLCPP_WARN(get_logger(), "[reconcile] %s: resetting stale pairing state", device_label.c_str());
                 state_lock.unlock();
                 clear_peer_runtime(mac);
                 state_lock.lock();
                 session.phase = "recovering";
-                session.detail = "repairing stale pairing";
+                session.detail = "resetting stale security";
                 session.pairing_reset_pending = true;
                 session.stale_pairing_detected = false;
                 session.last_repair_monotonic = now;
@@ -2515,9 +2478,47 @@ void ServiceNode::reconcile_peers() {
                 session.services_wait_started_monotonic = 0.0;
                 session.bridge_wait_started_monotonic = 0.0;
                 session.bridge_wait_reason.clear();
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
+                note_pending();
             }
+            continue;
+        }
+
+        if (!is_connected) {
+            if (peers_->should_attempt_connect(session, now, retry_period_s)) {
+                if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
+                        (void)client_->connect(mac, retry_period_s);
+                    })) {
+                    RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
+                                device_label.c_str(), session.phase.c_str());
+                    session.phase = "connecting";
+                    session.detail = "auto-connect requested";
+                    session.last_connect_attempt_monotonic = now;
+                    session.connect_started_monotonic = now;
+                }
+            }
+            note_pending();
+            continue;
+        }
+
+        if (device && !(device->paired || device->bonded)) {
+            if (peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
+                if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
+                        std::string pair_error;
+                        const bool pair_ok = client_->pair(mac, retry_period_s, &pair_error);
+                        note_pair_attempt_result(mac, pair_ok, pair_error);
+                    })) {
+                    RCLCPP_INFO(get_logger(),
+                                "[reconcile] %s: attempting pair (phase=%s)",
+                                device_label.c_str(),
+                                session.phase.c_str());
+                    session.phase = "securing";
+                    session.detail = session.pairing_reset_pending
+                        ? "re-pair requested"
+                        : "auto-pair requested";
+                    session.last_security_attempt_monotonic = now;
+                }
+            }
+            note_pending();
             continue;
         }
 
@@ -2531,48 +2532,10 @@ void ServiceNode::reconcile_peers() {
                             device->bonded ? "Y" : "N",
                             device->trusted ? "Y" : "N");
                 session.phase = "securing";
-                session.detail = "trust repair requested";
+                session.detail = "trust requested";
                 session.last_security_attempt_monotonic = now;
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
             }
-            continue;
-        }
-
-        if (peers_->should_attempt_connect(session, now, retry_period_s)) {
-            if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
-                    (void)client_->connect(mac, retry_period_s);
-                })) {
-                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
-                            device_label.c_str(), session.phase.c_str());
-                session.phase = "connecting";
-                session.detail = "auto-connect requested";
-                session.last_connect_attempt_monotonic = now;
-                session.connect_started_monotonic = now;
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
-            }
-            continue;
-        }
-
-        if (device && allow_pair_repair && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
-            if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
-                    std::string pair_error;
-                    const bool pair_ok = client_->pair(mac, retry_period_s, &pair_error);
-                    note_pair_attempt_result(mac, pair_ok, pair_error);
-                })) {
-                RCLCPP_INFO(get_logger(),
-                            "[reconcile] %s: attempting pair (phase=%s)",
-                            device_label.c_str(),
-                            session.phase.c_str());
-                session.phase = "securing";
-                session.detail = session.pairing_reset_pending
-                    ? "local bond reset, re-pair requested"
-                    : "auto-pair requested";
-                session.last_security_attempt_monotonic = now;
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
-            }
+            note_pending();
             continue;
         }
 
@@ -2583,85 +2546,10 @@ void ServiceNode::reconcile_peers() {
                     (void)client_->wait_services_resolved(mac, std::max(8.0, retry_period_s * 4.0));
                 })) {
                 session.last_service_retry_monotonic = now;
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, retry_period_s);
             }
-        }
-
-        const bool services_stuck = is_connected && device->trusted && (device->paired || device->bonded) &&
-            !device->services_resolved && session.services_wait_started_monotonic > 0.0 &&
-            (now - session.services_wait_started_monotonic) >= session.services_wait_grace_s;
-        const bool remote_gatt_cache_stuck = is_connected && device->trusted && (device->paired || device->bonded) &&
-            device->services_resolved && session.bridge_wait_reason == "gatt-cache" &&
-            session.bridge_wait_started_monotonic > 0.0 &&
-            (now - session.bridge_wait_started_monotonic) >= kRemoteGattDiscoveryRepairGraceMin;
-        const bool bridge_stuck = is_connected && device->trusted && (device->paired || device->bonded) &&
-            device->services_resolved && session.bridge_wait_started_monotonic > 0.0 &&
-            (now - session.bridge_wait_started_monotonic) >= bridge_grace_s;
-        if (remote_gatt_cache_stuck &&
-            (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= repair_cooldown_s) &&
-            run_peer_task_once(mac, "repair remote gatt", [this, mac]() {
-                (void)client_->disconnect(mac, 5.0);
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                (void)client_->untrust(mac);
-                (void)client_->remove(mac);
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                (void)client_->unblock(mac);
-            })) {
-            RCLCPP_WARN(get_logger(),
-                        "[reconcile] %s: repairing stale remote GATT discovery after ServicesResolved with zero GATT objects",
-                        device_label.c_str());
-            state_lock.unlock();
-            clear_peer_runtime(mac);
-            state_lock.lock();
-            session.pairing_reset_pending = true;
-            session.phase = "recovering";
-            session.detail = "repairing stale remote GATT discovery";
-            session.last_repair_monotonic = now;
-            session.connect_repair_count += 1;
-            session.last_connect_attempt_monotonic = 0.0;
-            session.connect_started_monotonic = 0.0;
-            session.connected_since_monotonic = 0.0;
-            session.last_security_attempt_monotonic = 0.0;
-            session.last_service_retry_monotonic = 0.0;
-            session.services_wait_started_monotonic = 0.0;
-            session.bridge_wait_started_monotonic = 0.0;
-            session.bridge_wait_reason.clear();
-            pending_deadline = true;
-            next_deadline_s = std::min(next_deadline_s, retry_period_s);
-            continue;
-        }
-
-        const bool repair_due = services_stuck || bridge_stuck;
-        if (repair_due &&
-            (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= repair_cooldown_s) &&
-            run_peer_task_once(mac, "repair", [this, mac]() {
-                (void)client_->disconnect(mac, 5.0);
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                (void)client_->untrust(mac);
-                (void)client_->remove(mac);
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                (void)client_->unblock(mac);
-                (void)client_->connect(mac, 10.0);
-            })) {
-            state_lock.unlock();
-            clear_peer_runtime(mac);
-            state_lock.lock();
-            session.pairing_reset_pending = true;
-            session.phase = "recovering";
-            session.detail = services_stuck ? "repairing unresolved services via re-pair"
-                                            : "repairing missing bridge via re-pair";
-            session.last_repair_monotonic = now;
-            session.connect_repair_count += 1;
-            session.last_connect_attempt_monotonic = 0.0;
-            session.connect_started_monotonic = 0.0;
-            session.connected_since_monotonic = 0.0;
-            session.last_security_attempt_monotonic = 0.0;
-            session.last_service_retry_monotonic = 0.0;
-            session.bridge_wait_started_monotonic = 0.0;
-            session.bridge_wait_reason.clear();
-            pending_deadline = true;
-            next_deadline_s = std::min(next_deadline_s, retry_period_s);
+            session.phase = "connected_unready";
+            session.detail = "connected, waiting for services";
+            note_pending();
             continue;
         }
 
@@ -2671,8 +2559,7 @@ void ServiceNode::reconcile_peers() {
             const bool bridge_ready = update_peer_time_bridge(mac, device_copy, session);
             state_lock.lock();
             if (!bridge_ready) {
-                pending_deadline = true;
-                next_deadline_s = std::min(next_deadline_s, bridge_wait_remaining_s(session));
+                note_pending();
             }
             continue;
         }
@@ -2684,16 +2571,7 @@ void ServiceNode::reconcile_peers() {
                      device ? (device->paired ? "Y" : "N") : "?",
                      device ? (device->trusted ? "Y" : "N") : "?",
                      device ? (device->services_resolved ? "Y" : "N") : "?");
-        pending_deadline = true;
-        if (session.services_wait_started_monotonic > 0.0 && session.services_wait_grace_s > 0.0) {
-            const auto remaining = std::max(0.1,
-                session.services_wait_started_monotonic + session.services_wait_grace_s - now);
-            next_deadline_s = std::min(next_deadline_s, remaining);
-        } else if (session.bridge_wait_started_monotonic > 0.0) {
-            next_deadline_s = std::min(next_deadline_s, bridge_wait_remaining_s(session));
-        } else {
-            next_deadline_s = std::min(next_deadline_s, retry_period_s);
-        }
+        note_pending();
     }
 
     if (pending_deadline) {
