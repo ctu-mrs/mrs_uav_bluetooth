@@ -277,6 +277,7 @@ bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) 
 
     PendingNotifications notifications;
     size_t refreshed_count = 0;
+    size_t refreshed_gatt_count = 0;
     {
         std::lock_guard lock(mutex_);
         for (const auto& [path, ifaces] : objects) {
@@ -286,6 +287,11 @@ bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) 
             }
             process_object(path_string, ifaces, &notifications);
             refreshed_count += 1;
+            if (ifaces.count(std::string(kGattServiceIface)) != 0 ||
+                ifaces.count(std::string(kGattCharacteristicIface)) != 0 ||
+                ifaces.count(std::string(kGattDescriptorIface)) != 0) {
+                refreshed_gatt_count += 1;
+            }
         }
     }
 
@@ -293,12 +299,13 @@ bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) 
         return false;
     }
 
-    RCLCPP_INFO(logger_, "[cache] refreshed %zu object(s) for %s from GetManagedObjects",
-                refreshed_count, device_path.c_str());
+    RCLCPP_INFO(logger_, "[cache] refreshed %zu object(s) for %s from GetManagedObjects (%zu GATT, %zu new event%s)",
+                refreshed_count, device_path.c_str(), refreshed_gatt_count,
+                notifications.size(), notifications.size() == 1 ? "" : "s");
     dispatch_notifications(notifications, [this](CacheEvent event, const std::string& object_path) {
         notify(event, object_path);
     });
-    return true;
+    return refreshed_gatt_count != 0;
 }
 
 // ---- Signal handlers ----
@@ -493,13 +500,15 @@ void ObjectManagerCache::process_object(const std::string& path,
     auto device_it = ifaces.find(std::string(kDeviceIface));
     if (device_it != ifaces.end()) {
         auto dev = parse_device(path, device_it->second);
-        RCLCPP_INFO(logger_, "[cache] Device added: %s mac=%s name='%s' connected=%s paired=%s trusted=%s",
-                    path.c_str(), dev.mac.c_str(), dev.name.c_str(),
-                    dev.connected ? "true" : "false",
-                    dev.paired ? "true" : "false",
-                    dev.trusted ? "true" : "false");
-        devices_[path] = std::move(dev);
-        if (notifications) {
+        auto [it, inserted] = devices_.insert_or_assign(path, std::move(dev));
+        if (inserted) {
+            RCLCPP_INFO(logger_, "[cache] Device added: %s mac=%s name='%s' connected=%s paired=%s trusted=%s",
+                        path.c_str(), it->second.mac.c_str(), it->second.name.c_str(),
+                        it->second.connected ? "true" : "false",
+                        it->second.paired ? "true" : "false",
+                        it->second.trusted ? "true" : "false");
+        }
+        if (notifications && inserted) {
             notifications->emplace_back(CacheEvent::DeviceAdded, path);
         }
     }
@@ -507,11 +516,13 @@ void ObjectManagerCache::process_object(const std::string& path,
     auto svc_it = ifaces.find(std::string(kGattServiceIface));
     if (svc_it != ifaces.end()) {
         auto svc = parse_gatt_service(path, svc_it->second);
-        RCLCPP_INFO(logger_, "[cache] GATT service added: %s uuid=%s device=%s primary=%s",
-                    path.c_str(), svc.uuid.c_str(), svc.device_path.c_str(),
-                    svc.primary ? "true" : "false");
-        gatt_services_[path] = std::move(svc);
-        if (notifications) {
+        auto [it, inserted] = gatt_services_.insert_or_assign(path, std::move(svc));
+        if (inserted) {
+            RCLCPP_INFO(logger_, "[cache] GATT service added: %s uuid=%s device=%s primary=%s",
+                        path.c_str(), it->second.uuid.c_str(), it->second.device_path.c_str(),
+                        it->second.primary ? "true" : "false");
+        }
+        if (notifications && inserted) {
             notifications->emplace_back(CacheEvent::GattServiceAdded, path);
         }
     }
@@ -519,11 +530,13 @@ void ObjectManagerCache::process_object(const std::string& path,
     auto chrc_it = ifaces.find(std::string(kGattCharacteristicIface));
     if (chrc_it != ifaces.end()) {
         auto chrc = parse_gatt_characteristic(path, chrc_it->second);
-        RCLCPP_INFO(logger_, "[cache] GATT characteristic added: %s uuid=%s service=%s notifying=%s",
-                    path.c_str(), chrc.uuid.c_str(), chrc.service_path.c_str(),
-                    chrc.notifying ? "true" : "false");
-        gatt_characteristics_[path] = std::move(chrc);
-        if (notifications) {
+        auto [it, inserted] = gatt_characteristics_.insert_or_assign(path, std::move(chrc));
+        if (inserted) {
+            RCLCPP_INFO(logger_, "[cache] GATT characteristic added: %s uuid=%s service=%s notifying=%s",
+                        path.c_str(), it->second.uuid.c_str(), it->second.service_path.c_str(),
+                        it->second.notifying ? "true" : "false");
+        }
+        if (notifications && inserted) {
             notifications->emplace_back(CacheEvent::GattCharacteristicAdded, path);
         }
     }
@@ -531,10 +544,12 @@ void ObjectManagerCache::process_object(const std::string& path,
     auto desc_it = ifaces.find(std::string(kGattDescriptorIface));
     if (desc_it != ifaces.end()) {
         auto desc = parse_gatt_descriptor(path, desc_it->second);
-        RCLCPP_INFO(logger_, "[cache] GATT descriptor added: %s uuid=%s chrc=%s",
-                    path.c_str(), desc.uuid.c_str(), desc.characteristic_path.c_str());
-        gatt_descriptors_[path] = std::move(desc);
-        if (notifications) {
+        auto [it, inserted] = gatt_descriptors_.insert_or_assign(path, std::move(desc));
+        if (inserted) {
+            RCLCPP_INFO(logger_, "[cache] GATT descriptor added: %s uuid=%s chrc=%s",
+                        path.c_str(), it->second.uuid.c_str(), it->second.characteristic_path.c_str());
+        }
+        if (notifications && inserted) {
             notifications->emplace_back(CacheEvent::GattDescriptorAdded, path);
         }
     }

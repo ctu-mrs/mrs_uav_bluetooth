@@ -83,7 +83,8 @@ public:
 
     /// Refresh a device subtree from a fresh GetManagedObjects snapshot when
     /// BlueZ has already resolved services but the signal-driven cache missed
-    /// the remote GATT objects.
+    /// the remote GATT objects. Returns true when the snapshot contained any
+    /// remote GATT objects for the device.
     bool refresh_device_subtree(const std::string& device_path);
 
 private:
