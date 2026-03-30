@@ -1722,21 +1722,15 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
         normalized_error.find("authentication canceled") != std::string::npos;
 
     if (authentication_failed) {
-        const auto device = client_ ? client_->get_device(mac) : std::optional<bluez::DeviceInfo>{};
-        if (device && device_has_local_security(*device)) {
-            session.stale_pairing_detected = true;
-            session.pairing_reset_pending = true;
-            session.forget_pending = false;
-            session.phase = "recovering";
-            session.detail = "pair auth failed, resetting stale security";
-            session.last_repair_monotonic = 0.0;
-            session.services_wait_started_monotonic = 0.0;
-            session.bridge_wait_started_monotonic = 0.0;
-            session.bridge_wait_reason.clear();
-        } else {
-            session.phase = "securing";
-            session.detail = "pair auth failed, waiting for peer stale security reset";
-        }
+        session.stale_pairing_detected = true;
+        session.pairing_reset_pending = true;
+        session.forget_pending = false;
+        session.phase = "recovering";
+        session.detail = "pair auth failed, resetting stale security";
+        session.last_repair_monotonic = 0.0;
+        session.services_wait_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
         return;
     }
 
@@ -2280,6 +2274,18 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                                time_characteristic_uuid + " not found among " +
                                std::to_string(characteristics.size()) + " characteristics");
         state_lock.lock();
+        if (characteristics.empty()) {
+            session.stale_pairing_detected = true;
+            session.pairing_reset_pending = true;
+            session.forget_pending = false;
+            session.last_repair_monotonic = 0.0;
+            session.services_wait_started_monotonic = 0.0;
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+            session.phase = "recovering";
+            session.detail = "services resolved without remote GATT, resetting stale security";
+            return false;
+        }
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }

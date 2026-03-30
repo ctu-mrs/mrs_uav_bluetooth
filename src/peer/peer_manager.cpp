@@ -204,7 +204,9 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
         session.secure_pre_ready_disconnects = 0;
-        session.forget_pending = false;
+        if (!device_needs_forget(device)) {
+            session.forget_pending = false;
+        }
         if (session.peer_candidate) {
             set_session_phase(session,
                               "policy_blocked",
