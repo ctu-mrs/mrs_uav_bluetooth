@@ -27,6 +27,7 @@ namespace {
 constexpr double kPeerRepairCooldownMin = 8.0;
 constexpr double kBridgeGraceMin = 8.0;
 constexpr double kPolicyConfigSettleGraceMin = 5.0;
+constexpr double kGattCacheRepairGraceMin = 2.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kGattReadWriteLogInterval = std::chrono::seconds(10);
@@ -255,6 +256,40 @@ PublishRateSample update_publish_rate(double last_publish_monotonic) {
         return {now, 1.0 / (now - last_publish_monotonic)};
     }
     return {now, 0.0};
+}
+
+std::string gatt_layout_signature_for_config(const mrs_uav_bluetooth::config::NodeConfig& cfg) {
+    std::vector<std::string> tokens;
+    tokens.reserve(cfg.shared_topics.size() + 3);
+
+    if (!cfg.enable_server) {
+        return "server:off";
+    }
+
+    tokens.push_back("server:on");
+    if (cfg.enable_wifi_service) {
+        tokens.push_back("svc:wifi");
+    }
+    if (cfg.enable_time_service) {
+        tokens.push_back("svc:time");
+    }
+
+    for (const auto& shared_topic : cfg.shared_topics) {
+        if (shared_topic.mode != "export" && shared_topic.mode != "both") {
+            continue;
+        }
+        tokens.push_back("bridge:" + shared_topic.bridge_name);
+    }
+
+    std::sort(tokens.begin(), tokens.end());
+    std::ostringstream stream;
+    for (size_t index = 0; index < tokens.size(); ++index) {
+        if (index != 0) {
+            stream << '|';
+        }
+        stream << tokens[index];
+    }
+    return stream.str();
 }
 
 std::string peer_status_snapshot(const std::string& mac,
@@ -615,6 +650,11 @@ void ServiceNode::create_services() {
 }
 
 void ServiceNode::apply_config(const config::NodeConfig& cfg) {
+    const auto new_gatt_layout_signature = gatt_layout_signature_for_config(cfg);
+    const bool gatt_layout_changed = !local_gatt_layout_signature_.empty() &&
+        local_gatt_layout_signature_ != new_gatt_layout_signature;
+    std::vector<std::string> gatt_cache_reset_macs;
+
     active_config_ = cfg;
     ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
     apply_adapter_state(cfg);
@@ -693,8 +733,42 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             }
             refresh_import_bridges_for_device(device);
         }
+
+        if (gatt_layout_changed) {
+            std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+            for (const auto& device : client_->get_devices()) {
+                const auto session_it = peers_->sessions().find(device.mac);
+                if (session_it == peers_->sessions().end()) {
+                    continue;
+                }
+                const auto& session = session_it->second;
+                if (!session.peer_candidate && !session.desired) {
+                    continue;
+                }
+                if (!(device.connected || device.paired || device.bonded || device.trusted)) {
+                    continue;
+                }
+                gatt_cache_reset_macs.push_back(device.mac);
+            }
+        }
     }
+
+    if (gatt_layout_changed && !gatt_cache_reset_macs.empty()) {
+        RCLCPP_WARN(get_logger(),
+                    "Local GATT layout changed, resetting %zu peer cache(s) before rebuilding the server",
+                    gatt_cache_reset_macs.size());
+        for (const auto& mac : gatt_cache_reset_macs) {
+            clear_peer_runtime(mac);
+            (void)client_->disconnect(mac, 5.0);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            (void)client_->remove(mac);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            (void)client_->unblock(mac);
+        }
+    }
+
     rebuild_server_objects();
+    local_gatt_layout_signature_ = new_gatt_layout_signature;
 
     if (time_service_timer_) {
         time_service_timer_->cancel();
@@ -2165,6 +2239,7 @@ void ServiceNode::reconcile_peers() {
     double next_deadline_s = retry_period_s;
     const double repair_cooldown_s = std::max(kPeerRepairCooldownMin, retry_period_s * 2.0);
     const double bridge_grace_s = std::max(kBridgeGraceMin, retry_period_s * 4.0);
+    const double gatt_cache_repair_grace_s = std::max(kGattCacheRepairGraceMin, retry_period_s);
 
     for (auto& [mac, session] : peers_->sessions()) {
         const auto device = client_->get_device(mac);
@@ -2385,7 +2460,14 @@ void ServiceNode::reconcile_peers() {
 
         if (is_connected && device->trusted && (device->paired || device->bonded) && device->services_resolved) {
             const auto resolved_characteristics = client_->list_characteristics(mac);
-            if (resolved_characteristics.empty()) {
+            const std::string time_characteristic_uuid = active_config_.enable_time_service
+                ? util::named_characteristic_uuid("time/ns")
+                : std::string{};
+            const bool missing_time_characteristic = !time_characteristic_uuid.empty() &&
+                client_->find_characteristic(mac, time_characteristic_uuid).empty();
+            const bool stale_gatt_cache = resolved_characteristics.empty() || missing_time_characteristic;
+
+            if (stale_gatt_cache) {
                 if ((session.last_service_retry_monotonic <= 0.0 ||
                      now - session.last_service_retry_monotonic >= retry_period_s) &&
                     run_peer_task_once(mac, "wait gatt cache", [this, mac, retry_period_s]() {
@@ -2396,9 +2478,47 @@ void ServiceNode::reconcile_peers() {
                 if (session.bridge_wait_started_monotonic <= 0.0) {
                     session.bridge_wait_started_monotonic = now;
                 }
-                session.bridge_wait_reason = "gatt-cache";
+                session.bridge_wait_reason = resolved_characteristics.empty()
+                    ? "gatt-cache"
+                    : "gatt-layout";
                 session.phase = "connected_unready";
-                session.detail = "waiting for remote GATT cache";
+                session.detail = resolved_characteristics.empty()
+                    ? "waiting for remote GATT cache"
+                    : "remote GATT missing expected time characteristic";
+
+                const bool cache_repair_due =
+                    (now - session.bridge_wait_started_monotonic) >= gatt_cache_repair_grace_s;
+                if (cache_repair_due &&
+                    (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= repair_cooldown_s) &&
+                    run_peer_task_once(mac, "repair gatt cache", [this, mac]() {
+                        (void)client_->disconnect(mac, 5.0);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                        (void)client_->remove(mac);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                        (void)client_->unblock(mac);
+                    })) {
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: repairing stale remote GATT cache after services resolved",
+                                device_label.c_str());
+                    state_lock.unlock();
+                    clear_peer_runtime(mac);
+                    state_lock.lock();
+                    session.phase = "recovering";
+                    session.detail = "repairing stale remote GATT cache";
+                    session.last_repair_monotonic = now;
+                    session.connect_repair_count += 1;
+                    session.last_connect_attempt_monotonic = 0.0;
+                    session.connect_started_monotonic = 0.0;
+                    session.connected_since_monotonic = 0.0;
+                    session.last_security_attempt_monotonic = 0.0;
+                    session.last_service_retry_monotonic = 0.0;
+                    session.bridge_wait_started_monotonic = 0.0;
+                    session.bridge_wait_reason.clear();
+                    pending_deadline = true;
+                    next_deadline_s = std::min(next_deadline_s, retry_period_s);
+                    continue;
+                }
+
                 pending_deadline = true;
                 next_deadline_s = std::min(next_deadline_s, retry_period_s);
                 continue;
