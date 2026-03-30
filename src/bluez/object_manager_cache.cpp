@@ -356,8 +356,14 @@ void ObjectManagerCache::on_properties_changed(
                 auto& a = it->second;
                 if (changed.count("Powered"))
                     a.powered = get_or<bool>(changed, "Powered", a.powered);
+                if (changed.count("Connectable"))
+                    a.connectable = get_or<bool>(changed, "Connectable", a.connectable);
                 if (changed.count("Discoverable"))
                     a.discoverable = get_or<bool>(changed, "Discoverable", a.discoverable);
+                if (changed.count("DiscoverableTimeout"))
+                    a.discoverable_timeout = get_or<uint32_t>(changed, "DiscoverableTimeout", a.discoverable_timeout);
+                if (changed.count("Pairable"))
+                    a.pairable = get_or<bool>(changed, "Pairable", a.pairable);
                 if (changed.count("Discovering"))
                     a.discovering = get_or<bool>(changed, "Discovering", a.discovering);
                 if (changed.count("Alias"))

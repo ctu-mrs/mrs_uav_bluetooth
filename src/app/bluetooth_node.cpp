@@ -494,9 +494,6 @@ void BluetoothNode::apply_adapter_state(const config::NodeConfig& cfg) {
     if (!adapter_info || !adapter_info->powered) {
         adapter_->power_on();
     }
-    if (!adapter_info || !adapter_info->connectable) {
-        adapter_->set_connectable(true);
-    }
     if (!adapter_info || adapter_info->alias != hostname_) {
         adapter_->set_alias(hostname_);
     }
@@ -1279,14 +1276,13 @@ void BluetoothNode::on_cache_event(bluez::CacheEvent event, const std::string& o
             if (const auto adapter = cache_->adapter(object_path)) {
                 const bool should_be_discoverable = active_config_.enable_server;
                 const bool drifted = !adapter->powered ||
-                    !adapter->connectable ||
                     !adapter->pairable ||
                     adapter->alias != hostname_ ||
                     adapter->discoverable != should_be_discoverable ||
                     (should_be_discoverable && adapter->discoverable_timeout != active_config_.discoverable_timeout);
                 if (drifted) {
                     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                                         "[node] adapter state drift detected, reapplying powered/connectable/pairable/discoverable/alias settings");
+                                         "[node] adapter state drift detected, reapplying powered/pairable/discoverable/alias settings");
                     apply_adapter_state(active_config_);
                 }
             }
