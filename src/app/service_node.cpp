@@ -144,6 +144,16 @@ std::string peer_topic_token(const std::string& peer_name, const std::string& ma
     return token;
 }
 
+bool local_peer_should_initiate_link(const std::string& local_hostname,
+                                     const std::string& peer_name) {
+    const auto local = lower_trim(local_hostname);
+    const auto peer = lower_trim(peer_name);
+    if (local.empty() || peer.empty()) {
+        return true;
+    }
+    return local < peer;
+}
+
 std::string trim_topic_segment(const std::string& value) {
     const auto start = value.find_first_not_of(" \t\r\n/");
     if (start == std::string::npos) {
@@ -1658,12 +1668,14 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
     const bool desired_peer = session_it != peers_->sessions().end() && session_it->second.desired;
     const auto peer_name = device_hostname_guess(device);
     const bool local_peer = !peer_name.empty() && lower_trim(peer_name) == lower_trim(hostname_);
+    const bool secure_peer = device.connected && desired_peer && !local_peer &&
+        device.trusted && (device.paired || device.bonded) && device.services_resolved;
     const auto now_mono = peers_->now_monotonic();
     const auto retry_period_s = std::max(1.0, active_config_.auto_connect_period);
     const auto missing_path_grace_s = std::max(8.0, retry_period_s * 4.0);
 
     std::set<std::string> desired_keys;
-    if (device.connected && desired_peer && !local_peer) {
+    if (secure_peer) {
         for (const auto& shared_topic : active_config_.shared_topics) {
             if (shared_topic.mode != "import" && shared_topic.mode != "both") {
                 continue;
@@ -1719,7 +1731,7 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
                                                  const std::set<std::string>& desired_keys,
                                                  double now_mono,
                                                  double missing_path_grace_s) {
-    if (!peers_ || !import_bridges_) {
+    if (!peers_ || !import_bridges_ || !client_) {
         return;
     }
 
@@ -1728,6 +1740,7 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
         return;
     }
     auto& session = session_it->second;
+    std::vector<std::string> removed_paths;
 
     for (auto it = bridge_registry_.imports().begin(); it != bridge_registry_.imports().end();) {
         if (!it->second.auto_managed || it->second.mac != mac) {
@@ -1736,6 +1749,9 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
         }
         if (desired_keys.find(it->first) == desired_keys.end()) {
             session.import_bridge_missing_since.erase(it->first);
+            if (!it->second.path.empty()) {
+                removed_paths.push_back(it->second.path);
+            }
             import_bridges_->destroy_import_bridge(it->second);
             it = bridge_registry_.imports().erase(it);
             continue;
@@ -1758,8 +1774,15 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
         }
 
         session.import_bridge_missing_since.erase(it->first);
+        if (!it->second.path.empty()) {
+            removed_paths.push_back(it->second.path);
+        }
         import_bridges_->destroy_import_bridge(it->second);
         it = bridge_registry_.imports().erase(it);
+    }
+
+    for (const auto& path : removed_paths) {
+        client_->stop_notify(path);
     }
 }
 
@@ -2073,6 +2096,7 @@ void ServiceNode::reconcile_peers() {
         const auto device = client_->get_device(mac);
         const auto device_label = mac + " (" + session.peer_name + ")";
         const bool is_connected = device && device->connected;
+        const bool local_initiates_link = local_peer_should_initiate_link(hostname_, session.peer_name);
 
         if (!session.desired || !is_connected) {
             clear_peer_runtime(mac);
@@ -2117,6 +2141,14 @@ void ServiceNode::reconcile_peers() {
 
         // Skip non-desired sessions entirely — they are not managed by us.
         if (!session.desired) {
+            continue;
+        }
+
+        if (!is_connected && !local_initiates_link) {
+            session.phase = "connect_pending";
+            session.detail = "awaiting remote connection";
+            pending_deadline = true;
+            next_deadline_s = std::min(next_deadline_s, retry_period_s);
             continue;
         }
 
@@ -2182,7 +2214,7 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (peers_->should_attempt_connect(session, now, retry_period_s)) {
+        if (local_initiates_link && peers_->should_attempt_connect(session, now, retry_period_s)) {
             if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
                     (void)client_->connect(mac, retry_period_s);
                 })) {
@@ -2198,7 +2230,7 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (device && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
+        if (device && local_initiates_link && peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
             if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
                     (void)client_->pair(mac, retry_period_s);
                 })) {
