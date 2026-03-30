@@ -28,6 +28,7 @@ constexpr double kPeerRepairCooldownMin = 8.0;
 constexpr double kBridgeGraceMin = 8.0;
 constexpr double kPolicyConfigSettleGraceMin = 5.0;
 constexpr double kLocalReconfigureGraceMin = 5.0;
+constexpr double kRemoteGattDiscoveryRepairGraceMin = 2.0;
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kGattReadWriteLogInterval = std::chrono::seconds(10);
@@ -813,6 +814,10 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         }
     }
 
+    if (!can_run_callbacks()) {
+        return;
+    }
+
     rebuild_server_objects();
     { 
         std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
@@ -825,6 +830,9 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     if (time_service_timer_) {
         time_service_timer_->cancel();
         time_service_timer_.reset();
+    }
+    if (!can_run_callbacks()) {
+        return;
     }
     if (cfg.enable_time_service && cfg.time_update_period > 0.0) {
         time_service_timer_ = create_grouped_wall_timer(
@@ -842,6 +850,9 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     if (wifi_service_timer_) {
         wifi_service_timer_->cancel();
         wifi_service_timer_.reset();
+    }
+    if (!can_run_callbacks()) {
+        return;
     }
     if (cfg.enable_wifi_service && cfg.wifi_refresh_period > 0.0) {
         wifi_service_timer_ = create_grouped_wall_timer(
@@ -2182,9 +2193,11 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
-        session.bridge_wait_reason = "characteristic";
+        session.bridge_wait_reason = characteristics.empty() ? "gatt-cache" : "gatt-layout";
         session.phase = "connected_unready";
-        session.detail = "peer time characteristic not available";
+        session.detail = characteristics.empty()
+            ? "waiting for remote GATT cache"
+            : "peer time characteristic not available";
         return false;
     }
 
@@ -2533,9 +2546,47 @@ void ServiceNode::reconcile_peers() {
         const bool services_stuck = is_connected && device->trusted && (device->paired || device->bonded) &&
             !device->services_resolved && session.services_wait_started_monotonic > 0.0 &&
             (now - session.services_wait_started_monotonic) >= session.services_wait_grace_s;
+        const bool remote_gatt_cache_stuck = is_connected && device->trusted && (device->paired || device->bonded) &&
+            device->services_resolved && session.bridge_wait_reason == "gatt-cache" &&
+            session.bridge_wait_started_monotonic > 0.0 &&
+            (now - session.bridge_wait_started_monotonic) >= kRemoteGattDiscoveryRepairGraceMin;
         const bool bridge_stuck = is_connected && device->trusted && (device->paired || device->bonded) &&
             device->services_resolved && session.bridge_wait_started_monotonic > 0.0 &&
             (now - session.bridge_wait_started_monotonic) >= bridge_grace_s;
+        if (remote_gatt_cache_stuck &&
+            (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= repair_cooldown_s) &&
+            run_peer_task_once(mac, "repair remote gatt", [this, mac]() {
+                (void)client_->disconnect(mac, 5.0);
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                (void)client_->untrust(mac);
+                (void)client_->remove(mac);
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                (void)client_->unblock(mac);
+            })) {
+            RCLCPP_WARN(get_logger(),
+                        "[reconcile] %s: repairing stale remote GATT discovery after ServicesResolved with zero GATT objects",
+                        device_label.c_str());
+            state_lock.unlock();
+            clear_peer_runtime(mac);
+            state_lock.lock();
+            session.pairing_reset_pending = true;
+            session.phase = "recovering";
+            session.detail = "repairing stale remote GATT discovery";
+            session.last_repair_monotonic = now;
+            session.connect_repair_count += 1;
+            session.last_connect_attempt_monotonic = 0.0;
+            session.connect_started_monotonic = 0.0;
+            session.connected_since_monotonic = 0.0;
+            session.last_security_attempt_monotonic = 0.0;
+            session.last_service_retry_monotonic = 0.0;
+            session.services_wait_started_monotonic = 0.0;
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+            pending_deadline = true;
+            next_deadline_s = std::min(next_deadline_s, retry_period_s);
+            continue;
+        }
+
         const bool repair_due = services_stuck || bridge_stuck;
         if (repair_due &&
             (session.last_repair_monotonic <= 0.0 || now - session.last_repair_monotonic >= repair_cooldown_s) &&
