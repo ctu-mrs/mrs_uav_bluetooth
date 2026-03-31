@@ -382,15 +382,6 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     }
 
     if (!device.services_resolved) {
-        if (preserve_ready_runtime) {
-            session.services_wait_started_monotonic = 0.0;
-            session.bridge_wait_started_monotonic = 0.0;
-            session.bridge_wait_reason.clear();
-            session.last_service_retry_monotonic = 0.0;
-            set_session_phase(session, "ready", "peer time bridge active");
-            return;
-        }
-
         session.last_service_retry_monotonic = 0.0;
         session.services_resolved_since_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;

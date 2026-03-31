@@ -17,6 +17,7 @@ constexpr double kRemoteGattSnapshotFallbackDelay = 2.0;
 constexpr double kRemoteGattSnapshotRetryInterval = 2.0;
 constexpr double kPeerNotifyRetryBackoff = 1.0;
 constexpr int kPeerNotifyFailureReconnectThreshold = 3;
+constexpr double kPeerNotifyHandshakeTimeout = 10.0;
 constexpr double kPeerPairTimeout = 20.0;
 constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
 
@@ -403,20 +404,42 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         auto& bridge = bridge_it->second;
         bridge.mac = mac;
         bridge.peer_name = peer_name;
-        bridge.status = "ready";
-        bridge.detail = "peer time bridge active";
-        peers_->clear_device_reset(session);
-        session.bridge_wait_started_monotonic = 0.0;
-        session.bridge_wait_reason.clear();
+        const bool handshake_complete = bridge.time_notification_received && bridge.time_writeback_received;
+        if (handshake_complete) {
+            bridge.status = "ready";
+            bridge.detail = "peer time bridge active";
+            peers_->clear_device_reset(session);
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+            session.remote_gatt_missing_since_monotonic = 0.0;
+            session.remote_gatt_missing_checks = 0;
+            session.last_service_retry_monotonic = 0.0;
+            session.last_notify_failure_monotonic = 0.0;
+            session.notify_failure_count = 0;
+            session.last_notify_failure_characteristic_path.clear();
+            session.phase = "ready";
+            session.detail = "peer time bridge active";
+            return true;
+        }
+
+        bridge.status = "subscribing";
+        bridge.detail = bridge.time_notification_received
+            ? "awaiting peer time writeback"
+            : "awaiting peer time notifications";
         session.remote_gatt_missing_since_monotonic = 0.0;
         session.remote_gatt_missing_checks = 0;
         session.last_service_retry_monotonic = 0.0;
         session.last_notify_failure_monotonic = 0.0;
         session.notify_failure_count = 0;
         session.last_notify_failure_characteristic_path.clear();
-        session.phase = "ready";
-        session.detail = "peer time bridge active";
-        return true;
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = now_mono;
+        }
+        session.bridge_wait_reason = "notify";
+        session.phase = "connected_unready";
+        session.detail = bridge.detail;
+        schedule_peer_reconcile(kPeerWaitReconcileDelay);
+        return false;
     }
 
     RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): %zu services, %zu characteristics, %zu descriptors resolved",
@@ -879,6 +902,29 @@ void ServiceNode::reconcile_peers() {
             state_lock.unlock();
             (void)update_peer_time_bridge(mac, device_copy, session);
             state_lock.lock();
+
+            const auto bridge_it = peers_->time_bridges().find(mac);
+            const bool handshake_complete =
+                bridge_it != peers_->time_bridges().end() &&
+                bridge_it->second.time_notification_received &&
+                bridge_it->second.time_writeback_received;
+            const bool notify_handshake_timed_out =
+                session.bridge_wait_reason == "notify" &&
+                session.bridge_wait_started_monotonic > 0.0 &&
+                !handshake_complete &&
+                (now - session.bridge_wait_started_monotonic) >= kPeerNotifyHandshakeTimeout;
+            if (notify_handshake_timed_out) {
+                const bool missing_writeback =
+                    bridge_it != peers_->time_bridges().end() &&
+                    bridge_it->second.time_notification_received &&
+                    !bridge_it->second.time_writeback_received;
+                peers_->request_device_reset(session,
+                                             missing_writeback
+                                                 ? "peer time writeback missing, resetting peer device state"
+                                                 : "peer time notifications missing, resetting peer device state",
+                                             false);
+                continue;
+            }
 
             const bool repeated_notify_failures =
                 session.notify_failure_count >= kPeerNotifyFailureReconnectThreshold &&

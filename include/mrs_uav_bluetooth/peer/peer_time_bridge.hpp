@@ -19,6 +19,8 @@ struct PeerTimeBridge {
     double current_hz{0.0};
     uint64_t last_time_value_ns{0};
     double last_rtt_s{0.0};
+    bool time_notification_received{false};
+    bool time_writeback_received{false};
     std::string status;
     std::string detail;
     double services_wait_started_monotonic{0.0};

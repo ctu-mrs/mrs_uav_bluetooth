@@ -352,12 +352,18 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
     auto& bridge = bridge_it->second;
     bridge.last_activity_monotonic = peers_->now_monotonic();
     bridge.last_time_value_ns = peer_time_ns;
+    bridge.time_notification_received = true;
     const auto publish_rate = update_publish_rate(bridge.last_publish_monotonic);
     bridge.last_publish_monotonic = publish_rate.monotonic_now;
     bridge.current_hz = publish_rate.hz;
-    bridge.status = "ready";
-    bridge.detail = "time notification";
-    publish_peer_time_status(bridge);
+    if (bridge.time_writeback_received) {
+        bridge.status = "ready";
+        bridge.detail = "time notification";
+        publish_peer_time_status(bridge);
+    } else {
+        bridge.status = "subscribing";
+        bridge.detail = "time notification received, awaiting writeback";
+    }
 
     if (!bridge.writeback_descriptor_path.empty()) {
         client_->write_descriptor_async(bridge.writeback_descriptor_path, data);
@@ -421,6 +427,13 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
     auto& bridge = bridge_it->second;
     bridge.last_activity_monotonic = peers_->now_monotonic();
     bridge.last_rtt_s = std::max(0.0, static_cast<double>(received_time_ns - echoed_time_ns) / 1e9);
+    bridge.time_writeback_received = true;
+    if (!bridge.time_notification_received) {
+        bridge.status = "subscribing";
+        bridge.detail = "peer time writeback received, awaiting notifications";
+        return;
+    }
+
     bridge.status = "ready";
     bridge.detail = "time writeback";
     publish_peer_time_status(bridge);
