@@ -335,13 +335,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
             }
         }
         if (!affected_mac.empty() && peer_runtime_clear_in_progress_.count(affected_mac) == 0) {
-            const auto device = cache_->device_by_mac(affected_mac);
-            const bool expected_services_rediscovery =
-                device &&
-                should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
-            if (expected_services_rediscovery) {
-                refresh_device = *device;
-            } else if (event_type == "client_notify_failed") {
+            if (event_type == "client_notify_failed") {
                 const auto session_it = peers_->sessions().find(affected_mac);
                 if (session_it != peers_->sessions().end()) {
                     auto& session = session_it->second;
@@ -369,9 +363,9 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                         }
                         session.time_bridge_init_notify_failure_monotonic = failure_now;
 
-                        const auto live_device = client_->get_device(affected_mac);
-                        if (live_device &&
-                            device_has_recorded_bond(*live_device) &&
+                        const auto device = client_->get_device(affected_mac);
+                        if (device &&
+                            device_has_recorded_bond(*device) &&
                             session.time_bridge_init_notify_failure_count >= 3) {
                             peers_->request_device_reset(
                                 session,
@@ -385,10 +379,8 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                         }
                     }
                 }
-                clear_runtime_mac = affected_mac;
-            } else {
-                clear_runtime_mac = affected_mac;
             }
+            clear_runtime_mac = affected_mac;
         }
     }
 
