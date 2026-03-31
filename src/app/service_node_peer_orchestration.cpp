@@ -26,17 +26,6 @@ std::string lower_trim(std::string value) {
     return value.substr(start, end - start + 1);
 }
 
-std::string normalize_mac_key(std::string value) {
-    value = lower_trim(std::move(value));
-    value.erase(std::remove_if(value.begin(), value.end(),
-                               [](unsigned char ch) {
-                                   return std::isspace(ch) != 0 || ch == '-';
-                               }),
-                value.end());
-    std::replace(value.begin(), value.end(), '_', ':');
-    return value;
-}
-
 std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
     if (mrs_uav_bluetooth::util::is_uav_hostname(device.name)) {
         return device.name;
@@ -59,26 +48,6 @@ bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& dev
                                  const mrs_uav_bluetooth::config::NodeConfig& config) {
     (void)config;
     return device.connected && device.services_resolved;
-}
-
-bool local_is_preferred_initiator(const std::string& local_hostname,
-                                  const std::string& local_adapter_mac,
-                                  const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
-                                  const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    const auto local_name = lower_trim(local_hostname);
-    const auto peer_name = lower_trim(session.peer_name.empty() ? device_hostname_guess(device)
-                                                                : session.peer_name);
-    if (!local_name.empty() && !peer_name.empty() && local_name != peer_name) {
-        return local_name < peer_name;
-    }
-
-    const auto local_mac = normalize_mac_key(local_adapter_mac);
-    const auto peer_mac = normalize_mac_key(device.mac);
-    if (!local_mac.empty() && !peer_mac.empty() && local_mac != peer_mac) {
-        return local_mac < peer_mac;
-    }
-
-    return true;
 }
 
 template<typename DurationT, typename CallbackT>
@@ -509,8 +478,6 @@ void ServiceNode::reconcile_peers() {
     const auto now = peers_->now_monotonic();
     const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
     const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
-    const auto adapter = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
-    const std::string local_adapter_mac = adapter ? adapter->address : std::string{};
     std::set<std::string> current_macs;
     for (const auto& device : client_->get_devices()) {
         current_macs.insert(device.mac);
@@ -552,12 +519,30 @@ void ServiceNode::reconcile_peers() {
             if (!session.forget_pending &&
                 run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
                                                             trusted = device->trusted]() {
+                    const auto should_continue_cleanup = [this, &mac]() {
+                        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+                        if (shutting_down_.load() || !peers_) {
+                            return false;
+                        }
+                        const auto session_it = peers_->sessions().find(mac);
+                        return session_it != peers_->sessions().end() && !session_it->second.desired;
+                    };
+
+                    if (!should_continue_cleanup()) {
+                        return;
+                    }
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
                         std::this_thread::sleep_for(std::chrono::milliseconds(300));
                     }
+                    if (!should_continue_cleanup()) {
+                        return;
+                    }
                     if (trusted) {
                         (void)client_->untrust(mac);
+                    }
+                    if (!should_continue_cleanup()) {
+                        return;
                     }
                     (void)client_->remove(mac);
                 })) {
@@ -574,12 +559,6 @@ void ServiceNode::reconcile_peers() {
         }
 
         session.forget_pending = false;
-
-        const bool should_initiate = device ? local_is_preferred_initiator(hostname_,
-                                                                           local_adapter_mac,
-                                                                           session,
-                                                                           *device)
-                                            : true;
 
         if (device && device->blocked) {
             if (run_peer_task_once(mac, "unblock", [this, mac]() {
@@ -598,12 +577,31 @@ void ServiceNode::reconcile_peers() {
 
             if (!session.repair_remove_issued &&
                 !run_peer_task_once(mac, "reset stale pairing", [this, mac, retry_period_s, connected = is_connected]() {
+                    const auto should_continue_repair = [this, &mac]() {
+                        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+                        if (shutting_down_.load() || !peers_) {
+                            return false;
+                        }
+                        const auto session_it = peers_->sessions().find(mac);
+                        return session_it != peers_->sessions().end() &&
+                               session_it->second.stale_pairing_detected;
+                    };
+
+                    if (!should_continue_repair()) {
+                        return;
+                    }
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
                         std::this_thread::sleep_for(std::chrono::milliseconds(300));
                     }
+                    if (!should_continue_repair()) {
+                        return;
+                    }
                     (void)client_->remove(mac);
                     std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    if (!should_continue_repair()) {
+                        return;
+                    }
                     (void)client_->unblock(mac);
                 })) {
                 continue;
@@ -646,22 +644,27 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (!is_connected) {
-            if (!should_initiate) {
+            const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
+            if (local_server_rebuild_monotonic_ > 0.0 &&
+                (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s) {
                 session.phase = session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered";
-                session.detail = "awaiting connection from preferred initiator";
+                session.detail = "waiting for local GATT rebuild";
+                continue;
+            }
+            if (peers_->should_defer_connect_due_to_remote_activity(session, now)) {
+                session.phase = session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered";
+                session.detail = "remote-initiated flow in progress";
                 continue;
             }
             if (peers_->should_attempt_connect(session, now, retry_period_s)) {
                 if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
-                        (void)client_->set_preferred_bearer(mac, "le");
                         (void)client_->connect(mac, retry_period_s);
                     })) {
                     RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
                                 device_label.c_str(), session.phase.c_str());
+                    peers_->note_local_connect_attempt(session, now);
                     session.phase = "connecting";
                     session.detail = "auto-connect requested";
-                    session.last_connect_attempt_monotonic = now;
-                    session.connect_started_monotonic = now;
                 }
             }
             continue;
@@ -687,7 +690,7 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
 
             if (session.phase == "ready" && device) {
-                if (should_initiate && peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
+                if (peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
                     if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
                             std::string pair_error;
                             const bool pair_ok = client_->pair(mac, retry_period_s, &pair_error);

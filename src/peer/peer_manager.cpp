@@ -14,6 +14,7 @@ constexpr double kConnectAttemptGraceMultiplier = 5.0;
 constexpr double kServicesWaitGraceMin = 15.0;
 constexpr double kPairCooldownMin = 10.0;
 constexpr double kTrustCooldownMin = 0.5;
+constexpr double kRemoteInitiatedBackoffMin = 8.0;
 bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
               std::initializer_list<const char*> values) {
     for (const char* value : values) {
@@ -177,6 +178,13 @@ void PeerManager::set_session_phase(PeerConnectionSession& session,
     session.detail = detail;
 }
 
+void PeerManager::note_local_connect_attempt(PeerConnectionSession& session,
+                                             double now_mono) const {
+    session.last_connect_attempt_monotonic = now_mono;
+    session.connect_started_monotonic = now_mono;
+    session.remote_initiated_until_monotonic = 0.0;
+}
+
 void PeerManager::request_pairing_repair(PeerConnectionSession& session,
                                          const std::string& reason) {
     if (session.stale_pairing_detected) {
@@ -219,6 +227,7 @@ void PeerManager::clear_pairing_repair(PeerConnectionSession& session,
     }
     session.forget_pending = false;
     session.repair_reason.clear();
+    session.remote_initiated_until_monotonic = 0.0;
     session.remote_gatt_missing_since_monotonic = 0.0;
     session.remote_gatt_missing_checks = 0;
     session.secure_pre_ready_disconnects = 0;
@@ -266,6 +275,7 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
         session.secure_pre_ready_disconnects = 0;
+        session.remote_initiated_until_monotonic = 0.0;
         session.remote_gatt_missing_since_monotonic = 0.0;
         session.remote_gatt_missing_checks = 0;
         if (!device_needs_forget(device)) {
@@ -306,6 +316,10 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        if (session.remote_initiated_until_monotonic > 0.0 &&
+            now >= session.remote_initiated_until_monotonic) {
+            session.remote_initiated_until_monotonic = 0.0;
+        }
         session.remote_gatt_missing_since_monotonic = 0.0;
         session.remote_gatt_missing_checks = 0;
 
@@ -320,8 +334,22 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         return;
     }
 
+    const bool first_connection_observed = session.connected_since_monotonic <= 0.0;
+    const double connect_grace_s = std::max(kConnectAttemptGraceMin,
+                                            config.auto_connect_period * kConnectAttemptGraceMultiplier);
+    const bool local_connect_in_flight = session.connect_started_monotonic > 0.0 &&
+        (now - session.connect_started_monotonic) < connect_grace_s;
+
     session.connected_since_monotonic = session.connected_since_monotonic > 0.0
         ? session.connected_since_monotonic : now;
+    if (first_connection_observed) {
+        if (local_connect_in_flight) {
+            session.remote_initiated_until_monotonic = 0.0;
+        } else {
+            session.remote_initiated_until_monotonic =
+                now + std::max(kRemoteInitiatedBackoffMin, config.auto_connect_period * 2.0);
+        }
+    }
 
     if (!device.services_resolved) {
         session.bridge_wait_started_monotonic = 0.0;
@@ -452,6 +480,13 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
     return session.last_connect_attempt_monotonic <= 0.0 ||
            now_mono - session.last_connect_attempt_monotonic >= retry_period_s;
 }
+
+    bool PeerManager::should_defer_connect_due_to_remote_activity(const PeerConnectionSession& session,
+                                          double now_mono) const {
+        return session.remote_initiated_until_monotonic > 0.0 &&
+            now_mono < session.remote_initiated_until_monotonic &&
+            !is_phase(session, {"ready"});
+    }
 
 bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
                                       const bluez::DeviceInfo& device,

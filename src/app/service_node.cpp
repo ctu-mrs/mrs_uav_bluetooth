@@ -439,7 +439,6 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     const auto new_gatt_layout_signature = gatt_layout_signature_for_config(cfg);
     const bool gatt_layout_changed = !local_gatt_layout_signature_.empty() &&
         local_gatt_layout_signature_ != new_gatt_layout_signature;
-    std::vector<std::string> gatt_cache_reset_macs;
 
     active_config_ = cfg;
     if (pairing_agent_) {
@@ -521,40 +520,25 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             refresh_import_bridges_for_device(device);
         }
 
-        if (gatt_layout_changed) {
-            std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
-            for (const auto& device : client_->get_devices()) {
-                const auto session_it = peers_->sessions().find(device.mac);
-                if (session_it == peers_->sessions().end()) {
-                    continue;
-                }
-                const auto& session = session_it->second;
-                if (!session.peer_candidate && !session.desired) {
-                    continue;
-                }
-                if (!(device.connected || device.paired || device.bonded || device.trusted)) {
-                    continue;
-                }
-                gatt_cache_reset_macs.push_back(device.mac);
-            }
-        }
     }
 
-    if (gatt_layout_changed && !gatt_cache_reset_macs.empty()) {
+    if (gatt_layout_changed) {
         RCLCPP_WARN(get_logger(),
-                    "Local GATT layout changed, clearing %zu peer runtime(s) before rebuilding the server",
-                    gatt_cache_reset_macs.size());
-        for (const auto& mac : gatt_cache_reset_macs) {
-            clear_peer_runtime(mac);
-        }
+                    "Local GATT layout changed, rebuilding the server without clearing active peer runtime");
     }
 
     if (!can_run_callbacks()) {
         return;
     }
 
+    {
+        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+        local_server_rebuild_monotonic_ = peers_ ? peers_->now_monotonic()
+                                                 : std::chrono::duration<double>(
+                                                       std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     rebuild_server_objects();
-    { 
+    {
         std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
         local_server_rebuild_monotonic_ = peers_ ? peers_->now_monotonic()
                                                  : std::chrono::duration<double>(

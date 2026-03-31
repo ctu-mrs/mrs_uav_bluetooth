@@ -41,11 +41,15 @@ public:
     bool should_attempt_connect(const PeerConnectionSession& session,
                                 double now_mono,
                                 double retry_period_s) const;
+    bool should_defer_connect_due_to_remote_activity(const PeerConnectionSession& session,
+                                                     double now_mono) const;
     bool should_attempt_pair(const PeerConnectionSession& session,
                              const bluez::DeviceInfo& device,
                              const config::NodeConfig& config,
                              double now_mono,
                              double retry_period_s) const;
+    void note_local_connect_attempt(PeerConnectionSession& session,
+                                    double now_mono) const;
     void prune_sessions(const std::set<std::string>& current_macs, double now_mono, double ttl_s);
     double now_monotonic() const;
 

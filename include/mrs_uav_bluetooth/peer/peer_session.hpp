@@ -41,6 +41,7 @@ struct PeerConnectionSession {
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};
     int secure_pre_ready_disconnects{0};
+    double remote_initiated_until_monotonic{0.0};
     double remote_gatt_missing_since_monotonic{0.0};
     int remote_gatt_missing_checks{0};
     std::map<std::string, double> import_bridge_missing_since;
