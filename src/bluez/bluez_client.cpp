@@ -707,4 +707,9 @@ void BluezClient::remove_notify_match(const std::string& chrc_path) {
     notify_paths_.erase(chrc_path);
 }
 
+bool BluezClient::is_notify_active(const std::string& chrc_path) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return notify_paths_.count(chrc_path) != 0;
+}
+
 }  // namespace mrs_uav_bluetooth::bluez

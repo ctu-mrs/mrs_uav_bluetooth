@@ -299,7 +299,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                 break;
             }
         }
-        if (!affected_mac.empty()) {
+        if (!affected_mac.empty() && peer_runtime_clear_in_progress_.count(affected_mac) == 0) {
             clear_runtime_mac = affected_mac;
         }
     }

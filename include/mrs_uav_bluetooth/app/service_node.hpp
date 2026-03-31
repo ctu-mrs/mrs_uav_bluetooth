@@ -207,6 +207,7 @@ private:
     double local_server_rebuild_monotonic_{0.0};
     std::atomic_bool local_server_rebuild_in_progress_{false};
     std::string local_gatt_layout_signature_;
+    std::set<std::string> peer_runtime_clear_in_progress_;
 };
 
 }  // namespace mrs_uav_bluetooth::app

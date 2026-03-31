@@ -194,6 +194,9 @@ bool BluezClient::start_notify(const std::string& chrc_path) {
 
 bool BluezClient::stop_notify(const std::string& chrc_path) {
     RCLCPP_DEBUG(logger_, "[client] stop_notify path=%s", chrc_path.c_str());
+    if (!is_notify_active(chrc_path)) {
+        return true;
+    }
     try {
         auto proxy = create_bluez_proxy(dbus_.connection(), chrc_path);
         proxy->callMethod("StopNotify")

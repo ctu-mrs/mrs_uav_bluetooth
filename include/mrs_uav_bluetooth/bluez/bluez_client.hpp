@@ -98,6 +98,7 @@ public:
     // ---- Notifications ----
     bool start_notify(const std::string& chrc_path);
     bool stop_notify(const std::string& chrc_path);
+    bool is_notify_active(const std::string& chrc_path) const;
 
     /// Register for notification value callbacks.  Returns a token for removal.
     int add_notification_handler(NotificationCallback cb);

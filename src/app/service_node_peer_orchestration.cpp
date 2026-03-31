@@ -15,8 +15,6 @@ namespace {
 constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr double kRemoteGattSnapshotFallbackDelay = 2.0;
 constexpr double kRemoteGattSnapshotRetryInterval = 2.0;
-constexpr double kServicesResolveRepairDelay = 4.0;
-constexpr double kRemoteGattRepairDelay = 3.0;
 constexpr double kPeerPairTimeout = 20.0;
 constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
 
@@ -97,24 +95,15 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
         return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
     }();
 
-    if (authentication_failed) {
-        if (bridge_ready || session.phase == "ready") {
-            session.repair_in_progress = false;
-            session.detail = error_detail.empty() ? "late pair failed" : "late pair failed: " + error_detail;
-            return;
-        }
-        peers_->request_device_reset(session, "pair auth failed, resetting stale security", true);
-        session.last_repair_monotonic = 0.0;
-        return;
-    }
-
     session.repair_in_progress = false;
     if (bridge_ready || session.phase == "ready") {
-        session.detail = error_detail.empty() ? "late pair failed" : "late pair failed: " + error_detail;
+        session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
         return;
     }
-    session.phase = "recovering";
-    session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
+    session.phase = "connected_unready";
+    session.detail = error_detail.empty()
+        ? (authentication_failed ? "pair authentication failed" : "pair failed")
+        : "pair failed: " + error_detail;
 }
 
 bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
@@ -385,12 +374,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                 session.remote_gatt_missing_since_monotonic = now_mono;
             }
             session.remote_gatt_missing_checks += 1;
-            if ((now_mono - session.remote_gatt_missing_since_monotonic) >= kRemoteGattRepairDelay) {
-                peers_->request_device_reset(session,
-                                             "services resolved but BlueZ exposed no remote GATT objects");
-                schedule_peer_reconcile(std::chrono::milliseconds(1));
-                return false;
-            }
             if (session.bridge_wait_started_monotonic <= 0.0) {
                 session.bridge_wait_started_monotonic = now_mono;
             }
@@ -573,6 +556,16 @@ void ServiceNode::reconcile_peers() {
 
         if (!session.desired) {
             session.forget_pending = false;
+            if (device && device->connected) {
+                if (run_peer_task_once(mac, "disconnect undesired peer", [this, mac, retry_period_s]() {
+                        (void)client_->disconnect(mac, retry_period_s);
+                    })) {
+                    session.phase = "policy_blocked";
+                    session.detail = whitelist_enabled ? "disconnecting peer not present in whitelist"
+                                                      : "disconnecting peer not allowed by current config";
+                }
+                continue;
+            }
             session.phase = "policy_blocked";
             session.detail = whitelist_enabled ? "peer not present in whitelist"
                                               : "peer not allowed by current config";
@@ -693,13 +686,22 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (is_connected && device && !device->services_resolved) {
-            if (session.services_wait_started_monotonic > 0.0 &&
-                (now - session.services_wait_started_monotonic) >= kServicesResolveRepairDelay) {
-                peers_->request_device_reset(session, "connected but services never resolved");
-                schedule_peer_reconcile(std::chrono::milliseconds(1));
+        if (is_connected && device &&
+            peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
+            if (run_peer_task_once(mac, "pair", [this, mac]() {
+                    std::string error_detail;
+                    const bool success = client_->pair(mac, kPeerPairTimeout, &error_detail);
+                    note_pair_attempt_result(mac, success, error_detail);
+                })) {
+                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair after connection", device_label.c_str());
+                session.phase = "securing";
+                session.detail = "pair requested";
+                session.last_security_attempt_monotonic = now;
                 continue;
             }
+        }
+
+        if (is_connected && device && !device->services_resolved) {
             schedule_peer_reconcile(kPeerWaitReconcileDelay);
             session.phase = "connected_unready";
             session.detail = "connected, waiting for services";

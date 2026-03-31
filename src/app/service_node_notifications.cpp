@@ -91,6 +91,9 @@ void ServiceNode::clear_peer_runtime(const std::string& mac,
     if (!peers_ || !client_ || !import_bridges_) {
         return;
     }
+    if (!peer_runtime_clear_in_progress_.insert(mac).second) {
+        return;
+    }
 
     std::string characteristic_path;
 
@@ -106,6 +109,9 @@ void ServiceNode::clear_peer_runtime(const std::string& mac,
     if (!characteristic_path.empty() && characteristic_path != skip_characteristic_path) {
         client_->stop_notify(characteristic_path);
     }
+
+    state_lock.lock();
+    peer_runtime_clear_in_progress_.erase(mac);
 }
 
 void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& device) {
