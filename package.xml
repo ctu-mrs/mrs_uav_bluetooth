@@ -24,7 +24,7 @@
   <build_depend>mrs-libsdbus-c++</build_depend>
   <exec_depend>yaml-cpp</exec_depend>
   <exec_depend>mrs-libsdbus-c++</exec_depend>
-  <exec_depend>mrs-bluez</exec_depend>
+  <!--<exec_depend>mrs-bluez</exec_depend>-->
 
   <depend>launch</depend>
   <depend>launch_ros</depend>

@@ -50,6 +50,10 @@ bool device_has_required_pairing(const mrs_uav_bluetooth::bluez::DeviceInfo& dev
     return !config.auto_pair || device.paired || device.bonded;
 }
 
+bool device_has_recorded_bond(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.paired || device.bonded;
+}
+
 template<typename DurationT, typename CallbackT>
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
@@ -93,6 +97,9 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
     session.pairing_failures += 1;
     session.pairing_in_progress = false;
     const auto normalized_error = lower_trim(error_detail);
+    const bool stale_bond_detected = normalized_error.find("already exists") != std::string::npos ||
+        normalized_error.find("already paired") != std::string::npos ||
+        normalized_error.find("already bonded") != std::string::npos;
     const bool authentication_failed = normalized_error.find("authentication failed") != std::string::npos ||
         normalized_error.find("authentication rejected") != std::string::npos ||
         normalized_error.find("authentication canceled") != std::string::npos;
@@ -103,6 +110,12 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
     }();
 
     session.repair_in_progress = false;
+    if (stale_bond_detected && !bridge_ready && session.phase != "ready") {
+        peers_->request_device_reset(session,
+                                     "stale local bond detected, resetting peer device state",
+                                     true);
+        return;
+    }
     if (bridge_ready || session.phase == "ready") {
         session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
         return;
@@ -149,6 +162,19 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         log_warn_coalesced("pairing-rejected-stale:" + device->mac + ":" + event_type,
                            "[node] rejecting pairing request for " + device->mac +
                                " because peer state reset is already in progress");
+        return false;
+    }
+
+    const bool is_pairing_request_event = event_type.rfind("request_", 0) == 0;
+    if (is_pairing_request_event && device_has_recorded_bond(*device)) {
+        session.pairing_in_progress = false;
+        peers_->request_device_reset(session,
+                                     "incoming pairing request conflicts with local bond",
+                                     true);
+        log_warn_coalesced("pairing-rejected-bond-reset:" + device->mac + ":" + event_type,
+                           "[node] rejecting pairing request for " + device->mac +
+                               " because local bond is stale; resetting BlueZ device state");
+        schedule_peer_reconcile(std::chrono::milliseconds(1));
         return false;
     }
 
