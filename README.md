@@ -19,7 +19,7 @@ Main capabilities:
 
 ```bash
 sudo apt update
-sudo apt install mrs-bluez # optional (replaces distro's bluez)
+sudo apt install mrs-bluez # required due to the experimental mode
 sudo apt install ros-jazzy-mrs-uav-bluetooth mrs-uav-bluetooth-service
 ```
 

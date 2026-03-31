@@ -80,6 +80,18 @@ PACKAGE_ROOT="$(pwd)/bluez_package" ;
 mkdir -p "$PACKAGE_ROOT/DEBIAN" ;
 make DESTDIR="$PACKAGE_ROOT" install ;
 
+# enable experimental features by default in the packaged BlueZ config
+MAIN_CONF="$PACKAGE_ROOT/etc/bluetooth/main.conf" ;
+if [ -f "$MAIN_CONF" ] ; then
+    if grep -Eq '^[[:space:]]*#?[[:space:]]*Experimental[[:space:]]*=' "$MAIN_CONF" ; then
+        sed -Ei 's/^[[:space:]]*#?[[:space:]]*Experimental[[:space:]]*=.*/Experimental = true/' "$MAIN_CONF" ;
+    elif grep -Eq '^\[General\]' "$MAIN_CONF" ; then
+        sed -Ei '/^\[General\]/a Experimental = true' "$MAIN_CONF" ;
+    else
+        printf '\n[General]\nExperimental = true\n' >> "$MAIN_CONF" ;
+    fi
+fi
+
 # create package control file
 cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOT
 Package: $PACKAGE_NAME
