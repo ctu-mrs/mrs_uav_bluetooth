@@ -161,7 +161,10 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         }
     }
 
-    if (session.repair_requested || session.repair_in_progress) {
+    const bool active_repair = session.repair_in_progress ||
+        (session.repair_requested &&
+         (!session.repair_remove_issued || session.repair_awaiting_cache_removal));
+    if (active_repair) {
         log_warn_coalesced("pairing-rejected-stale:" + device->mac + ":" + event_type,
                            "[node] rejecting pairing request for " + device->mac +
                                " because peer state reset is already in progress");
@@ -334,12 +337,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     }
 
     if (!device.services_resolved) {
-        if (bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready") {
-            session.phase = "ready";
-            session.detail = "peer time bridge active";
-            return true;
-        }
-
         clear_time_bridge();
         state_lock.unlock();
         if (!stop_notify_path.empty()) {
@@ -647,10 +644,6 @@ void ServiceNode::reconcile_peers() {
         const auto device_label = mac + " (" + session.peer_name + ")";
         const bool is_connected = device && device->connected;
         const bool functional_bridge_peer = device && device_can_host_peer_bridge(*device);
-        const bool had_ready_bridge = [&]() {
-            const auto bridge_it = peers_->time_bridges().find(mac);
-            return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
-        }();
 
         if (!session.desired || !functional_bridge_peer) {
             state_lock.unlock();
@@ -864,12 +857,6 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device->services_resolved) {
-            if (had_ready_bridge) {
-                session.phase = "ready";
-                session.detail = "peer time bridge active";
-                continue;
-            }
-
             const double services_wait_started_monotonic = session.services_wait_started_monotonic;
             const double services_wait_grace_s = session.services_wait_grace_s;
             const bool services_wait_expired =

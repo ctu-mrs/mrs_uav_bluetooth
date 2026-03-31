@@ -435,13 +435,13 @@ void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
     it->second.remote_gatt_missing_since_monotonic = 0.0;
     it->second.remote_gatt_missing_checks = 0;
     if (it->second.repair_requested && it->second.repair_awaiting_cache_removal) {
-        it->second.repair_in_progress = false;
-        it->second.repair_awaiting_cache_removal = false;
+        const auto repair_detail = it->second.repair_reason.empty()
+            ? std::string{"awaiting fresh discovery after security reset"}
+            : it->second.repair_reason;
+        clear_device_reset(it->second);
         set_session_phase(it->second,
                           "stale",
-                          it->second.repair_reason.empty()
-                              ? "awaiting fresh discovery after security reset"
-                              : it->second.repair_reason);
+                          repair_detail);
         return;
     }
     set_session_phase(it->second, "stale", "device missing from cache");
