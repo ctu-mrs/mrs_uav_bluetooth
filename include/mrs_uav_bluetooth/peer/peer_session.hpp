@@ -17,7 +17,6 @@ struct PeerConnectionSession {
     double first_seen_monotonic{0.0};
     double last_seen_monotonic{0.0};
     double desired_since_monotonic{0.0};
-    double connect_eligible_after_monotonic{0.0};
     double last_connect_attempt_monotonic{0.0};
     double connect_started_monotonic{0.0};
     double connected_since_monotonic{0.0};
@@ -30,7 +29,6 @@ struct PeerConnectionSession {
     double missing_since_monotonic{0.0};
     double bridge_wait_started_monotonic{0.0};
     std::string bridge_wait_reason;
-    int connect_repair_count{0};
     int pairing_failures{0};
     bool repair_requested{false};
     bool pairing_reset_pending{false};
@@ -42,8 +40,6 @@ struct PeerConnectionSession {
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};
     double services_resolved_since_monotonic{0.0};
-    int secure_pre_ready_disconnects{0};
-    double remote_initiated_until_monotonic{0.0};
     double remote_gatt_missing_since_monotonic{0.0};
     int remote_gatt_missing_checks{0};
     std::map<std::string, double> import_bridge_missing_since;

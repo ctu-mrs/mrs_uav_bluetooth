@@ -42,8 +42,6 @@ public:
     bool should_attempt_connect(const PeerConnectionSession& session,
                                 double now_mono,
                                 double retry_period_s) const;
-    bool should_defer_connect_due_to_remote_activity(const PeerConnectionSession& session,
-                                                     double now_mono) const;
     bool should_attempt_pair(const PeerConnectionSession& session,
                              const bluez::DeviceInfo& device,
                              const config::NodeConfig& config,

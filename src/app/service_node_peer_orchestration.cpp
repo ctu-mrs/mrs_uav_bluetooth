@@ -478,7 +478,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
         session.bridge_wait_reason = "notify";
-        session.connect_repair_count = 0;
         session.phase = "connected_unready";
         session.detail = "awaiting peer time notifications";
         return false;
@@ -535,15 +534,13 @@ void ServiceNode::reconcile_peers() {
 
         const bool recent_connect_flow = session.last_connect_attempt_monotonic > 0.0 &&
             (now - session.last_connect_attempt_monotonic) < std::max(4.0, retry_period_s * 2.0);
-        const bool remote_flow_active = session.remote_initiated_until_monotonic > 0.0 &&
-            now < session.remote_initiated_until_monotonic;
         const bool waiting_for_bridge = session.services_wait_started_monotonic > 0.0 ||
             session.bridge_wait_started_monotonic > 0.0;
 
         if (session.desired &&
             (is_connected || session.phase == "connecting" || session.phase == "connect_pending" ||
              session.phase == "connected_unready" || session.phase == "securing" || session.phase == "ready" ||
-             recent_connect_flow || remote_flow_active || waiting_for_bridge)) {
+             recent_connect_flow || waiting_for_bridge)) {
             should_suspend_scan = true;
         }
 
@@ -662,11 +659,6 @@ void ServiceNode::reconcile_peers() {
                  (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s)) {
                 session.phase = session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered";
                 session.detail = "waiting for local GATT rebuild";
-                continue;
-            }
-            if (peers_->should_defer_connect_due_to_remote_activity(session, now)) {
-                session.phase = session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered";
-                session.detail = "remote-initiated flow in progress";
                 continue;
             }
             if (peers_->should_attempt_connect(session, now, retry_period_s)) {
