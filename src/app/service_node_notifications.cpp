@@ -85,6 +85,20 @@ PublishRateSample update_publish_rate(double last_publish_monotonic) {
 
 namespace mrs_uav_bluetooth::app {
 
+bool ServiceNode::has_ready_peer_time_bridge(const std::string& mac) const {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_) {
+        return false;
+    }
+
+    const auto bridge_it = peers_->time_bridges().find(mac);
+    return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
+}
+
+bool ServiceNode::device_can_host_peer_bridge(const bluez::DeviceInfo& device) const {
+    return device.connected && (device.services_resolved || has_ready_peer_time_bridge(device.mac));
+}
+
 void ServiceNode::clear_peer_runtime(const std::string& mac,
                                      const std::string& skip_characteristic_path) {
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
@@ -124,7 +138,7 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
     const bool desired_peer = session_it != peers_->sessions().end() && session_it->second.desired;
     const auto peer_name = device_hostname_guess(device);
     const bool local_peer = !peer_name.empty() && lower_trim(peer_name) == lower_trim(hostname_);
-    const bool functional_peer = desired_peer && !local_peer && device_can_host_peer_bridge(device, active_config_);
+    const bool functional_peer = desired_peer && !local_peer && device_can_host_peer_bridge(device);
     const auto now_mono = peers_ ? peers_->now_monotonic() : 0.0;
     const auto retry_period_s = std::max(1.0, active_config_.auto_connect_period);
     const auto missing_path_grace_s = std::max(8.0, retry_period_s * 4.0);
@@ -305,7 +319,7 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
 
     if (!mac.empty()) {
         const auto device = cache_->device_by_mac(mac);
-        if (!device || !device_can_host_peer_bridge(*device, active_config_)) {
+        if (!device || !device_can_host_peer_bridge(*device)) {
             clear_runtime_mac = mac;
         }
     }
@@ -380,7 +394,7 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
 
     if (cache_) {
         const auto device = cache_->device_by_mac(mac);
-        if (!device || !device_can_host_peer_bridge(*device, active_config_)) {
+        if (!device || !device_can_host_peer_bridge(*device)) {
             clear_runtime_mac = mac;
         }
     }

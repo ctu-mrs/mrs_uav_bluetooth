@@ -153,7 +153,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                            "[node] on_cache_event: DeviceAdded mac=" + device->mac +
                                " name='" + device->name + "' peer_name='" + peer_name +
                                " path=" + object_path);
-        peers_->sync_device(*device, active_config_, peer_name);
+        peers_->sync_device(*device, active_config_, peer_name, has_ready_peer_time_bridge(device->mac));
         refresh_device = *device;
     } else if (event == bluez::CacheEvent::DeviceRemoved) {
         std::string removed_mac;
@@ -191,7 +191,10 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                            std::string{"[node] on_cache_event: "} + event_name + " path=" + object_path);
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
-                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                peers_->sync_device(*device,
+                                    active_config_,
+                                    device_hostname_guess(*device),
+                                    has_ready_peer_time_bridge(device->mac));
                 refresh_device = *device;
             }
         }
@@ -206,7 +209,10 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         }
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
-                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                peers_->sync_device(*device,
+                                    active_config_,
+                                    device_hostname_guess(*device),
+                                    has_ready_peer_time_bridge(device->mac));
                 refresh_device = *device;
             }
         }
@@ -222,7 +228,10 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         }
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
-                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                peers_->sync_device(*device,
+                                    active_config_,
+                                    device_hostname_guess(*device),
+                                    has_ready_peer_time_bridge(device->mac));
                 refresh_device = *device;
             }
         }
@@ -246,7 +255,10 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         }
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
             if (const auto device = cache_->device(*device_path)) {
-                peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+                peers_->sync_device(*device,
+                                    active_config_,
+                                    device_hostname_guess(*device),
+                                    has_ready_peer_time_bridge(device->mac));
                 refresh_device = *device;
             }
         }
@@ -326,7 +338,10 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
 
     if (const auto device_path = device_path_for_gatt_object(*cache_, object_path)) {
         if (const auto device = cache_->device(*device_path)) {
-            peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
+            peers_->sync_device(*device,
+                                active_config_,
+                                device_hostname_guess(*device),
+                                has_ready_peer_time_bridge(device->mac));
             if (!clear_runtime_mac) {
                 refresh_device = *device;
             }

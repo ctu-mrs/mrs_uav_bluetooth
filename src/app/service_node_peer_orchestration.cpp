@@ -16,8 +16,6 @@ constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr double kRemoteGattSnapshotFallbackDelay = 2.0;
 constexpr double kRemoteGattSnapshotRetryInterval = 2.0;
 constexpr double kPeerNotifyRetryBackoff = 1.0;
-constexpr double kPeerServiceRegressionReconnectMin = 3.0;
-constexpr double kPeerServiceRegressionReconnectMax = 8.0;
 constexpr int kPeerNotifyFailureReconnectThreshold = 3;
 constexpr double kPeerPairTimeout = 20.0;
 constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
@@ -41,12 +39,6 @@ std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& de
         return device.alias;
     }
     return {};
-}
-
-bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
-                                 const mrs_uav_bluetooth::config::NodeConfig& config) {
-    (void)config;
-    return device.connected && device.services_resolved;
 }
 
 bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
@@ -132,7 +124,7 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
 
     const auto peer_name = device_hostname_guess(*device);
     auto& session = peers_->get_or_create_session(device->mac, peer_name);
-    peers_->sync_device(*device, active_config_, peer_name);
+    peers_->sync_device(*device, active_config_, peer_name, has_ready_peer_time_bridge(device->mac));
 
     if (!session.desired) {
         log_warn_coalesced("pairing-rejected-policy:" + device->mac + ":" + event_type,
@@ -283,7 +275,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         }
     };
 
-    if (!device.connected || !device.services_resolved) {
+    if (!device.connected) {
         clear_time_bridge();
         state_lock.unlock();
         if (!stop_notify_path.empty()) {
@@ -296,7 +288,30 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.bridge_wait_reason.clear();
         session.last_service_retry_monotonic = 0.0;
         session.phase = "connected_unready";
-        session.detail = device.connected ? "connected, waiting for services" : "awaiting connection";
+        session.detail = "awaiting connection";
+        return false;
+    }
+
+    if (!device.services_resolved) {
+        if (bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready") {
+            session.phase = "ready";
+            session.detail = "peer time bridge active";
+            return true;
+        }
+
+        clear_time_bridge();
+        state_lock.unlock();
+        if (!stop_notify_path.empty()) {
+            client_->stop_notify(stop_notify_path);
+        }
+        state_lock.lock();
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.last_service_retry_monotonic = 0.0;
+        session.phase = "connected_unready";
+        session.detail = "connected, waiting for services";
         return false;
     }
 
@@ -568,20 +583,11 @@ void ServiceNode::reconcile_peers() {
         const auto device = client_->get_device(mac);
         const auto device_label = mac + " (" + session.peer_name + ")";
         const bool is_connected = device && device->connected;
-        const bool functional_bridge_peer = device && device_can_host_peer_bridge(*device, active_config_);
+        const bool functional_bridge_peer = device && device_can_host_peer_bridge(*device);
         const bool had_ready_bridge = [&]() {
             const auto bridge_it = peers_->time_bridges().find(mac);
             return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
         }();
-
-        if (session.desired && device && device->connected && !device->services_resolved &&
-            (had_ready_bridge || session.phase == "ready") &&
-            session.service_regression_started_monotonic <= 0.0) {
-            session.service_regression_started_monotonic = now;
-            log_warn_coalesced("peer-services-regressed:" + mac,
-                               "[reconcile] " + device_label +
-                                   ": services dropped after peer bridge became ready, scheduling fast reconnect");
-        }
 
         if (!session.desired || !functional_bridge_peer) {
             state_lock.unlock();
@@ -772,15 +778,14 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device->services_resolved) {
-            const bool services_regressed = session.service_regression_started_monotonic > 0.0;
-            const double services_wait_started_monotonic = services_regressed
-                ? session.service_regression_started_monotonic
-                : session.services_wait_started_monotonic;
-            const double services_wait_grace_s = services_regressed
-                ? std::clamp(retry_period_s * 2.0,
-                             kPeerServiceRegressionReconnectMin,
-                             kPeerServiceRegressionReconnectMax)
-                : session.services_wait_grace_s;
+            if (had_ready_bridge) {
+                session.phase = "ready";
+                session.detail = "peer time bridge active";
+                continue;
+            }
+
+            const double services_wait_started_monotonic = session.services_wait_started_monotonic;
+            const double services_wait_grace_s = session.services_wait_grace_s;
             const bool services_wait_expired =
                 services_wait_started_monotonic > 0.0 &&
                 services_wait_grace_s > 0.0 &&
@@ -790,30 +795,19 @@ void ServiceNode::reconcile_peers() {
                 if (run_peer_task_once(mac, "recover unresolved services", [this, mac, retry_period_s]() {
                         (void)client_->disconnect(mac, retry_period_s);
                     })) {
-                    if (services_regressed) {
-                        RCLCPP_WARN(get_logger(),
-                                    "[reconcile] %s: services regressed for %.1fs after bridge activation, forcing reconnect",
-                                    device_label.c_str(),
-                                    now - services_wait_started_monotonic);
-                    } else {
-                        RCLCPP_WARN(get_logger(),
-                                    "[reconcile] %s: services unresolved for %.1fs, forcing reconnect",
-                                    device_label.c_str(),
-                                    now - services_wait_started_monotonic);
-                    }
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: services unresolved for %.1fs, forcing reconnect",
+                                device_label.c_str(),
+                                now - services_wait_started_monotonic);
                     session.phase = "recovering";
-                    session.detail = services_regressed
-                        ? "services dropped after bridge activation, reconnecting"
-                        : "services unresolved too long, reconnecting";
+                    session.detail = "services unresolved too long, reconnecting";
                 }
                 continue;
             }
 
             schedule_peer_reconcile(kPeerWaitReconcileDelay);
             session.phase = "connected_unready";
-            session.detail = services_regressed
-                ? "services disappeared after bridge activation"
-                : "connected, waiting for services";
+            session.detail = "connected, waiting for services";
             continue;
         }
 

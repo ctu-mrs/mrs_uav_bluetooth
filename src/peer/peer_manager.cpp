@@ -248,7 +248,8 @@ void PeerManager::clear_device_reset(PeerConnectionSession& session,
 
 void PeerManager::sync_device(const bluez::DeviceInfo& device,
                               const config::NodeConfig& config,
-                              const std::string& peer_name) {
+                              const std::string& peer_name,
+                              bool preserve_ready_runtime) {
     auto& session = get_or_create_session(device.mac, peer_name);
     const auto now = now_monotonic();
     const bool was_desired = session.desired;
@@ -359,6 +360,15 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     (void)local_connect_in_flight;
 
     if (!device.services_resolved) {
+        if (preserve_ready_runtime) {
+            session.services_wait_started_monotonic = 0.0;
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+            session.last_service_retry_monotonic = 0.0;
+            set_session_phase(session, "ready", "peer time bridge active");
+            return;
+        }
+
         session.last_service_retry_monotonic = 0.0;
         session.services_resolved_since_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
@@ -380,6 +390,11 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_resolved_since_monotonic = now;
     }
     session.service_regression_started_monotonic = 0.0;
+    if (preserve_ready_runtime) {
+        set_session_phase(session, "ready", "peer time bridge active");
+        session.services_wait_started_monotonic = 0.0;
+        return;
+    }
     set_session_phase(session, "connected_unready", "connected, services resolved, awaiting peer time bridge");
     session.services_wait_started_monotonic = 0.0;
 }
