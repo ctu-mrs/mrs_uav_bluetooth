@@ -411,22 +411,24 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     auto [created_bridge_it, inserted_bridge] = peers_->time_bridges().try_emplace(mac);
     (void)inserted_bridge;
     bridge_it = created_bridge_it;
-    auto& bridge = bridge_it->second;
 
     const auto topic_name = peer_status_topic(mac, peer_name);
-    if (!bridge.publisher || bridge.status_topic_name != topic_name) {
-        if (bridge.publisher) {
-            bridge.publisher.reset();
+    {
+        auto& bridge = bridge_it->second;
+        if (!bridge.publisher || bridge.status_topic_name != topic_name) {
+            if (bridge.publisher) {
+                bridge.publisher.reset();
+            }
+            bridge.publisher = create_publisher<mrs_uav_bluetooth::msg::BlePeerTimeStatus>(topic_name, 10);
+            bridge.status_topic_name = topic_name;
         }
-        bridge.publisher = create_publisher<mrs_uav_bluetooth::msg::BlePeerTimeStatus>(topic_name, 10);
-        bridge.status_topic_name = topic_name;
+
+        bridge.mac = mac;
+        bridge.peer_name = peer_name;
+        bridge.characteristic_path = characteristic_path;
     }
 
-    bridge.mac = mac;
-    bridge.peer_name = peer_name;
-    bridge.characteristic_path = characteristic_path;
-
-    if (bridge.status == "subscribing") {
+    if (bridge_it->second.status == "subscribing") {
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
@@ -436,7 +438,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         return false;
     }
 
-    if (bridge.status == "notify_failed") {
+    if (bridge_it->second.status == "notify_failed") {
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
@@ -455,11 +457,11 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): no descriptors resolved for this device, writeback disabled",
                      mac.c_str());
     }
-    bridge.writeback_descriptor_path = wb_path;
-    bridge.status = "subscribing";
-    bridge.detail = "enabling peer time notifications";
-    bridge.services_wait_grace_s = session.services_wait_grace_s;
-    bridge.pairing_failures = session.pairing_failures;
+    bridge_it->second.writeback_descriptor_path = wb_path;
+    bridge_it->second.status = "subscribing";
+    bridge_it->second.detail = "enabling peer time notifications";
+    bridge_it->second.services_wait_grace_s = session.services_wait_grace_s;
+    bridge_it->second.pairing_failures = session.pairing_failures;
 
     const auto notify_start_log = "[node] update_peer_time_bridge(" + mac + "): notifications requested on " +
         characteristic_path + " (writeback=" +
@@ -486,8 +488,12 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     state_lock.lock();
     RCLCPP_WARN(get_logger(), "[node] update_peer_time_bridge(%s): failed to enable notifications on %s",
                 mac.c_str(), characteristic_path.c_str());
-    bridge.status = "notify_failed";
-    bridge.detail = "failed to enable peer time notifications";
+    bridge_it = peers_->time_bridges().find(mac);
+    if (bridge_it != peers_->time_bridges().end() &&
+        bridge_it->second.characteristic_path == characteristic_path) {
+        bridge_it->second.status = "notify_failed";
+        bridge_it->second.detail = "failed to enable peer time notifications";
+    }
     if (session.bridge_wait_started_monotonic <= 0.0) {
         session.bridge_wait_started_monotonic = peers_->now_monotonic();
     }
@@ -694,6 +700,25 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device->services_resolved) {
+            const bool services_wait_expired =
+                session.services_wait_started_monotonic > 0.0 &&
+                session.services_wait_grace_s > 0.0 &&
+                (now - session.services_wait_started_monotonic) >= session.services_wait_grace_s;
+
+            if (services_wait_expired) {
+                if (run_peer_task_once(mac, "recover unresolved services", [this, mac, retry_period_s]() {
+                        (void)client_->disconnect(mac, retry_period_s);
+                    })) {
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: services unresolved for %.1fs, forcing reconnect",
+                                device_label.c_str(),
+                                now - session.services_wait_started_monotonic);
+                    session.phase = "recovering";
+                    session.detail = "services unresolved too long, reconnecting";
+                }
+                continue;
+            }
+
             schedule_peer_reconcile(kPeerWaitReconcileDelay);
             session.phase = "connected_unready";
             session.detail = "connected, waiting for services";
