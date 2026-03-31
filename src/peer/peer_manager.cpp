@@ -154,6 +154,36 @@ void PeerManager::set_session_phase(PeerConnectionSession& session,
     session.detail = detail;
 }
 
+void PeerManager::request_pairing_repair(PeerConnectionSession& session,
+                                         const std::string& reason) {
+    session.stale_pairing_detected = true;
+    session.pairing_reset_pending = true;
+    session.forget_pending = false;
+    session.repair_reason = reason;
+    session.services_wait_started_monotonic = 0.0;
+    session.bridge_wait_started_monotonic = 0.0;
+    session.bridge_wait_reason.clear();
+    session.remote_gatt_missing_since_monotonic = 0.0;
+    session.remote_gatt_missing_checks = 0;
+    set_session_phase(session,
+                      "recovering",
+                      reason.empty() ? "resetting stale security" : reason);
+}
+
+void PeerManager::clear_pairing_repair(PeerConnectionSession& session,
+                                       bool clear_pairing_reset_pending) {
+    session.stale_pairing_detected = false;
+    session.repair_in_progress = false;
+    if (clear_pairing_reset_pending) {
+        session.pairing_reset_pending = false;
+    }
+    session.forget_pending = false;
+    session.repair_reason.clear();
+    session.remote_gatt_missing_since_monotonic = 0.0;
+    session.remote_gatt_missing_checks = 0;
+    session.secure_pre_ready_disconnects = 0;
+}
+
 void PeerManager::sync_device(const bluez::DeviceInfo& device,
                               const config::NodeConfig& config,
                               const std::string& peer_name) {
@@ -184,17 +214,14 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
 
     if (!device.connected && !device_has_local_security(device) && !device.services_resolved) {
         session.forget_pending = false;
+        if (session.repair_in_progress) {
+            session.repair_in_progress = false;
+        }
     }
 
     if (session.desired && !was_desired && device_needs_forget(device)) {
-        session.stale_pairing_detected = true;
-        session.pairing_reset_pending = true;
-        session.forget_pending = false;
         session.connected_since_monotonic = 0.0;
-        session.services_wait_started_monotonic = 0.0;
-        session.bridge_wait_started_monotonic = 0.0;
-        session.bridge_wait_reason.clear();
-        set_session_phase(session, "recovering", "resetting cached security before use");
+        request_pairing_repair(session, "resetting cached security before use");
         return;
     }
 
@@ -204,8 +231,11 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
         session.secure_pre_ready_disconnects = 0;
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
         if (!device_needs_forget(device)) {
             session.forget_pending = false;
+            session.repair_in_progress = false;
         }
         if (session.peer_candidate) {
             set_session_phase(session,
@@ -229,11 +259,31 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     }
 
     if (!device.connected) {
-        session.secure_pre_ready_disconnects = 0;
+        const bool disconnected_before_ready = session.connected_since_monotonic > 0.0 &&
+            device_has_local_security(device) &&
+            is_phase(session, {"securing", "connected_unready"});
+        if (disconnected_before_ready) {
+            session.secure_pre_ready_disconnects += 1;
+            if (session.secure_pre_ready_disconnects >= 2 &&
+                !session.stale_pairing_detected &&
+                !session.repair_in_progress) {
+                request_pairing_repair(session, "secure link dropped before peer became ready");
+                session.connected_since_monotonic = 0.0;
+                session.services_wait_started_monotonic = 0.0;
+                session.bridge_wait_started_monotonic = 0.0;
+                session.remote_gatt_missing_since_monotonic = 0.0;
+                session.remote_gatt_missing_checks = 0;
+                return;
+            }
+        } else {
+            session.secure_pre_ready_disconnects = 0;
+        }
         session.connected_since_monotonic = 0.0;
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
 
         if (is_phase(session, {"connecting", "connect_pending"})) {
             set_session_phase(session, "connect_pending", "awaiting connection");
@@ -262,6 +312,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     if (!device.services_resolved) {
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
         if (session.services_wait_started_monotonic <= 0.0) {
             session.services_wait_started_monotonic = now;
         }
@@ -287,6 +339,13 @@ void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
     it->second.services_wait_started_monotonic = 0.0;
     it->second.bridge_wait_started_monotonic = 0.0;
     it->second.bridge_wait_reason.clear();
+    it->second.remote_gatt_missing_since_monotonic = 0.0;
+    it->second.remote_gatt_missing_checks = 0;
+    if (it->second.repair_in_progress) {
+        it->second.repair_in_progress = false;
+        it->second.stale_pairing_detected = false;
+        it->second.repair_reason.clear();
+    }
     set_session_phase(it->second, "stale", "device missing from cache");
 }
 
@@ -306,10 +365,7 @@ void PeerManager::note_pairing_event(const std::string& device_path,
         event == "request_passkey" || event == "request_pin") {
         session.last_pairing_request_monotonic = now;
         if (device_has_local_security(*device)) {
-            session.stale_pairing_detected = true;
-            session.pairing_reset_pending = true;
-            session.forget_pending = false;
-            set_session_phase(session, "recovering", "stale pairing detected");
+            request_pairing_repair(session, "stale pairing detected");
             return;
         }
         set_session_phase(session, "securing", event);
@@ -334,6 +390,9 @@ bool PeerManager::should_attempt_trust(const PeerConnectionSession& session,
     if (!session.desired) {
         return false;
     }
+    if (session.stale_pairing_detected || session.repair_in_progress) {
+        return false;
+    }
     if (!(device.paired || device.bonded) || device.trusted) {
         return false;
     }
@@ -345,6 +404,9 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
                                          double now_mono,
                                          double retry_period_s) const {
     if (!session.desired) {
+        return false;
+    }
+    if (session.stale_pairing_detected || session.repair_in_progress) {
         return false;
     }
     if (is_phase(session, {"ready", "connected_unready", "securing", "blocked", "policy_blocked"})) {
@@ -367,6 +429,9 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
                                       double now_mono,
                                       double retry_period_s) const {
     if (!session.desired) {
+        return false;
+    }
+    if (session.stale_pairing_detected || session.repair_in_progress) {
         return false;
     }
     if (!is_phase(session, {"securing", "connected_unready", "recovering"})) {

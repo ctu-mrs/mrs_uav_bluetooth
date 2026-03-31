@@ -290,6 +290,10 @@ target_link_libraries(${PROJECT_NAME}_bridge_mgr ${cpp_typesupport_target})
 add_executable(service_node
   src/app/main_service_node.cpp
   src/app/service_node.cpp
+  src/app/service_node_cache_events.cpp
+  src/app/service_node_notifications.cpp
+  src/app/service_node_peer_orchestration.cpp
+  src/app/service_node_status.cpp
   src/app/service_node_services.cpp
 )
 target_include_directories(service_node PRIVATE
