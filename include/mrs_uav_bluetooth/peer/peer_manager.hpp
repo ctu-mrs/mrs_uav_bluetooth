@@ -35,6 +35,7 @@ public:
                               bool clear_pairing_reset_pending = true);
     bool should_attempt_trust(const PeerConnectionSession& session,
                               const bluez::DeviceInfo& device,
+                              const config::NodeConfig& config,
                               double now_mono,
                               double retry_period_s) const;
     bool should_attempt_connect(const PeerConnectionSession& session,
@@ -42,6 +43,7 @@ public:
                                 double retry_period_s) const;
     bool should_attempt_pair(const PeerConnectionSession& session,
                              const bluez::DeviceInfo& device,
+                             const config::NodeConfig& config,
                              double now_mono,
                              double retry_period_s) const;
     void prune_sessions(const std::set<std::string>& current_macs, double now_mono, double ttl_s);

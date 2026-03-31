@@ -417,6 +417,25 @@ bool BluezClient::remove(const std::string& mac) {
     }
 }
 
+bool BluezClient::set_preferred_bearer(const std::string& mac, const std::string& bearer) {
+    auto path = device_path_for_mac(mac);
+    if (path.empty()) return false;
+    try {
+        set_device_property(path, "PreferredBearer", sdbus::Variant{bearer});
+        return true;
+    } catch (const sdbus::Error& error) {
+        const auto message = error.getMessage();
+        if (message_contains(message, {"UnknownProperty", "InvalidArguments", "NotSupported", "does not exist"})) {
+            RCLCPP_DEBUG(logger_, "set_preferred_bearer(%s, %s) unavailable: %s",
+                         mac.c_str(), bearer.c_str(), message.c_str());
+            return false;
+        }
+        RCLCPP_WARN(logger_, "set_preferred_bearer(%s, %s) failed: %s",
+                    mac.c_str(), bearer.c_str(), message.c_str());
+        return false;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Services resolved
 // ---------------------------------------------------------------------------

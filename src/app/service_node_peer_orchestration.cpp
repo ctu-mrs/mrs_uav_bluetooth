@@ -14,8 +14,6 @@
 namespace {
 
 constexpr double kLocalReconfigureGraceMin = 5.0;
-constexpr double kRemoteGattRepairGraceMin = 10.0;
-constexpr int kRemoteGattRepairMinChecks = 3;
 
 std::string lower_trim(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -57,12 +55,10 @@ bool device_needs_forget(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
     return device.connected || device.services_resolved || device_has_local_security(device);
 }
 
-bool device_is_secure_peer(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    return device.connected && device.trusted && (device.paired || device.bonded);
-}
-
-bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    return device_is_secure_peer(device) && device.services_resolved;
+bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                                 const mrs_uav_bluetooth::config::NodeConfig& config) {
+    (void)config;
+    return device.connected && device.services_resolved;
 }
 
 bool local_is_preferred_initiator(const std::string& local_hostname,
@@ -85,16 +81,6 @@ bool local_is_preferred_initiator(const std::string& local_hostname,
     return true;
 }
 
-std::string passive_peer_wait_detail(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    if (!device.connected) {
-        return "awaiting connection from preferred initiator";
-    }
-    if (!(device.paired || device.bonded)) {
-        return "connected, waiting for peer-initiated pairing";
-    }
-    return "connected, waiting for service discovery";
-}
-
 template<typename DurationT, typename CallbackT>
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
@@ -107,11 +93,6 @@ rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
         group,
         node.get_node_base_interface().get(),
         node.get_node_timers_interface().get());
-}
-
-double remote_gatt_repair_grace_s(const mrs_uav_bluetooth::peer::PeerConnectionSession& session) {
-    return std::max(kRemoteGattRepairGraceMin,
-                    session.services_wait_grace_s > 0.0 ? session.services_wait_grace_s : kRemoteGattRepairGraceMin);
 }
 
 }  // namespace
@@ -145,13 +126,27 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
         normalized_error.find("authentication rejected") != std::string::npos ||
         normalized_error.find("authentication canceled") != std::string::npos;
 
+    const bool bridge_ready = [&]() {
+        const auto bridge_it = peers_->time_bridges().find(mac);
+        return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
+    }();
+
     if (authentication_failed) {
+        if (bridge_ready || session.phase == "ready") {
+            session.repair_in_progress = false;
+            session.detail = error_detail.empty() ? "late pair failed" : "late pair failed: " + error_detail;
+            return;
+        }
         peers_->request_pairing_repair(session, "pair auth failed, resetting stale security");
         session.last_repair_monotonic = 0.0;
         return;
     }
 
     session.repair_in_progress = false;
+    if (bridge_ready || session.phase == "ready") {
+        session.detail = error_detail.empty() ? "late pair failed" : "late pair failed: " + error_detail;
+        return;
+    }
     session.phase = "recovering";
     session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
 }
@@ -160,6 +155,10 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
                                                const std::string& device_path) {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !cache_) {
+        return false;
+    }
+
+    if (!active_config_.auto_pair) {
         return false;
     }
 
@@ -324,7 +323,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         }
     };
 
-    if (!device_is_secure_peer(device)) {
+    if (!device.connected || !device.services_resolved) {
         clear_time_bridge();
         state_lock.unlock();
         if (!stop_notify_path.empty()) {
@@ -335,10 +334,8 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.remote_gatt_missing_checks = 0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
-        session.phase = "securing";
-        session.detail = device_has_local_security(device)
-            ? "connected, repairing trust"
-            : "connected, waiting for pairing";
+        session.phase = "connected_unready";
+        session.detail = device.connected ? "connected, waiting for services" : "awaiting connection";
         return false;
     }
 
@@ -391,17 +388,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
             session.bridge_wait_reason = "gatt-cache";
             session.phase = "connected_unready";
             session.detail = "waiting for remote GATT cache";
-
-            const auto waited_s = now_mono - session.remote_gatt_missing_since_monotonic;
-            if (session.remote_gatt_missing_checks >= kRemoteGattRepairMinChecks &&
-                waited_s >= remote_gatt_repair_grace_s(session) &&
-                (session.last_repair_monotonic <= 0.0 ||
-                 now_mono - session.last_repair_monotonic >= remote_gatt_repair_grace_s(session)) &&
-                !session.stale_pairing_detected &&
-                !session.repair_in_progress) {
-                peers_->request_pairing_repair(session, "services resolved without remote GATT after grace");
-                session.last_repair_monotonic = 0.0;
-            }
             return false;
         }
 
@@ -542,15 +528,15 @@ void ServiceNode::reconcile_peers() {
         const auto device = client_->get_device(mac);
         const auto device_label = mac + " (" + session.peer_name + ")";
         const bool is_connected = device && device->connected;
-        const bool secure_bridge_peer = device && device_can_host_peer_bridge(*device);
+        const bool functional_bridge_peer = device && device_can_host_peer_bridge(*device, active_config_);
 
-        if (!session.desired || !secure_bridge_peer) {
+        if (!session.desired || !functional_bridge_peer) {
             state_lock.unlock();
             clear_peer_runtime(mac);
             state_lock.lock();
         }
 
-        if (secure_bridge_peer) {
+        if (functional_bridge_peer) {
             const auto device_copy = *device;
             state_lock.unlock();
             refresh_import_bridges_for_device(device_copy);
@@ -667,6 +653,7 @@ void ServiceNode::reconcile_peers() {
             }
             if (peers_->should_attempt_connect(session, now, retry_period_s)) {
                 if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
+                        (void)client_->set_preferred_bearer(mac, "le");
                         (void)client_->connect(mac, retry_period_s);
                     })) {
                     RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
@@ -680,49 +667,7 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (device && !(device->paired || device->bonded)) {
-            if (!should_initiate) {
-                session.phase = "securing";
-                session.detail = passive_peer_wait_detail(*device);
-                continue;
-            }
-            if (peers_->should_attempt_pair(session, *device, now, retry_period_s)) {
-                if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
-                        std::string pair_error;
-                        const bool pair_ok = client_->pair(mac, retry_period_s, &pair_error);
-                        note_pair_attempt_result(mac, pair_ok, pair_error);
-                    })) {
-                    RCLCPP_INFO(get_logger(),
-                                "[reconcile] %s: attempting pair (phase=%s)",
-                                device_label.c_str(),
-                                session.phase.c_str());
-                    session.phase = "securing";
-                    session.detail = session.pairing_reset_pending
-                        ? "re-pair requested"
-                        : "auto-pair requested";
-                    session.last_security_attempt_monotonic = now;
-                }
-            }
-            continue;
-        }
-
-        if (device && peers_->should_attempt_trust(session, *device, now, retry_period_s)) {
-            if (run_peer_task_once(mac, "trust", [this, mac]() {
-                    (void)client_->trust(mac);
-                })) {
-                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting trust (paired=%s bonded=%s trusted=%s)",
-                            device_label.c_str(),
-                            device->paired ? "Y" : "N",
-                            device->bonded ? "Y" : "N",
-                            device->trusted ? "Y" : "N");
-                session.phase = "securing";
-                session.detail = "trust requested";
-                session.last_security_attempt_monotonic = now;
-            }
-            continue;
-        }
-
-        if (is_connected && device->trusted && (device->paired || device->bonded) && !device->services_resolved) {
+        if (is_connected && device && !device->services_resolved) {
             if ((session.last_service_retry_monotonic <= 0.0 ||
                  now - session.last_service_retry_monotonic >= retry_period_s) &&
                 run_peer_task_once(mac, "wait services", [this, mac, retry_period_s]() {
@@ -735,11 +680,47 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (is_connected && device->trusted && (device->paired || device->bonded) && device->services_resolved) {
+        if (is_connected && device && device->services_resolved) {
             const auto device_copy = *device;
             state_lock.unlock();
             (void)update_peer_time_bridge(mac, device_copy, session);
             state_lock.lock();
+
+            if (session.phase == "ready" && device) {
+                if (should_initiate && peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
+                    if (run_peer_task_once(mac, "pair", [this, mac, retry_period_s]() {
+                            std::string pair_error;
+                            const bool pair_ok = client_->pair(mac, retry_period_s, &pair_error);
+                            note_pair_attempt_result(mac, pair_ok, pair_error);
+                        })) {
+                        RCLCPP_INFO(get_logger(),
+                                    "[reconcile] %s: attempting late pair (phase=%s)",
+                                    device_label.c_str(),
+                                    session.phase.c_str());
+                        session.detail = session.pairing_reset_pending
+                            ? "peer time bridge active, re-pair requested"
+                            : "peer time bridge active, auto-pair requested";
+                        session.last_security_attempt_monotonic = now;
+                        continue;
+                    }
+                }
+
+                if (peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
+                    if (run_peer_task_once(mac, "trust", [this, mac]() {
+                            (void)client_->trust(mac);
+                        })) {
+                        RCLCPP_INFO(get_logger(),
+                                    "[reconcile] %s: attempting late trust (paired=%s bonded=%s trusted=%s)",
+                                    device_label.c_str(),
+                                    device->paired ? "Y" : "N",
+                                    device->bonded ? "Y" : "N",
+                                    device->trusted ? "Y" : "N");
+                        session.detail = "peer time bridge active, trust requested";
+                        session.last_security_attempt_monotonic = now;
+                        continue;
+                    }
+                }
+            }
             continue;
         }
 

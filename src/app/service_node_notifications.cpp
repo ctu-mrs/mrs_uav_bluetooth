@@ -31,16 +31,10 @@ std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& de
     return {};
 }
 
-bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    return device.paired || device.bonded || device.trusted;
-}
-
-bool device_is_secure_peer(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    return device.connected && device.trusted && (device.paired || device.bonded);
-}
-
-bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    return device_is_secure_peer(device) && device.services_resolved;
+bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                                 const mrs_uav_bluetooth::config::NodeConfig& config) {
+    (void)config;
+    return device.connected && device.services_resolved;
 }
 
 std::string bridge_characteristic_name_for_host(const std::string& host,
@@ -123,13 +117,13 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
     const bool desired_peer = session_it != peers_->sessions().end() && session_it->second.desired;
     const auto peer_name = device_hostname_guess(device);
     const bool local_peer = !peer_name.empty() && lower_trim(peer_name) == lower_trim(hostname_);
-    const bool secure_peer = desired_peer && !local_peer && device_can_host_peer_bridge(device);
+    const bool functional_peer = desired_peer && !local_peer && device_can_host_peer_bridge(device, active_config_);
     const auto now_mono = peers_ ? peers_->now_monotonic() : 0.0;
     const auto retry_period_s = std::max(1.0, active_config_.auto_connect_period);
     const auto missing_path_grace_s = std::max(8.0, retry_period_s * 4.0);
 
     std::set<std::string> desired_keys;
-    if (secure_peer) {
+    if (functional_peer) {
         for (const auto& shared_topic : active_config_.shared_topics) {
             if (shared_topic.mode != "import" && shared_topic.mode != "both") {
                 continue;
@@ -174,7 +168,7 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
 
     state_lock.unlock();
 
-    if (secure_peer) {
+    if (functional_peer) {
         import_bridges_->refresh_import_paths_for_mac(device.mac, *client_);
     }
 
@@ -304,7 +298,7 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
 
     if (!mac.empty()) {
         const auto device = cache_->device_by_mac(mac);
-        if (!device || !device_is_secure_peer(*device)) {
+        if (!device || !device_can_host_peer_bridge(*device, active_config_)) {
             clear_runtime_mac = mac;
         }
     }
@@ -379,7 +373,7 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
 
     if (cache_) {
         const auto device = cache_->device_by_mac(mac);
-        if (!device || !device_is_secure_peer(*device)) {
+        if (!device || !device_can_host_peer_bridge(*device, active_config_)) {
             clear_runtime_mac = mac;
         }
     }

@@ -482,9 +482,14 @@ std::string ServiceNode::build_detailed_status_report(
         }
 
         std::vector<std::string> status_parts;
-        if (device->paired && device->trusted && device->bonded && bridge != nullptr && bridge->status == "ready") {
-            status_parts.push_back("fully-paired");
+        if (bridge != nullptr && bridge->status == "ready") {
             status_parts.push_back("time-bridge-ready");
+            if (device->paired && device->trusted && device->bonded) {
+                status_parts.push_back("fully-paired");
+            } else {
+                status_parts.push_back(device->paired || device->bonded ? "paired" : "pairing-pending");
+                status_parts.push_back(device->trusted ? "trusted" : "trust-pending");
+            }
         } else {
             status_parts.push_back(device->paired || device->bonded ? "paired" : "pairing-pending");
             status_parts.push_back(device->trusted ? "trusted" : "trust-pending");

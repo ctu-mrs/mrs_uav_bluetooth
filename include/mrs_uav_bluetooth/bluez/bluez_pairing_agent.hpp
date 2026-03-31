@@ -45,6 +45,10 @@ public:
     /// Set the per-request policy callback. Return true to allow the request.
     void set_request_policy_callback(AgentRequestPolicyCallback cb);
 
+    /// Update runtime pairing-agent policy.
+    void set_auto_pair(bool auto_pair);
+    void set_auto_trust(bool auto_trust);
+
 private:
     void set_trusted(const std::string& device_path);
     void emit(const std::string& event, const std::string& device_path = "");
@@ -53,7 +57,7 @@ private:
 
     DbusConnection& dbus_;
     rclcpp::Logger logger_;
-    bool auto_accept_;
+    bool auto_pair_;
     bool auto_trust_;
     AgentEventCallback on_event_;
     AgentRequestPolicyCallback request_policy_;

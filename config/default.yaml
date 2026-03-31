@@ -25,8 +25,8 @@ auto_connect_period: 3.0
 # This timeout controls how long it stays discoverable. 0 means indefinitely.
 discoverable_timeout: 0
 
-# BlueZ pairing agent behaviour.
-auto_accept_pairing: true
+# BlueZ pairing agent and peer-security behaviour.
+auto_pair: true
 auto_trust: true
 
 # Enable the built-in services hosted by the system node.

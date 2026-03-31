@@ -272,7 +272,7 @@ void ServiceNode::configure_parameters() {
     declare_parameter<bool>("enable_wifi_service", true);
     declare_parameter<bool>("enable_time_service", true);
     declare_parameter<bool>("enable_scan", true);
-    declare_parameter<bool>("auto_accept_pairing", true);
+    declare_parameter<bool>("auto_pair", true);
     declare_parameter<bool>("auto_trust", true);
     declare_parameter<std::string>("pairing_agent", "NoInputNoOutput");
     declare_parameter<std::string>("scan_mode", "le");
@@ -307,7 +307,7 @@ void ServiceNode::build_runtime() {
     apply_adapter_state(active_config_);
     pairing_agent_ = std::make_unique<bluez::BluezPairingAgent>(
         *dbus_, get_logger(),
-        get_parameter("auto_accept_pairing").as_bool(),
+        get_parameter("auto_pair").as_bool(),
         get_parameter("auto_trust").as_bool());
     cache_observer_token_ = cache_->add_observer(
         [this](bluez::CacheEvent event, const std::string& object_path) {
@@ -442,6 +442,10 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     std::vector<std::string> gatt_cache_reset_macs;
 
     active_config_ = cfg;
+    if (pairing_agent_) {
+        pairing_agent_->set_auto_pair(cfg.auto_pair);
+        pairing_agent_->set_auto_trust(cfg.auto_trust);
+    }
     ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
     apply_adapter_state(cfg);
 

@@ -5,9 +5,9 @@ namespace mrs_uav_bluetooth::bluez {
 
 BluezPairingAgent::BluezPairingAgent(DbusConnection& dbus,
                                      rclcpp::Logger logger,
-                                     bool auto_accept,
+                                     bool auto_pair,
                                      bool auto_trust)
-    : dbus_(dbus), logger_(logger), auto_accept_(auto_accept), auto_trust_(auto_trust) {}
+    : dbus_(dbus), logger_(logger), auto_pair_(auto_pair), auto_trust_(auto_trust) {}
 
 BluezPairingAgent::~BluezPairingAgent() {
     if (registered_) {
@@ -144,6 +144,14 @@ void BluezPairingAgent::set_request_policy_callback(AgentRequestPolicyCallback c
     request_policy_ = std::move(cb);
 }
 
+void BluezPairingAgent::set_auto_pair(bool auto_pair) {
+    auto_pair_ = auto_pair;
+}
+
+void BluezPairingAgent::set_auto_trust(bool auto_trust) {
+    auto_trust_ = auto_trust;
+}
+
 void BluezPairingAgent::set_trusted(const std::string& device_path) {
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
@@ -171,7 +179,7 @@ void BluezPairingAgent::emit(const std::string& event,
 
 bool BluezPairingAgent::should_allow_request(const std::string& event,
                                              const std::string& device_path) const {
-    if (!auto_accept_) {
+    if (!auto_pair_) {
         return false;
     }
     if (!request_policy_) {

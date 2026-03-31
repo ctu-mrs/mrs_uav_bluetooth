@@ -99,6 +99,24 @@ bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& devic
     return device.paired || device.bonded || device.trusted;
 }
 
+bool pairing_required(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return config.auto_pair;
+}
+
+bool trust_required(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return config.auto_trust;
+}
+
+bool device_has_required_pairing(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                                 const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return !pairing_required(config) || device.paired || device.bonded;
+}
+
+bool device_has_required_trust(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                               const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return !trust_required(config) || device.trusted;
+}
+
 bool device_needs_forget(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
     return device.connected || device.services_resolved || device_has_local_security(device);
 }
@@ -305,16 +323,6 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     session.connected_since_monotonic = session.connected_since_monotonic > 0.0
         ? session.connected_since_monotonic : now;
 
-    if ((device.paired || device.bonded) && !device.trusted) {
-        set_session_phase(session, "securing", "connected, repairing trust");
-        return;
-    }
-
-    if (!device.paired && !device.bonded) {
-        set_session_phase(session, "securing", "connected, waiting for pairing");
-        return;
-    }
-
     if (!device.services_resolved) {
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
@@ -396,19 +404,29 @@ void PeerManager::note_pairing_event(const std::string& device_path,
 
 bool PeerManager::should_attempt_trust(const PeerConnectionSession& session,
                                        const bluez::DeviceInfo& device,
+                                       const config::NodeConfig& config,
                                        double now_mono,
                                        double retry_period_s) const {
+    if (!config.auto_trust) {
+        return false;
+    }
     if (!session.desired) {
         return false;
     }
     if (repair_blocks_regular_actions(session) || session.repair_in_progress) {
         return false;
     }
-    if (!(device.paired || device.bonded) || device.trusted) {
+    if (!is_phase(session, {"ready"})) {
         return false;
     }
-        return session.last_security_attempt_monotonic <= 0.0 ||
-            now_mono - session.last_security_attempt_monotonic >= std::max(kTrustCooldownMin, retry_period_s * 0.25);
+    if (!device.connected || device.blocked || device.trusted) {
+        return false;
+    }
+    if (!(device.paired || device.bonded)) {
+        return false;
+    }
+    return session.last_security_attempt_monotonic <= 0.0 ||
+           now_mono - session.last_security_attempt_monotonic >= std::max(kTrustCooldownMin, retry_period_s * 0.25);
 }
 
 bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
@@ -437,15 +455,19 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
 
 bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
                                       const bluez::DeviceInfo& device,
+                                      const config::NodeConfig& config,
                                       double now_mono,
                                       double retry_period_s) const {
+    if (!config.auto_pair) {
+        return false;
+    }
     if (!session.desired) {
         return false;
     }
     if (repair_blocks_regular_actions(session) || session.repair_in_progress) {
         return false;
     }
-    if (!is_phase(session, {"securing", "connected_unready", "recovering"})) {
+    if (!is_phase(session, {"ready"})) {
         return false;
     }
     if (session.connected_since_monotonic <= 0.0) {
@@ -454,7 +476,10 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
     if (device.blocked) {
         return false;
     }
-    if (device.paired || device.bonded) {
+    if (!device.services_resolved) {
+        return false;
+    }
+    if (device_has_required_pairing(device, config)) {
         return false;
     }
     const double cooldown = std::max(kPairCooldownMin,

@@ -64,6 +64,7 @@ public:
     bool block(const std::string& mac);
     bool unblock(const std::string& mac);
     bool remove(const std::string& mac);
+    bool set_preferred_bearer(const std::string& mac, const std::string& bearer);
 
     // ---- Services resolved waiter ----
     bool wait_services_resolved(const std::string& mac, double timeout_s = 15.0);

@@ -180,7 +180,11 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.wifi_refresh_period = dbl("wifi_refresh_period", cfg.wifi_refresh_period);
     cfg.auto_connect_period = dbl("auto_connect_period", cfg.auto_connect_period);
     cfg.discoverable_timeout = u32("discoverable_timeout", cfg.discoverable_timeout);
-    cfg.auto_accept_pairing = b("auto_accept_pairing", cfg.auto_accept_pairing);
+    if (doc["auto_pair"]) {
+        cfg.auto_pair = b("auto_pair", cfg.auto_pair);
+    } else if (doc["auto_accept_pairing"]) {
+        cfg.auto_pair = b("auto_accept_pairing", cfg.auto_pair);
+    }
     cfg.auto_trust = b("auto_trust", cfg.auto_trust);
     cfg.enable_time_service = b("enable_time_service", cfg.enable_time_service);
     cfg.enable_wifi_service = b("enable_wifi_service", cfg.enable_wifi_service);

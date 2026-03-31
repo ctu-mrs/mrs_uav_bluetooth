@@ -40,7 +40,7 @@ struct NodeConfig {
     double wifi_refresh_period{2.0};
     double auto_connect_period{3.0};
     uint32_t discoverable_timeout{0};
-    bool auto_accept_pairing{true};
+    bool auto_pair{true};
     bool auto_trust{true};
     bool enable_time_service{true};
     bool enable_wifi_service{true};
