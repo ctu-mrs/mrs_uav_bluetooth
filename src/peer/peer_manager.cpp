@@ -544,6 +544,9 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
     if (repair_blocks_regular_actions(session) || session.repair_in_progress) {
         return false;
     }
+    if (session.missing_since_monotonic > 0.0) {
+        return false;
+    }
     if (is_phase(session, {"ready", "connected_unready", "securing", "blocked", "policy_blocked"})) {
         return false;
     }
