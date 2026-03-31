@@ -15,7 +15,7 @@ using ManagedObjectMap = std::map<sdbus::ObjectPath,
 
 constexpr auto kConnectPollInterval = std::chrono::milliseconds(300);
 constexpr auto kPairPollInterval = std::chrono::milliseconds(500);
-constexpr auto kGattRefreshRetryBackoff = std::chrono::milliseconds(1000);
+constexpr auto kGattRefreshRetryBackoff = std::chrono::milliseconds(3000);
 
 std::unique_ptr<sdbus::IConnection> create_blocking_system_bus() {
     return sdbus::createSystemBusConnection();

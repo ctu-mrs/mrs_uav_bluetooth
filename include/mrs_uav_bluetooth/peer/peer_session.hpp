@@ -17,6 +17,7 @@ struct PeerConnectionSession {
     double first_seen_monotonic{0.0};
     double last_seen_monotonic{0.0};
     double desired_since_monotonic{0.0};
+    double connect_eligible_after_monotonic{0.0};
     double last_connect_attempt_monotonic{0.0};
     double connect_started_monotonic{0.0};
     double connected_since_monotonic{0.0};
@@ -40,6 +41,7 @@ struct PeerConnectionSession {
     std::string repair_reason;
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};
+    double services_resolved_since_monotonic{0.0};
     int secure_pre_ready_disconnects{0};
     double remote_initiated_until_monotonic{0.0};
     double remote_gatt_missing_since_monotonic{0.0};

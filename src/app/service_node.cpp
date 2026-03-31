@@ -537,7 +537,14 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                                                  : std::chrono::duration<double>(
                                                        std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    rebuild_server_objects();
+    local_server_rebuild_in_progress_.store(true);
+    try {
+        rebuild_server_objects();
+    } catch (...) {
+        local_server_rebuild_in_progress_.store(false);
+        throw;
+    }
+    local_server_rebuild_in_progress_.store(false);
     {
         std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
         local_server_rebuild_monotonic_ = peers_ ? peers_->now_monotonic()

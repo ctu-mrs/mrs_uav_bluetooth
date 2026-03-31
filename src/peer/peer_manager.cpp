@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
+#include <functional>
 
 namespace {
 
@@ -14,7 +16,18 @@ constexpr double kConnectAttemptGraceMultiplier = 5.0;
 constexpr double kServicesWaitGraceMin = 15.0;
 constexpr double kPairCooldownMin = 10.0;
 constexpr double kTrustCooldownMin = 0.5;
-constexpr double kRemoteInitiatedBackoffMin = 8.0;
+constexpr double kRemoteInitiatedBackoffMin = 20.0;
+
+double initial_connect_jitter_s(const std::string& mac,
+                                double now_mono,
+                                double retry_period_s) {
+    const auto bucket = static_cast<uint64_t>(now_mono * 1000.0);
+    const auto seed = std::hash<std::string>{}(mac) ^ (bucket + 0x9e3779b97f4a7c15ULL);
+    const double max_jitter = std::clamp(retry_period_s * 0.5, 0.5, 2.5);
+    const double fraction = static_cast<double>(seed % 1000ULL) / 1000.0;
+    return 0.2 + (fraction * max_jitter);
+}
+
 bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
               std::initializer_list<const char*> values) {
     for (const char* value : values) {
@@ -180,6 +193,7 @@ void PeerManager::set_session_phase(PeerConnectionSession& session,
 
 void PeerManager::note_local_connect_attempt(PeerConnectionSession& session,
                                              double now_mono) const {
+    session.connect_eligible_after_monotonic = 0.0;
     session.last_connect_attempt_monotonic = now_mono;
     session.connect_started_monotonic = now_mono;
     session.remote_initiated_until_monotonic = 0.0;
@@ -230,6 +244,7 @@ void PeerManager::clear_pairing_repair(PeerConnectionSession& session,
     session.remote_initiated_until_monotonic = 0.0;
     session.remote_gatt_missing_since_monotonic = 0.0;
     session.remote_gatt_missing_checks = 0;
+    session.services_resolved_since_monotonic = 0.0;
     session.secure_pre_ready_disconnects = 0;
 }
 
@@ -255,9 +270,14 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     if (session.desired) {
         if (!was_desired || session.desired_since_monotonic <= 0.0) {
             session.desired_since_monotonic = now;
+            if (!device.connected) {
+                session.connect_eligible_after_monotonic =
+                    now + initial_connect_jitter_s(device.mac, now, config.auto_connect_period);
+            }
         }
     } else {
         session.desired_since_monotonic = 0.0;
+        session.connect_eligible_after_monotonic = 0.0;
     }
     session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
 
@@ -274,6 +294,7 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.services_resolved_since_monotonic = 0.0;
         session.secure_pre_ready_disconnects = 0;
         session.remote_initiated_until_monotonic = 0.0;
         session.remote_gatt_missing_since_monotonic = 0.0;
@@ -316,12 +337,28 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.services_resolved_since_monotonic = 0.0;
         if (session.remote_initiated_until_monotonic > 0.0 &&
             now >= session.remote_initiated_until_monotonic) {
             session.remote_initiated_until_monotonic = 0.0;
         }
         session.remote_gatt_missing_since_monotonic = 0.0;
         session.remote_gatt_missing_checks = 0;
+
+        if (session.remote_initiated_until_monotonic > 0.0 &&
+            now < session.remote_initiated_until_monotonic) {
+            set_session_phase(session,
+                              session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered",
+                              "awaiting remote reconnect");
+            return;
+        }
+
+        if (session.connect_eligible_after_monotonic > 0.0 &&
+            now < session.connect_eligible_after_monotonic &&
+            session.last_connect_attempt_monotonic <= 0.0) {
+            set_session_phase(session, "discovered", "awaiting randomized connect slot");
+            return;
+        }
 
         if (is_phase(session, {"connecting", "connect_pending"})) {
             set_session_phase(session, "connect_pending", "awaiting connection");
@@ -347,11 +384,13 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
             session.remote_initiated_until_monotonic = 0.0;
         } else {
             session.remote_initiated_until_monotonic =
-                now + std::max(kRemoteInitiatedBackoffMin, config.auto_connect_period * 2.0);
+                now + std::max(kRemoteInitiatedBackoffMin, config.auto_connect_period * 6.0);
+            session.connect_eligible_after_monotonic = session.remote_initiated_until_monotonic;
         }
     }
 
     if (!device.services_resolved) {
+        session.services_resolved_since_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
         session.remote_gatt_missing_since_monotonic = 0.0;
@@ -364,6 +403,9 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         return;
     }
 
+    if (session.services_resolved_since_monotonic <= 0.0) {
+        session.services_resolved_since_monotonic = now;
+    }
     set_session_phase(session, "connected_unready", "connected, services resolved, awaiting peer time bridge");
     session.services_wait_started_monotonic = 0.0;
 }
@@ -381,6 +423,7 @@ void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
     it->second.services_wait_started_monotonic = 0.0;
     it->second.bridge_wait_started_monotonic = 0.0;
     it->second.bridge_wait_reason.clear();
+    it->second.services_resolved_since_monotonic = 0.0;
     it->second.remote_gatt_missing_since_monotonic = 0.0;
     it->second.remote_gatt_missing_checks = 0;
     if (it->second.stale_pairing_detected && it->second.repair_awaiting_cache_removal) {
@@ -467,6 +510,11 @@ bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
         return false;
     }
     if (is_phase(session, {"ready", "connected_unready", "securing", "blocked", "policy_blocked"})) {
+        return false;
+    }
+
+    if (session.connect_eligible_after_monotonic > 0.0 &&
+        now_mono < session.connect_eligible_after_monotonic) {
         return false;
     }
 

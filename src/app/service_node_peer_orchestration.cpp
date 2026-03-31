@@ -270,6 +270,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                                           const bluez::DeviceInfo& device,
                                           peer::PeerConnectionSession& session) {
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
+    const auto now_mono = peers_->now_monotonic();
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
     const auto writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
     const auto peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
@@ -305,6 +306,17 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.bridge_wait_reason.clear();
         session.phase = "connected_unready";
         session.detail = device.connected ? "connected, waiting for services" : "awaiting connection";
+        return false;
+    }
+
+    if (session.services_resolved_since_monotonic > 0.0 &&
+        (now_mono - session.services_resolved_since_monotonic) < 1.5) {
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = now_mono;
+        }
+        session.bridge_wait_reason = "gatt-cache";
+        session.phase = "connected_unready";
+        session.detail = "waiting for remote GATT cache";
         return false;
     }
 
@@ -345,7 +357,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                                std::to_string(characteristics.size()) + " characteristics");
         state_lock.lock();
 
-        const auto now_mono = peers_->now_monotonic();
         if (characteristics.empty()) {
             if (session.remote_gatt_missing_since_monotonic <= 0.0) {
                 session.remote_gatt_missing_since_monotonic = now_mono;
@@ -478,6 +489,7 @@ void ServiceNode::reconcile_peers() {
     const auto now = peers_->now_monotonic();
     const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
     const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
+    bool should_suspend_scan = false;
     std::set<std::string> current_macs;
     for (const auto& device : client_->get_devices()) {
         current_macs.insert(device.mac);
@@ -503,6 +515,12 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
         }
 
+        if (session.desired &&
+            (is_connected || session.phase == "connecting" || session.phase == "connect_pending" ||
+             session.phase == "connected_unready" || session.phase == "securing" || session.phase == "ready")) {
+            should_suspend_scan = true;
+        }
+
         if (functional_bridge_peer) {
             const auto device_copy = *device;
             state_lock.unlock();
@@ -511,50 +529,10 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (!session.desired) {
-            const bool policy_violation = session.peer_candidate && device && device_needs_forget(*device);
-            if (!policy_violation) {
-                session.forget_pending = false;
-                continue;
-            }
-            if (!session.forget_pending &&
-                run_peer_task_once(mac, "policy cleanup", [this, mac, retry_period_s, connected = device->connected,
-                                                            trusted = device->trusted]() {
-                    const auto should_continue_cleanup = [this, &mac]() {
-                        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
-                        if (shutting_down_.load() || !peers_) {
-                            return false;
-                        }
-                        const auto session_it = peers_->sessions().find(mac);
-                        return session_it != peers_->sessions().end() && !session_it->second.desired;
-                    };
-
-                    if (!should_continue_cleanup()) {
-                        return;
-                    }
-                    if (connected) {
-                        (void)client_->disconnect(mac, retry_period_s);
-                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                    }
-                    if (!should_continue_cleanup()) {
-                        return;
-                    }
-                    if (trusted) {
-                        (void)client_->untrust(mac);
-                    }
-                    if (!should_continue_cleanup()) {
-                        return;
-                    }
-                    (void)client_->remove(mac);
-                })) {
-                RCLCPP_INFO(get_logger(),
-                            "[reconcile] %s: forgetting peer blocked by current config",
-                            device_label.c_str());
-                session.forget_pending = true;
-                session.phase = "policy_blocked";
-                session.detail = whitelist_enabled ? "peer not present in whitelist"
-                                                  : "peer not allowed by current config";
-                session.last_policy_action_monotonic = now;
-            }
+            session.forget_pending = false;
+            session.phase = "policy_blocked";
+            session.detail = whitelist_enabled ? "peer not present in whitelist"
+                                              : "peer not allowed by current config";
             continue;
         }
 
@@ -645,8 +623,9 @@ void ServiceNode::reconcile_peers() {
 
         if (!is_connected) {
             const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
-            if (local_server_rebuild_monotonic_ > 0.0 &&
-                (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s) {
+            if (local_server_rebuild_in_progress_.load() ||
+                (local_server_rebuild_monotonic_ > 0.0 &&
+                 (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s)) {
                 session.phase = session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered";
                 session.detail = "waiting for local GATT rebuild";
                 continue;
@@ -658,6 +637,9 @@ void ServiceNode::reconcile_peers() {
             }
             if (peers_->should_attempt_connect(session, now, retry_period_s)) {
                 if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
+                        if (local_server_rebuild_in_progress_.load()) {
+                            return;
+                        }
                         (void)client_->connect(mac, retry_period_s);
                     })) {
                     RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
@@ -671,13 +653,6 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device->services_resolved) {
-            if ((session.last_service_retry_monotonic <= 0.0 ||
-                 now - session.last_service_retry_monotonic >= retry_period_s) &&
-                run_peer_task_once(mac, "wait services", [this, mac, retry_period_s]() {
-                    (void)client_->wait_services_resolved(mac, std::max(8.0, retry_period_s * 4.0));
-                })) {
-                session.last_service_retry_monotonic = now;
-            }
             session.phase = "connected_unready";
             session.detail = "connected, waiting for services";
             continue;
@@ -733,6 +708,18 @@ void ServiceNode::reconcile_peers() {
                      device ? (device->paired ? "Y" : "N") : "?",
                      device ? (device->trusted ? "Y" : "N") : "?",
                      device ? (device->services_resolved ? "Y" : "N") : "?");
+    }
+
+    const bool should_scan = active_config_.enable_scan && !should_suspend_scan;
+    state_lock.unlock();
+    if (should_scan) {
+        if (!client_->is_scanning()) {
+            client_->start_scan(active_config_.scan_mode, active_config_.enable_server);
+        }
+    } else {
+        if (client_->is_scanning()) {
+            client_->stop_scan();
+        }
     }
 }
 
