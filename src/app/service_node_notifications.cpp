@@ -95,6 +95,31 @@ bool ServiceNode::has_ready_peer_time_bridge(const std::string& mac) const {
     return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
 }
 
+double ServiceNode::healthy_peer_time_bridge_last_activity_monotonic(
+    const std::string& mac,
+    double max_inactivity_s) const {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_ || max_inactivity_s <= 0.0) {
+        return 0.0;
+    }
+
+    const auto bridge_it = peers_->time_bridges().find(mac);
+    if (bridge_it == peers_->time_bridges().end()) {
+        return 0.0;
+    }
+
+    const auto& bridge = bridge_it->second;
+    const bool handshake_complete = bridge.status == "ready" &&
+        bridge.time_notification_received &&
+        bridge.time_writeback_received;
+    if (!handshake_complete || bridge.last_activity_monotonic <= 0.0) {
+        return 0.0;
+    }
+
+    const double inactivity_s = peers_->now_monotonic() - bridge.last_activity_monotonic;
+    return inactivity_s <= max_inactivity_s ? bridge.last_activity_monotonic : 0.0;
+}
+
 bool ServiceNode::should_preserve_ready_bridge_during_expected_services_rediscovery(
     const bluez::DeviceInfo& device) const {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);

@@ -880,6 +880,12 @@ void ServiceNode::reconcile_peers() {
             if (preserve_ready_runtime && session.service_regression_started_monotonic <= 0.0) {
                 session.service_regression_started_monotonic = now;
             }
+            const double healthy_bridge_activity_monotonic = preserve_ready_runtime
+                ? healthy_peer_time_bridge_last_activity_monotonic(mac, session.services_wait_grace_s)
+                : 0.0;
+            if (healthy_bridge_activity_monotonic > session.service_regression_started_monotonic) {
+                session.service_regression_started_monotonic = healthy_bridge_activity_monotonic;
+            }
             const double services_wait_started_monotonic = preserve_ready_runtime
                 ? session.service_regression_started_monotonic
                 : session.services_wait_started_monotonic;
