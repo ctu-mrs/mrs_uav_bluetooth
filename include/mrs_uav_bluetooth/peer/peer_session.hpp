@@ -42,6 +42,7 @@ struct PeerConnectionSession {
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};
     double services_resolved_since_monotonic{0.0};
+    double service_regression_started_monotonic{0.0};
     std::string last_notify_failure_characteristic_path;
     double remote_gatt_missing_since_monotonic{0.0};
     int remote_gatt_missing_checks{0};
