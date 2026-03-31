@@ -94,6 +94,7 @@ private:
     bool should_preserve_ready_bridge_during_expected_services_rediscovery(
         const bluez::DeviceInfo& device) const;
     bool device_can_host_peer_bridge(const bluez::DeviceInfo& device) const;
+    bool device_can_host_peer_import_bridges(const bluez::DeviceInfo& device) const;
     void clear_peer_runtime(const std::string& mac,
                             const std::string& skip_characteristic_path = {});
     void refresh_import_bridges_for_device(const bluez::DeviceInfo& device);

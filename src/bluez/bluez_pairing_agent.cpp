@@ -3,6 +3,12 @@
 
 namespace mrs_uav_bluetooth::bluez {
 
+namespace {
+
+constexpr auto kPendingPairingCancelTimeout = std::chrono::seconds(20);
+
+}
+
 BluezPairingAgent::BluezPairingAgent(DbusConnection& dbus,
                                      rclcpp::Logger logger,
                                      bool auto_pair,
@@ -48,6 +54,8 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "PIN code request rejected");
                 }
+                pending_pairing_device_path_ = std::string(device);
+                pending_pairing_request_time_ = std::chrono::steady_clock::now();
                 emit("request_pin", std::string(device));
                 if (auto_trust_) set_trusted(std::string(device));
                 return "";
@@ -60,6 +68,8 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Passkey request rejected");
                 }
+                pending_pairing_device_path_ = std::string(device);
+                pending_pairing_request_time_ = std::chrono::steady_clock::now();
                 emit("request_passkey", std::string(device));
                 if (auto_trust_) set_trusted(std::string(device));
                 return 0;
@@ -86,6 +96,8 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Passkey not confirmed");
                 }
+                pending_pairing_device_path_ = std::string(device);
+                pending_pairing_request_time_ = std::chrono::steady_clock::now();
                 emit("request_confirmation", std::string(device));
                 if (auto_trust_) set_trusted(std::string(device));
             }),
@@ -96,11 +108,25 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Authorization rejected");
                 }
+                pending_pairing_device_path_ = std::string(device);
+                pending_pairing_request_time_ = std::chrono::steady_clock::now();
                 emit("request_authorization", std::string(device));
             }),
         sdbus::registerMethod("Cancel")
             .implementedAs([this]() {
-                emit("cancel");
+                if (pending_pairing_device_path_.empty()) {
+                    return;
+                }
+                if ((std::chrono::steady_clock::now() - pending_pairing_request_time_) >
+                    kPendingPairingCancelTimeout) {
+                    pending_pairing_device_path_.clear();
+                    pending_pairing_request_time_ = std::chrono::steady_clock::time_point{};
+                    return;
+                }
+                const auto device_path = pending_pairing_device_path_;
+                pending_pairing_device_path_.clear();
+                pending_pairing_request_time_ = std::chrono::steady_clock::time_point{};
+                emit("cancel", device_path);
             })
     ).forInterface(agent_iface);
 
@@ -146,6 +172,10 @@ void BluezPairingAgent::set_request_policy_callback(AgentRequestPolicyCallback c
 
 void BluezPairingAgent::set_auto_pair(bool auto_pair) {
     auto_pair_ = auto_pair;
+    if (!auto_pair_) {
+        pending_pairing_device_path_.clear();
+        pending_pairing_request_time_ = std::chrono::steady_clock::time_point{};
+    }
 }
 
 void BluezPairingAgent::set_auto_trust(bool auto_trust) {
@@ -170,6 +200,10 @@ void BluezPairingAgent::set_trusted(const std::string& device_path) {
 
 void BluezPairingAgent::emit(const std::string& event,
                               const std::string& device_path) {
+    if (event == "agent_release") {
+        pending_pairing_device_path_.clear();
+        pending_pairing_request_time_ = std::chrono::steady_clock::time_point{};
+    }
     if (on_event_) {
         try {
             on_event_(event, device_path);

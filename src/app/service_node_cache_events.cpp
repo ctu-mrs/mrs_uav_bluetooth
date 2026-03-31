@@ -411,11 +411,16 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
 
 void ServiceNode::on_pairing_event(const std::string& event_type, const std::string& device_path) {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
-    RCLCPP_INFO(get_logger(), "[node] on_pairing_event: type=%s device=%s",
-                event_type.c_str(), device_path.c_str());
     if (!peers_ || !cache_) {
         return;
     }
+
+    if (!active_config_.auto_pair) {
+        return;
+    }
+
+    RCLCPP_INFO(get_logger(), "[node] on_pairing_event: type=%s device=%s",
+                event_type.c_str(), device_path.c_str());
 
     if (event_type == "cancel" && device_path.empty()) {
         peer::PeerConnectionSession* candidate_session = nullptr;

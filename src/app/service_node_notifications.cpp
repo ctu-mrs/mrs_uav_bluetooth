@@ -156,6 +156,12 @@ bool ServiceNode::device_can_host_peer_bridge(const bluez::DeviceInfo& device) c
             should_preserve_ready_bridge_during_expected_services_rediscovery(device));
 }
 
+bool ServiceNode::device_can_host_peer_import_bridges(const bluez::DeviceInfo& device) const {
+    return device.connected &&
+           (has_ready_peer_time_bridge(device.mac) ||
+            should_preserve_ready_bridge_during_expected_services_rediscovery(device));
+}
+
 void ServiceNode::clear_peer_runtime(const std::string& mac,
                                      const std::string& skip_characteristic_path) {
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
@@ -195,7 +201,7 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
     const bool desired_peer = session_it != peers_->sessions().end() && session_it->second.desired;
     const auto peer_name = device_hostname_guess(device);
     const bool local_peer = !peer_name.empty() && lower_trim(peer_name) == lower_trim(hostname_);
-    const bool functional_peer = desired_peer && !local_peer && device_can_host_peer_bridge(device);
+    const bool functional_peer = desired_peer && !local_peer && device_can_host_peer_import_bridges(device);
     const auto now_mono = peers_ ? peers_->now_monotonic() : 0.0;
     const auto retry_period_s = std::max(1.0, active_config_.auto_connect_period);
     const auto missing_path_grace_s = std::max(8.0, retry_period_s * 4.0);

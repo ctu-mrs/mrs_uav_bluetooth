@@ -8,6 +8,7 @@
 #include <sdbus-c++/sdbus-c++.h>
 
 #include <functional>
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -61,6 +62,8 @@ private:
     bool auto_trust_;
     AgentEventCallback on_event_;
     AgentRequestPolicyCallback request_policy_;
+    std::string pending_pairing_device_path_;
+    std::chrono::steady_clock::time_point pending_pairing_request_time_{};
 
     std::unique_ptr<sdbus::IObject> exported_object_;
     bool registered_{false};
