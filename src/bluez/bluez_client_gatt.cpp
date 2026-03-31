@@ -34,11 +34,6 @@ std::string BluezClient::find_characteristic(const std::string& mac,
         return {};
     }
     auto result = cache_.find_characteristic_by_uuid(dev->object_path, uuid);
-    if (!result && dev->services_resolved) {
-        if (refresh_device_gatt_cache(dev->object_path)) {
-            result = cache_.find_characteristic_by_uuid(dev->object_path, uuid);
-        }
-    }
     return result ? result->object_path : std::string{};
 }
 
@@ -47,14 +42,6 @@ std::string BluezClient::find_descriptor(const std::string& mac,
                                          const std::string& chrc_path) const {
     if (!chrc_path.empty()) {
         auto result = cache_.find_descriptor_by_uuid(chrc_path, uuid);
-        if (!result) {
-            const auto dev = cache_.device_by_mac(mac);
-            if (dev && dev->services_resolved) {
-                if (refresh_device_gatt_cache(dev->object_path)) {
-                    result = cache_.find_descriptor_by_uuid(chrc_path, uuid);
-                }
-            }
-        }
         return result ? result->object_path : std::string{};
     }
     for (const auto& ch : list_characteristics(mac)) {

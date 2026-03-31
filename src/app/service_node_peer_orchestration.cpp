@@ -14,6 +14,8 @@
 namespace {
 
 constexpr double kLocalReconfigureGraceMin = 5.0;
+constexpr double kRemoteGattSnapshotFallbackDelay = 8.0;
+constexpr double kRemoteGattSnapshotRetryInterval = 10.0;
 
 std::string lower_trim(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -274,10 +276,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
     const auto writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
     const auto peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
-    const auto characteristic_path = client_->find_characteristic(mac, time_characteristic_uuid);
-    const auto cached_characteristic = (!characteristic_path.empty() && cache_)
-        ? cache_->characteristic(characteristic_path)
-        : std::optional<bluez::GattCharacteristicInfo>{};
     auto bridge_it = peers_->time_bridges().find(mac);
     std::string stop_notify_path;
 
@@ -304,6 +302,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.remote_gatt_missing_checks = 0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.last_service_retry_monotonic = 0.0;
         session.phase = "connected_unready";
         session.detail = device.connected ? "connected, waiting for services" : "awaiting connection";
         return false;
@@ -320,6 +319,35 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         return false;
     }
 
+    auto services = client_->list_services(mac);
+    auto characteristics = client_->list_characteristics(mac);
+    auto characteristic_path = client_->find_characteristic(mac, time_characteristic_uuid);
+    auto cached_characteristic = (!characteristic_path.empty() && cache_)
+        ? cache_->characteristic(characteristic_path)
+        : std::optional<bluez::GattCharacteristicInfo>{};
+
+    const bool should_attempt_snapshot_refresh =
+        characteristic_path.empty() && characteristics.empty() &&
+        session.services_resolved_since_monotonic > 0.0 &&
+        (now_mono - session.services_resolved_since_monotonic) >= kRemoteGattSnapshotFallbackDelay &&
+        (session.last_service_retry_monotonic <= 0.0 ||
+         (now_mono - session.last_service_retry_monotonic) >= kRemoteGattSnapshotRetryInterval);
+
+    if (should_attempt_snapshot_refresh) {
+        session.last_service_retry_monotonic = now_mono;
+        state_lock.unlock();
+        const bool refreshed = client_->refresh_gatt_snapshot(mac);
+        state_lock.lock();
+        if (refreshed) {
+            services = client_->list_services(mac);
+            characteristics = client_->list_characteristics(mac);
+            characteristic_path = client_->find_characteristic(mac, time_characteristic_uuid);
+            cached_characteristic = (!characteristic_path.empty() && cache_)
+                ? cache_->characteristic(characteristic_path)
+                : std::optional<bluez::GattCharacteristicInfo>{};
+        }
+    }
+
     if (!characteristic_path.empty() &&
         bridge_it != peers_->time_bridges().end() &&
         bridge_it->second.characteristic_path == characteristic_path &&
@@ -334,16 +362,15 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.bridge_wait_reason.clear();
         session.remote_gatt_missing_since_monotonic = 0.0;
         session.remote_gatt_missing_checks = 0;
+        session.last_service_retry_monotonic = 0.0;
         session.phase = "ready";
         session.detail = "peer time bridge active";
         return true;
     }
 
-    const auto services = client_->list_services(mac);
-    const auto characteristics = client_->list_characteristics(mac);
-    const auto descriptors = client_->list_descriptors(mac);
     RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): %zu services, %zu characteristics, %zu descriptors resolved",
-                 mac.c_str(), services.size(), characteristics.size(), descriptors.size());
+                 mac.c_str(), services.size(), characteristics.size(),
+                 characteristic_path.empty() ? size_t{0} : client_->list_descriptors(mac, characteristic_path).size());
 
     if (characteristic_path.empty()) {
         clear_time_bridge();
@@ -367,7 +394,9 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
             }
             session.bridge_wait_reason = "gatt-cache";
             session.phase = "connected_unready";
-            session.detail = "waiting for remote GATT cache";
+            session.detail = should_attempt_snapshot_refresh
+                ? "waiting for remote GATT objects after fallback snapshot"
+                : "waiting for remote GATT objects";
             return false;
         }
 
@@ -384,6 +413,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
 
     session.remote_gatt_missing_since_monotonic = 0.0;
     session.remote_gatt_missing_checks = 0;
+    session.last_service_retry_monotonic = 0.0;
 
     if (bridge_it != peers_->time_bridges().end() &&
         !bridge_it->second.characteristic_path.empty() &&
@@ -429,6 +459,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         return false;
     }
 
+    const auto descriptors = client_->list_descriptors(mac, characteristic_path);
     const auto wb_path = client_->find_descriptor(mac, writeback_descriptor_uuid, characteristic_path);
     if (wb_path.empty() && !descriptors.empty()) {
         RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): writeback descriptor uuid=%s not found (descriptors resolved=%zu)",
@@ -515,9 +546,17 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
         }
 
+        const bool recent_connect_flow = session.last_connect_attempt_monotonic > 0.0 &&
+            (now - session.last_connect_attempt_monotonic) < std::max(4.0, retry_period_s * 2.0);
+        const bool remote_flow_active = session.remote_initiated_until_monotonic > 0.0 &&
+            now < session.remote_initiated_until_monotonic;
+        const bool waiting_for_bridge = session.services_wait_started_monotonic > 0.0 ||
+            session.bridge_wait_started_monotonic > 0.0;
+
         if (session.desired &&
             (is_connected || session.phase == "connecting" || session.phase == "connect_pending" ||
-             session.phase == "connected_unready" || session.phase == "securing" || session.phase == "ready")) {
+             session.phase == "connected_unready" || session.phase == "securing" || session.phase == "ready" ||
+             recent_connect_flow || remote_flow_active || waiting_for_bridge)) {
             should_suspend_scan = true;
         }
 

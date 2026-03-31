@@ -467,6 +467,14 @@ bool BluezClient::wait_services_resolved(const std::string& mac, double timeout_
     });
 }
 
+bool BluezClient::refresh_gatt_snapshot(const std::string& mac) const {
+    auto dev = cache_.device_by_mac(mac);
+    if (!dev || !dev->connected || !dev->services_resolved) {
+        return false;
+    }
+    return refresh_device_gatt_cache(dev->object_path);
+}
+
 // ---------------------------------------------------------------------------
 // GATT queries
 // ---------------------------------------------------------------------------
@@ -474,13 +482,7 @@ bool BluezClient::wait_services_resolved(const std::string& mac, double timeout_
 std::vector<GattServiceInfo> BluezClient::list_services(const std::string& mac) const {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return {};
-    auto services = cache_.services_for_device(dev->object_path);
-    if (services.empty() && dev->services_resolved) {
-        if (refresh_device_gatt_cache(dev->object_path)) {
-            services = cache_.services_for_device(dev->object_path);
-        }
-    }
-    return services;
+    return cache_.services_for_device(dev->object_path);
 }
 
 std::vector<GattCharacteristicInfo> BluezClient::list_characteristics(const std::string& mac) const {
@@ -488,11 +490,6 @@ std::vector<GattCharacteristicInfo> BluezClient::list_characteristics(const std:
     if (!dev) return {};
     std::vector<GattCharacteristicInfo> result;
     auto services = cache_.services_for_device(dev->object_path);
-    if (services.empty() && dev->services_resolved) {
-        if (refresh_device_gatt_cache(dev->object_path)) {
-            services = cache_.services_for_device(dev->object_path);
-        }
-    }
     for (const auto& svc : services) {
         auto chars = cache_.characteristics_for_service(svc.object_path);
         result.insert(result.end(), chars.begin(), chars.end());

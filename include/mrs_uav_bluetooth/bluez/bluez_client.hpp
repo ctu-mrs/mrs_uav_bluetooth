@@ -68,6 +68,7 @@ public:
 
     // ---- Services resolved waiter ----
     bool wait_services_resolved(const std::string& mac, double timeout_s = 15.0);
+    bool refresh_gatt_snapshot(const std::string& mac) const;
 
     // ---- GATT queries (from cache) ----
     std::vector<GattServiceInfo> list_services(const std::string& mac) const;
