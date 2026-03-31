@@ -32,6 +32,7 @@ struct PeerConnectionSession {
     std::string bridge_wait_reason;
     int pairing_failures{0};
     int notify_failure_count{0};
+    bool pairing_in_progress{false};
     bool repair_requested{false};
     bool pairing_reset_pending{false};
     bool repair_in_progress{false};

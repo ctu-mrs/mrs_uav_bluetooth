@@ -96,7 +96,9 @@ bool ServiceNode::has_ready_peer_time_bridge(const std::string& mac) const {
 }
 
 bool ServiceNode::device_can_host_peer_bridge(const bluez::DeviceInfo& device) const {
-    return device.connected && (device.services_resolved || has_ready_peer_time_bridge(device.mac));
+    const bool pairing_ready = !active_config_.auto_pair || device.paired || device.bonded;
+    return pairing_ready && device.connected &&
+           (device.services_resolved || has_ready_peer_time_bridge(device.mac));
 }
 
 void ServiceNode::clear_peer_runtime(const std::string& mac,

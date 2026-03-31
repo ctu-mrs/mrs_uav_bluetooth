@@ -45,6 +45,11 @@ bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& devic
     return device.paired || device.bonded || device.trusted;
 }
 
+bool device_has_required_pairing(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                                 const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return !config.auto_pair || device.paired || device.bonded;
+}
+
 template<typename DurationT, typename CallbackT>
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
@@ -79,12 +84,14 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
     auto& session = session_it->second;
     session.last_security_attempt_monotonic = peers_->now_monotonic();
     if (success) {
+        session.pairing_in_progress = false;
         session.pairing_failures = 0;
         peers_->clear_device_reset(session);
         return;
     }
 
     session.pairing_failures += 1;
+    session.pairing_in_progress = false;
     const auto normalized_error = lower_trim(error_detail);
     const bool authentication_failed = normalized_error.find("authentication failed") != std::string::npos ||
         normalized_error.find("authentication rejected") != std::string::npos ||
@@ -125,12 +132,17 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
     const auto peer_name = device_hostname_guess(*device);
     auto& session = peers_->get_or_create_session(device->mac, peer_name);
     peers_->sync_device(*device, active_config_, peer_name, has_ready_peer_time_bridge(device->mac));
+    
+    const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
 
     if (!session.desired) {
-        log_warn_coalesced("pairing-rejected-policy:" + device->mac + ":" + event_type,
-                           "[node] rejecting pairing request for " + device->mac +
-                               " due to current config");
-        return false;
+        const bool allow_passive_non_peer = !whitelist_enabled && !session.peer_candidate;
+        if (!allow_passive_non_peer) {
+            log_warn_coalesced("pairing-rejected-policy:" + device->mac + ":" + event_type,
+                               "[node] rejecting pairing request for " + device->mac +
+                                   " due to current config");
+            return false;
+        }
     }
 
     if (session.repair_requested || session.repair_in_progress) {
@@ -736,6 +748,35 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
+        if (is_connected && device && !device_has_required_pairing(*device, active_config_)) {
+            if (peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
+                if (run_peer_task_once(mac, "pair", [this, mac]() {
+                        std::string error_detail;
+                        const bool success = client_->pair(mac, kPeerPairTimeout, &error_detail);
+                        note_pair_attempt_result(mac, success, error_detail);
+                    })) {
+                    RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair as blocking post-connect step",
+                                device_label.c_str());
+                    session.phase = "securing";
+                    session.detail = "pair requested";
+                    session.pairing_in_progress = true;
+                    session.last_security_attempt_monotonic = now;
+                    continue;
+                }
+            }
+
+            session.phase = session.pairing_in_progress ? "securing" : "connected_unready";
+            if (session.detail.empty() ||
+                session.detail == "connected, waiting for services" ||
+                session.detail == "connected, services resolved, awaiting peer time bridge") {
+                session.detail = session.pairing_in_progress
+                    ? "awaiting pairing completion"
+                    : "connected, waiting for pairing";
+            }
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            continue;
+        }
+
         if (!is_connected) {
             const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
             if (local_server_rebuild_in_progress_.load() ||
@@ -760,21 +801,6 @@ void ServiceNode::reconcile_peers() {
                 }
             }
             continue;
-        }
-
-        if (is_connected && device &&
-            peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
-            if (run_peer_task_once(mac, "pair", [this, mac]() {
-                    std::string error_detail;
-                    const bool success = client_->pair(mac, kPeerPairTimeout, &error_detail);
-                    note_pair_attempt_result(mac, success, error_detail);
-                })) {
-                RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair after connection", device_label.c_str());
-                session.phase = "securing";
-                session.detail = "pair requested";
-                session.last_security_attempt_monotonic = now;
-                continue;
-            }
         }
 
         if (is_connected && device && !device->services_resolved) {
