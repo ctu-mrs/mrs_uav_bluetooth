@@ -300,6 +300,25 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
             }
         }
         if (!affected_mac.empty() && peer_runtime_clear_in_progress_.count(affected_mac) == 0) {
+            if (event_type == "client_notify_failed") {
+                const auto session_it = peers_->sessions().find(affected_mac);
+                if (session_it != peers_->sessions().end()) {
+                    auto& session = session_it->second;
+                    if (session.last_notify_failure_characteristic_path == object_path) {
+                        session.notify_failure_count += 1;
+                    } else {
+                        session.notify_failure_count = 1;
+                    }
+                    session.last_notify_failure_monotonic = peers_->now_monotonic();
+                    session.last_notify_failure_characteristic_path = object_path;
+                    if (session.bridge_wait_started_monotonic <= 0.0) {
+                        session.bridge_wait_started_monotonic = session.last_notify_failure_monotonic;
+                    }
+                    session.bridge_wait_reason = "notify";
+                    session.phase = "connected_unready";
+                    session.detail = "failed to enable peer time notifications";
+                }
+            }
             clear_runtime_mac = affected_mac;
         }
     }

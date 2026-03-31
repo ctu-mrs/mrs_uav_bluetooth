@@ -213,6 +213,9 @@ void PeerManager::request_device_reset(PeerConnectionSession& session,
     session.services_wait_started_monotonic = 0.0;
     session.bridge_wait_started_monotonic = 0.0;
     session.bridge_wait_reason.clear();
+    session.last_notify_failure_monotonic = 0.0;
+    session.notify_failure_count = 0;
+    session.last_notify_failure_characteristic_path.clear();
     session.remote_gatt_missing_since_monotonic = 0.0;
     session.remote_gatt_missing_checks = 0;
     set_session_phase(session,
@@ -236,6 +239,9 @@ void PeerManager::clear_device_reset(PeerConnectionSession& session,
     session.remote_gatt_missing_checks = 0;
     session.last_service_retry_monotonic = 0.0;
     session.services_resolved_since_monotonic = 0.0;
+    session.last_notify_failure_monotonic = 0.0;
+    session.notify_failure_count = 0;
+    session.last_notify_failure_characteristic_path.clear();
 }
 
 void PeerManager::sync_device(const bluez::DeviceInfo& device,
@@ -279,6 +285,9 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
         session.last_service_retry_monotonic = 0.0;
         session.services_resolved_since_monotonic = 0.0;
         session.remote_gatt_missing_since_monotonic = 0.0;
@@ -313,6 +322,9 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_wait_started_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
         session.last_service_retry_monotonic = 0.0;
         session.services_resolved_since_monotonic = 0.0;
         session.remote_gatt_missing_since_monotonic = 0.0;
@@ -345,6 +357,9 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.services_resolved_since_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
         session.bridge_wait_reason.clear();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
         session.remote_gatt_missing_since_monotonic = 0.0;
         session.remote_gatt_missing_checks = 0;
         if (session.services_wait_started_monotonic <= 0.0) {
@@ -375,6 +390,9 @@ void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
     it->second.services_wait_started_monotonic = 0.0;
     it->second.bridge_wait_started_monotonic = 0.0;
     it->second.bridge_wait_reason.clear();
+    it->second.last_notify_failure_monotonic = 0.0;
+    it->second.notify_failure_count = 0;
+    it->second.last_notify_failure_characteristic_path.clear();
     it->second.last_service_retry_monotonic = 0.0;
     it->second.services_resolved_since_monotonic = 0.0;
     it->second.remote_gatt_missing_since_monotonic = 0.0;

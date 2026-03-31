@@ -15,6 +15,8 @@ namespace {
 constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr double kRemoteGattSnapshotFallbackDelay = 2.0;
 constexpr double kRemoteGattSnapshotRetryInterval = 2.0;
+constexpr double kPeerNotifyRetryBackoff = 1.0;
+constexpr int kPeerNotifyFailureReconnectThreshold = 3;
 constexpr double kPeerPairTimeout = 20.0;
 constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
 
@@ -348,6 +350,9 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.remote_gatt_missing_since_monotonic = 0.0;
         session.remote_gatt_missing_checks = 0;
         session.last_service_retry_monotonic = 0.0;
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
         session.phase = "ready";
         session.detail = "peer time bridge active";
         return true;
@@ -402,6 +407,13 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     session.remote_gatt_missing_checks = 0;
     session.last_service_retry_monotonic = 0.0;
 
+    if (!session.last_notify_failure_characteristic_path.empty() &&
+        session.last_notify_failure_characteristic_path != characteristic_path) {
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
+    }
+
     if (bridge_it != peers_->time_bridges().end() &&
         !bridge_it->second.characteristic_path.empty() &&
         bridge_it->second.characteristic_path != characteristic_path) {
@@ -426,6 +438,23 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         bridge.mac = mac;
         bridge.peer_name = peer_name;
         bridge.characteristic_path = characteristic_path;
+    }
+
+    if (session.last_notify_failure_characteristic_path == characteristic_path &&
+        session.last_notify_failure_monotonic > 0.0) {
+        const auto failure_age = now_mono - session.last_notify_failure_monotonic;
+        if (failure_age < kPeerNotifyRetryBackoff) {
+            bridge_it->second.status = "notify_failed";
+            bridge_it->second.detail = "waiting to retry peer time notifications";
+            if (session.bridge_wait_started_monotonic <= 0.0) {
+                session.bridge_wait_started_monotonic = session.last_notify_failure_monotonic;
+            }
+            session.bridge_wait_reason = "notify";
+            session.phase = "connected_unready";
+            session.detail = "waiting to retry peer time notifications";
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            return false;
+        }
     }
 
     if (bridge_it->second.status == "subscribing") {
@@ -476,6 +505,9 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         log_info_coalesced("peer-time-bridge-notify-start:" + mac + ":" + characteristic_path,
                            notify_start_log);
         state_lock.lock();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
@@ -730,6 +762,23 @@ void ServiceNode::reconcile_peers() {
             state_lock.unlock();
             (void)update_peer_time_bridge(mac, device_copy, session);
             state_lock.lock();
+
+            const bool repeated_notify_failures =
+                session.notify_failure_count >= kPeerNotifyFailureReconnectThreshold &&
+                session.last_notify_failure_monotonic > 0.0 &&
+                (now - session.last_notify_failure_monotonic) < std::max(3.0, retry_period_s * 2.0);
+            if (repeated_notify_failures) {
+                if (run_peer_task_once(mac, "recover failed notify", [this, mac, retry_period_s]() {
+                        (void)client_->disconnect(mac, retry_period_s);
+                    })) {
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: repeated notify failures on peer time bridge, forcing reconnect",
+                                device_label.c_str());
+                    session.phase = "recovering";
+                    session.detail = "peer time notifications failing, reconnecting";
+                }
+                continue;
+            }
 
             if (session.phase == "ready" && device) {
                 if (peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
