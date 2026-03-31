@@ -713,24 +713,6 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
 
             if (session.phase == "ready" && device) {
-                if (peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
-                    if (run_peer_task_once(mac, "pair", [this, mac]() {
-                            std::string pair_error;
-                            const bool pair_ok = client_->pair(mac, kPeerPairTimeout, &pair_error);
-                            note_pair_attempt_result(mac, pair_ok, pair_error);
-                        })) {
-                        RCLCPP_INFO(get_logger(),
-                                    "[reconcile] %s: attempting late pair (phase=%s)",
-                                    device_label.c_str(),
-                                    session.phase.c_str());
-                        session.detail = session.pairing_reset_pending
-                            ? "peer time bridge active, re-pair requested"
-                            : "peer time bridge active, auto-pair requested";
-                        session.last_security_attempt_monotonic = now;
-                        continue;
-                    }
-                }
-
                 if (peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
                     if (run_peer_task_once(mac, "trust", [this, mac]() {
                             (void)client_->trust(mac);

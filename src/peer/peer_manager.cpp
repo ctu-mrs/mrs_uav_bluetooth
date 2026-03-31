@@ -490,7 +490,15 @@ void PeerManager::note_pairing_event(const std::string& device_path,
         event == "request_passkey" || event == "request_pin") {
         session.last_pairing_request_monotonic = now;
         if (device_has_local_security(*device)) {
-            request_device_reset(session, "stale pairing detected", true);
+            if (!is_phase(session, {"ready", "connected_unready"})) {
+                set_session_phase(session, "securing", event);
+            } else if (session.detail.empty()) {
+                session.detail = event;
+            }
+            return;
+        }
+        if (is_phase(session, {"ready"})) {
+            session.detail = event;
             return;
         }
         set_session_phase(session, "securing", event);

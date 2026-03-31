@@ -307,13 +307,15 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
     if (const auto device_path = device_path_for_gatt_object(*cache_, object_path)) {
         if (const auto device = cache_->device(*device_path)) {
             peers_->sync_device(*device, active_config_, device_hostname_guess(*device));
-            refresh_device = *device;
+            if (!clear_runtime_mac) {
+                refresh_device = *device;
+            }
         }
     }
 
     state_lock.unlock();
     if (clear_runtime_mac) {
-        clear_peer_runtime(*clear_runtime_mac);
+        clear_peer_runtime(*clear_runtime_mac, object_path);
     }
     if (refresh_device) {
         refresh_import_bridges_for_device(*refresh_device);

@@ -88,7 +88,8 @@ private:
                                       const std::string& device_path);
     void reconcile_peers();
     void schedule_peer_reconcile(std::chrono::milliseconds delay = std::chrono::milliseconds(0));
-    void clear_peer_runtime(const std::string& mac);
+    void clear_peer_runtime(const std::string& mac,
+                            const std::string& skip_characteristic_path = {});
     void refresh_import_bridges_for_device(const bluez::DeviceInfo& device);
     void prune_missing_import_bridges(const std::string& mac,
                                       const std::set<std::string>& desired_keys,

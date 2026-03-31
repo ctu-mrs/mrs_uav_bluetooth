@@ -85,7 +85,8 @@ PublishRateSample update_publish_rate(double last_publish_monotonic) {
 
 namespace mrs_uav_bluetooth::app {
 
-void ServiceNode::clear_peer_runtime(const std::string& mac) {
+void ServiceNode::clear_peer_runtime(const std::string& mac,
+                                     const std::string& skip_characteristic_path) {
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !client_ || !import_bridges_) {
         return;
@@ -102,7 +103,7 @@ void ServiceNode::clear_peer_runtime(const std::string& mac) {
 
     import_bridges_->clear_import_paths_for_mac(mac, *client_);
 
-    if (!characteristic_path.empty()) {
+    if (!characteristic_path.empty() && characteristic_path != skip_characteristic_path) {
         client_->stop_notify(characteristic_path);
     }
 }
