@@ -217,6 +217,8 @@ void PeerManager::request_device_reset(PeerConnectionSession& session,
     session.last_notify_failure_monotonic = 0.0;
     session.notify_failure_count = 0;
     session.last_notify_failure_characteristic_path.clear();
+    session.time_bridge_init_notify_failure_monotonic = 0.0;
+    session.time_bridge_init_notify_failure_count = 0;
     session.service_regression_started_monotonic = 0.0;
     session.remote_gatt_missing_since_monotonic = 0.0;
     session.remote_gatt_missing_checks = 0;
@@ -244,6 +246,8 @@ void PeerManager::clear_device_reset(PeerConnectionSession& session,
     session.last_notify_failure_monotonic = 0.0;
     session.notify_failure_count = 0;
     session.last_notify_failure_characteristic_path.clear();
+    session.time_bridge_init_notify_failure_monotonic = 0.0;
+    session.time_bridge_init_notify_failure_count = 0;
     session.service_regression_started_monotonic = 0.0;
 }
 
@@ -278,6 +282,11 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     }
     session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
 
+    if (!device.paired && !device.bonded) {
+        session.time_bridge_init_notify_failure_monotonic = 0.0;
+        session.time_bridge_init_notify_failure_count = 0;
+    }
+
     if (!device.connected && !device_has_local_security(device) && !device.services_resolved &&
         !session.repair_requested) {
         session.forget_pending = false;
@@ -296,6 +305,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.last_notify_failure_monotonic = 0.0;
         session.notify_failure_count = 0;
         session.last_notify_failure_characteristic_path.clear();
+        session.time_bridge_init_notify_failure_monotonic = 0.0;
+        session.time_bridge_init_notify_failure_count = 0;
         session.last_service_retry_monotonic = 0.0;
         session.services_resolved_since_monotonic = 0.0;
         session.service_regression_started_monotonic = 0.0;

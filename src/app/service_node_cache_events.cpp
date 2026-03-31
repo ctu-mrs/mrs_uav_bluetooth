@@ -8,6 +8,11 @@
 namespace {
 
 constexpr double kPairingCancelAssociationTimeout = 20.0;
+constexpr double kPeerInitNotifyFailureResetWindow = 45.0;
+
+bool device_has_recorded_bond(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.paired || device.bonded;
+}
 
 bool is_read_write_gatt_event(const std::string& event_type) {
     return event_type == "client_read" ||
@@ -334,12 +339,13 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                 const auto session_it = peers_->sessions().find(affected_mac);
                 if (session_it != peers_->sessions().end()) {
                     auto& session = session_it->second;
+                    const auto failure_now = peers_->now_monotonic();
                     if (session.last_notify_failure_characteristic_path == object_path) {
                         session.notify_failure_count += 1;
                     } else {
                         session.notify_failure_count = 1;
                     }
-                    session.last_notify_failure_monotonic = peers_->now_monotonic();
+                    session.last_notify_failure_monotonic = failure_now;
                     session.last_notify_failure_characteristic_path = object_path;
                     if (session.bridge_wait_started_monotonic <= 0.0) {
                         session.bridge_wait_started_monotonic = session.last_notify_failure_monotonic;
@@ -347,6 +353,31 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                     session.bridge_wait_reason = "notify";
                     session.phase = "connected_unready";
                     session.detail = "failed to enable peer time notifications";
+
+                    if (!session.time_bridge_healthy_this_connection) {
+                        if (session.time_bridge_init_notify_failure_monotonic > 0.0 &&
+                            (failure_now - session.time_bridge_init_notify_failure_monotonic) <= kPeerInitNotifyFailureResetWindow) {
+                            session.time_bridge_init_notify_failure_count += 1;
+                        } else {
+                            session.time_bridge_init_notify_failure_count = 1;
+                        }
+                        session.time_bridge_init_notify_failure_monotonic = failure_now;
+
+                        const auto device = client_->get_device(affected_mac);
+                        if (device &&
+                            device_has_recorded_bond(*device) &&
+                            session.time_bridge_init_notify_failure_count >= 3) {
+                            peers_->request_device_reset(
+                                session,
+                                "bonded peer repeatedly rejected time notifications, resetting peer device state",
+                                true);
+                            RCLCPP_WARN(
+                                get_logger(),
+                                "[gatt] %s: repeated init-time peer time notify failures indicate stale local bond, arming BlueZ device reset",
+                                affected_mac.c_str());
+                            schedule_peer_reconcile(std::chrono::milliseconds(1));
+                        }
+                    }
                 }
             }
             clear_runtime_mac = affected_mac;

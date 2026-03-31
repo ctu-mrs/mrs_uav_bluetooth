@@ -29,9 +29,11 @@ struct PeerConnectionSession {
     double missing_since_monotonic{0.0};
     double bridge_wait_started_monotonic{0.0};
     double last_notify_failure_monotonic{0.0};
+    double time_bridge_init_notify_failure_monotonic{0.0};
     std::string bridge_wait_reason;
     int pairing_failures{0};
     int notify_failure_count{0};
+    int time_bridge_init_notify_failure_count{0};
     bool pairing_in_progress{false};
     bool repair_requested{false};
     bool pairing_reset_pending{false};

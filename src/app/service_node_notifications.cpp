@@ -416,6 +416,8 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
         bridge.detail = "time notification";
         if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
             session_it->second.time_bridge_healthy_this_connection = true;
+            session_it->second.time_bridge_init_notify_failure_monotonic = 0.0;
+            session_it->second.time_bridge_init_notify_failure_count = 0;
         }
         publish_peer_time_status(bridge);
     } else {
@@ -496,6 +498,8 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
     bridge.detail = "time writeback";
     if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
         session_it->second.time_bridge_healthy_this_connection = true;
+        session_it->second.time_bridge_init_notify_failure_monotonic = 0.0;
+        session_it->second.time_bridge_init_notify_failure_count = 0;
     }
     publish_peer_time_status(bridge);
 }
