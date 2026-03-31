@@ -9,7 +9,6 @@
 #include <future>
 #include <optional>
 #include <rclcpp/create_timer.hpp>
-#include <thread>
 
 namespace {
 
@@ -39,14 +38,6 @@ std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& de
         return device.alias;
     }
     return {};
-}
-
-bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    return device.paired || device.bonded || device.trusted;
-}
-
-bool device_needs_forget(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    return device.connected || device.services_resolved || device_has_local_security(device);
 }
 
 bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
