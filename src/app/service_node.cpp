@@ -396,6 +396,9 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
     if (!adapter_info || !adapter_info->pairable) {
         adapter_->set_pairable(true);
     }
+    if (!adapter_info || !adapter_info->connectable) {
+        adapter_->set_connectable(true);
+    }
     adapter_->set_pairable_timeout(0);
 
     if (!adapter_info ||
@@ -527,6 +530,15 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                     "Local GATT layout changed, rebuilding the server without clearing active peer runtime");
     }
 
+    if (time_service_timer_) {
+        time_service_timer_->cancel();
+        time_service_timer_.reset();
+    }
+    if (wifi_service_timer_) {
+        wifi_service_timer_->cancel();
+        wifi_service_timer_.reset();
+    }
+
     if (!can_run_callbacks()) {
         return;
     }
@@ -553,10 +565,6 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     }
     local_gatt_layout_signature_ = new_gatt_layout_signature;
 
-    if (time_service_timer_) {
-        time_service_timer_->cancel();
-        time_service_timer_.reset();
-    }
     if (!can_run_callbacks()) {
         return;
     }
@@ -573,10 +581,6 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             timer_callback_group_);
     }
 
-    if (wifi_service_timer_) {
-        wifi_service_timer_->cancel();
-        wifi_service_timer_.reset();
-    }
     if (!can_run_callbacks()) {
         return;
     }
@@ -671,7 +675,7 @@ void ServiceNode::rebuild_server_objects() {
 
     RCLCPP_INFO(get_logger(), "[node] GATT server registered, setting up advertisement");
     advertisement_ = std::make_unique<gatt::Advertisement>(
-        *server_dbus_, "/org/bluez/advertisement0", "peripheral");
+        *server_dbus_, "/org/bluez/advertisement0", active_config_.advertise_mode);
     advertisement_->set_local_name(hostname_);
     advertisement_->set_discoverable(active_config_.enable_server);
     advertisement_->set_discoverable_timeout(
@@ -686,13 +690,16 @@ void ServiceNode::rebuild_server_objects() {
 
     const auto advertised_service_uuids = select_advertised_service_uuids(service_uuids, hostname_);
     if (advertised_service_uuids.size() != service_uuids.size()) {
-        RCLCPP_WARN(get_logger(),
-                    "BLE advertisement trimmed from %zu to %zu service UUIDs to fit legacy controller limits",
+        RCLCPP_INFO(get_logger(),
+                    "Prepared legacy BLE advertisement fallback trimmed from %zu to %zu service UUIDs",
                     service_uuids.size(), advertised_service_uuids.size());
     }
 
     std::vector<std::vector<std::string>> attempts;
-    attempts.push_back(advertised_service_uuids);
+    attempts.push_back(service_uuids);
+    if (advertised_service_uuids != service_uuids) {
+        attempts.push_back(advertised_service_uuids);
+    }
     if (!advertised_service_uuids.empty()) {
         attempts.push_back({});
     }

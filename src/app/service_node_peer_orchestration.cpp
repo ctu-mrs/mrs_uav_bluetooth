@@ -575,10 +575,7 @@ void ServiceNode::reconcile_peers() {
         const bool waiting_for_bridge = session.services_wait_started_monotonic > 0.0 ||
             session.bridge_wait_started_monotonic > 0.0;
 
-        if (session.desired &&
-            (is_connected || session.phase == "connecting" || session.phase == "connect_pending" ||
-             session.phase == "connected_unready" || session.phase == "securing" || session.phase == "ready" ||
-             recent_connect_flow || waiting_for_bridge)) {
+        if (session.desired && is_connected) {
             should_suspend_scan = true;
         }
 
@@ -590,7 +587,14 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (!session.desired) {
+            const bool allow_passive_non_peer = !whitelist_enabled && !session.peer_candidate;
             session.forget_pending = false;
+            if (allow_passive_non_peer) {
+                session.phase = "idle";
+                session.detail = session.peer_name.empty() ? "device does not match peer policy"
+                                                           : "not a peer candidate";
+                continue;
+            }
             if (device && device->connected) {
                 if (run_peer_task_once(mac, "disconnect undesired peer", [this, mac, retry_period_s]() {
                         (void)client_->disconnect(mac, retry_period_s);

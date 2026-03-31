@@ -9,6 +9,20 @@ namespace mrs_uav_bluetooth::gatt {
 
 using namespace mrs_uav_bluetooth::bluez;
 
+namespace {
+
+void log_properties_changed_failure(const char* object_kind,
+                                   const std::string& path,
+                                   const std::string& property,
+                                   const sdbus::Error& error) {
+    static rclcpp::Clock throttle_clock{RCL_STEADY_TIME};
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("mrs_uav_bluetooth"), throttle_clock, 5000,
+                         "[server] failed to emit PropertiesChanged for %s %s property %s: %s",
+                         object_kind, path.c_str(), property.c_str(), error.what());
+}
+
+}  // namespace
+
 // ===========================================================================
 // GattDescriptor
 // ===========================================================================
@@ -76,8 +90,12 @@ void GattDescriptor::set_value(const std::vector<uint8_t>& val, bool emit) {
         value_ = val;
     }
     if (emit && exported_) {
-        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattDescriptorIface)},
-                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
+        try {
+            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattDescriptorIface)},
+                                                  std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
+        } catch (const sdbus::Error& error) {
+            log_properties_changed_failure("descriptor", path_, "Value", error);
+        }
     }
 }
 
@@ -189,8 +207,12 @@ void GattCharacteristic::set_value(const std::vector<uint8_t>& val, bool emit) {
         RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("mrs_uav_bluetooth"), throttle_clock, 5000,
                               "[server] value changed path=%s bytes=%zu",
                               path_.c_str(), val.size());
-        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
-                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
+        try {
+            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+                                                  std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
+        } catch (const sdbus::Error& error) {
+            log_properties_changed_failure("characteristic", path_, "Value", error);
+        }
     }
 }
 
@@ -228,8 +250,12 @@ void GattCharacteristic::on_start_notify() {
     RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
                 "[server] notify enabled path=%s", path_.c_str());
     if (exported_) {
-        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
-                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
+        try {
+            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+                                                  std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
+        } catch (const sdbus::Error& error) {
+            log_properties_changed_failure("characteristic", path_, "Notifying", error);
+        }
     }
     if (notify_cb_) notify_cb_(true);
 }
@@ -240,8 +266,12 @@ void GattCharacteristic::on_stop_notify() {
     RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
                 "[server] notify disabled path=%s", path_.c_str());
     if (exported_) {
-        exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
-                                              std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
+        try {
+            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+                                                  std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
+        } catch (const sdbus::Error& error) {
+            log_properties_changed_failure("characteristic", path_, "Notifying", error);
+        }
     }
     if (notify_cb_) notify_cb_(false);
 }
