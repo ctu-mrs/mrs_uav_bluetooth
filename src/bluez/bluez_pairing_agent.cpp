@@ -33,22 +33,22 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
         sdbus::registerMethod("AuthorizeService")
             .withInputParamNames("device", "uuid")
             .implementedAs([this](const sdbus::ObjectPath& device, const std::string& uuid) {
-                emit("authorize_service", std::string(device));
                 if (!should_allow_request("authorize_service", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Connection rejected");
                 }
+                emit("authorize_service", std::string(device));
                 (void)uuid;
             }),
         sdbus::registerMethod("RequestPinCode")
             .withInputParamNames("device")
             .withOutputParamNames("pincode")
             .implementedAs([this](const sdbus::ObjectPath& device) -> std::string {
-                emit("request_pin", std::string(device));
                 if (!should_allow_request("request_pin", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "PIN code request rejected");
                 }
+                emit("request_pin", std::string(device));
                 if (auto_trust_) set_trusted(std::string(device));
                 return "";
             }),
@@ -56,11 +56,11 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
             .withInputParamNames("device")
             .withOutputParamNames("passkey")
             .implementedAs([this](const sdbus::ObjectPath& device) -> uint32_t {
-                emit("request_passkey", std::string(device));
                 if (!should_allow_request("request_passkey", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Passkey request rejected");
                 }
+                emit("request_passkey", std::string(device));
                 if (auto_trust_) set_trusted(std::string(device));
                 return 0;
             }),
@@ -81,22 +81,22 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
         sdbus::registerMethod("RequestConfirmation")
             .withInputParamNames("device", "passkey")
             .implementedAs([this](const sdbus::ObjectPath& device, uint32_t passkey) {
-                emit("request_confirmation", std::string(device));
                 (void)passkey;
                 if (!should_allow_request("request_confirmation", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Passkey not confirmed");
                 }
+                emit("request_confirmation", std::string(device));
                 if (auto_trust_) set_trusted(std::string(device));
             }),
         sdbus::registerMethod("RequestAuthorization")
             .withInputParamNames("device")
             .implementedAs([this](const sdbus::ObjectPath& device) {
-                emit("request_authorization", std::string(device));
                 if (!should_allow_request("request_authorization", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Authorization rejected");
                 }
+                emit("request_authorization", std::string(device));
             }),
         sdbus::registerMethod("Cancel")
             .implementedAs([this]() {
