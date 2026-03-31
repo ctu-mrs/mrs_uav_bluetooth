@@ -242,6 +242,7 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
     if (!dev) return false;
     if (dev->connected) return true;
     auto path = dev->object_path;
+    const bool prefer_le_transport = prefer_le && is_le_address_type(dev->address_type);
     RCLCPP_INFO(logger_, "[client] connect(%s) path=%s timeout=%.1fs prefer_le=%s addr_type=%s",
                 mac.c_str(), path.c_str(), timeout_s,
                 prefer_le ? "true" : "false",
@@ -249,7 +250,7 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
 
     auto connection = create_blocking_system_bus();
     bool use_device_connect_fallback = true;
-    if (prefer_le && is_le_address_type(dev->address_type)) {
+    if (prefer_le_transport) {
         try {
             auto adapter_proxy = create_bluez_proxy(*connection, adapter_path_);
             std::map<std::string, sdbus::Variant> properties;
@@ -277,14 +278,19 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
                                                   "In Progress", "Operation already in progress"})) {
                 use_device_connect_fallback = false;
             } else {
-                RCLCPP_WARN(logger_, "connect(%s) explicit LE connect failed: %s",
+                RCLCPP_WARN(logger_, "connect(%s) explicit LE connect failed, retrying with Device1.Connect() and PreferredBearer=le: %s",
                             mac.c_str(), message.c_str());
-                return false;
             }
         }
     }
 
     if (use_device_connect_fallback) {
+        if (prefer_le_transport) {
+            (void)set_preferred_bearer(mac, "le");
+            if (const auto refreshed = cache_.device_by_mac(mac)) {
+                path = refreshed->object_path;
+            }
+        }
         try {
             auto proxy = create_bluez_proxy(*connection, path);
             proxy->callMethod("Connect")

@@ -15,6 +15,7 @@ constexpr double kConnectAttemptGraceMin = 15.0;
 constexpr double kConnectAttemptGraceMultiplier = 5.0;
 constexpr double kServicesWaitGraceMin = 15.0;
 constexpr double kPairCooldownMin = 10.0;
+constexpr double kPairAfterConnectGraceMin = 5.0;
 constexpr double kTrustCooldownMin = 0.5;
 
 bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
@@ -552,9 +553,24 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
     if (session.connected_since_monotonic <= 0.0) {
         return false;
     }
+    if (is_phase(session, {"ready"})) {
+        return false;
+    }
     if (device_has_required_pairing(device, config)) {
         return false;
     }
+    if (device.services_resolved) {
+        return false;
+    }
+
+    const double pair_grace_s = std::max(kPairAfterConnectGraceMin, retry_period_s);
+    const double services_wait_started = session.services_wait_started_monotonic > 0.0
+        ? session.services_wait_started_monotonic
+        : session.connected_since_monotonic;
+    if (services_wait_started <= 0.0 || (now_mono - services_wait_started) < pair_grace_s) {
+        return false;
+    }
+
     const double cooldown = std::max(kPairCooldownMin,
                                      retry_period_s * std::max(1, session.pairing_failures + 1));
     return session.last_security_attempt_monotonic <= 0.0 ||
