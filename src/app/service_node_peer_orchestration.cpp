@@ -954,6 +954,16 @@ void ServiceNode::reconcile_peers() {
                 session.last_notify_failure_monotonic > 0.0 &&
                 (now - session.last_notify_failure_monotonic) < std::max(3.0, retry_period_s * 2.0);
             if (repeated_notify_failures) {
+                if (device_has_recorded_bond(*device)) {
+                    peers_->request_device_reset(session,
+                                                 "bonded peer repeatedly rejected time notifications, resetting peer device state",
+                                                 true);
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: repeated notify failures while locally bonded, resetting BlueZ device state",
+                                device_label.c_str());
+                    schedule_peer_reconcile(std::chrono::milliseconds(1));
+                    continue;
+                }
                 if (run_peer_task_once(mac, "recover failed notify", [this, mac, retry_period_s]() {
                         (void)client_->disconnect(mac, retry_period_s);
                     })) {
