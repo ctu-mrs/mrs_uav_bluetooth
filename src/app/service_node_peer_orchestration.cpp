@@ -110,9 +110,11 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
     }();
 
     session.repair_in_progress = false;
-    if (stale_bond_detected && !bridge_ready && session.phase != "ready") {
+    if ((stale_bond_detected || authentication_failed) && !bridge_ready && session.phase != "ready") {
         peers_->request_device_reset(session,
-                                     "stale local bond detected, resetting peer device state",
+                                     stale_bond_detected
+                                         ? "stale local bond detected, resetting peer device state"
+                                         : "pair authentication failed, resetting peer device state",
                                      true);
         return;
     }
@@ -775,6 +777,15 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device_has_required_pairing(*device, active_config_)) {
+            if (session.pairing_in_progress &&
+                session.last_security_attempt_monotonic > 0.0 &&
+                (now - session.last_security_attempt_monotonic) >= kPeerPairTimeout) {
+                peers_->request_device_reset(session,
+                                             "pairing stalled, resetting peer device state",
+                                             true);
+                continue;
+            }
+
             if (peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
                 if (run_peer_task_once(mac, "pair", [this, mac]() {
                         std::string error_detail;

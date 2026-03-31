@@ -7,6 +7,8 @@
 
 namespace {
 
+constexpr double kPairingCancelAssociationTimeout = 20.0;
+
 bool is_read_write_gatt_event(const std::string& event_type) {
     return event_type == "client_read" ||
            event_type == "client_write" ||
@@ -365,6 +367,44 @@ void ServiceNode::on_pairing_event(const std::string& event_type, const std::str
     if (!peers_ || !cache_) {
         return;
     }
+
+    if (event_type == "cancel" && device_path.empty()) {
+        peer::PeerConnectionSession* candidate_session = nullptr;
+        double latest_activity_monotonic = 0.0;
+        const double now = peers_->now_monotonic();
+
+        for (auto& [mac, session] : peers_->sessions()) {
+            (void)mac;
+            if (!session.desired || session.repair_requested || session.repair_in_progress) {
+                continue;
+            }
+            if (!session.pairing_in_progress && session.phase != "securing") {
+                continue;
+            }
+
+            const double activity_monotonic = std::max(session.last_pairing_request_monotonic,
+                                                       session.last_security_attempt_monotonic);
+            if (activity_monotonic <= 0.0 ||
+                (now - activity_monotonic) > kPairingCancelAssociationTimeout) {
+                continue;
+            }
+            if (!candidate_session || activity_monotonic > latest_activity_monotonic) {
+                candidate_session = &session;
+                latest_activity_monotonic = activity_monotonic;
+            }
+        }
+
+        if (candidate_session) {
+            candidate_session->pairing_in_progress = false;
+            candidate_session->pairing_failures += 1;
+            peers_->request_device_reset(*candidate_session,
+                                         "pairing cancelled by remote, resetting peer device state",
+                                         true);
+            schedule_peer_reconcile(std::chrono::milliseconds(1));
+            return;
+        }
+    }
+
     peers_->note_pairing_event(device_path, event_type, *cache_);
     schedule_peer_reconcile();
 }
