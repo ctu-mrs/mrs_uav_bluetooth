@@ -518,10 +518,13 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         for (const auto& device : client_->get_devices()) {
             {
                 std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+                const bool preserve_ready_runtime =
+                    has_ready_peer_time_bridge(device.mac) ||
+                    should_preserve_ready_bridge_during_expected_services_rediscovery(device);
                 peers_->sync_device(device,
                                     active_config_,
                                     device_hostname_guess(device),
-                                    has_ready_peer_time_bridge(device.mac));
+                                    preserve_ready_runtime);
             }
             refresh_import_bridges_for_device(device);
         }

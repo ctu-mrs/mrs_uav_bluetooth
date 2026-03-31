@@ -95,9 +95,40 @@ bool ServiceNode::has_ready_peer_time_bridge(const std::string& mac) const {
     return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
 }
 
+bool ServiceNode::should_preserve_ready_bridge_during_expected_services_rediscovery(
+    const bluez::DeviceInfo& device) const {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_ || !device.connected || device.services_resolved) {
+        return false;
+    }
+
+    const auto session_it = peers_->sessions().find(device.mac);
+    const auto bridge_it = peers_->time_bridges().find(device.mac);
+    if (session_it == peers_->sessions().end() || bridge_it == peers_->time_bridges().end()) {
+        return false;
+    }
+
+    const auto& session = session_it->second;
+    const auto& bridge = bridge_it->second;
+    const bool handshake_complete = bridge.status == "ready" &&
+        bridge.time_notification_received &&
+        bridge.time_writeback_received;
+
+    // BlueZ can pulse ServicesResolved=false during a fresh rediscovery even when the
+    // already-handshaken time bridge is still healthy. Preserve that runtime until a
+    // concrete teardown signal arrives, otherwise healthy bridges are torn down by churn.
+    return handshake_complete &&
+           session.desired &&
+           !session.repair_requested &&
+           !session.repair_in_progress;
+}
+
 bool ServiceNode::device_can_host_peer_bridge(const bluez::DeviceInfo& device) const {
     const bool pairing_ready = !active_config_.auto_pair || device.paired || device.bonded;
-    return pairing_ready && device.connected && device.services_resolved;
+    return pairing_ready &&
+           device.connected &&
+           (device.services_resolved ||
+            should_preserve_ready_bridge_during_expected_services_rediscovery(device));
 }
 
 void ServiceNode::clear_peer_runtime(const std::string& mac,

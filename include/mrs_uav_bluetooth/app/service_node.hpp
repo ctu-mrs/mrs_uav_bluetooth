@@ -89,6 +89,8 @@ private:
     void reconcile_peers();
     void schedule_peer_reconcile(std::chrono::milliseconds delay = std::chrono::milliseconds(0));
     bool has_ready_peer_time_bridge(const std::string& mac) const;
+    bool should_preserve_ready_bridge_during_expected_services_rediscovery(
+        const bluez::DeviceInfo& device) const;
     bool device_can_host_peer_bridge(const bluez::DeviceInfo& device) const;
     void clear_peer_runtime(const std::string& mac,
                             const std::string& skip_characteristic_path = {});

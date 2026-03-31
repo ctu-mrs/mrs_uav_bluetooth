@@ -147,7 +147,10 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
 
     const auto peer_name = device_hostname_guess(*device);
     auto& session = peers_->get_or_create_session(device->mac, peer_name);
-    peers_->sync_device(*device, active_config_, peer_name, has_ready_peer_time_bridge(device->mac));
+    const bool preserve_ready_runtime =
+        has_ready_peer_time_bridge(device->mac) ||
+        should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
+    peers_->sync_device(*device, active_config_, peer_name, preserve_ready_runtime);
     
     const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
 
@@ -337,6 +340,21 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     }
 
     if (!device.services_resolved) {
+        if (should_preserve_ready_bridge_during_expected_services_rediscovery(device)) {
+            if (session.service_regression_started_monotonic <= 0.0) {
+                session.service_regression_started_monotonic = now_mono;
+            }
+            session.services_wait_started_monotonic = 0.0;
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+            session.remote_gatt_missing_since_monotonic = 0.0;
+            session.remote_gatt_missing_checks = 0;
+            session.last_service_retry_monotonic = 0.0;
+            session.phase = "ready";
+            session.detail = "peer time bridge active during expected services rediscovery";
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            return true;
+        }
         clear_time_bridge();
         state_lock.unlock();
         if (!stop_notify_path.empty()) {
@@ -857,7 +875,14 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device->services_resolved) {
-            const double services_wait_started_monotonic = session.services_wait_started_monotonic;
+            const bool preserve_ready_runtime =
+                should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
+            if (preserve_ready_runtime && session.service_regression_started_monotonic <= 0.0) {
+                session.service_regression_started_monotonic = now;
+            }
+            const double services_wait_started_monotonic = preserve_ready_runtime
+                ? session.service_regression_started_monotonic
+                : session.services_wait_started_monotonic;
             const double services_wait_grace_s = session.services_wait_grace_s;
             const bool services_wait_expired =
                 services_wait_started_monotonic > 0.0 &&
@@ -879,8 +904,13 @@ void ServiceNode::reconcile_peers() {
             }
 
             schedule_peer_reconcile(kPeerWaitReconcileDelay);
-            session.phase = "connected_unready";
-            session.detail = "connected, waiting for services";
+            if (preserve_ready_runtime) {
+                session.phase = "ready";
+                session.detail = "peer time bridge active during expected services rediscovery";
+            } else {
+                session.phase = "connected_unready";
+                session.detail = "connected, waiting for services";
+            }
             continue;
         }
 
