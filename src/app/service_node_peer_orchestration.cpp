@@ -204,13 +204,13 @@ bool ServiceNode::run_peer_task_once(const std::string& mac,
     }
 
     std::lock_guard<std::mutex> lock(peer_task_mutex_);
-    auto existing = peer_tasks_.find(mac);
-    if (existing != peer_tasks_.end()) {
-        if (existing->second.valid() &&
-            existing->second.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+    if (peer_task_.valid()) {
+        if (peer_task_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
             return false;
         }
-        peer_tasks_.erase(existing);
+        peer_task_ = std::shared_future<void>{};
+        peer_task_mac_.clear();
+        peer_task_label_.clear();
     }
 
     auto future = std::async(std::launch::async, [this, mac, label, task = std::move(task)]() mutable {
@@ -232,24 +232,26 @@ bool ServiceNode::run_peer_task_once(const std::string& mac,
             schedule_peer_reconcile(std::chrono::milliseconds(1));
         }
     }).share();
-    peer_tasks_[mac] = std::move(future);
+    peer_task_ = std::move(future);
+    peer_task_mac_ = mac;
+    peer_task_label_ = label;
     return true;
 }
 
 void ServiceNode::wait_for_peer_tasks() {
-    std::vector<std::shared_future<void>> tasks;
+    std::shared_future<void> task;
     {
         std::lock_guard<std::mutex> lock(peer_task_mutex_);
-        for (const auto& [_, future] : peer_tasks_) {
-            if (future.valid()) {
-                tasks.push_back(future);
-            }
+        if (peer_task_.valid()) {
+            task = peer_task_;
         }
-        peer_tasks_.clear();
+        peer_task_ = std::shared_future<void>{};
+        peer_task_mac_.clear();
+        peer_task_label_.clear();
     }
 
-    for (auto& future : tasks) {
-        future.wait();
+    if (task.valid()) {
+        task.wait();
     }
 }
 
@@ -350,6 +352,8 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
             const auto waited_s = now_mono - session.remote_gatt_missing_since_monotonic;
             if (session.remote_gatt_missing_checks >= kRemoteGattRepairMinChecks &&
                 waited_s >= remote_gatt_repair_grace_s(session) &&
+                (session.last_repair_monotonic <= 0.0 ||
+                 now_mono - session.last_repair_monotonic >= remote_gatt_repair_grace_s(session)) &&
                 !session.stale_pairing_detected &&
                 !session.repair_in_progress) {
                 peers_->request_pairing_repair(session, "services resolved without remote GATT after grace");
@@ -551,7 +555,11 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (session.stale_pairing_detected) {
-            if ((session.repair_in_progress || session.forget_pending) ||
+            if (session.repair_awaiting_cache_removal || session.repair_in_progress) {
+                continue;
+            }
+
+            if (!session.repair_remove_issued &&
                 !run_peer_task_once(mac, "reset stale pairing", [this, mac, retry_period_s, connected = is_connected]() {
                     if (connected) {
                         (void)client_->disconnect(mac, retry_period_s);
@@ -564,27 +572,36 @@ void ServiceNode::reconcile_peers() {
                 continue;
             }
 
-            RCLCPP_WARN(get_logger(), "[reconcile] %s: resetting stale pairing state (%s)",
-                        device_label.c_str(),
-                        session.repair_reason.empty() ? "stale security" : session.repair_reason.c_str());
-            session.forget_pending = true;
-            session.repair_in_progress = true;
-            state_lock.unlock();
-            clear_peer_runtime(mac);
-            state_lock.lock();
-            session.phase = "recovering";
-            session.detail = session.repair_reason.empty() ? "resetting stale security" : session.repair_reason;
-            session.last_repair_monotonic = now;
-            session.last_connect_attempt_monotonic = 0.0;
-            session.connect_started_monotonic = 0.0;
-            session.connected_since_monotonic = 0.0;
-            session.last_security_attempt_monotonic = 0.0;
-            session.services_wait_started_monotonic = 0.0;
-            session.bridge_wait_started_monotonic = 0.0;
-            session.bridge_wait_reason.clear();
-            session.remote_gatt_missing_since_monotonic = 0.0;
-            session.remote_gatt_missing_checks = 0;
-            continue;
+            if (!session.repair_remove_issued) {
+                RCLCPP_WARN(get_logger(), "[reconcile] %s: resetting stale pairing state (%s)",
+                            device_label.c_str(),
+                            session.repair_reason.empty() ? "stale security" : session.repair_reason.c_str());
+                session.repair_remove_issued = true;
+                session.repair_awaiting_cache_removal = true;
+                session.repair_in_progress = true;
+                state_lock.unlock();
+                clear_peer_runtime(mac);
+                state_lock.lock();
+                session.phase = "recovering";
+                session.detail = session.repair_reason.empty() ? "resetting stale security" : session.repair_reason;
+                session.last_repair_monotonic = now;
+                session.last_connect_attempt_monotonic = 0.0;
+                session.connect_started_monotonic = 0.0;
+                session.connected_since_monotonic = 0.0;
+                session.last_security_attempt_monotonic = 0.0;
+                session.services_wait_started_monotonic = 0.0;
+                session.bridge_wait_started_monotonic = 0.0;
+                session.bridge_wait_reason.clear();
+                session.remote_gatt_missing_since_monotonic = 0.0;
+                session.remote_gatt_missing_checks = 0;
+                continue;
+            }
+
+            if (session.phase == "recovering") {
+                session.phase = device ? "discovered" : "stale";
+                session.detail = device ? "awaiting fresh connection after security reset"
+                                        : "awaiting fresh discovery after security reset";
+            }
         }
 
         if (session.repair_in_progress) {

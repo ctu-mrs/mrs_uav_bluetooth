@@ -193,7 +193,9 @@ private:
     std::atomic_bool shutting_down_{false};
     mutable std::recursive_mutex state_mutex_;
     mutable std::mutex peer_task_mutex_;
-    std::map<std::string, std::shared_future<void>> peer_tasks_;
+    std::shared_future<void> peer_task_;
+    std::string peer_task_mac_;
+    std::string peer_task_label_;
     mutable std::mutex log_state_mutex_;
     std::string last_status_log_summary_;
     std::chrono::steady_clock::time_point last_status_log_time_{};
