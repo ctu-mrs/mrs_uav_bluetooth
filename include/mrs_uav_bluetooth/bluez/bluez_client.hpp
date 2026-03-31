@@ -52,7 +52,9 @@ public:
     std::vector<DeviceInfo> get_connected_devices() const;
 
     // ---- Connection management ----
-    bool connect(const std::string& mac, double timeout_s = 15.0);
+    bool connect(const std::string& mac,
+                 double timeout_s = 15.0,
+                 bool prefer_le = false);
     bool disconnect(const std::string& mac, double timeout_s = 10.0);
 
     // ---- Pairing/trust ----

@@ -18,7 +18,6 @@ constexpr double kRemoteGattSnapshotRetryInterval = 2.0;
 constexpr double kServicesResolveRepairDelay = 4.0;
 constexpr double kRemoteGattRepairDelay = 3.0;
 constexpr double kPeerPairTimeout = 20.0;
-constexpr double kPeerPairSettleGrace = 8.0;
 constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
 
 std::string lower_trim(std::string value) {
@@ -677,50 +676,24 @@ void ServiceNode::reconcile_peers() {
                 session.detail = "remote-initiated flow in progress";
                 continue;
             }
-            if (device && peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
-                if (run_peer_task_once(mac, "pair", [this, mac]() {
-                        std::string pair_error;
-                        const bool pair_ok = client_->pair(mac, kPeerPairTimeout, &pair_error);
-                        note_pair_attempt_result(mac, pair_ok, pair_error);
-                    })) {
-                    RCLCPP_INFO(get_logger(),
-                                "[reconcile] %s: attempting pre-connect pair (phase=%s)",
-                                device_label.c_str(),
-                                session.phase.c_str());
-                    session.phase = "securing";
-                    session.detail = "auto-pair requested before connect";
-                    session.last_security_attempt_monotonic = now;
-                }
-                continue;
-            }
             if (peers_->should_attempt_connect(session, now, retry_period_s)) {
                 if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
                         if (local_server_rebuild_in_progress_.load()) {
                             return;
                         }
-                        // The peer bridge depends on BlueZ remote GATT objects, which are
-                        // only reliable on the LE bearer for these dual-mode peers.
-                        (void)client_->set_preferred_bearer(mac, "le");
-                        (void)client_->connect(mac, retry_period_s);
+                        (void)client_->connect(mac, retry_period_s, true);
                     })) {
                     RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
                                 device_label.c_str(), session.phase.c_str());
                     peers_->note_local_connect_attempt(session, now);
                     session.phase = "connecting";
-                    session.detail = "auto-connect requested (LE preferred)";
+                    session.detail = "auto-connect requested (explicit LE when available)";
                 }
             }
             continue;
         }
 
         if (is_connected && device && !device->services_resolved) {
-            if (session.phase == "securing" &&
-                session.last_security_attempt_monotonic > 0.0 &&
-                (now - session.last_security_attempt_monotonic) < kPeerPairSettleGrace) {
-                schedule_peer_reconcile(kPeerWaitReconcileDelay);
-                session.detail = "pairing in progress";
-                continue;
-            }
             if (session.services_wait_started_monotonic > 0.0 &&
                 (now - session.services_wait_started_monotonic) >= kServicesResolveRepairDelay) {
                 peers_->request_device_reset(session, "connected but services never resolved");

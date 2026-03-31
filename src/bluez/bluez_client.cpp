@@ -61,6 +61,10 @@ bool is_missing_object_error(const std::string& message) {
            message.find("doesn't exist") != std::string::npos;
 }
 
+bool is_le_address_type(const std::string& address_type) {
+    return address_type == "public" || address_type == "random";
+}
+
 std::string device_root_path(const std::string& object_path) {
     const auto device_pos = object_path.find("/dev_");
     if (device_pos == std::string::npos) {
@@ -233,26 +237,66 @@ std::vector<DeviceInfo> BluezClient::get_connected_devices() const {
 // Connection management
 // ---------------------------------------------------------------------------
 
-bool BluezClient::connect(const std::string& mac, double timeout_s) {
+bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_le) {
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return false;
     if (dev->connected) return true;
-    const auto path = dev->object_path;
-    RCLCPP_INFO(logger_, "[client] connect(%s) path=%s timeout=%.1fs",
-                mac.c_str(), path.c_str(), timeout_s);
+    auto path = dev->object_path;
+    RCLCPP_INFO(logger_, "[client] connect(%s) path=%s timeout=%.1fs prefer_le=%s addr_type=%s",
+                mac.c_str(), path.c_str(), timeout_s,
+                prefer_le ? "true" : "false",
+                dev->address_type.empty() ? "<unknown>" : dev->address_type.c_str());
 
     auto connection = create_blocking_system_bus();
-    try {
-        auto proxy = create_bluez_proxy(*connection, path);
-        proxy->callMethod("Connect")
-            .onInterface(std::string(kDeviceIface));
-    } catch (const sdbus::Error& error) {
-        const auto message = error.getMessage();
-        if (!message_contains(message, {"Already Connected", "AlreadyConnected", "InProgress",
-                                        "In Progress", "Operation already in progress",
-                                        "No more profiles to connect to", "br-connection-already-connected"})) {
-            RCLCPP_WARN(logger_, "connect(%s) failed: %s", mac.c_str(), message.c_str());
-            return false;
+    bool use_device_connect_fallback = true;
+    if (prefer_le && is_le_address_type(dev->address_type)) {
+        try {
+            auto adapter_proxy = create_bluez_proxy(*connection, adapter_path_);
+            std::map<std::string, sdbus::Variant> properties;
+            properties["Address"] = sdbus::Variant{dev->mac};
+            properties["AddressType"] = sdbus::Variant{dev->address_type};
+
+            sdbus::ObjectPath resolved_device_path;
+            adapter_proxy->callMethod("ConnectDevice")
+                .onInterface(std::string(kAdapterIface))
+                .withArguments(properties)
+                .storeResultsTo(resolved_device_path);
+
+            const auto resolved_path = static_cast<std::string>(resolved_device_path);
+            if (!resolved_path.empty()) {
+                path = resolved_path;
+            }
+            use_device_connect_fallback = false;
+        } catch (const sdbus::Error& error) {
+            const auto message = error.getMessage();
+            if (message_contains(message, {"UnknownMethod", "NotSupported", "doesn't exist"})) {
+                RCLCPP_WARN(logger_, "connect(%s) explicit LE connect unavailable, falling back to Device1.Connect(): %s",
+                            mac.c_str(), message.c_str());
+            } else if (message_contains(message, {"AlreadyExists", "Already Connected",
+                                                  "AlreadyConnected", "InProgress",
+                                                  "In Progress", "Operation already in progress"})) {
+                use_device_connect_fallback = false;
+            } else {
+                RCLCPP_WARN(logger_, "connect(%s) explicit LE connect failed: %s",
+                            mac.c_str(), message.c_str());
+                return false;
+            }
+        }
+    }
+
+    if (use_device_connect_fallback) {
+        try {
+            auto proxy = create_bluez_proxy(*connection, path);
+            proxy->callMethod("Connect")
+                .onInterface(std::string(kDeviceIface));
+        } catch (const sdbus::Error& error) {
+            const auto message = error.getMessage();
+            if (!message_contains(message, {"Already Connected", "AlreadyConnected", "InProgress",
+                                            "In Progress", "Operation already in progress",
+                                            "No more profiles to connect to", "br-connection-already-connected"})) {
+                RCLCPP_WARN(logger_, "connect(%s) failed: %s", mac.c_str(), message.c_str());
+                return false;
+            }
         }
     }
 

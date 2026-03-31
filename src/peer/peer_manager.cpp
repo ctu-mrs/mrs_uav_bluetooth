@@ -591,16 +591,17 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
     if (device.blocked) {
         return false;
     }
-    if (device.connected) {
-        if (!is_phase(session, {"ready"})) {
-            return false;
-        }
-        if (session.connected_since_monotonic <= 0.0) {
-            return false;
-        }
-        if (!device.services_resolved) {
-            return false;
-        }
+    if (!device.connected) {
+        return false;
+    }
+    if (!is_phase(session, {"ready"})) {
+        return false;
+    }
+    if (session.connected_since_monotonic <= 0.0) {
+        return false;
+    }
+    if (!device.services_resolved) {
+        return false;
     }
     if (device_has_required_pairing(device, config)) {
         return false;
