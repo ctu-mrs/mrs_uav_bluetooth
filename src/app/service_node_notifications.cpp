@@ -414,6 +414,9 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
     if (bridge.time_writeback_received) {
         bridge.status = "ready";
         bridge.detail = "time notification";
+        if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
+            session_it->second.time_bridge_healthy_this_connection = true;
+        }
         publish_peer_time_status(bridge);
     } else {
         bridge.status = "subscribing";
@@ -491,6 +494,9 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
 
     bridge.status = "ready";
     bridge.detail = "time writeback";
+    if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
+        session_it->second.time_bridge_healthy_this_connection = true;
+    }
     publish_peer_time_status(bridge);
 }
 

@@ -2,7 +2,7 @@
 <package format="3">
   <name>mrs_uav_bluetooth</name>
   <version>0.2.0</version>
-  <description>ROS 2 BLE service node for MRS UAV server and client control.</description>
+  <description>ROS 2 Bluetooth for MRS UAV System (server and client).</description>
   <maintainer email="vojtech.vrba@fel.cvut.cz">Vojtech Vrba</maintainer>
   <license>MIT</license>
 
