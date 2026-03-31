@@ -680,13 +680,16 @@ void ServiceNode::reconcile_peers() {
                         if (local_server_rebuild_in_progress_.load()) {
                             return;
                         }
+                        // The peer bridge depends on BlueZ remote GATT objects, which are
+                        // only reliable on the LE bearer for these dual-mode peers.
+                        (void)client_->set_preferred_bearer(mac, "le");
                         (void)client_->connect(mac, retry_period_s);
                     })) {
                     RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
                                 device_label.c_str(), session.phase.c_str());
                     peers_->note_local_connect_attempt(session, now);
                     session.phase = "connecting";
-                    session.detail = "auto-connect requested";
+                    session.detail = "auto-connect requested (LE preferred)";
                 }
             }
             continue;
