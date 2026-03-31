@@ -401,7 +401,7 @@ bool BluezClient::unblock(const std::string& mac) {
 
 bool BluezClient::remove(const std::string& mac) {
     auto dev = cache_.device_by_mac(mac);
-    if (!dev) return false;
+    if (!dev) return true;
     RCLCPP_INFO(logger_, "[client] remove(%s) path=%s", mac.c_str(), dev->object_path.c_str());
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
@@ -410,11 +410,26 @@ bool BluezClient::remove(const std::string& mac) {
         proxy->callMethod("RemoveDevice")
             .onInterface(std::string(kAdapterIface))
             .withArguments(sdbus::ObjectPath{dev->object_path});
-        return true;
     } catch (const sdbus::Error& e) {
-        RCLCPP_WARN(logger_, "remove(%s) failed: %s", mac.c_str(), e.getMessage().c_str());
+        const auto message = e.getMessage();
+        if (message_contains(message, {"NoSuchObject", "UnknownObject", "doesn't exist"})) {
+            return true;
+        }
+        RCLCPP_WARN(logger_, "remove(%s) failed: %s", mac.c_str(), message.c_str());
         return false;
     }
+
+    return poll_until(8.0, kConnectPollInterval, [&]() {
+        const auto current = cache_.device_by_mac(mac);
+        if (!current) {
+            return true;
+        }
+        return !current->connected &&
+               !current->services_resolved &&
+               !current->paired &&
+               !current->bonded &&
+               !current->trusted;
+    });
 }
 
 bool BluezClient::set_preferred_bearer(const std::string& mac, const std::string& bearer) {

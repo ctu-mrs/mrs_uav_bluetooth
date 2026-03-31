@@ -29,10 +29,11 @@ public:
     void note_pairing_event(const std::string& device_path,
                             const std::string& event,
                             const bluez::ObjectManagerCache& cache);
-    void request_pairing_repair(PeerConnectionSession& session,
-                                const std::string& reason);
-    void clear_pairing_repair(PeerConnectionSession& session,
-                              bool clear_pairing_reset_pending = true);
+    void request_device_reset(PeerConnectionSession& session,
+                              const std::string& reason,
+                              bool reset_pairing_state = false);
+    void clear_device_reset(PeerConnectionSession& session,
+                            bool clear_pairing_reset_pending = true);
     bool should_attempt_trust(const PeerConnectionSession& session,
                               const bluez::DeviceInfo& device,
                               const config::NodeConfig& config,
