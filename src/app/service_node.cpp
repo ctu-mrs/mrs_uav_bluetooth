@@ -673,6 +673,7 @@ void ServiceNode::rebuild_server_objects() {
             chrc->set_notify_callback([this, uuid = chrc->uuid()](bool enabled) {
                 RCLCPP_INFO(get_logger(), "[server] time characteristic %s: client %s notifications",
                             uuid.c_str(), enabled ? "started" : "stopped");
+                note_local_time_notify_state(enabled);
             });
         }
         gatt_app_->add_service(time_service_->service());

@@ -80,6 +80,7 @@ private:
     void handle_time_writeback(const std::vector<uint8_t>& payload,
                                const std::string& device_path,
                                uint64_t received_time_ns);
+    void note_local_time_notify_state(bool enabled);
     void on_pairing_event(const std::string& event_type, const std::string& device_path);
     void note_pair_attempt_result(const std::string& mac,
                                   bool success,

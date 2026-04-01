@@ -85,6 +85,45 @@ PublishRateSample update_publish_rate(double last_publish_monotonic) {
 
 namespace mrs_uav_bluetooth::app {
 
+void ServiceNode::note_local_time_notify_state(bool enabled) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_ || !client_) {
+        return;
+    }
+
+    if (!enabled) {
+        for (auto& [mac, session] : peers_->sessions()) {
+            (void)mac;
+            session.local_time_notify_active_this_connection = false;
+        }
+        return;
+    }
+
+    std::string only_connected_desired_mac;
+    for (const auto& [mac, session] : peers_->sessions()) {
+        if (!session.desired) {
+            continue;
+        }
+        const auto device = client_->get_device(mac);
+        if (!device || !device->connected) {
+            continue;
+        }
+        if (!only_connected_desired_mac.empty()) {
+            return;
+        }
+        only_connected_desired_mac = mac;
+    }
+
+    if (only_connected_desired_mac.empty()) {
+        return;
+    }
+
+    auto session_it = peers_->sessions().find(only_connected_desired_mac);
+    if (session_it != peers_->sessions().end()) {
+        session_it->second.local_time_notify_active_this_connection = true;
+    }
+}
+
 bool ServiceNode::has_ready_peer_time_bridge(const std::string& mac) const {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_) {

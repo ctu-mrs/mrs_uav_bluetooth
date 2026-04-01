@@ -42,6 +42,7 @@ struct PeerConnectionSession {
     bool repair_awaiting_cache_removal{false};
     bool forget_pending{false};
     bool time_bridge_healthy_this_connection{false};
+    bool local_time_notify_active_this_connection{false};
     std::string repair_reason;
     double services_wait_started_monotonic{0.0};
     double services_wait_grace_s{0.0};

@@ -305,6 +305,18 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         }
     }
 
+    if (refresh_device && !active_config_.auto_pair) {
+        const auto session_it = peers_->sessions().find(refresh_device->mac);
+        if (session_it != peers_->sessions().end() &&
+            session_it->second.desired &&
+            device_has_recorded_bond(*refresh_device)) {
+            peers_->request_device_reset(session_it->second,
+                                         "pairing disabled by config, removing unexpected peer bond",
+                                         true);
+            schedule_peer_reconcile(std::chrono::milliseconds(1));
+        }
+    }
+
     state_lock.unlock();
     if (clear_runtime_mac) {
         clear_peer_runtime(*clear_runtime_mac);

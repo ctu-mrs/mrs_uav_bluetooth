@@ -982,6 +982,8 @@ void ServiceNode::reconcile_peers() {
                 should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
             const bool preserve_ready_runtime =
                 should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
+            const bool preserve_manual_security_runtime =
+                !active_config_.auto_pair && session.local_time_notify_active_this_connection;
             if (preserve_bridge_runtime && session.service_regression_started_monotonic <= 0.0) {
                 session.service_regression_started_monotonic = now;
             }
@@ -1015,7 +1017,7 @@ void ServiceNode::reconcile_peers() {
                 continue;
             }
 
-            const double services_wait_started_monotonic = preserve_bridge_runtime
+            const double services_wait_started_monotonic = (preserve_bridge_runtime || preserve_manual_security_runtime)
                 ? 0.0
                 : session.services_wait_started_monotonic;
             const double services_wait_grace_s = session.services_wait_grace_s;
@@ -1042,6 +1044,9 @@ void ServiceNode::reconcile_peers() {
             if (preserve_ready_runtime) {
                 session.phase = "ready";
                 session.detail = "peer time bridge active during expected services rediscovery";
+            } else if (preserve_manual_security_runtime) {
+                session.phase = "connected_unready";
+                session.detail = "local time notifications active during expected services rediscovery";
             } else if (preserve_bridge_runtime) {
                 session.phase = "connected_unready";
                 session.detail = bridge_it != peers_->time_bridges().end() &&
