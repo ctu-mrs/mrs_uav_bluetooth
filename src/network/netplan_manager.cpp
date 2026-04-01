@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <optional>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 
 namespace mrs_uav_bluetooth::network {
 
@@ -82,7 +84,15 @@ std::string read_command_output(const char* command) {
     std::array<char, 256> buffer{};
     std::string output;
 
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command, "r"), pclose);
+    struct PipeCloser {
+        void operator()(FILE* file) const {
+            if (file != nullptr) {
+                pclose(file);
+            }
+        }
+    };
+
+    std::unique_ptr<FILE, PipeCloser> pipe(popen(command, "r"));
     if (!pipe) {
         return {};
     }
@@ -177,6 +187,39 @@ std::pair<bool, std::string> rollback_netplan_change(const std::string& path,
     return {false, std::move(message)};
 }
 
+std::string default_uav_static_address() {
+    char hostname_buf[256]{};
+    std::string hostname;
+    if (gethostname(hostname_buf, sizeof(hostname_buf) - 1) == 0) {
+        hostname = hostname_buf;
+    }
+
+    std::string lowered = hostname;
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+
+    std::string digits = "00";
+    const auto uav_pos = lowered.find("uav");
+    if (uav_pos != std::string::npos) {
+        size_t idx = uav_pos + 3;
+        std::string parsed;
+        while (idx < lowered.size() && std::isdigit(static_cast<unsigned char>(lowered[idx]))) {
+            parsed.push_back(lowered[idx]);
+            ++idx;
+        }
+        if (!parsed.empty()) {
+            if (parsed.size() == 1) {
+                digits = "0" + parsed;
+            } else {
+                digits = parsed.substr(parsed.size() - 2);
+            }
+        }
+    }
+
+    return "192.168.69.1" + digits + "/24";
+}
+
 }  // namespace
 
 NetplanManager::NetplanManager(std::string netplan_config_file,
@@ -256,7 +299,6 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
     if (!network || !network.IsMap()) {
         network = config["network"] = YAML::Node(YAML::NodeType::Map);
     }
-    network["version"] = 2;
     auto wifis = network["wifis"];
     if (!wifis || !wifis.IsMap() || wifis.size() == 0) {
         wifis = network["wifis"] = YAML::Node(YAML::NodeType::Map);
@@ -266,9 +308,11 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
     auto iface_cfg = first->second;
     if (!iface_cfg || !iface_cfg.IsMap()) {
         iface_cfg = YAML::Node(YAML::NodeType::Map);
+        iface_cfg["dhcp4"] = false;
+        iface_cfg["dhcp6"] = false;
+        iface_cfg["addresses"] = YAML::Node(YAML::NodeType::Sequence);
+        iface_cfg["addresses"].push_back(default_uav_static_address());
     }
-    iface_cfg["dhcp4"] = true;
-    iface_cfg["optional"] = true;
     YAML::Node aps(YAML::NodeType::Map);
     YAML::Node ap_cfg(YAML::NodeType::Map);
 
