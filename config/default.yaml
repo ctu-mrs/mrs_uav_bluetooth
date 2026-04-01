@@ -26,7 +26,7 @@ auto_connect_period: 3.0
 discoverable_timeout: 0
 
 # BlueZ pairing agent and peer-security behaviour.
-auto_pair: false
+auto_pair: true
 auto_trust: true
 
 # Enable the built-in services hosted by the system node.
