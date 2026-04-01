@@ -885,6 +885,13 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
+        if (!active_config_.auto_pair && session.desired && device && device_has_recorded_bond(*device)) {
+            peers_->request_device_reset(session,
+                                         "pairing disabled by config, removing unexpected peer bond",
+                                         true);
+            continue;
+        }
+
         if (is_connected && device &&
             peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
             if (run_peer_task_once(mac, "trust", [this, mac]() {

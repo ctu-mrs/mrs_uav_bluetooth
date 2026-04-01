@@ -386,6 +386,7 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
 
     const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
     const bool should_be_discoverable = cfg.enable_server;
+    const bool should_be_pairable = cfg.auto_pair;
 
     if (!adapter_info || !adapter_info->powered) {
         adapter_->power_on();
@@ -393,8 +394,8 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
     if (!adapter_info || adapter_info->alias != hostname_) {
         adapter_->set_alias(hostname_);
     }
-    if (!adapter_info || !adapter_info->pairable) {
-        adapter_->set_pairable(true);
+    if (!adapter_info || adapter_info->pairable != should_be_pairable) {
+        adapter_->set_pairable(should_be_pairable);
     }
     if (!adapter_info || !adapter_info->connectable) {
         adapter_->set_connectable(true);

@@ -274,9 +274,10 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         if (event == bluez::CacheEvent::AdapterChanged && object_path == adapter_path_) {
             if (const auto adapter = cache_->adapter(object_path)) {
                 const bool should_be_discoverable = active_config_.enable_server;
+                const bool should_be_pairable = active_config_.auto_pair;
                 const bool drifted = !adapter->powered ||
                     !adapter->connectable ||
-                    !adapter->pairable ||
+                    adapter->pairable != should_be_pairable ||
                     adapter->alias != hostname_ ||
                     adapter->discoverable != should_be_discoverable ||
                     (should_be_discoverable && adapter->discoverable_timeout != active_config_.discoverable_timeout);
