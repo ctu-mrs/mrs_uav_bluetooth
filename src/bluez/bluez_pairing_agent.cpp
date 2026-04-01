@@ -10,8 +10,7 @@ constexpr auto kPendingPairingCancelTimeout = std::chrono::seconds(20);
 bool request_requires_pairing_flow(const std::string& event) {
     return event == "request_pin" ||
            event == "request_passkey" ||
-           event == "request_confirmation" ||
-           event == "request_authorization";
+           event == "request_confirmation";
 }
 
 }

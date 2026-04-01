@@ -120,6 +120,33 @@ double ServiceNode::healthy_peer_time_bridge_last_activity_monotonic(
     return inactivity_s <= max_inactivity_s ? bridge.last_activity_monotonic : 0.0;
 }
 
+bool ServiceNode::should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(
+    const bluez::DeviceInfo& device) const {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_ || !device.connected || device.services_resolved) {
+        return false;
+    }
+
+    const auto session_it = peers_->sessions().find(device.mac);
+    const auto bridge_it = peers_->time_bridges().find(device.mac);
+    if (session_it == peers_->sessions().end() || bridge_it == peers_->time_bridges().end()) {
+        return false;
+    }
+
+    const auto& session = session_it->second;
+    const auto& bridge = bridge_it->second;
+    const bool handshake_complete = bridge.status == "ready" &&
+        bridge.time_notification_received &&
+        bridge.time_writeback_received;
+    const bool subscription_active = bridge.status == "subscribing" &&
+        !bridge.characteristic_path.empty();
+
+    return (handshake_complete || subscription_active) &&
+           session.desired &&
+           !session.repair_requested &&
+           !session.repair_in_progress;
+}
+
 bool ServiceNode::should_preserve_ready_bridge_during_expected_services_rediscovery(
     const bluez::DeviceInfo& device) const {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
@@ -153,7 +180,7 @@ bool ServiceNode::device_can_host_peer_bridge(const bluez::DeviceInfo& device) c
     return pairing_ready &&
            device.connected &&
            (device.services_resolved ||
-            should_preserve_ready_bridge_during_expected_services_rediscovery(device));
+            should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(device));
 }
 
 bool ServiceNode::device_can_host_peer_import_bridges(const bluez::DeviceInfo& device) const {

@@ -91,6 +91,8 @@ private:
     bool has_ready_peer_time_bridge(const std::string& mac) const;
     double healthy_peer_time_bridge_last_activity_monotonic(const std::string& mac,
                                                             double max_inactivity_s) const;
+    bool should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(
+        const bluez::DeviceInfo& device) const;
     bool should_preserve_ready_bridge_during_expected_services_rediscovery(
         const bluez::DeviceInfo& device) const;
     bool device_can_host_peer_bridge(const bluez::DeviceInfo& device) const;

@@ -62,13 +62,14 @@ bool is_interactive_pairing_request_event(const std::string& event_type) {
            event_type == "request_pin";
 }
 
-bool is_pairing_request_event(const std::string& event_type) {
+bool is_stale_bond_sensitive_pairing_event(const std::string& event_type) {
     return is_interactive_pairing_request_event(event_type) ||
            event_type == "request_authorization";
 }
 
 bool is_service_authorization_event(const std::string& event_type) {
-    return event_type == "authorize_service";
+    return event_type == "authorize_service" ||
+           event_type == "request_authorization";
 }
 
 template<typename DurationT, typename CallbackT>
@@ -164,20 +165,14 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
     peers_->sync_device(*device, active_config_, peer_name, preserve_ready_runtime);
 
-    const bool pairing_request_event = is_pairing_request_event(event_type);
+    const bool stale_bond_sensitive_event = is_stale_bond_sensitive_pairing_event(event_type);
     const bool service_authorization_event = is_service_authorization_event(event_type);
 
     if (!active_config_.auto_pair) {
         if (is_interactive_pairing_request_event(event_type)) {
             return false;
         }
-        if (pairing_request_event && !device_has_local_security(*device)) {
-            log_warn_coalesced("pairing-rejected-manual-security:" + device->mac + ":" + event_type,
-                               "[node] rejecting pairing request for " + device->mac +
-                                   " because auto_pair is disabled and no local security state exists");
-            return false;
-        }
-        if (!pairing_request_event && !service_authorization_event) {
+        if (!service_authorization_event) {
             return false;
         }
     }
@@ -204,7 +199,7 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         return false;
     }
 
-    if (active_config_.auto_pair && pairing_request_event && device_has_recorded_bond(*device)) {
+    if (active_config_.auto_pair && stale_bond_sensitive_event && device_has_recorded_bond(*device)) {
         session.pairing_in_progress = false;
         peers_->request_device_reset(session,
                                      "incoming pairing request conflicts with local bond",
@@ -369,20 +364,36 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     }
 
     if (!device.services_resolved) {
-        if (should_preserve_ready_bridge_during_expected_services_rediscovery(device)) {
+        if (should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(device)) {
             if (session.service_regression_started_monotonic <= 0.0) {
                 session.service_regression_started_monotonic = now_mono;
             }
             session.services_wait_started_monotonic = 0.0;
-            session.bridge_wait_started_monotonic = 0.0;
-            session.bridge_wait_reason.clear();
             session.remote_gatt_missing_since_monotonic = 0.0;
             session.remote_gatt_missing_checks = 0;
             session.last_service_retry_monotonic = 0.0;
-            session.phase = "ready";
-            session.detail = "peer time bridge active during expected services rediscovery";
+            if (bridge_it != peers_->time_bridges().end() &&
+                bridge_it->second.status == "ready" &&
+                bridge_it->second.time_notification_received &&
+                bridge_it->second.time_writeback_received) {
+                session.bridge_wait_started_monotonic = 0.0;
+                session.bridge_wait_reason.clear();
+                session.phase = "ready";
+                session.detail = "peer time bridge active during expected services rediscovery";
+                schedule_peer_reconcile(kPeerWaitReconcileDelay);
+                return true;
+            }
+            if (session.bridge_wait_started_monotonic <= 0.0) {
+                session.bridge_wait_started_monotonic = now_mono;
+            }
+            session.bridge_wait_reason = "notify";
+            session.phase = "connected_unready";
+            session.detail = bridge_it != peers_->time_bridges().end() &&
+                    !bridge_it->second.detail.empty()
+                ? bridge_it->second.detail + " during expected services rediscovery"
+                : "awaiting peer time notifications during expected services rediscovery";
             schedule_peer_reconcile(kPeerWaitReconcileDelay);
-            return true;
+            return false;
         }
         clear_time_bridge();
         state_lock.unlock();
