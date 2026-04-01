@@ -43,39 +43,27 @@ std::string trim_ascii_whitespace(std::string value) {
 }
 
 std::string read_access_point_ssid(const YAML::Node& config) {
-    const auto aps = config["network"]["wifis"];
-    if (!aps || !aps.IsMap()) {
+    const auto access_points = config["network"]["wifis"]["wlan0"]["access-points"];
+    if (!access_points || !access_points.IsMap()) {
         return {};
     }
-    for (auto it = aps.begin(); it != aps.end(); ++it) {
-        const auto access_points = it->second["access-points"];
-        if (!access_points || !access_points.IsMap()) {
-            continue;
-        }
-        for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
-            return ap->first.as<std::string>("");
-        }
+    for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
+        return ap->first.as<std::string>("");
     }
     return {};
 }
 
 std::string read_access_point_password(const YAML::Node& config) {
-    const auto aps = config["network"]["wifis"];
-    if (!aps || !aps.IsMap()) {
+    const auto access_points = config["network"]["wifis"]["wlan0"]["access-points"];
+    if (!access_points || !access_points.IsMap()) {
         return {};
     }
-    for (auto it = aps.begin(); it != aps.end(); ++it) {
-        const auto access_points = it->second["access-points"];
-        if (!access_points || !access_points.IsMap()) {
-            continue;
+    for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
+        const auto ap_cfg = ap->second;
+        if (!ap_cfg || !ap_cfg.IsMap() || !ap_cfg["password"]) {
+            return {};
         }
-        for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
-            const auto ap_cfg = ap->second;
-            if (!ap_cfg || !ap_cfg.IsMap() || !ap_cfg["password"]) {
-                return {};
-            }
-            return ap_cfg["password"].as<std::string>("");
-        }
+        return ap_cfg["password"].as<std::string>("");
     }
     return {};
 }
@@ -304,8 +292,7 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
         wifis = network["wifis"] = YAML::Node(YAML::NodeType::Map);
         wifis["wlan0"] = YAML::Node(YAML::NodeType::Map);
     }
-    auto first = wifis.begin();
-    auto iface_cfg = first->second;
+    auto iface_cfg = wifis["wlan0"];
     if (!iface_cfg || !iface_cfg.IsMap()) {
         iface_cfg = YAML::Node(YAML::NodeType::Map);
         iface_cfg["dhcp4"] = false;
@@ -328,7 +315,7 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
     }
     aps[ssid] = ap_cfg;
     iface_cfg["access-points"] = aps;
-    first->second = iface_cfg;
+    wifis["wlan0"] = iface_cfg;
 
     try {
         std::ofstream out(netplan_config_file_, std::ios::binary | std::ios::trunc);
