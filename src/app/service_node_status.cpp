@@ -482,16 +482,20 @@ std::string ServiceNode::build_detailed_status_report(
         }
 
         std::vector<std::string> status_parts;
+        const bool fully_paired = device->paired && device->trusted && device->bonded;
+        const bool pairing_ready = device->paired || device->bonded;
+        const std::string pairing_state = device->paired ? "paired"
+            : (device->bonded ? "bonded" : "pairing-pending");
         if (bridge != nullptr && bridge->status == "ready") {
             status_parts.push_back("time-bridge-ready");
-            if (device->paired && device->trusted && device->bonded) {
+            if (fully_paired) {
                 status_parts.push_back("fully-paired");
             } else {
-                status_parts.push_back(device->paired || device->bonded ? "paired" : "pairing-pending");
+                status_parts.push_back(pairing_state);
                 status_parts.push_back(device->trusted ? "trusted" : "trust-pending");
             }
         } else {
-            status_parts.push_back(device->paired || device->bonded ? "paired" : "pairing-pending");
+            status_parts.push_back(pairing_state);
             status_parts.push_back(device->trusted ? "trusted" : "trust-pending");
             status_parts.push_back(device->services_resolved ? "services-resolved" : "services-resolving");
             if (bridge != nullptr) {
@@ -528,7 +532,10 @@ std::string ServiceNode::build_detailed_status_report(
 
         lines.push_back("    peer: " + device->mac + " " + display_name_for_device(*device) +
                         " RSSI=" + std::to_string(device->rssi) +
-                        " paired=" + std::string(bool_text(device->paired && device->trusted && device->bonded)) +
+                        " secure=" + std::string(bool_text(pairing_ready)) +
+                        " paired=" + std::string(bool_text(device->paired)) +
+                        " bonded=" + std::string(bool_text(device->bonded)) +
+                        " trusted=" + std::string(bool_text(device->trusted)) +
                         " inactive_s=" + inactivity_stream.str() +
                         " status=" + status_stream.str());
     }

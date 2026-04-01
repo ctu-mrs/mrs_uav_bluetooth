@@ -502,10 +502,11 @@ void ObjectManagerCache::process_object(const std::string& path,
         auto dev = parse_device(path, device_it->second);
         auto [it, inserted] = devices_.insert_or_assign(path, std::move(dev));
         if (inserted) {
-            RCLCPP_INFO(logger_, "[cache] Device added: %s mac=%s name='%s' connected=%s paired=%s trusted=%s",
+            RCLCPP_INFO(logger_, "[cache] Device added: %s mac=%s name='%s' connected=%s paired=%s bonded=%s trusted=%s",
                         path.c_str(), it->second.mac.c_str(), it->second.name.c_str(),
                         it->second.connected ? "true" : "false",
                         it->second.paired ? "true" : "false",
+                        it->second.bonded ? "true" : "false",
                         it->second.trusted ? "true" : "false");
         }
         if (notifications && inserted) {

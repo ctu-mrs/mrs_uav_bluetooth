@@ -249,6 +249,27 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
                 dev->address_type.empty() ? "<unknown>" : dev->address_type.c_str());
 
     auto connection = create_blocking_system_bus();
+    const auto device_connected_now = [&]() {
+        if (const auto refreshed = cache_.device_by_mac(mac)) {
+            if (!refreshed->object_path.empty()) {
+                path = refreshed->object_path;
+            }
+            if (refreshed->connected) {
+                return true;
+            }
+        }
+
+        try {
+            const auto properties = read_device_properties(*connection, path);
+            return properties && get_variant_or<bool>(*properties, "Connected", false);
+        } catch (const sdbus::Error& error) {
+            if (is_missing_object_error(error.getMessage())) {
+                return false;
+            }
+            throw;
+        }
+    };
+
     bool use_device_connect_fallback = true;
     if (prefer_le_transport) {
         try {
@@ -278,6 +299,9 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
                                                   "In Progress", "Operation already in progress"})) {
                 use_device_connect_fallback = false;
             } else {
+                if (device_connected_now()) {
+                    return true;
+                }
                 RCLCPP_WARN(logger_, "connect(%s) explicit LE connect failed, retrying with Device1.Connect() and PreferredBearer=le: %s",
                             mac.c_str(), message.c_str());
             }
@@ -285,6 +309,9 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
     }
 
     if (use_device_connect_fallback) {
+        if (device_connected_now()) {
+            return true;
+        }
         if (prefer_le_transport) {
             (void)set_preferred_bearer(mac, "le");
             if (const auto refreshed = cache_.device_by_mac(mac)) {
@@ -300,6 +327,9 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
             if (!message_contains(message, {"Already Connected", "AlreadyConnected", "InProgress",
                                             "In Progress", "Operation already in progress",
                                             "No more profiles to connect to", "br-connection-already-connected"})) {
+                if (device_connected_now()) {
+                    return true;
+                }
                 RCLCPP_WARN(logger_, "connect(%s) failed: %s", mac.c_str(), message.c_str());
                 return false;
             }
