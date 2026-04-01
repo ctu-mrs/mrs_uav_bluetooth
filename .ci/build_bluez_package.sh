@@ -80,16 +80,16 @@ PACKAGE_ROOT="$(pwd)/bluez_package" ;
 mkdir -p "$PACKAGE_ROOT/DEBIAN" ;
 make DESTDIR="$PACKAGE_ROOT" install ;
 
-# enable experimental features by default in the packaged BlueZ config
-MAIN_CONF="$PACKAGE_ROOT/etc/bluetooth/main.conf" ;
-if [ -f "$MAIN_CONF" ] ; then
-    if grep -Eq '^[[:space:]]*#?[[:space:]]*Experimental[[:space:]]*=' "$MAIN_CONF" ; then
-        sed -Ei 's/^[[:space:]]*#?[[:space:]]*Experimental[[:space:]]*=.*/Experimental = true/' "$MAIN_CONF" ;
-    elif grep -Eq '^\[General\]' "$MAIN_CONF" ; then
-        sed -Ei '/^\[General\]/a Experimental = true' "$MAIN_CONF" ;
-    else
-        printf '\n[General]\nExperimental = true\n' >> "$MAIN_CONF" ;
-    fi
+# enable experimental mode and disable all plugins in the packaged systemd unit
+BLUETOOTH_SERVICE="$PACKAGE_ROOT/usr/lib/systemd/system/bluetooth.service" ;
+if [ ! -f "$BLUETOOTH_SERVICE" ] ; then
+    BLUETOOTH_SERVICE="$PACKAGE_ROOT/lib/systemd/system/bluetooth.service" ;
+fi
+if [ -f "$BLUETOOTH_SERVICE" ] ; then
+    sed -Ei '/^[[:space:]]*ExecStart=/ {
+        /(^|[[:space:]])-E([[:space:]]|$)/! s#$# -E#
+        /(^|[[:space:]])-P[[:space:]]+\*([[:space:]]|$)/! s#$# -P *#
+    }' "$BLUETOOTH_SERVICE" ;
 fi
 
 # create package control file
