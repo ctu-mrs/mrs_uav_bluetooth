@@ -72,6 +72,10 @@ bool is_service_authorization_event(const std::string& event_type) {
            event_type == "request_authorization";
 }
 
+bool is_manual_security_authorization_event(const std::string& event_type) {
+    return event_type == "authorize_service";
+}
+
 template<typename DurationT, typename CallbackT>
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
@@ -172,13 +176,14 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
                         preserve_active_bridge_runtime);
 
     const bool stale_bond_sensitive_event = is_stale_bond_sensitive_pairing_event(event_type);
-    const bool service_authorization_event = is_service_authorization_event(event_type);
+    const bool manual_security_authorization_event =
+        is_manual_security_authorization_event(event_type);
 
     if (!active_config_.auto_pair) {
         if (is_interactive_pairing_request_event(event_type)) {
             return false;
         }
-        if (!service_authorization_event) {
+        if (!manual_security_authorization_event) {
             return false;
         }
     }
