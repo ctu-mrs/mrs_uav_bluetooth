@@ -5,18 +5,22 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <thread>
 
 namespace mrs_uav_bluetooth::network {
 
 namespace {
 
 constexpr const char* kIwGetIdCommand = "iwgetid -r 2>/dev/null";
+constexpr auto kConnectionVerifyTimeout = std::chrono::seconds(20);
+constexpr auto kConnectionVerifyPollInterval = std::chrono::milliseconds(500);
 
 bool contains_value(const std::vector<std::string>& values, const std::string& candidate) {
     return std::find(values.begin(), values.end(), candidate) != values.end();
@@ -89,6 +93,10 @@ std::string read_command_output(const char* command) {
     return trim_ascii_whitespace(std::move(output));
 }
 
+std::string read_connected_ssid() {
+    return read_command_output(kIwGetIdCommand);
+}
+
 struct FileSnapshot {
     bool existed{false};
     std::string contents;
@@ -137,6 +145,36 @@ std::string run_netplan_apply() {
         return {};
     }
     return "netplan apply failed with code " + std::to_string(rc);
+}
+
+bool wait_for_connected_ssid(const std::string& expected_ssid) {
+    const auto deadline = std::chrono::steady_clock::now() + kConnectionVerifyTimeout;
+    while (true) {
+        if (read_connected_ssid() == expected_ssid) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(kConnectionVerifyPollInterval);
+    }
+}
+
+std::pair<bool, std::string> rollback_netplan_change(const std::string& path,
+                                                     const FileSnapshot& snapshot,
+                                                     std::string message) {
+    const auto restore_error = restore_snapshot(path, snapshot);
+    const auto rollback_apply_error = restore_error.empty() ? run_netplan_apply() : std::string{};
+
+    if (!restore_error.empty()) {
+        message += "; rollback write failed: " + restore_error;
+    } else if (!rollback_apply_error.empty()) {
+        message += "; rollback apply failed: " + rollback_apply_error;
+    } else {
+        message += "; previous netplan config restored";
+    }
+
+    return {false, std::move(message)};
 }
 
 }  // namespace
@@ -260,24 +298,29 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
     }
 
     const auto apply_error = run_netplan_apply();
-    if (apply_error.empty()) {
+    if (!apply_error.empty()) {
         busy_ = false;
-        return {true, "netplan applied for SSID '" + ssid + "'"};
+        return rollback_netplan_change(netplan_config_file_, snapshot, apply_error);
     }
 
-    const auto restore_error = restore_snapshot(netplan_config_file_, snapshot);
-    const auto rollback_apply_error = restore_error.empty() ? run_netplan_apply() : std::string{};
+    if (!wait_for_connected_ssid(ssid)) {
+        const auto connected_ssid = read_connected_ssid();
+        std::string message = "failed to connect to SSID '" + ssid + "' within " +
+                              std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+                                                 kConnectionVerifyTimeout)
+                                                 .count()) +
+                              "s";
+        if (!connected_ssid.empty()) {
+            message += "; connected SSID remained '" + connected_ssid + "'";
+        } else {
+            message += "; no active Wi-Fi connection detected";
+        }
+        busy_ = false;
+        return rollback_netplan_change(netplan_config_file_, snapshot, std::move(message));
+    }
+
     busy_ = false;
-
-    std::string message = apply_error;
-    if (!restore_error.empty()) {
-        message += "; rollback write failed: " + restore_error;
-    } else if (!rollback_apply_error.empty()) {
-        message += "; rollback apply failed: " + rollback_apply_error;
-    } else {
-        message += "; previous netplan config restored";
-    }
-    return {false, message};
+    return {true, "connected to SSID '" + ssid + "'"};
 }
 
 std::pair<bool, std::string> NetplanManager::set_current_network(const std::string& ssid,
