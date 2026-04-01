@@ -508,7 +508,14 @@ void PeerManager::note_pairing_event(const std::string& device_path,
     const auto now = now_monotonic();
     session.last_security_attempt_monotonic = now;
 
-    if (event == "request_confirmation" || event == "request_authorization" ||
+    if (event == "request_authorization") {
+        if (is_phase(session, {"ready"}) && session.detail.empty()) {
+            session.detail = event;
+        }
+        return;
+    }
+
+    if (event == "request_confirmation" ||
         event == "request_passkey" || event == "request_pin") {
         session.pairing_in_progress = true;
         session.last_pairing_request_monotonic = now;

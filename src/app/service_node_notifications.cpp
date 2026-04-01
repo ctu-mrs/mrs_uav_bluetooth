@@ -451,11 +451,19 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
             session_it->second.time_bridge_healthy_this_connection = true;
             session_it->second.time_bridge_init_notify_failure_monotonic = 0.0;
             session_it->second.time_bridge_init_notify_failure_count = 0;
+            session_it->second.bridge_wait_started_monotonic = 0.0;
+            session_it->second.bridge_wait_reason.clear();
         }
         publish_peer_time_status(bridge);
     } else {
         bridge.status = "subscribing";
         bridge.detail = "time notification received, awaiting writeback";
+        if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
+            session_it->second.bridge_wait_started_monotonic = bridge.last_activity_monotonic;
+            session_it->second.bridge_wait_reason = "writeback";
+            session_it->second.phase = "connected_unready";
+            session_it->second.detail = bridge.detail;
+        }
     }
 
     if (!bridge.writeback_descriptor_path.empty()) {
@@ -524,6 +532,12 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
     if (!bridge.time_notification_received) {
         bridge.status = "subscribing";
         bridge.detail = "peer time writeback received, awaiting notifications";
+        if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
+            session_it->second.bridge_wait_started_monotonic = bridge.last_activity_monotonic;
+            session_it->second.bridge_wait_reason = "notify";
+            session_it->second.phase = "connected_unready";
+            session_it->second.detail = bridge.detail;
+        }
         return;
     }
 
@@ -533,6 +547,8 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
         session_it->second.time_bridge_healthy_this_connection = true;
         session_it->second.time_bridge_init_notify_failure_monotonic = 0.0;
         session_it->second.time_bridge_init_notify_failure_count = 0;
+        session_it->second.bridge_wait_started_monotonic = 0.0;
+        session_it->second.bridge_wait_reason.clear();
     }
     publish_peer_time_status(bridge);
 }

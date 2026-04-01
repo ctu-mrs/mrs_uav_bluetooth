@@ -114,8 +114,6 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Authorization rejected");
                 }
-                pending_pairing_device_path_ = std::string(device);
-                pending_pairing_request_time_ = std::chrono::steady_clock::now();
                 emit("request_authorization", std::string(device));
             }),
         sdbus::registerMethod("Cancel")

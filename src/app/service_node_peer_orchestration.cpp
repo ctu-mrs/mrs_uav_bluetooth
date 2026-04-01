@@ -605,13 +605,48 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         }
     }
 
+    const auto descriptors = client_->list_descriptors(mac, characteristic_path);
+    const auto wb_path = client_->find_descriptor(mac, writeback_descriptor_uuid, characteristic_path);
+    if (wb_path.empty() && !descriptors.empty()) {
+        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): writeback descriptor uuid=%s not found (descriptors resolved=%zu)",
+                     mac.c_str(), writeback_descriptor_uuid.c_str(), descriptors.size());
+    } else if (wb_path.empty()) {
+        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): no descriptors resolved for this device, writeback disabled",
+                     mac.c_str());
+    }
+
+    const auto previous_wb_path = bridge_it->second.writeback_descriptor_path;
+    bridge_it->second.writeback_descriptor_path = wb_path;
+
+    std::vector<uint8_t> recovered_writeback_payload;
+    const bool recovered_writeback_path = previous_wb_path.empty() && !wb_path.empty();
+    if (recovered_writeback_path &&
+        bridge_it->second.time_notification_received &&
+        !bridge_it->second.time_writeback_received) {
+        recovered_writeback_payload.resize(sizeof(uint64_t));
+        std::memcpy(recovered_writeback_payload.data(),
+                    &bridge_it->second.last_time_value_ns,
+                    sizeof(uint64_t));
+    }
+
     if (bridge_it->second.status == "subscribing") {
+        const bool awaiting_writeback =
+            bridge_it->second.time_notification_received &&
+            !bridge_it->second.time_writeback_received;
         if (session.bridge_wait_started_monotonic <= 0.0) {
             session.bridge_wait_started_monotonic = peers_->now_monotonic();
         }
-        session.bridge_wait_reason = "notify";
+        session.bridge_wait_reason = awaiting_writeback ? "writeback" : "notify";
         session.phase = "connected_unready";
-        session.detail = "awaiting peer time notifications";
+        session.detail = awaiting_writeback
+            ? "awaiting peer time writeback"
+            : "awaiting peer time notifications";
+
+        state_lock.unlock();
+        if (!recovered_writeback_payload.empty()) {
+            client_->write_descriptor_async(wb_path, recovered_writeback_payload);
+        }
+        state_lock.lock();
         return false;
     }
 
@@ -625,16 +660,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         return false;
     }
 
-    const auto descriptors = client_->list_descriptors(mac, characteristic_path);
-    const auto wb_path = client_->find_descriptor(mac, writeback_descriptor_uuid, characteristic_path);
-    if (wb_path.empty() && !descriptors.empty()) {
-        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): writeback descriptor uuid=%s not found (descriptors resolved=%zu)",
-                     mac.c_str(), writeback_descriptor_uuid.c_str(), descriptors.size());
-    } else if (wb_path.empty()) {
-        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): no descriptors resolved for this device, writeback disabled",
-                     mac.c_str());
-    }
-    bridge_it->second.writeback_descriptor_path = wb_path;
     bridge_it->second.status = "subscribing";
     bridge_it->second.detail = "enabling peer time notifications";
     bridge_it->second.services_wait_grace_s = session.services_wait_grace_s;
@@ -945,7 +970,8 @@ void ServiceNode::reconcile_peers() {
             const bool notify_handshake_timed_out =
                 preserve_bridge_runtime &&
                 !handshake_complete &&
-                session.bridge_wait_reason == "notify" &&
+                (session.bridge_wait_reason == "notify" ||
+                 session.bridge_wait_reason == "writeback") &&
                 session.bridge_wait_started_monotonic > 0.0 &&
                 (now - session.bridge_wait_started_monotonic) >= kPeerNotifyHandshakeTimeout;
             if (notify_handshake_timed_out) {
@@ -1013,7 +1039,8 @@ void ServiceNode::reconcile_peers() {
                 bridge_it->second.time_notification_received &&
                 bridge_it->second.time_writeback_received;
             const bool notify_handshake_timed_out =
-                session.bridge_wait_reason == "notify" &&
+                (session.bridge_wait_reason == "notify" ||
+                 session.bridge_wait_reason == "writeback") &&
                 session.bridge_wait_started_monotonic > 0.0 &&
                 !handshake_complete &&
                 (now - session.bridge_wait_started_monotonic) >= kPeerNotifyHandshakeTimeout;
