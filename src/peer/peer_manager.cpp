@@ -254,7 +254,8 @@ void PeerManager::clear_device_reset(PeerConnectionSession& session,
 void PeerManager::sync_device(const bluez::DeviceInfo& device,
                               const config::NodeConfig& config,
                               const std::string& peer_name,
-                              bool preserve_ready_runtime) {
+                              bool preserve_ready_runtime,
+                              bool preserve_active_bridge_runtime) {
     auto& session = get_or_create_session(device.mac, peer_name);
     const auto now = now_monotonic();
     const bool was_desired = session.desired;
@@ -411,6 +412,21 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
             set_session_phase(session,
                               "ready",
                               "peer time bridge active during expected services rediscovery");
+            return;
+        }
+
+        if (preserve_active_bridge_runtime) {
+            if (session.service_regression_started_monotonic <= 0.0) {
+                session.service_regression_started_monotonic = now;
+            }
+            session.services_wait_started_monotonic = 0.0;
+            session.last_service_retry_monotonic = 0.0;
+            session.remote_gatt_missing_since_monotonic = 0.0;
+            session.remote_gatt_missing_checks = 0;
+            session.phase = "connected_unready";
+            if (session.detail.empty()) {
+                session.detail = "peer time bridge active during expected services rediscovery";
+            }
             return;
         }
 

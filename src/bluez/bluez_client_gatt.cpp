@@ -92,14 +92,16 @@ bool BluezClient::write_characteristic_async(const std::string& chrc_path,
                                              const std::vector<uint8_t>& data,
                                              bool with_response) {
     try {
-        auto proxy = create_bluez_proxy(dbus_.connection(), chrc_path);
+        auto proxy = std::shared_ptr<sdbus::IProxy>(
+            create_bluez_proxy(dbus_.connection(), chrc_path).release());
         std::map<std::string, sdbus::Variant> options;
         options["type"] = sdbus::Variant{std::string(with_response ? "request" : "command")};
         const auto path_copy = chrc_path;
         proxy->callMethodAsync("WriteValue")
             .onInterface(std::string(kGattCharacteristicIface))
             .withArguments(data, options)
-            .uponReplyInvoke([this, path_copy](std::optional<sdbus::Error> err) {
+            .uponReplyInvoke([this, path_copy, proxy](std::optional<sdbus::Error> err) {
+                (void)proxy;
                 if (err) {
                     emit_gatt("client_write_failed", path_copy, err->getMessage());
                 } else {
@@ -149,13 +151,15 @@ bool BluezClient::write_descriptor(const std::string& desc_path,
 bool BluezClient::write_descriptor_async(const std::string& desc_path,
                                          const std::vector<uint8_t>& data) {
     try {
-        auto proxy = create_bluez_proxy(dbus_.connection(), desc_path);
+        auto proxy = std::shared_ptr<sdbus::IProxy>(
+            create_bluez_proxy(dbus_.connection(), desc_path).release());
         std::map<std::string, sdbus::Variant> options;
         const auto path_copy = desc_path;
         proxy->callMethodAsync("WriteValue")
             .onInterface(std::string(kGattDescriptorIface))
             .withArguments(data, options)
-            .uponReplyInvoke([this, path_copy](std::optional<sdbus::Error> err) {
+            .uponReplyInvoke([this, path_copy, proxy](std::optional<sdbus::Error> err) {
+                (void)proxy;
                 if (err) {
                     emit_gatt("client_descriptor_write_failed", path_copy, err->getMessage());
                 } else {

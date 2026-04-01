@@ -25,7 +25,8 @@ public:
     void sync_device(const bluez::DeviceInfo& device,
                      const config::NodeConfig& config,
                      const std::string& peer_name = {},
-                     bool preserve_ready_runtime = false);
+                     bool preserve_ready_runtime = false,
+                     bool preserve_active_bridge_runtime = false);
     void note_missing_device(const std::string& mac, double now_mono);
     void note_pairing_event(const std::string& device_path,
                             const std::string& event,

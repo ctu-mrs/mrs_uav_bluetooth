@@ -521,10 +521,13 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                 const bool preserve_ready_runtime =
                     has_ready_peer_time_bridge(device.mac) ||
                     should_preserve_ready_bridge_during_expected_services_rediscovery(device);
+                const bool preserve_active_bridge_runtime =
+                    should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(device);
                 peers_->sync_device(device,
                                     active_config_,
                                     device_hostname_guess(device),
-                                    preserve_ready_runtime);
+                                    preserve_ready_runtime,
+                                    preserve_active_bridge_runtime);
             }
             refresh_import_bridges_for_device(device);
         }

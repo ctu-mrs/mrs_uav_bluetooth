@@ -159,6 +159,14 @@ BluezClient::~BluezClient() {
 
 bool BluezClient::start_scan(const std::string& transport,
                              bool make_discoverable_while_scanning) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (scan_running_) {
+            return true;
+        }
+        scan_running_ = true;
+    }
+
     RCLCPP_INFO(logger_, "[client] start_scan transport=%s discoverable=%s",
                 transport.c_str(), make_discoverable_while_scanning ? "true" : "false");
     try {
@@ -174,15 +182,15 @@ bool BluezClient::start_scan(const std::string& transport,
             .withArguments(filter);
         proxy->callMethod("StartDiscovery")
             .onInterface(std::string(kAdapterIface));
-        std::lock_guard<std::mutex> lock(mutex_);
-        scan_running_ = true;
         return true;
     } catch (const sdbus::Error& e) {
         std::string msg = e.getMessage();
-        if (msg.find("InProgress") != std::string::npos) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            scan_running_ = true;
+        if (message_contains(msg, {"InProgress", "In Progress", "Operation already in progress"})) {
             return true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_running_ = false;
         }
         RCLCPP_WARN(logger_, "start_scan failed: %s", msg.c_str());
         return false;
