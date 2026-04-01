@@ -7,6 +7,13 @@ namespace {
 
 constexpr auto kPendingPairingCancelTimeout = std::chrono::seconds(20);
 
+bool request_requires_pairing_flow(const std::string& event) {
+    return event == "request_pin" ||
+           event == "request_passkey" ||
+           event == "request_confirmation" ||
+           event == "request_authorization";
+}
+
 }
 
 BluezPairingAgent::BluezPairingAgent(DbusConnection& dbus,
@@ -213,11 +220,8 @@ void BluezPairingAgent::emit(const std::string& event,
 
 bool BluezPairingAgent::should_allow_request(const std::string& event,
                                              const std::string& device_path) const {
-    if (!auto_pair_) {
-        return false;
-    }
     if (!request_policy_) {
-        return true;
+        return auto_pair_ || !request_requires_pairing_flow(event);
     }
     try {
         return request_policy_(event, device_path);

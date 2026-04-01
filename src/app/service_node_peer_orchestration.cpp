@@ -56,6 +56,21 @@ bool device_has_recorded_bond(const mrs_uav_bluetooth::bluez::DeviceInfo& device
     return device.paired || device.bonded;
 }
 
+bool is_interactive_pairing_request_event(const std::string& event_type) {
+    return event_type == "request_confirmation" ||
+           event_type == "request_passkey" ||
+           event_type == "request_pin";
+}
+
+bool is_pairing_request_event(const std::string& event_type) {
+    return is_interactive_pairing_request_event(event_type) ||
+           event_type == "request_authorization";
+}
+
+bool is_service_authorization_event(const std::string& event_type) {
+    return event_type == "authorize_service";
+}
+
 template<typename DurationT, typename CallbackT>
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
@@ -137,10 +152,6 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         return false;
     }
 
-    if (!active_config_.auto_pair) {
-        return false;
-    }
-
     const auto device = cache_->device(device_path);
     if (!device) {
         return false;
@@ -152,7 +163,25 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         has_ready_peer_time_bridge(device->mac) ||
         should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
     peers_->sync_device(*device, active_config_, peer_name, preserve_ready_runtime);
-    
+
+    const bool pairing_request_event = is_pairing_request_event(event_type);
+    const bool service_authorization_event = is_service_authorization_event(event_type);
+
+    if (!active_config_.auto_pair) {
+        if (is_interactive_pairing_request_event(event_type)) {
+            return false;
+        }
+        if (pairing_request_event && !device_has_local_security(*device)) {
+            log_warn_coalesced("pairing-rejected-manual-security:" + device->mac + ":" + event_type,
+                               "[node] rejecting pairing request for " + device->mac +
+                                   " because auto_pair is disabled and no local security state exists");
+            return false;
+        }
+        if (!pairing_request_event && !service_authorization_event) {
+            return false;
+        }
+    }
+
     const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
 
     if (!session.desired) {
@@ -175,8 +204,7 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         return false;
     }
 
-    const bool is_pairing_request_event = event_type.rfind("request_", 0) == 0;
-    if (is_pairing_request_event && device_has_recorded_bond(*device)) {
+    if (active_config_.auto_pair && pairing_request_event && device_has_recorded_bond(*device)) {
         session.pairing_in_progress = false;
         peers_->request_device_reset(session,
                                      "incoming pairing request conflicts with local bond",
