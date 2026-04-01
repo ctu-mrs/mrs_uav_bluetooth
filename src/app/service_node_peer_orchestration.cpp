@@ -206,6 +206,7 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
     }
 
     if (active_config_.auto_pair && stale_bond_sensitive_event && device_has_recorded_bond(*device)) {
+        peers_->note_pairing_event(device_path, event_type, *cache_);
         session.pairing_in_progress = false;
         peers_->request_device_reset(session,
                                      "incoming pairing request conflicts with local bond",
@@ -884,6 +885,26 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
+        if (is_connected && device &&
+            peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
+            if (run_peer_task_once(mac, "trust", [this, mac]() {
+                    (void)client_->trust(mac);
+                })) {
+                RCLCPP_INFO(get_logger(),
+                            "[reconcile] %s: attempting trust repair (phase=%s paired=%s bonded=%s trusted=%s)",
+                            device_label.c_str(),
+                            session.phase.c_str(),
+                            device->paired ? "Y" : "N",
+                            device->bonded ? "Y" : "N",
+                            device->trusted ? "Y" : "N");
+                session.detail = session.phase == "ready"
+                    ? "peer time bridge active, trust requested"
+                    : "trust requested";
+                session.last_security_attempt_monotonic = now;
+                continue;
+            }
+        }
+
         if (is_connected && device && !device_has_required_pairing(*device, active_config_)) {
             if (session.pairing_in_progress &&
                 session.last_security_attempt_monotonic > 0.0 &&
@@ -1103,23 +1124,6 @@ void ServiceNode::reconcile_peers() {
                 continue;
             }
 
-            if (session.phase == "ready" && device) {
-                if (peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
-                    if (run_peer_task_once(mac, "trust", [this, mac]() {
-                            (void)client_->trust(mac);
-                        })) {
-                        RCLCPP_INFO(get_logger(),
-                                    "[reconcile] %s: attempting late trust (paired=%s bonded=%s trusted=%s)",
-                                    device_label.c_str(),
-                                    device->paired ? "Y" : "N",
-                                    device->bonded ? "Y" : "N",
-                                    device->trusted ? "Y" : "N");
-                        session.detail = "peer time bridge active, trust requested";
-                        session.last_security_attempt_monotonic = now;
-                        continue;
-                    }
-                }
-            }
             continue;
         }
 

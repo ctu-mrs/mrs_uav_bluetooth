@@ -562,13 +562,23 @@ bool PeerManager::should_attempt_trust(const PeerConnectionSession& session,
     if (repair_blocks_regular_actions(session) || session.repair_in_progress) {
         return false;
     }
-    if (!is_phase(session, {"ready"})) {
-        return false;
-    }
     if (!device.connected || device.blocked || device.trusted) {
         return false;
     }
-    if (!(device.paired || device.bonded)) {
+    if (session.connected_since_monotonic <= 0.0) {
+        return false;
+    }
+    if (session.pairing_in_progress) {
+        return false;
+    }
+    if (pairing_required(config) && !device_has_required_pairing(device, config)) {
+        return false;
+    }
+    if (is_phase(session, {"connecting", "connect_pending", "discovered", "disconnected",
+                           "blocked", "policy_blocked", "recovering", "stale"})) {
+        return false;
+    }
+    if ((now_mono - session.connected_since_monotonic) < kTrustCooldownMin) {
         return false;
     }
     return session.last_security_attempt_monotonic <= 0.0 ||

@@ -49,6 +49,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Connection rejected");
                 }
+                if (auto_trust_) set_trusted(std::string(device));
                 emit("authorize_service", std::string(device));
                 (void)uuid;
             }),
@@ -114,6 +115,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Authorization rejected");
                 }
+                if (auto_trust_) set_trusted(std::string(device));
                 emit("request_authorization", std::string(device));
             }),
         sdbus::registerMethod("Cancel")
