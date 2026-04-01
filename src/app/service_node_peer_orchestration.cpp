@@ -67,11 +67,6 @@ bool is_stale_bond_sensitive_pairing_event(const std::string& event_type) {
            event_type == "request_authorization";
 }
 
-bool is_service_authorization_event(const std::string& event_type) {
-    return event_type == "authorize_service" ||
-           event_type == "request_authorization";
-}
-
 bool is_manual_security_authorization_event(const std::string& event_type) {
     return event_type == "authorize_service";
 }
