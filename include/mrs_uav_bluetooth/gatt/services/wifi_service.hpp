@@ -5,7 +5,9 @@
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
 #include <functional>
+#include <mutex>
 #include <string>
+#include <utility>
 
 namespace mrs_uav_bluetooth::gatt::services {
 
@@ -13,7 +15,8 @@ namespace mrs_uav_bluetooth::gatt::services {
 class WifiService {
 public:
     using ReadCb = std::function<std::string()>;
-    using WriteCb = std::function<void(const std::string&)>;
+    using WriteResult = std::pair<bool, std::string>;
+    using WriteCb = std::function<WriteResult(const std::string&)>;
 
     WifiService(bluez::DbusConnection& dbus,
                 const std::string& base_path,
@@ -27,11 +30,17 @@ public:
     std::string uuid() const;
 
     void update(const std::string& ssid);
+    void update_status(const std::string& status);
 
 private:
+    std::string status_text() const;
+
     std::shared_ptr<GattService> service_;
     std::shared_ptr<GattCharacteristic> ssid_characteristic_;
     std::shared_ptr<GattCharacteristic> password_characteristic_;
+    std::shared_ptr<GattCharacteristic> status_characteristic_;
+    mutable std::mutex status_mutex_;
+    std::string status_text_;
 };
 
 }  // namespace mrs_uav_bluetooth::gatt::services

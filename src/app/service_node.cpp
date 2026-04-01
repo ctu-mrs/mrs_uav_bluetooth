@@ -347,7 +347,7 @@ void ServiceNode::build_runtime() {
         apply_config(cfg);
     });
 
-    netplan_ = std::make_unique<network::NetplanManager>();
+    netplan_ = std::make_unique<network::NetplanManager>(active_config_.wifi_netplan_config_path);
 
     export_bridges_ = std::make_unique<bridge::ExportBridgeManager>(*this, get_logger());
     export_bridges_->set_registry(&bridge_registry_);
@@ -508,6 +508,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         }
     }
 
+    netplan_->set_config_file(cfg.wifi_netplan_config_path);
     netplan_->set_allowed_networks(cfg.allowed_wifi_networks);
     if (cfg.enable_scan) {
         client_->start_scan(cfg.scan_mode, cfg.enable_server);
@@ -649,9 +650,25 @@ void ServiceNode::rebuild_server_objects() {
                 auto ssid = netplan_->get_current_ssid();
                 return ssid.empty() ? std::string("unknown") : ssid;
             },
-            [this](const std::string& ssid) { netplan_->set_current_network(ssid); },
+            [this](const std::string& ssid) {
+                return netplan_->set_current_network(ssid);
+            },
             [this](const std::string& password) {
-                netplan_->set_current_network(netplan_->get_current_ssid(), password);
+                std::string trimmed = password;
+                while (!trimmed.empty() &&
+                       (trimmed.back() == ' ' || trimmed.back() == '\n' ||
+                        trimmed.back() == '\r' || trimmed.back() == '\t')) {
+                    trimmed.pop_back();
+                }
+                if (trimmed.empty()) {
+                    return std::make_pair(false, std::string("password update ignored because the written value is empty"));
+                }
+
+                const auto ssid = netplan_->get_current_ssid();
+                if (ssid.empty() || ssid == "unknown") {
+                    return std::make_pair(false, std::string("password update failed because no current SSID is available"));
+                }
+                return netplan_->set_current_network(ssid, trimmed);
             },
             [this]() { return netplan_->get_configured_password(); });
         gatt_app_->add_service(wifi_service_->service());

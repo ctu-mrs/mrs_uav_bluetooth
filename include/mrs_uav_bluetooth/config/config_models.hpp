@@ -48,6 +48,7 @@ struct NodeConfig {
     std::vector<std::string> auto_connect_whitelist;
     std::string auto_connect_pattern = "^uav[0-9]{2}$";
     double peer_connection_timeout{30.0};
+    std::string wifi_netplan_config_path = "/etc/netplan/01-netcfg.yaml";
     std::vector<std::string> allowed_wifi_networks;
     double status_report_period{1.0};
     bool log_topic_enable{false};

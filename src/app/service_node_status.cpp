@@ -412,6 +412,7 @@ std::string ServiceNode::build_detailed_status_report(
     const auto time_service_uuid = util::named_service_uuid("time");
     const auto wifi_ssid_characteristic_uuid = util::named_characteristic_uuid("wifi/ssid");
     const auto wifi_password_characteristic_uuid = util::named_characteristic_uuid("wifi/password");
+    const auto wifi_status_characteristic_uuid = util::named_characteristic_uuid("wifi/status");
     const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
     const auto time_value_descriptor_uuid = util::named_descriptor_uuid("time/ns/value");
     const auto time_writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
@@ -505,6 +506,8 @@ std::string ServiceNode::build_detailed_status_report(
                     characteristic_name = "wifi/ssid";
                 } else if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_password_characteristic_uuid) {
                     characteristic_name = "wifi/password";
+                } else if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_status_characteristic_uuid) {
+                    characteristic_name = "wifi/status";
                 } else if (service->uuid() == time_service_uuid && characteristic->uuid() == time_characteristic_uuid) {
                     characteristic_name = "time/ns";
                 } else if (export_state != nullptr && characteristic->uuid() == export_state->bridge_uuid) {

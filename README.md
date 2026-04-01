@@ -44,6 +44,7 @@ Important configuration keys in `config/default.yaml`:
 - `enable_scan`, `scan_mode`, `scan_publish_period`: BLE discovery behavior.
 - `enable_server`, `enable_time_service`, `enable_wifi_service`: built-in BLE server features.
 - `auto_connect_enable`, `auto_connect_whitelist`, `auto_connect_pattern`, `peer_connection_timeout`: automatic peer management.
+- `wifi_netplan_config_path`: netplan file updated by the BLE Wi-Fi service.
 - `allowed_wifi_networks`: Wi-Fi SSIDs that may be selected over BLE.
 - `status_report_period`, `log_topic_enable`, `verbose_log_file`: observability and logging.
 - `shared_topics`: declarative topic bridge definitions.
@@ -83,10 +84,13 @@ Core published topics:
 
 ### UAV Wi-Fi configuration
 
-When `enable_wifi_service` is enabled, the service node exposes two BLE characteristics for Wi-Fi SSID and password. Both are readable and writable, and the node applies changes through the configured netplan backend.
+When `enable_wifi_service` is enabled, the service node exposes three BLE characteristics: readable/writable SSID and password characteristics plus a readable/notifiable status text characteristic. The node applies changes through the configured netplan backend.
 
 - Only SSIDs listed in `allowed_wifi_networks` are accepted.
-- The service writes the system netplan Wi-Fi configuration and then runs `netplan apply`.
+- The service writes `wifi_netplan_config_path` and then runs `netplan apply`.
+- Writing a non-empty password updates the stored password for the selected access point.
+- If writing the file or `netplan apply` fails, the previous netplan file is restored and re-applied.
+- The status characteristic reports the latest Wi-Fi provisioning success or error text.
 - The Wi-Fi service value is refreshed periodically according to `wifi_refresh_period`.
 - This feature is intended for BLE-side provisioning; there is no separate ROS topic API for Wi-Fi credentials.
 

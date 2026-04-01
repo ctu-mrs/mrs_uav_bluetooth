@@ -4,59 +4,159 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <sstream>
 
 namespace mrs_uav_bluetooth::network {
 
 namespace {
 
-constexpr const char* kPreferredNetplanConfigFile = "/etc/netplan/01-netcfg.yaml";
-constexpr const char* kNetplanConfigDirectory = "/etc/netplan";
-
-std::string resolve_netplan_config_file() {
-    namespace fs = std::filesystem;
-
-    const fs::path preferred{kPreferredNetplanConfigFile};
-    if (fs::exists(preferred)) {
-        return preferred.string();
-    }
-
-    const fs::path config_dir{kNetplanConfigDirectory};
-    if (fs::is_directory(config_dir)) {
-        std::vector<fs::path> candidates;
-        for (const auto& entry : fs::directory_iterator(config_dir)) {
-            if (!entry.is_regular_file()) {
-                continue;
-            }
-            const auto extension = entry.path().extension().string();
-            if (extension == ".yaml" || extension == ".yml") {
-                candidates.push_back(entry.path());
-            }
-        }
-        std::sort(candidates.begin(), candidates.end());
-        if (!candidates.empty()) {
-            return candidates.front().string();
-        }
-    }
-
-    return preferred.string();
-}
+constexpr const char* kIwGetIdCommand = "iwgetid -r 2>/dev/null";
 
 bool contains_value(const std::vector<std::string>& values, const std::string& candidate) {
     return std::find(values.begin(), values.end(), candidate) != values.end();
 }
 
+std::string trim_ascii_whitespace(std::string value) {
+    const auto is_space = [](unsigned char ch) {
+        return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
+    };
+    while (!value.empty() && is_space(static_cast<unsigned char>(value.back()))) {
+        value.pop_back();
+    }
+    auto first = std::find_if_not(value.begin(), value.end(), [&](unsigned char ch) {
+        return is_space(ch);
+    });
+    value.erase(value.begin(), first);
+    return value;
+}
+
+std::string read_access_point_ssid(const YAML::Node& config) {
+    const auto aps = config["network"]["wifis"];
+    if (!aps || !aps.IsMap()) {
+        return {};
+    }
+    for (auto it = aps.begin(); it != aps.end(); ++it) {
+        const auto access_points = it->second["access-points"];
+        if (!access_points || !access_points.IsMap()) {
+            continue;
+        }
+        for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
+            return ap->first.as<std::string>("");
+        }
+    }
+    return {};
+}
+
+std::string read_access_point_password(const YAML::Node& config) {
+    const auto aps = config["network"]["wifis"];
+    if (!aps || !aps.IsMap()) {
+        return {};
+    }
+    for (auto it = aps.begin(); it != aps.end(); ++it) {
+        const auto access_points = it->second["access-points"];
+        if (!access_points || !access_points.IsMap()) {
+            continue;
+        }
+        for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
+            const auto ap_cfg = ap->second;
+            if (!ap_cfg || !ap_cfg.IsMap() || !ap_cfg["password"]) {
+                return {};
+            }
+            return ap_cfg["password"].as<std::string>("");
+        }
+    }
+    return {};
+}
+
+std::string read_command_output(const char* command) {
+    std::array<char, 256> buffer{};
+    std::string output;
+
+    std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(command, "r"), pclose);
+    if (!pipe) {
+        return {};
+    }
+
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
+        output.append(buffer.data());
+    }
+    return trim_ascii_whitespace(std::move(output));
+}
+
+struct FileSnapshot {
+    bool existed{false};
+    std::string contents;
+};
+
+FileSnapshot take_file_snapshot(const std::string& path) {
+    FileSnapshot snapshot;
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) {
+        return snapshot;
+    }
+
+    snapshot.existed = true;
+    std::ostringstream stream;
+    stream << input.rdbuf();
+    snapshot.contents = stream.str();
+    return snapshot;
+}
+
+std::string restore_snapshot(const std::string& path, const FileSnapshot& snapshot) {
+    namespace fs = std::filesystem;
+
+    if (!snapshot.existed) {
+        std::error_code error;
+        fs::remove(path, error);
+        if (error) {
+            return error.message();
+        }
+        return {};
+    }
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output.good()) {
+        return "failed to reopen config file for rollback";
+    }
+    output << snapshot.contents;
+    if (!output.good()) {
+        return "failed to restore previous config contents";
+    }
+    return {};
+}
+
+std::string run_netplan_apply() {
+    const int rc = std::system("netplan apply");
+    if (rc == 0) {
+        return {};
+    }
+    return "netplan apply failed with code " + std::to_string(rc);
+}
+
 }  // namespace
 
-NetplanManager::NetplanManager(std::vector<std::string> allowed_networks)
-    : netplan_config_file_(resolve_netplan_config_file()),
+NetplanManager::NetplanManager(std::string netplan_config_file,
+                               std::vector<std::string> allowed_networks)
+    : netplan_config_file_(std::move(netplan_config_file)),
       allowed_networks_(std::move(allowed_networks)) {}
 
 bool NetplanManager::busy() {
     std::lock_guard<std::mutex> lock(mutex_);
     return busy_;
+}
+
+void NetplanManager::set_config_file(std::string value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    netplan_config_file_ = trim_ascii_whitespace(std::move(value));
+    if (netplan_config_file_.empty()) {
+        netplan_config_file_ = "/etc/netplan/01-netcfg.yaml";
+    }
 }
 
 void NetplanManager::set_allowed_networks(std::vector<std::string> value) {
@@ -67,45 +167,19 @@ void NetplanManager::set_allowed_networks(std::vector<std::string> value) {
 std::string NetplanManager::get_current_ssid() {
     std::lock_guard<std::mutex> lock(mutex_);
     try {
-        YAML::Node config = YAML::LoadFile(netplan_config_file_);
-        auto aps = config["network"]["wifis"];
-        if (aps && aps.IsMap()) {
-            for (auto it = aps.begin(); it != aps.end(); ++it) {
-                auto iface_cfg = it->second;
-                auto access_points = iface_cfg["access-points"];
-                if (access_points && access_points.IsMap()) {
-                    for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
-                        return ap->first.as<std::string>();
-                    }
-                }
-            }
+        const auto ssid = read_access_point_ssid(YAML::LoadFile(netplan_config_file_));
+        if (!ssid.empty()) {
+            return ssid;
         }
     } catch (...) {
     }
-    return {};
+    return read_command_output(kIwGetIdCommand);
 }
 
 std::string NetplanManager::get_configured_password() {
     std::lock_guard<std::mutex> lock(mutex_);
     try {
-        YAML::Node config = YAML::LoadFile(netplan_config_file_);
-        auto aps = config["network"]["wifis"];
-        if (aps && aps.IsMap()) {
-            for (auto it = aps.begin(); it != aps.end(); ++it) {
-                auto iface_cfg = it->second;
-                auto access_points = iface_cfg["access-points"];
-                if (!access_points || !access_points.IsMap()) {
-                    continue;
-                }
-                for (auto ap = access_points.begin(); ap != access_points.end(); ++ap) {
-                    auto ap_cfg = ap->second;
-                    if (ap_cfg && ap_cfg.IsMap() && ap_cfg["password"]) {
-                        return ap_cfg["password"].as<std::string>("");
-                    }
-                    return {};
-                }
-            }
-        }
+        return read_access_point_password(YAML::LoadFile(netplan_config_file_));
     } catch (...) {
     }
     return {};
@@ -122,17 +196,24 @@ std::vector<std::string> NetplanManager::list_known_ssids() {
     return result;
 }
 
-std::pair<bool, std::string> NetplanManager::write_netplan(const std::string& ssid,
-                                                           const std::string& password) {
+std::pair<bool, std::string> NetplanManager::write_netplan(
+    const std::string& ssid,
+    const std::optional<std::string>& password) {
     busy_ = true;
-    YAML::Node config;
+    const auto snapshot = take_file_snapshot(netplan_config_file_);
+
+    YAML::Node config(YAML::NodeType::Map);
+    std::string previous_password;
     try {
         if (std::filesystem::exists(netplan_config_file_)) {
             config = YAML::LoadFile(netplan_config_file_);
+            previous_password = read_access_point_password(config);
         }
-    } catch (...) {
-        config = YAML::Node(YAML::NodeType::Map);
+    } catch (const std::exception& e) {
+        busy_ = false;
+        return {false, std::string("failed to parse netplan config: ") + e.what()};
     }
+
     auto network = config["network"];
     if (!network || !network.IsMap()) {
         network = config["network"] = YAML::Node(YAML::NodeType::Map);
@@ -145,36 +226,62 @@ std::pair<bool, std::string> NetplanManager::write_netplan(const std::string& ss
     }
     auto first = wifis.begin();
     auto iface_cfg = first->second;
+    if (!iface_cfg || !iface_cfg.IsMap()) {
+        iface_cfg = YAML::Node(YAML::NodeType::Map);
+    }
     iface_cfg["dhcp4"] = true;
     iface_cfg["optional"] = true;
     YAML::Node aps(YAML::NodeType::Map);
     YAML::Node ap_cfg(YAML::NodeType::Map);
-    if (!password.empty()) {
-        ap_cfg["password"] = password;
+
+    if (password.has_value()) {
+        const auto trimmed_password = trim_ascii_whitespace(*password);
+        if (!trimmed_password.empty()) {
+            ap_cfg["password"] = trimmed_password;
+        } else if (!previous_password.empty()) {
+            ap_cfg["password"] = previous_password;
+        }
+    } else if (!previous_password.empty()) {
+        ap_cfg["password"] = previous_password;
     }
     aps[ssid] = ap_cfg;
     iface_cfg["access-points"] = aps;
     first->second = iface_cfg;
 
     try {
-        std::ofstream out(netplan_config_file_);
+        std::ofstream out(netplan_config_file_, std::ios::binary | std::ios::trunc);
         out << config;
-        out.close();
+        if (!out.good()) {
+            throw std::runtime_error("failed to flush updated config to disk");
+        }
     } catch (const std::exception& e) {
         busy_ = false;
         return {false, e.what()};
     }
 
-    int rc = std::system("netplan apply");
-    busy_ = false;
-    if (rc == 0) {
-        return {true, "netplan:" + ssid};
+    const auto apply_error = run_netplan_apply();
+    if (apply_error.empty()) {
+        busy_ = false;
+        return {true, "netplan applied for SSID '" + ssid + "'"};
     }
-    return {false, "netplan apply failed with code " + std::to_string(rc)};
+
+    const auto restore_error = restore_snapshot(netplan_config_file_, snapshot);
+    const auto rollback_apply_error = restore_error.empty() ? run_netplan_apply() : std::string{};
+    busy_ = false;
+
+    std::string message = apply_error;
+    if (!restore_error.empty()) {
+        message += "; rollback write failed: " + restore_error;
+    } else if (!rollback_apply_error.empty()) {
+        message += "; rollback apply failed: " + rollback_apply_error;
+    } else {
+        message += "; previous netplan config restored";
+    }
+    return {false, message};
 }
 
 std::pair<bool, std::string> NetplanManager::set_current_network(const std::string& ssid,
-                                                                 const std::string& password) {
+                                                                 std::optional<std::string> password) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (busy_) {
         return {false, "netplan change already in progress"};
@@ -186,11 +293,14 @@ std::pair<bool, std::string> NetplanManager::set_current_network(const std::stri
     if (!allowed_networks_.empty() && !contains_value(allowed_networks_, target)) {
         return {false, "SSID not present in allowed_wifi_networks"};
     }
+    if (password.has_value() && trim_ascii_whitespace(*password).empty()) {
+        password.reset();
+    }
     return write_netplan(target, password);
 }
 
 std::pair<bool, std::string> NetplanManager::set_current_ssid(const std::string& target) {
-    return set_current_network(target, {});
+    return set_current_network(target, std::nullopt);
 }
 
 }  // namespace mrs_uav_bluetooth::network

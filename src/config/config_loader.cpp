@@ -192,6 +192,7 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.auto_connect_whitelist = str_list("auto_connect_whitelist");
     cfg.auto_connect_pattern = str("auto_connect_pattern", cfg.auto_connect_pattern);
     cfg.peer_connection_timeout = dbl("peer_connection_timeout", cfg.peer_connection_timeout);
+    cfg.wifi_netplan_config_path = str("wifi_netplan_config_path", cfg.wifi_netplan_config_path);
     cfg.allowed_wifi_networks = str_list("allowed_wifi_networks");
     cfg.status_report_period = dbl("status_report_period", cfg.status_report_period);
     cfg.log_topic_enable = b("log_topic_enable", cfg.log_topic_enable);
