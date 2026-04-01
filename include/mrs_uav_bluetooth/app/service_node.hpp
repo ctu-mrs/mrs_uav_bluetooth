@@ -46,6 +46,7 @@
 #include <set>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -214,6 +215,7 @@ private:
     std::chrono::steady_clock::time_point last_peer_status_log_time_{};
     mutable std::mutex repeated_log_mutex_;
     std::map<std::string, RepeatedLogEntry> repeated_log_entries_;
+    std::map<std::string, std::string> expected_disconnect_reasons_;
     double local_server_rebuild_monotonic_{0.0};
     std::atomic_bool local_server_rebuild_in_progress_{false};
     std::string local_gatt_layout_signature_;

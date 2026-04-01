@@ -4,6 +4,8 @@
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 
 #include <algorithm>
+#include <iomanip>
+#include <sstream>
 
 namespace {
 
@@ -122,6 +124,10 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
 
     std::optional<bluez::DeviceInfo> refresh_device;
     std::optional<std::string> clear_runtime_mac;
+    bool emit_disconnect_log = false;
+    bool disconnect_expected = false;
+    std::string disconnect_log_key;
+    std::string disconnect_log_message;
 
     if (event == bluez::CacheEvent::GattCharacteristicValueChanged ||
         event == bluez::CacheEvent::GattDescriptorValueChanged) {
@@ -148,6 +154,64 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         }
     }(event);
 
+    const auto maybe_capture_disconnect_transition = [&](const bluez::DeviceInfo& device) {
+        auto session_it = peers_->sessions().find(device.mac);
+        if (device.connected) {
+            expected_disconnect_reasons_.erase(device.mac);
+            return;
+        }
+        if (session_it == peers_->sessions().end() || session_it->second.connected_since_monotonic <= 0.0) {
+            return;
+        }
+
+        const auto& session = session_it->second;
+        const auto bridge_it = peers_->time_bridges().find(device.mac);
+        const std::string bridge_status = bridge_it != peers_->time_bridges().end()
+            ? bridge_it->second.status
+            : "none";
+        const double now_mono = peers_->now_monotonic();
+        const double connected_for_s = session.connected_since_monotonic > 0.0
+            ? std::max(0.0, now_mono - session.connected_since_monotonic)
+            : 0.0;
+        const double bridge_inactivity_s = bridge_it != peers_->time_bridges().end() &&
+                bridge_it->second.last_activity_monotonic > 0.0
+            ? std::max(0.0, now_mono - bridge_it->second.last_activity_monotonic)
+            : -1.0;
+        const std::string label = !session.peer_name.empty()
+            ? session.peer_name
+            : (!device.name.empty() ? device.name : device.mac);
+
+        auto expected_it = expected_disconnect_reasons_.find(device.mac);
+        disconnect_expected = expected_it != expected_disconnect_reasons_.end();
+        const std::string expected_reason = disconnect_expected ? expected_it->second : std::string{};
+        if (expected_it != expected_disconnect_reasons_.end()) {
+            expected_disconnect_reasons_.erase(expected_it);
+        }
+
+        std::ostringstream stream;
+        stream << "[disconnect] " << device.mac << " (" << label << "): "
+               << (disconnect_expected ? "expected disconnect" : "unexpected disconnect")
+               << " phase=" << session.phase
+               << " bridge=" << bridge_status
+               << " conn_for=" << std::fixed << std::setprecision(1) << connected_for_s << "s"
+               << " local_time_notify=" << (session.local_time_notify_active_this_connection ? "Y" : "N")
+               << " bridge_healthy=" << (session.time_bridge_healthy_this_connection ? "Y" : "N");
+        if (bridge_inactivity_s >= 0.0) {
+            stream << " bridge_idle=" << std::fixed << std::setprecision(1) << bridge_inactivity_s << "s";
+        }
+        if (!session.detail.empty()) {
+            stream << " detail=" << session.detail;
+        }
+        if (disconnect_expected && !expected_reason.empty()) {
+            stream << " reason=" << expected_reason;
+        }
+
+        disconnect_log_key = std::string{"disconnect:"} + (disconnect_expected ? "expected:" : "unexpected:") +
+            device.mac + ":" + session.phase + ":" + bridge_status;
+        disconnect_log_message = stream.str();
+        emit_disconnect_log = true;
+    };
+
     if (event == bluez::CacheEvent::DeviceAdded) {
         auto device = cache_->device(object_path);
         if (!device) {
@@ -165,6 +229,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
             should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
         const bool preserve_active_bridge_runtime =
             should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
+        maybe_capture_disconnect_transition(*device);
         peers_->sync_device(*device,
                             active_config_,
                             peer_name,
@@ -212,6 +277,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                     should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
                 const bool preserve_active_bridge_runtime =
                     should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
+                maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
                                     device_hostname_guess(*device),
@@ -236,6 +302,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                     should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
                 const bool preserve_active_bridge_runtime =
                     should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
+                maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
                                     device_hostname_guess(*device),
@@ -261,6 +328,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                     should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
                 const bool preserve_active_bridge_runtime =
                     should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
+                maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
                                     device_hostname_guess(*device),
@@ -295,6 +363,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                     should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
                 const bool preserve_active_bridge_runtime =
                     should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
+                maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
                                     device_hostname_guess(*device),
@@ -318,6 +387,13 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
     }
 
     state_lock.unlock();
+    if (emit_disconnect_log) {
+        if (disconnect_expected) {
+            log_info_coalesced(disconnect_log_key, disconnect_log_message);
+        } else {
+            log_warn_coalesced(disconnect_log_key, disconnect_log_message);
+        }
+    }
     if (clear_runtime_mac) {
         clear_peer_runtime(*clear_runtime_mac);
     }

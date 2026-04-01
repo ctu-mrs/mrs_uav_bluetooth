@@ -67,21 +67,86 @@ bool is_interesting_peer_status(const mrs_uav_bluetooth::peer::PeerConnectionSes
            !phase_matches(session.phase, {"idle"});
 }
 
+std::string security_mode_summary(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    if (config.auto_pair) {
+        return config.auto_trust ? "pair=auto trust=auto" : "pair=auto trust=manual";
+    }
+    return config.auto_trust ? "pair=off trust=auto" : "pair=off trust=manual";
+}
+
+std::string peer_security_summary(const std::optional<mrs_uav_bluetooth::bluez::DeviceInfo>& device,
+                                  const mrs_uav_bluetooth::config::NodeConfig& config) {
+    if (!device) {
+        return config.auto_pair ? "pairing" : "manual";
+    }
+
+    if (!config.auto_pair) {
+        if (device->paired || device->bonded) {
+            return "forbidden-bond";
+        }
+        if (device->trusted) {
+            return "trusted";
+        }
+        return config.auto_trust ? "trust-pending" : "manual";
+    }
+
+    if (device->paired && device->bonded && device->trusted) {
+        return "paired+trusted";
+    }
+    if (device->paired && device->trusted) {
+        return "paired";
+    }
+    if (device->bonded && device->trusted) {
+        return "bonded+trusted";
+    }
+    if (device->paired) {
+        return device->trusted ? "paired" : "paired/untrusted";
+    }
+    if (device->bonded) {
+        return device->trusted ? "bonded" : "bonded/untrusted";
+    }
+    if (device->trusted) {
+        return "trusted-only";
+    }
+    return "pairing";
+}
+
+std::string peer_gatt_summary(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
+                              bool connected,
+                              bool services_resolved,
+                              const std::string& bridge_status) {
+    if (!connected) {
+        return "down";
+    }
+    if (services_resolved) {
+        return "ready";
+    }
+    if (bridge_status == "ready" || bridge_status == "subscribing" ||
+        session.local_time_notify_active_this_connection ||
+        session.time_bridge_healthy_this_connection) {
+        return "rediscovery";
+    }
+    return "loading";
+}
+
 std::string peer_status_snapshot(const std::string& mac,
                                  const std::string& device_label,
                                  const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
+                                 const std::optional<mrs_uav_bluetooth::bluez::DeviceInfo>& device,
+                                 const mrs_uav_bluetooth::config::NodeConfig& config,
                                  bool connected,
                                  bool services_resolved,
                                  const std::string& bridge_status) {
     std::ostringstream stream;
     stream << "peer=" << mac
-           << " device='" << device_label << "'"
-           << " peer='" << session.peer_name << "'"
+           << " name='" << device_label << "'"
+           << " target='" << session.peer_name << "'"
            << " phase=" << session.phase
-           << " desired=" << (session.desired ? "Y" : "N")
-           << " conn=" << (connected ? "Y" : "N")
-           << " svc=" << (services_resolved ? "Y" : "N")
+           << " want=" << (session.desired ? "Y" : "N")
+           << " link=" << (connected ? "up" : "down")
+           << " gatt=" << peer_gatt_summary(session, connected, services_resolved, bridge_status)
            << " bridge=" << bridge_status
+           << " sec=" << peer_security_summary(device, config)
            << " detail=" << session.detail;
     return stream.str();
 }
@@ -181,6 +246,8 @@ void ServiceNode::publish_periodic_status() {
             auto dev_it = devices_map.find(mac);
             const bool conn = dev_it != devices_map.end() && dev_it->second.connected;
             const bool svc = dev_it != devices_map.end() && dev_it->second.services_resolved;
+            const std::optional<bluez::DeviceInfo> device =
+                dev_it != devices_map.end() ? std::optional<bluez::DeviceInfo>(dev_it->second) : std::nullopt;
             auto bridge_it = peers_->time_bridges().find(mac);
             const std::string bridge_status =
                 bridge_it != peers_->time_bridges().end() ? bridge_it->second.status : "none";
@@ -197,11 +264,19 @@ void ServiceNode::publish_periodic_status() {
                 continue;
             }
             peer_snapshots.emplace_back(mac,
-                                        peer_status_snapshot(mac, device_label, session, conn, svc, bridge_status));
+                                        peer_status_snapshot(mac,
+                                                             device_label,
+                                                             session,
+                                                             device,
+                                                             active_config_,
+                                                             conn,
+                                                             svc,
+                                                             bridge_status));
         }
     }
 
     const auto summary = "state=" + status_word +
+        " " + security_mode_summary(active_config_) +
         " devices=" + std::to_string(devices_map.size()) +
         " connected=" + std::to_string(static_cast<size_t>(connected_count)) +
         " sessions=" + std::to_string(peers_ ? peers_->sessions().size() : 0u) +
@@ -482,21 +557,12 @@ std::string ServiceNode::build_detailed_status_report(
         }
 
         std::vector<std::string> status_parts;
-        const bool fully_paired = device->paired && device->trusted && device->bonded;
         const bool pairing_ready = device->paired || device->bonded;
-        const std::string pairing_state = device->paired ? "paired"
-            : (device->bonded ? "bonded" : "pairing-pending");
+        status_parts.push_back("security=" +
+                               peer_security_summary(std::optional<bluez::DeviceInfo>(*device), active_config_));
         if (bridge != nullptr && bridge->status == "ready") {
             status_parts.push_back("time-bridge-ready");
-            if (fully_paired) {
-                status_parts.push_back("fully-paired");
-            } else {
-                status_parts.push_back(pairing_state);
-                status_parts.push_back(device->trusted ? "trusted" : "trust-pending");
-            }
         } else {
-            status_parts.push_back(pairing_state);
-            status_parts.push_back(device->trusted ? "trusted" : "trust-pending");
             status_parts.push_back(device->services_resolved ? "services-resolved" : "services-resolving");
             if (bridge != nullptr) {
                 if (!bridge->status.empty()) {
@@ -518,6 +584,11 @@ std::string ServiceNode::build_detailed_status_report(
             } else if (session != nullptr && !session->detail.empty()) {
                 status_parts.push_back(session->detail);
             }
+        }
+        if (inactivity >= 0.0) {
+            std::ostringstream inactivity_part;
+            inactivity_part << std::fixed << std::setprecision(1) << "bridge_idle=" << inactivity << "s";
+            status_parts.push_back(inactivity_part.str());
         }
 
         std::ostringstream inactivity_stream;

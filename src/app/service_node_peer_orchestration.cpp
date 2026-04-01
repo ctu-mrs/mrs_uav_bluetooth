@@ -779,6 +779,9 @@ void ServiceNode::reconcile_peers() {
                         (void)client_->disconnect(mac, retry_period_s);
                         (void)client_->remove(mac);
                     })) {
+                    expected_disconnect_reasons_[mac] = whitelist_enabled
+                        ? "removing saved peer not present in whitelist"
+                        : "removing saved peer not allowed by current config";
                     session.phase = "policy_blocked";
                     session.detail = whitelist_enabled
                         ? "removing saved peer not present in whitelist"
@@ -790,6 +793,9 @@ void ServiceNode::reconcile_peers() {
                 if (run_peer_task_once(mac, "disconnect undesired peer", [this, mac, retry_period_s]() {
                         (void)client_->disconnect(mac, retry_period_s);
                     })) {
+                    expected_disconnect_reasons_[mac] = whitelist_enabled
+                        ? "disconnecting peer not present in whitelist"
+                        : "disconnecting peer not allowed by current config";
                     session.phase = "policy_blocked";
                     session.detail = whitelist_enabled ? "disconnecting peer not present in whitelist"
                                                       : "disconnecting peer not allowed by current config";
@@ -847,6 +853,12 @@ void ServiceNode::reconcile_peers() {
                     (void)client_->unblock(mac);
                 })) {
                 continue;
+            }
+
+            if (!session.repair_remove_issued && is_connected) {
+                expected_disconnect_reasons_[mac] = session.repair_reason.empty()
+                    ? "resetting peer device state"
+                    : session.repair_reason;
             }
 
             if (!session.repair_remove_issued) {
@@ -1030,6 +1042,7 @@ void ServiceNode::reconcile_peers() {
                 if (run_peer_task_once(mac, "recover unresolved services", [this, mac, retry_period_s]() {
                         (void)client_->disconnect(mac, retry_period_s);
                     })) {
+                    expected_disconnect_reasons_[mac] = "services unresolved too long, reconnecting";
                     RCLCPP_WARN(get_logger(),
                                 "[reconcile] %s: services unresolved for %.1fs, forcing reconnect",
                                 device_label.c_str(),
@@ -1114,6 +1127,7 @@ void ServiceNode::reconcile_peers() {
                 if (run_peer_task_once(mac, "recover failed notify", [this, mac, retry_period_s]() {
                         (void)client_->disconnect(mac, retry_period_s);
                     })) {
+                    expected_disconnect_reasons_[mac] = "peer time notifications failing, reconnecting";
                     RCLCPP_WARN(get_logger(),
                                 "[reconcile] %s: repeated notify failures on peer time bridge after health or without bond evidence, forcing reconnect",
                                 device_label.c_str());
