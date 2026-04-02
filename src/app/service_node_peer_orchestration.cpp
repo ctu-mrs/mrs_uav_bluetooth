@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
+#include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
+#include "mrs_uav_bluetooth/util/device_utils.hpp"
+
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
@@ -21,27 +26,6 @@ constexpr double kPeerInitNotifyFailureResetWindow = 45.0;
 constexpr double kPeerNotifyHandshakeTimeout = 10.0;
 constexpr double kPeerPairTimeout = 20.0;
 constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
-
-std::string lower_trim(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    const auto start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return {};
-    }
-    const auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
-std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.name)) {
-        return device.name;
-    }
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.alias)) {
-        return device.alias;
-    }
-    return {};
-}
 
 bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
     return device.paired || device.bonded || device.trusted;
@@ -113,7 +97,7 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
 
     session.pairing_failures += 1;
     session.pairing_in_progress = false;
-    const auto normalized_error = lower_trim(error_detail);
+    const auto normalized_error = util::lower_trim_copy(error_detail);
     const bool stale_bond_detected = normalized_error.find("already exists") != std::string::npos ||
         normalized_error.find("already paired") != std::string::npos ||
         normalized_error.find("already bonded") != std::string::npos;
@@ -157,7 +141,7 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         return false;
     }
 
-    const auto peer_name = device_hostname_guess(*device);
+    const auto peer_name = util::device_hostname_guess(*device);
     auto& session = peers_->get_or_create_session(device->mac, peer_name);
     const bool preserve_ready_runtime =
         has_ready_peer_time_bridge(device->mac) ||
@@ -335,9 +319,9 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
                                           peer::PeerConnectionSession& session) {
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     const auto now_mono = peers_->now_monotonic();
-    const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
-    const auto writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
-    const auto peer_name = session.peer_name.empty() ? device_hostname_guess(device) : session.peer_name;
+    const auto& time_characteristic_uuid = gatt::time_characteristic_uuid();
+    const auto& writeback_descriptor_uuid = gatt::time_writeback_descriptor_uuid();
+    const auto peer_name = session.peer_name.empty() ? util::device_hostname_guess(device) : session.peer_name;
     auto bridge_it = peers_->time_bridges().find(mac);
     std::string stop_notify_path;
 

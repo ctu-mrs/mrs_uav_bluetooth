@@ -45,7 +45,7 @@ auto_connect_whitelist: []
 auto_connect_pattern: "^uav[0-9]{2}$"
 
 # Disconnect a peer if the time bridge stays inactive for too long.
-peer_connection_timeout: 30.0
+peer_connection_timeout: 15.0
 
 # Netplan file updated by the BLE Wi-Fi service.
 wifi_netplan_config_path: /etc/netplan/01-netcfg.yaml

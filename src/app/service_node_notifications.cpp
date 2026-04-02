@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
+#include "mrs_uav_bluetooth/util/device_utils.hpp"
+
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 #include "mrs_uav_bluetooth/util/topic_utils.hpp"
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
@@ -9,27 +13,6 @@
 #include <cstring>
 
 namespace {
-
-std::string lower_trim(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    const auto start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return {};
-    }
-    const auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
-std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.name)) {
-        return device.name;
-    }
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.alias)) {
-        return device.alias;
-    }
-    return {};
-}
 
 bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
                                  const mrs_uav_bluetooth::config::NodeConfig& config) {
@@ -265,8 +248,9 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
 
     const auto session_it = peers_->sessions().find(device.mac);
     const bool desired_peer = session_it != peers_->sessions().end() && session_it->second.desired;
-    const auto peer_name = device_hostname_guess(device);
-    const bool local_peer = !peer_name.empty() && lower_trim(peer_name) == lower_trim(hostname_);
+    const auto peer_name = util::device_hostname_guess(device);
+    const bool local_peer = !peer_name.empty() &&
+        util::lower_trim_copy(peer_name) == util::lower_trim_copy(hostname_);
     const bool functional_peer = desired_peer && !local_peer && device_can_host_peer_import_bridges(device);
     const auto now_mono = peers_ ? peers_->now_monotonic() : 0.0;
     const auto retry_period_s = std::max(1.0, active_config_.auto_connect_period);

@@ -1,18 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/gatt/services/wifi_service.hpp"
 
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+
 namespace mrs_uav_bluetooth::gatt::services {
-
-namespace {
-
-std::string trim_trailing_ascii_whitespace(std::string value) {
-    while (!value.empty() && (value.back() == ' ' || value.back() == '\n' || value.back() == '\r' || value.back() == '\t')) {
-        value.pop_back();
-    }
-    return value;
-}
-
-}  // namespace
 
 using namespace mrs_uav_bluetooth::bluez;
 using namespace mrs_uav_bluetooth::util;
@@ -72,7 +63,7 @@ WifiService::WifiService(DbusConnection& dbus,
     });
     ssid_characteristic_->set_write_callback([this, name_cb, password_read_cb, apply_cb](const std::vector<uint8_t>& data) {
         std::string requested(data.begin(), data.end());
-        requested = trim_trailing_ascii_whitespace(std::move(requested));
+        requested = trim_ascii_copy(std::move(requested));
         const auto result = apply_cb(requested);
         const auto actual_ssid = name_cb();
         const auto actual_password = password_read_cb();

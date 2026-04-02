@@ -3,6 +3,11 @@
 
 #include "mrs_uav_bluetooth/config/shared_topic_config.hpp"
 
+#include "mrs_uav_bluetooth/gatt/bridge_naming.hpp"
+#include "mrs_uav_bluetooth/util/device_utils.hpp"
+
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+
 #include "mrs_uav_bluetooth/util/topic_utils.hpp"
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
@@ -27,19 +32,8 @@ constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr size_t kLegacyAdvMaxBytes = 31;
 constexpr size_t kAdvFlagsBytes = 3;
 
-std::string lower_trim(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    const auto start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return {};
-    }
-    const auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
 std::string normalize_direction(const std::string& raw_direction) {
-    auto direction = lower_trim(raw_direction);
+    auto direction = mrs_uav_bluetooth::util::lower_trim_copy(raw_direction);
     if (direction == "in" || direction == "import" || direction == "rx") {
         return "import";
     }
@@ -68,7 +62,7 @@ std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec> parse_member_specs(
 
         std::string value_type = "float64";
         if (separator != std::string::npos) {
-            value_type = lower_trim(raw_member.substr(separator + 1));
+            value_type = mrs_uav_bluetooth::util::lower_trim_copy(raw_member.substr(separator + 1));
             if (value_type.empty()) {
                 throw std::runtime_error("member type must not be empty");
             }
@@ -97,24 +91,6 @@ std::string manual_bridge_key(const std::string& direction,
     std::string uuid = mrs_uav_bluetooth::util::uuid_from_name(source.str());
     uuid.erase(std::remove(uuid.begin(), uuid.end(), '-'), uuid.end());
     return uuid;
-}
-
-std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.name)) {
-        return device.name;
-    }
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.alias)) {
-        return device.alias;
-    }
-    return {};
-}
-
-std::string bridge_characteristic_name_for_service(const std::string& bridge_name) {
-    constexpr std::string_view prefix{"bridge:"};
-    if (bridge_name.rfind(prefix.data(), 0) == 0) {
-        return bridge_name.substr(prefix.size());
-    }
-    return bridge_name + "/value";
 }
 
 template<typename DurationT, typename CallbackT>
@@ -494,7 +470,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                 state.bridge_name = shared_topic.bridge_name;
                 state.bridge_key = shared_topic.bridge_key;
                 state.bridge_uuid = util::named_characteristic_uuid(
-                    bridge_characteristic_name_for_service(shared_topic.bridge_name));
+                    gatt::bridge_characteristic_name_for_service(shared_topic.bridge_name));
                 state.member_specs = shared_topic.member_specs;
                 state.rate_hz = shared_topic.rate_hz;
                 state.payload_format = shared_topic.payload_format;
@@ -527,7 +503,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                     should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(device);
                 peers_->sync_device(device,
                                     active_config_,
-                                    device_hostname_guess(device),
+                                    util::device_hostname_guess(device),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
             }
@@ -763,7 +739,7 @@ void ServiceNode::handle_configure_notification_bridge(const std::shared_ptr<mrs
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     try {
         const auto direction = normalize_direction(request->direction);
-        const auto message_type = lower_trim(request->message_type);
+        const auto message_type = util::lower_trim_copy(request->message_type);
         const auto resolved_topic = util::normalize_ros_topic(request->topic_name);
         const auto member_specs = parse_member_specs(request->member_paths);
 

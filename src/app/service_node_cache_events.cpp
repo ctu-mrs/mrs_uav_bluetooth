@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
+#include "mrs_uav_bluetooth/util/device_utils.hpp"
+
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 
 #include <algorithm>
@@ -29,16 +31,6 @@ bool is_failed_gatt_event(const std::string& event_type) {
            event_type.compare(event_type.size() - std::char_traits<char>::length(suffix),
                               std::char_traits<char>::length(suffix),
                               suffix) == 0;
-}
-
-std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.name)) {
-        return device.name;
-    }
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.alias)) {
-        return device.alias;
-    }
-    return {};
 }
 
 std::optional<std::string> device_path_for_cache_event(
@@ -219,7 +211,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                                "[node] on_cache_event: DeviceAdded path=" + object_path + " but device not in cache");
             return;
         }
-        const auto peer_name = device_hostname_guess(*device);
+        const auto peer_name = util::device_hostname_guess(*device);
         log_info_coalesced("cache:DeviceAdded:" + device->mac,
                            "[node] on_cache_event: DeviceAdded mac=" + device->mac +
                                " name='" + device->name + "' peer_name='" + peer_name +
@@ -280,7 +272,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    device_hostname_guess(*device),
+                                    util::device_hostname_guess(*device),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -305,7 +297,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    device_hostname_guess(*device),
+                                    util::device_hostname_guess(*device),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -331,7 +323,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    device_hostname_guess(*device),
+                                    util::device_hostname_guess(*device),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -366,7 +358,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    device_hostname_guess(*device),
+                                    util::device_hostname_guess(*device),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -500,7 +492,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                 should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
             peers_->sync_device(*device,
                                 active_config_,
-                                device_hostname_guess(*device),
+                                util::device_hostname_guess(*device),
                                 preserve_ready_runtime,
                                 preserve_active_bridge_runtime);
             if (!clear_runtime_mac) {

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
+#include "mrs_uav_bluetooth/gatt/bridge_naming.hpp"
+#include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
+#include "mrs_uav_bluetooth/util/device_utils.hpp"
+
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
@@ -14,35 +20,6 @@ namespace {
 constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kRepeatedLogWindow = std::chrono::seconds(5);
-
-std::string lower_trim(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    const auto start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return {};
-    }
-    const auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
-std::string device_hostname_guess(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.name)) {
-        return device.name;
-    }
-    if (mrs_uav_bluetooth::util::is_uav_hostname(device.alias)) {
-        return device.alias;
-    }
-    return {};
-}
-
-std::string bridge_characteristic_name_for_service(const std::string& bridge_name) {
-    constexpr std::string_view prefix{"bridge:"};
-    if (bridge_name.rfind(prefix.data(), 0) == 0) {
-        return bridge_name.substr(prefix.size());
-    }
-    return bridge_name + "/value";
-}
 
 bool phase_matches(const std::string& phase, std::initializer_list<const char*> values) {
     for (const char* value : values) {
@@ -398,24 +375,8 @@ std::string ServiceNode::build_detailed_status_report(
     const auto upper_state = [](bool value) {
         return value ? "ACTIVE" : "OFF";
     };
-    const auto display_name_for_device = [](const bluez::DeviceInfo& device) {
-        if (!device.alias.empty()) {
-            return device.alias;
-        }
-        if (!device.name.empty()) {
-            return device.name;
-        }
-        return std::string{"?"};
-    };
-
-    const auto wifi_service_uuid = util::named_service_uuid("wifi");
-    const auto time_service_uuid = util::named_service_uuid("time");
-    const auto wifi_ssid_characteristic_uuid = util::named_characteristic_uuid("wifi/ssid");
-    const auto wifi_password_characteristic_uuid = util::named_characteristic_uuid("wifi/password");
-    const auto wifi_status_characteristic_uuid = util::named_characteristic_uuid("wifi/status");
-    const auto time_characteristic_uuid = util::named_characteristic_uuid("time/ns");
-    const auto time_value_descriptor_uuid = util::named_descriptor_uuid("time/ns/value");
-    const auto time_writeback_descriptor_uuid = util::named_descriptor_uuid("time/ns/writeback");
+    const auto& wifi_service_uuid = gatt::wifi_service_uuid();
+    const auto& time_service_uuid = gatt::time_service_uuid();
 
     std::map<std::string, const bridge::TopicExportBridgeState*> exports_by_service_path;
     for (const auto& [_, state] : bridge_registry_.exports()) {
@@ -428,15 +389,10 @@ std::string ServiceNode::build_detailed_status_report(
                                          const bridge::TopicExportBridgeState* export_state,
                                          const std::string& descriptor_uuid) {
         if (service_uuid == time_service_uuid) {
-            if (descriptor_uuid == time_value_descriptor_uuid) {
-                return std::string{"time/ns/value"};
-            }
-            if (descriptor_uuid == time_writeback_descriptor_uuid) {
-                return std::string{"time/ns/writeback"};
-            }
+            return gatt::builtin_descriptor_name(service_uuid, descriptor_uuid);
         }
         if (export_state != nullptr) {
-            const auto characteristic_name = bridge_characteristic_name_for_service(export_state->bridge_name);
+            const auto characteristic_name = gatt::bridge_characteristic_name_for_service(export_state->bridge_name);
             const std::vector<std::pair<std::string, std::string>> bridge_descriptors{{"/type", "type"},
                                                                                       {"/format", "format"},
                                                                                       {"/members", "members"},
@@ -492,26 +448,18 @@ std::string ServiceNode::build_detailed_status_report(
             const auto export_it = exports_by_service_path.find(service->path());
             const auto* export_state = export_it != exports_by_service_path.end() ? export_it->second : nullptr;
             std::string service_name = service->uuid();
-            if (service->uuid() == wifi_service_uuid) {
-                service_name = "wifi";
-            } else if (service->uuid() == time_service_uuid) {
-                service_name = "time";
+            if (gatt::is_wifi_service_uuid(service->uuid()) ||
+                gatt::is_time_service_uuid(service->uuid())) {
+                service_name = gatt::builtin_service_name(service->uuid());
             } else if (export_state != nullptr) {
                 service_name = export_state->bridge_name;
             }
             lines.push_back("    service '" + service_name + "' UUID=" + service->uuid());
             for (const auto& characteristic : service->characteristics()) {
-                std::string characteristic_name = characteristic->uuid();
-                if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_ssid_characteristic_uuid) {
-                    characteristic_name = "wifi/ssid";
-                } else if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_password_characteristic_uuid) {
-                    characteristic_name = "wifi/password";
-                } else if (service->uuid() == wifi_service_uuid && characteristic->uuid() == wifi_status_characteristic_uuid) {
-                    characteristic_name = "wifi/status";
-                } else if (service->uuid() == time_service_uuid && characteristic->uuid() == time_characteristic_uuid) {
-                    characteristic_name = "time/ns";
-                } else if (export_state != nullptr && characteristic->uuid() == export_state->bridge_uuid) {
-                    characteristic_name = bridge_characteristic_name_for_service(export_state->bridge_name);
+                std::string characteristic_name = gatt::builtin_characteristic_name(
+                    service->uuid(), characteristic->uuid());
+                if (export_state != nullptr && characteristic->uuid() == export_state->bridge_uuid) {
+                    characteristic_name = gatt::bridge_characteristic_name_for_service(export_state->bridge_name);
                 }
                 lines.push_back("      chrc '" + characteristic_name + "' UUID=" + characteristic->uuid());
                 for (const auto& descriptor : characteristic->descriptors()) {
@@ -530,7 +478,7 @@ std::string ServiceNode::build_detailed_status_report(
         if (!device.connected) {
             continue;
         }
-        const auto guessed_name = device_hostname_guess(device);
+        const auto guessed_name = util::device_hostname_guess(device);
         if (!guessed_name.empty() && util::is_uav_hostname(guessed_name, active_config_.auto_connect_pattern)) {
             connected_peers.push_back(&device);
         } else {
@@ -604,7 +552,7 @@ std::string ServiceNode::build_detailed_status_report(
             status_stream << status_parts[index];
         }
 
-        lines.push_back("    peer: " + device->mac + " " + display_name_for_device(*device) +
+        lines.push_back("    peer: " + device->mac + " " + util::device_display_name(*device) +
                         " RSSI=" + std::to_string(device->rssi) +
                         " secure=" + std::string(bool_text(pairing_ready)) +
                         " paired=" + std::string(bool_text(device->paired)) +
@@ -621,7 +569,7 @@ std::string ServiceNode::build_detailed_status_report(
     } else {
         lines.push_back("    other:");
         for (const auto* device : other_connected) {
-            lines.push_back("      " + device->mac + " " + display_name_for_device(*device) +
+            lines.push_back("      " + device->mac + " " + util::device_display_name(*device) +
                             " RSSI=" + std::to_string(device->rssi));
         }
     }
@@ -706,7 +654,7 @@ mrs_uav_bluetooth::msg::BleDevice ServiceNode::to_device_msg(const bluez::Device
     msg.address_type = device.address_type;
     msg.name = device.name;
     msg.alias = device.alias;
-    msg.hostname = device_hostname_guess(device);
+    msg.hostname = util::device_hostname_guess(device);
     msg.icon = device.icon;
     msg.appearance = device.appearance;
     msg.rssi = device.rssi;

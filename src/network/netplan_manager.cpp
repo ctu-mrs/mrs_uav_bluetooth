@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/network/netplan_manager.hpp"
 
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -26,20 +28,6 @@ constexpr auto kConnectionVerifyPollInterval = std::chrono::milliseconds(500);
 
 bool contains_value(const std::vector<std::string>& values, const std::string& candidate) {
     return std::find(values.begin(), values.end(), candidate) != values.end();
-}
-
-std::string trim_ascii_whitespace(std::string value) {
-    const auto is_space = [](unsigned char ch) {
-        return ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t';
-    };
-    while (!value.empty() && is_space(static_cast<unsigned char>(value.back()))) {
-        value.pop_back();
-    }
-    auto first = std::find_if_not(value.begin(), value.end(), [&](unsigned char ch) {
-        return is_space(ch);
-    });
-    value.erase(value.begin(), first);
-    return value;
 }
 
 std::string read_access_point_ssid(const YAML::Node& config) {
@@ -88,7 +76,7 @@ std::string read_command_output(const char* command) {
     while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
         output.append(buffer.data());
     }
-    return trim_ascii_whitespace(std::move(output));
+    return util::trim_ascii_copy(std::move(output));
 }
 
 std::string read_connected_ssid() {
@@ -222,7 +210,7 @@ bool NetplanManager::busy() {
 
 void NetplanManager::set_config_file(std::string value) {
     std::lock_guard<std::mutex> lock(mutex_);
-    netplan_config_file_ = trim_ascii_whitespace(std::move(value));
+    netplan_config_file_ = util::trim_ascii_copy(std::move(value));
     if (netplan_config_file_.empty()) {
         netplan_config_file_ = "/etc/netplan/01-netcfg.yaml";
     }
@@ -304,7 +292,7 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
     YAML::Node ap_cfg(YAML::NodeType::Map);
 
     if (password.has_value()) {
-        const auto trimmed_password = trim_ascii_whitespace(*password);
+        const auto trimmed_password = util::trim_ascii_copy(*password);
         if (!trimmed_password.empty()) {
             ap_cfg["password"] = trimmed_password;
         } else if (!previous_password.empty()) {
@@ -367,7 +355,7 @@ std::pair<bool, std::string> NetplanManager::set_current_network(const std::stri
     if (!allowed_networks_.empty() && !contains_value(allowed_networks_, target)) {
         return {false, "SSID not present in allowed_wifi_networks"};
     }
-    if (password.has_value() && trim_ascii_whitespace(*password).empty()) {
+    if (password.has_value() && util::trim_ascii_copy(*password).empty()) {
         password.reset();
     }
     return write_netplan(target, password);

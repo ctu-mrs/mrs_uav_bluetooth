@@ -67,6 +67,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 # =====================================================================
 
 add_library(${PROJECT_NAME}_util STATIC
+  src/util/device_utils.cpp
+  src/util/string_utils.cpp
   src/util/uuid_utils.cpp
   src/util/hostname_utils.cpp
   src/util/topic_utils.cpp
@@ -160,6 +162,9 @@ ament_target_dependencies(${PROJECT_NAME}_bluez
 add_library(${PROJECT_NAME}_gatt STATIC
   src/gatt/gatt_application.cpp
   src/gatt/advertisement.cpp
+  src/gatt/builtin_gatt.cpp
+  src/gatt/bridge_naming.cpp
+  src/gatt/remote_gatt_inspector.cpp
   src/gatt/services/wifi_service.cpp
   src/gatt/services/time_service.cpp
   src/gatt/services/topic_bridge_service.cpp
@@ -331,11 +336,30 @@ ament_target_dependencies(user_node
   rclcpp std_msgs std_srvs builtin_interfaces ament_index_cpp
 )
 
+add_executable(tui_node
+  src/app/main_tui_node.cpp
+  src/app/central_client_runtime.cpp
+  src/app/raw_terminal.cpp
+  src/app/tui_node.cpp
+)
+target_include_directories(tui_node PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(tui_node
+  ${PROJECT_NAME}_util
+  ${PROJECT_NAME}_bluez
+  ${PROJECT_NAME}_gatt
+  ${cpp_typesupport_target}
+)
+ament_target_dependencies(tui_node
+  rclcpp
+)
+
 # =====================================================================
 # Install targets
 # =====================================================================
 
-install(TARGETS service_node user_node
+install(TARGETS service_node user_node tui_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/
