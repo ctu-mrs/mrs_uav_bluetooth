@@ -33,7 +33,6 @@ shared_topics:
   - export_topic: /{hostname}/mavros/odometry/local
     message_type: nav_msgs/msg/Odometry
     rate_hz: 10.0
-    transport_endpoint: characteristic
     members:
       - path: header.stamp
         type: time_ns

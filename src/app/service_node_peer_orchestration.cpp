@@ -1,0 +1,1161 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include "mrs_uav_bluetooth/app/service_node.hpp"
+
+#include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
+#include "mrs_uav_bluetooth/util/device_utils.hpp"
+
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+
+#include "mrs_uav_bluetooth/util/hostname_utils.hpp"
+#include "mrs_uav_bluetooth/util/uuid_utils.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <future>
+#include <optional>
+#include <rclcpp/create_timer.hpp>
+
+namespace {
+
+constexpr double kLocalReconfigureGraceMin = 5.0;
+constexpr double kRemoteGattSnapshotFallbackDelay = 2.0;
+constexpr double kRemoteGattSnapshotRetryInterval = 2.0;
+constexpr double kPeerNotifyRetryBackoff = 1.0;
+constexpr int kPeerNotifyFailureReconnectThreshold = 3;
+constexpr double kPeerInitNotifyFailureResetWindow = 45.0;
+constexpr double kPeerNotifyHandshakeTimeout = 10.0;
+constexpr double kPeerPairTimeout = 20.0;
+constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
+
+bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.paired || device.bonded || device.trusted;
+}
+
+bool device_has_required_pairing(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                                 const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return !config.auto_pair || device.paired || device.bonded;
+}
+
+bool device_has_recorded_bond(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.paired || device.bonded;
+}
+
+bool is_interactive_pairing_request_event(const std::string& event_type) {
+    return event_type == "request_confirmation" ||
+           event_type == "request_passkey" ||
+           event_type == "request_pin";
+}
+
+bool is_stale_bond_sensitive_pairing_event(const std::string& event_type) {
+    return is_interactive_pairing_request_event(event_type) ||
+           event_type == "request_authorization";
+}
+
+bool is_manual_security_authorization_event(const std::string& event_type) {
+    return event_type == "authorize_service";
+}
+
+template<typename DurationT, typename CallbackT>
+rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
+    rclcpp::Node& node,
+    DurationT period,
+    CallbackT&& callback,
+    const rclcpp::CallbackGroup::SharedPtr& group) {
+    return rclcpp::create_wall_timer(
+        period,
+        std::forward<CallbackT>(callback),
+        group,
+        node.get_node_base_interface().get(),
+        node.get_node_timers_interface().get());
+}
+
+}  // namespace
+
+namespace mrs_uav_bluetooth::app {
+
+void ServiceNode::note_pair_attempt_result(const std::string& mac,
+                                           bool success,
+                                           const std::string& error_detail) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_) {
+        return;
+    }
+
+    auto session_it = peers_->sessions().find(mac);
+    if (session_it == peers_->sessions().end()) {
+        return;
+    }
+
+    auto& session = session_it->second;
+    session.last_security_attempt_monotonic = peers_->now_monotonic();
+    if (success) {
+        session.pairing_in_progress = false;
+        session.pairing_failures = 0;
+        peers_->clear_device_reset(session);
+        return;
+    }
+
+    session.pairing_failures += 1;
+    session.pairing_in_progress = false;
+    const auto normalized_error = util::lower_trim_copy(error_detail);
+    const bool stale_bond_detected = normalized_error.find("already exists") != std::string::npos ||
+        normalized_error.find("already paired") != std::string::npos ||
+        normalized_error.find("already bonded") != std::string::npos;
+    const bool authentication_failed = normalized_error.find("authentication failed") != std::string::npos ||
+        normalized_error.find("authentication rejected") != std::string::npos ||
+        normalized_error.find("authentication canceled") != std::string::npos;
+
+    const bool bridge_ready = [&]() {
+        const auto bridge_it = peers_->time_bridges().find(mac);
+        return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
+    }();
+
+    session.repair_in_progress = false;
+    if ((stale_bond_detected || authentication_failed) && !bridge_ready && session.phase != "ready") {
+        peers_->request_device_reset(session,
+                                     stale_bond_detected
+                                         ? "stale local bond detected, resetting peer device state"
+                                         : "pair authentication failed, resetting peer device state",
+                                     true);
+        return;
+    }
+    if (bridge_ready || session.phase == "ready") {
+        session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
+        return;
+    }
+    session.phase = "connected_unready";
+    session.detail = error_detail.empty()
+        ? (authentication_failed ? "pair authentication failed" : "pair failed")
+        : "pair failed: " + error_detail;
+}
+
+bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
+                                               const std::string& device_path) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_ || !cache_) {
+        return false;
+    }
+
+    const auto device = cache_->device(device_path);
+    if (!device) {
+        return false;
+    }
+
+    const auto peer_name = util::device_hostname_guess(*device);
+    auto& session = peers_->get_or_create_session(device->mac, peer_name);
+    const bool preserve_ready_runtime =
+        has_ready_peer_time_bridge(device->mac) ||
+        should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
+    const bool preserve_active_bridge_runtime =
+        should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
+    peers_->sync_device(*device,
+                        active_config_,
+                        peer_name,
+                        preserve_ready_runtime,
+                        preserve_active_bridge_runtime);
+
+    const bool stale_bond_sensitive_event = is_stale_bond_sensitive_pairing_event(event_type);
+    const bool manual_security_authorization_event =
+        is_manual_security_authorization_event(event_type);
+
+    if (!active_config_.auto_pair) {
+        if (is_interactive_pairing_request_event(event_type)) {
+            return false;
+        }
+        if (!manual_security_authorization_event) {
+            return false;
+        }
+    }
+
+    const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
+
+    if (!session.desired) {
+        const bool allow_passive_non_peer = !whitelist_enabled && !session.peer_candidate;
+        if (!allow_passive_non_peer) {
+            log_warn_coalesced("pairing-rejected-policy:" + device->mac + ":" + event_type,
+                               "[node] rejecting pairing request for " + device->mac +
+                                   " due to current config");
+            return false;
+        }
+    }
+
+    const bool active_repair = session.repair_in_progress ||
+        (session.repair_requested &&
+         (!session.repair_remove_issued || session.repair_awaiting_cache_removal));
+    if (active_repair) {
+        log_warn_coalesced("pairing-rejected-stale:" + device->mac + ":" + event_type,
+                           "[node] rejecting pairing request for " + device->mac +
+                               " because peer state reset is already in progress");
+        return false;
+    }
+
+    if (active_config_.auto_pair && stale_bond_sensitive_event && device_has_recorded_bond(*device)) {
+        peers_->note_pairing_event(device_path, event_type, *cache_);
+        session.pairing_in_progress = false;
+        peers_->request_device_reset(session,
+                                     "incoming pairing request conflicts with local bond",
+                                     true);
+        log_warn_coalesced("pairing-rejected-bond-reset:" + device->mac + ":" + event_type,
+                           "[node] rejecting pairing request for " + device->mac +
+                               " because local bond is stale; resetting BlueZ device state");
+        schedule_peer_reconcile(std::chrono::milliseconds(1));
+        return false;
+    }
+
+    if (device->blocked) {
+        return false;
+    }
+
+    const auto now = peers_->now_monotonic();
+    const double retry_period_s = std::max(0.5, active_config_.auto_connect_period);
+    const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
+    if (local_server_rebuild_monotonic_ > 0.0 &&
+        (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s) {
+        log_warn_coalesced("pairing-rejected-reconfigure:" + device->mac + ":" + event_type,
+                           "[node] rejecting pairing request for " + device->mac +
+                               " while local GATT/server rebuild is still settling");
+        return false;
+    }
+
+    return true;
+}
+
+void ServiceNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
+    if (!can_run_callbacks() || !peers_ || !client_) {
+        return;
+    }
+
+    const auto arm_delay = std::max(delay, std::chrono::milliseconds(1));
+    const auto requested_deadline = std::chrono::steady_clock::now() + arm_delay;
+
+    if (peer_timer_ && peer_reconcile_deadline_ != std::chrono::steady_clock::time_point{} &&
+        requested_deadline >= peer_reconcile_deadline_) {
+        return;
+    }
+
+    if (peer_timer_) {
+        peer_timer_->cancel();
+        peer_timer_.reset();
+    }
+
+    peer_reconcile_deadline_ = requested_deadline;
+    peer_timer_ = create_grouped_wall_timer(*this, arm_delay, [this]() {
+        if (!can_run_callbacks()) {
+            peer_timer_.reset();
+            peer_reconcile_deadline_ = std::chrono::steady_clock::time_point{};
+            return;
+        }
+        auto timer = peer_timer_;
+        peer_timer_.reset();
+        peer_reconcile_deadline_ = std::chrono::steady_clock::time_point{};
+        if (timer) {
+            timer->cancel();
+        }
+        reconcile_peers();
+    }, peer_callback_group_);
+}
+
+bool ServiceNode::run_peer_task_once(const std::string& mac,
+                                     const std::string& label,
+                                     std::function<void()> task) {
+    if (shutting_down_.load()) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(peer_task_mutex_);
+    if (peer_task_.valid()) {
+        if (peer_task_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+            return false;
+        }
+        peer_task_ = std::shared_future<void>{};
+        peer_task_mac_.clear();
+        peer_task_label_.clear();
+    }
+
+    auto future = std::async(std::launch::async, [this, mac, label, task = std::move(task)]() mutable {
+        try {
+            task();
+        } catch (const std::exception& exception) {
+            if (!shutting_down_.load()) {
+                RCLCPP_WARN(get_logger(), "Peer task %s for %s failed: %s",
+                            label.c_str(), mac.c_str(), exception.what());
+            }
+        } catch (...) {
+            if (!shutting_down_.load()) {
+                RCLCPP_WARN(get_logger(), "Peer task %s for %s failed with unknown error",
+                            label.c_str(), mac.c_str());
+            }
+        }
+
+        if (!shutting_down_.load()) {
+            schedule_peer_reconcile(std::chrono::milliseconds(1));
+        }
+    }).share();
+    peer_task_ = std::move(future);
+    peer_task_mac_ = mac;
+    peer_task_label_ = label;
+    return true;
+}
+
+void ServiceNode::wait_for_peer_tasks() {
+    std::shared_future<void> task;
+    {
+        std::lock_guard<std::mutex> lock(peer_task_mutex_);
+        if (peer_task_.valid()) {
+            task = peer_task_;
+        }
+        peer_task_ = std::shared_future<void>{};
+        peer_task_mac_.clear();
+        peer_task_label_.clear();
+    }
+
+    if (task.valid()) {
+        task.wait();
+    }
+}
+
+bool ServiceNode::update_peer_time_bridge(const std::string& mac,
+                                          const bluez::DeviceInfo& device,
+                                          peer::PeerConnectionSession& session) {
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
+    const auto now_mono = peers_->now_monotonic();
+    const auto& time_characteristic_uuid = gatt::time_characteristic_uuid();
+    const auto& writeback_descriptor_uuid = gatt::time_writeback_descriptor_uuid();
+    const auto peer_name = session.peer_name.empty() ? util::device_hostname_guess(device) : session.peer_name;
+    auto bridge_it = peers_->time_bridges().find(mac);
+    std::string stop_notify_path;
+
+    const auto clear_time_bridge = [this, &mac, &bridge_it, &stop_notify_path]() {
+        if (bridge_it == peers_->time_bridges().end()) {
+            return;
+        }
+        const auto old_characteristic_path = bridge_it->second.characteristic_path;
+        peers_->remove_time_bridge(mac);
+        bridge_it = peers_->time_bridges().end();
+        if (!old_characteristic_path.empty()) {
+            stop_notify_path = old_characteristic_path;
+        }
+    };
+
+    if (!device.connected) {
+        clear_time_bridge();
+        state_lock.unlock();
+        if (!stop_notify_path.empty()) {
+            client_->stop_notify(stop_notify_path);
+        }
+        state_lock.lock();
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.last_service_retry_monotonic = 0.0;
+        session.phase = "connected_unready";
+        session.detail = "awaiting connection";
+        return false;
+    }
+
+    if (!device.services_resolved) {
+        if (should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(device)) {
+            if (session.service_regression_started_monotonic <= 0.0) {
+                session.service_regression_started_monotonic = now_mono;
+            }
+            session.services_wait_started_monotonic = 0.0;
+            session.remote_gatt_missing_since_monotonic = 0.0;
+            session.remote_gatt_missing_checks = 0;
+            session.last_service_retry_monotonic = 0.0;
+            if (bridge_it != peers_->time_bridges().end() &&
+                bridge_it->second.status == "ready" &&
+                bridge_it->second.time_notification_received &&
+                bridge_it->second.time_writeback_received) {
+                session.bridge_wait_started_monotonic = 0.0;
+                session.bridge_wait_reason.clear();
+                session.phase = "ready";
+                session.detail = "peer time bridge active during expected services rediscovery";
+                schedule_peer_reconcile(kPeerWaitReconcileDelay);
+                return true;
+            }
+            if (session.bridge_wait_started_monotonic <= 0.0) {
+                session.bridge_wait_started_monotonic = now_mono;
+            }
+            session.bridge_wait_reason = "notify";
+            session.phase = "connected_unready";
+            session.detail = bridge_it != peers_->time_bridges().end() &&
+                    !bridge_it->second.detail.empty()
+                ? bridge_it->second.detail + " during expected services rediscovery"
+                : "awaiting peer time notifications during expected services rediscovery";
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            return false;
+        }
+        clear_time_bridge();
+        state_lock.unlock();
+        if (!stop_notify_path.empty()) {
+            client_->stop_notify(stop_notify_path);
+        }
+        state_lock.lock();
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.last_service_retry_monotonic = 0.0;
+        session.phase = "connected_unready";
+        session.detail = "connected, waiting for services";
+        return false;
+    }
+
+    if (session.services_resolved_since_monotonic > 0.0 &&
+        (now_mono - session.services_resolved_since_monotonic) < 1.5) {
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = now_mono;
+        }
+        session.bridge_wait_reason = "gatt-cache";
+        session.phase = "connected_unready";
+        session.detail = "waiting for remote GATT cache";
+        schedule_peer_reconcile(kPeerWaitReconcileDelay);
+        return false;
+    }
+
+    auto services = client_->list_services(mac);
+    auto characteristics = client_->list_characteristics(mac);
+    auto characteristic_path = client_->find_characteristic(mac, time_characteristic_uuid);
+    auto cached_characteristic = (!characteristic_path.empty() && cache_)
+        ? cache_->characteristic(characteristic_path)
+        : std::optional<bluez::GattCharacteristicInfo>{};
+
+    const bool should_attempt_snapshot_refresh =
+        characteristic_path.empty() && characteristics.empty() &&
+        session.services_resolved_since_monotonic > 0.0 &&
+        (now_mono - session.services_resolved_since_monotonic) >= kRemoteGattSnapshotFallbackDelay &&
+        (session.last_service_retry_monotonic <= 0.0 ||
+         (now_mono - session.last_service_retry_monotonic) >= kRemoteGattSnapshotRetryInterval);
+
+    if (should_attempt_snapshot_refresh) {
+        session.last_service_retry_monotonic = now_mono;
+        state_lock.unlock();
+        const bool refreshed = client_->refresh_gatt_snapshot(mac);
+        state_lock.lock();
+        if (refreshed) {
+            services = client_->list_services(mac);
+            characteristics = client_->list_characteristics(mac);
+            characteristic_path = client_->find_characteristic(mac, time_characteristic_uuid);
+            cached_characteristic = (!characteristic_path.empty() && cache_)
+                ? cache_->characteristic(characteristic_path)
+                : std::optional<bluez::GattCharacteristicInfo>{};
+        }
+    }
+
+    if (!characteristic_path.empty() &&
+        bridge_it != peers_->time_bridges().end() &&
+        bridge_it->second.characteristic_path == characteristic_path &&
+        cached_characteristic && cached_characteristic->notifying) {
+        auto& bridge = bridge_it->second;
+        bridge.mac = mac;
+        bridge.peer_name = peer_name;
+        const bool handshake_complete = bridge.time_notification_received && bridge.time_writeback_received;
+        if (handshake_complete) {
+            bridge.status = "ready";
+            bridge.detail = "peer time bridge active";
+            peers_->clear_device_reset(session);
+            session.time_bridge_healthy_this_connection = true;
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+            session.remote_gatt_missing_since_monotonic = 0.0;
+            session.remote_gatt_missing_checks = 0;
+            session.last_service_retry_monotonic = 0.0;
+            session.last_notify_failure_monotonic = 0.0;
+            session.notify_failure_count = 0;
+            session.last_notify_failure_characteristic_path.clear();
+            session.time_bridge_init_notify_failure_monotonic = 0.0;
+            session.time_bridge_init_notify_failure_count = 0;
+            session.phase = "ready";
+            session.detail = "peer time bridge active";
+            return true;
+        }
+
+        bridge.status = "subscribing";
+        bridge.detail = bridge.time_notification_received
+            ? "awaiting peer time writeback"
+            : "awaiting peer time notifications";
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        session.last_service_retry_monotonic = 0.0;
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = now_mono;
+        }
+        session.bridge_wait_reason = "notify";
+        session.phase = "connected_unready";
+        session.detail = bridge.detail;
+        schedule_peer_reconcile(kPeerWaitReconcileDelay);
+        return false;
+    }
+
+    RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): %zu services, %zu characteristics, %zu descriptors resolved",
+                 mac.c_str(), services.size(), characteristics.size(),
+                 characteristic_path.empty() ? size_t{0} : client_->list_descriptors(mac, characteristic_path).size());
+
+    if (characteristic_path.empty()) {
+        clear_time_bridge();
+        state_lock.unlock();
+        if (!stop_notify_path.empty()) {
+            client_->stop_notify(stop_notify_path);
+        }
+        log_info_coalesced("peer-time-bridge-missing:" + mac + ":" + std::to_string(characteristics.size()),
+                           "[node] update_peer_time_bridge(" + mac + "): time characteristic uuid=" +
+                               time_characteristic_uuid + " not found among " +
+                               std::to_string(characteristics.size()) + " characteristics");
+        state_lock.lock();
+
+        if (characteristics.empty()) {
+            if (session.remote_gatt_missing_since_monotonic <= 0.0) {
+                session.remote_gatt_missing_since_monotonic = now_mono;
+            }
+            session.remote_gatt_missing_checks += 1;
+            if (session.bridge_wait_started_monotonic <= 0.0) {
+                session.bridge_wait_started_monotonic = now_mono;
+            }
+            session.bridge_wait_reason = "gatt-cache";
+            session.phase = "connected_unready";
+            session.detail = should_attempt_snapshot_refresh
+                ? "waiting for remote GATT objects after fallback snapshot"
+                : "waiting for remote GATT objects";
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            return false;
+        }
+
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = now_mono;
+        }
+        session.bridge_wait_reason = "gatt-layout";
+        session.phase = "connected_unready";
+        session.detail = "peer time characteristic not available";
+        schedule_peer_reconcile(kPeerWaitReconcileDelay);
+        return false;
+    }
+
+    session.remote_gatt_missing_since_monotonic = 0.0;
+    session.remote_gatt_missing_checks = 0;
+    session.last_service_retry_monotonic = 0.0;
+
+    if (!session.last_notify_failure_characteristic_path.empty() &&
+        session.last_notify_failure_characteristic_path != characteristic_path) {
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
+    }
+
+    if (bridge_it != peers_->time_bridges().end() &&
+        !bridge_it->second.characteristic_path.empty() &&
+        bridge_it->second.characteristic_path != characteristic_path) {
+        clear_time_bridge();
+    }
+
+    auto [created_bridge_it, inserted_bridge] = peers_->time_bridges().try_emplace(mac);
+    (void)inserted_bridge;
+    bridge_it = created_bridge_it;
+
+    const auto topic_name = peer_status_topic(mac, peer_name);
+    {
+        auto& bridge = bridge_it->second;
+        if (!bridge.publisher || bridge.status_topic_name != topic_name) {
+            if (bridge.publisher) {
+                bridge.publisher.reset();
+            }
+            bridge.publisher = create_publisher<mrs_uav_bluetooth::msg::BlePeerTimeStatus>(topic_name, 10);
+            bridge.status_topic_name = topic_name;
+        }
+
+        bridge.mac = mac;
+        bridge.peer_name = peer_name;
+        bridge.characteristic_path = characteristic_path;
+    }
+
+    if (session.last_notify_failure_characteristic_path == characteristic_path &&
+        session.last_notify_failure_monotonic > 0.0) {
+        const auto failure_age = now_mono - session.last_notify_failure_monotonic;
+        if (failure_age < kPeerNotifyRetryBackoff) {
+            bridge_it->second.status = "notify_failed";
+            bridge_it->second.detail = "waiting to retry peer time notifications";
+            if (session.bridge_wait_started_monotonic <= 0.0) {
+                session.bridge_wait_started_monotonic = session.last_notify_failure_monotonic;
+            }
+            session.bridge_wait_reason = "notify";
+            session.phase = "connected_unready";
+            session.detail = "waiting to retry peer time notifications";
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            return false;
+        }
+    }
+
+    const auto descriptors = client_->list_descriptors(mac, characteristic_path);
+    const auto wb_path = client_->find_descriptor(mac, writeback_descriptor_uuid, characteristic_path);
+    if (wb_path.empty() && !descriptors.empty()) {
+        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): writeback descriptor uuid=%s not found (descriptors resolved=%zu)",
+                     mac.c_str(), writeback_descriptor_uuid.c_str(), descriptors.size());
+    } else if (wb_path.empty()) {
+        RCLCPP_DEBUG(get_logger(), "[node] update_peer_time_bridge(%s): no descriptors resolved for this device, writeback disabled",
+                     mac.c_str());
+    }
+
+    const auto previous_wb_path = bridge_it->second.writeback_descriptor_path;
+    bridge_it->second.writeback_descriptor_path = wb_path;
+
+    std::vector<uint8_t> recovered_writeback_payload;
+    const bool recovered_writeback_path = previous_wb_path.empty() && !wb_path.empty();
+    if (recovered_writeback_path &&
+        bridge_it->second.time_notification_received &&
+        !bridge_it->second.time_writeback_received) {
+        recovered_writeback_payload.resize(sizeof(uint64_t));
+        std::memcpy(recovered_writeback_payload.data(),
+                    &bridge_it->second.last_time_value_ns,
+                    sizeof(uint64_t));
+    }
+
+    if (bridge_it->second.status == "subscribing") {
+        const bool awaiting_writeback =
+            bridge_it->second.time_notification_received &&
+            !bridge_it->second.time_writeback_received;
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = peers_->now_monotonic();
+        }
+        session.bridge_wait_reason = awaiting_writeback ? "writeback" : "notify";
+        session.phase = "connected_unready";
+        session.detail = awaiting_writeback
+            ? "awaiting peer time writeback"
+            : "awaiting peer time notifications";
+
+        state_lock.unlock();
+        if (!recovered_writeback_payload.empty()) {
+            client_->write_descriptor_async(wb_path, recovered_writeback_payload);
+        }
+        state_lock.lock();
+        return false;
+    }
+
+    if (bridge_it->second.status == "notify_failed") {
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = peers_->now_monotonic();
+        }
+        session.bridge_wait_reason = "notify";
+        session.phase = "connected_unready";
+        session.detail = "failed to enable peer time notifications";
+        return false;
+    }
+
+    bridge_it->second.status = "subscribing";
+    bridge_it->second.detail = "enabling peer time notifications";
+    bridge_it->second.services_wait_grace_s = session.services_wait_grace_s;
+    bridge_it->second.pairing_failures = session.pairing_failures;
+
+    const auto notify_start_log = "[node] update_peer_time_bridge(" + mac + "): notifications requested on " +
+        characteristic_path + " (writeback=" +
+        (wb_path.empty() ? std::string{"none"} : wb_path) + ")";
+
+    state_lock.unlock();
+    if (!stop_notify_path.empty()) {
+        client_->stop_notify(stop_notify_path);
+    }
+
+    if (client_->start_notify(characteristic_path)) {
+        log_info_coalesced("peer-time-bridge-notify-start:" + mac + ":" + characteristic_path,
+                           notify_start_log);
+        state_lock.lock();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
+        if (session.bridge_wait_started_monotonic <= 0.0) {
+            session.bridge_wait_started_monotonic = peers_->now_monotonic();
+        }
+        session.bridge_wait_reason = "notify";
+        session.phase = "connected_unready";
+        session.detail = "awaiting peer time notifications";
+        return false;
+    }
+
+    state_lock.lock();
+    RCLCPP_WARN(get_logger(), "[node] update_peer_time_bridge(%s): failed to enable notifications on %s",
+                mac.c_str(), characteristic_path.c_str());
+    bridge_it = peers_->time_bridges().find(mac);
+    if (bridge_it != peers_->time_bridges().end() &&
+        bridge_it->second.characteristic_path == characteristic_path) {
+        bridge_it->second.status = "notify_failed";
+        bridge_it->second.detail = "failed to enable peer time notifications";
+    }
+    if (session.bridge_wait_started_monotonic <= 0.0) {
+        session.bridge_wait_started_monotonic = peers_->now_monotonic();
+    }
+    session.bridge_wait_reason = "notify";
+    session.phase = "connected_unready";
+    session.detail = "failed to enable peer time notifications";
+    return false;
+}
+
+void ServiceNode::reconcile_peers() {
+    std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
+    if (!peers_ || !client_) {
+        return;
+    }
+
+    const auto now = peers_->now_monotonic();
+    const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
+    const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
+    bool should_suspend_scan = false;
+    std::set<std::string> current_macs;
+    for (const auto& device : client_->get_devices()) {
+        current_macs.insert(device.mac);
+    }
+
+    RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 10000,
+                          "[reconcile] sessions=%zu devices=%zu auto_connect=%s whitelist=%zu",
+                          peers_->sessions().size(), current_macs.size(),
+                          active_config_.auto_connect_enable ? "on" : "off",
+                          active_config_.auto_connect_whitelist.size());
+
+    peers_->prune_sessions(current_macs, now, std::max(5.0, active_config_.peer_connection_timeout));
+
+    for (auto& [mac, session] : peers_->sessions()) {
+        const auto device = client_->get_device(mac);
+        const auto device_label = mac + " (" + session.peer_name + ")";
+        const bool is_connected = device && device->connected;
+        const bool functional_bridge_peer = device && device_can_host_peer_bridge(*device);
+
+        if (!session.desired || !functional_bridge_peer) {
+            state_lock.unlock();
+            clear_peer_runtime(mac);
+            state_lock.lock();
+        }
+
+        const bool recent_connect_flow = session.last_connect_attempt_monotonic > 0.0 &&
+            (now - session.last_connect_attempt_monotonic) < std::max(4.0, retry_period_s * 2.0);
+        const bool waiting_for_bridge = session.services_wait_started_monotonic > 0.0 ||
+            session.bridge_wait_started_monotonic > 0.0;
+
+        if (session.desired && is_connected) {
+            should_suspend_scan = true;
+        }
+
+        if (functional_bridge_peer) {
+            const auto device_copy = *device;
+            state_lock.unlock();
+            refresh_import_bridges_for_device(device_copy);
+            state_lock.lock();
+        }
+
+        if (!session.desired) {
+            const bool allow_passive_non_peer = !whitelist_enabled && !session.peer_candidate;
+            if (allow_passive_non_peer) {
+                session.forget_pending = false;
+                session.phase = "idle";
+                session.detail = session.peer_name.empty() ? "device does not match peer policy"
+                                                           : "not a peer candidate";
+                continue;
+            }
+            const bool should_forget_blocked_peer =
+                session.forget_pending &&
+                session.peer_candidate &&
+                device &&
+                (device->connected || device->services_resolved || device_has_local_security(*device));
+            if (should_forget_blocked_peer) {
+                if (run_peer_task_once(mac, "forget blocked peer", [this, mac, retry_period_s]() {
+                        (void)client_->disconnect(mac, retry_period_s);
+                        (void)client_->remove(mac);
+                    })) {
+                    expected_disconnect_reasons_[mac] = whitelist_enabled
+                        ? "removing saved peer not present in whitelist"
+                        : "removing saved peer not allowed by current config";
+                    session.phase = "policy_blocked";
+                    session.detail = whitelist_enabled
+                        ? "removing saved peer not present in whitelist"
+                        : "removing saved peer not allowed by current config";
+                }
+                continue;
+            }
+            if (device && device->connected) {
+                if (run_peer_task_once(mac, "disconnect undesired peer", [this, mac, retry_period_s]() {
+                        (void)client_->disconnect(mac, retry_period_s);
+                    })) {
+                    expected_disconnect_reasons_[mac] = whitelist_enabled
+                        ? "disconnecting peer not present in whitelist"
+                        : "disconnecting peer not allowed by current config";
+                    session.phase = "policy_blocked";
+                    session.detail = whitelist_enabled ? "disconnecting peer not present in whitelist"
+                                                      : "disconnecting peer not allowed by current config";
+                }
+                continue;
+            }
+            session.phase = "policy_blocked";
+            session.detail = whitelist_enabled ? "peer not present in whitelist"
+                                              : "peer not allowed by current config";
+            continue;
+        }
+
+        session.forget_pending = false;
+
+        if (device && device->blocked) {
+            if (run_peer_task_once(mac, "unblock", [this, mac]() {
+                    (void)client_->unblock(mac);
+                })) {
+                session.phase = "discovered";
+                session.detail = "unblocking desired peer";
+            }
+            continue;
+        }
+
+        if (session.repair_requested) {
+            if (session.repair_awaiting_cache_removal || session.repair_in_progress) {
+                continue;
+            }
+
+            if (!session.repair_remove_issued &&
+                !run_peer_task_once(mac, "reset peer device", [this, mac, retry_period_s, connected = is_connected]() {
+                    const auto should_continue_repair = [this, &mac]() {
+                        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+                        if (shutting_down_.load() || !peers_) {
+                            return false;
+                        }
+                        const auto session_it = peers_->sessions().find(mac);
+                        return session_it != peers_->sessions().end() &&
+                               session_it->second.repair_requested;
+                    };
+
+                    if (!should_continue_repair()) {
+                        return;
+                    }
+                    if (connected) {
+                        (void)client_->disconnect(mac, retry_period_s);
+                    }
+                    if (!should_continue_repair()) {
+                        return;
+                    }
+                    (void)client_->remove(mac);
+                    if (!should_continue_repair()) {
+                        return;
+                    }
+                    (void)client_->unblock(mac);
+                })) {
+                continue;
+            }
+
+            if (!session.repair_remove_issued && is_connected) {
+                expected_disconnect_reasons_[mac] = session.repair_reason.empty()
+                    ? "resetting peer device state"
+                    : session.repair_reason;
+            }
+
+            if (!session.repair_remove_issued) {
+                RCLCPP_WARN(get_logger(), "[reconcile] %s: resetting BlueZ device state (%s)",
+                            device_label.c_str(),
+                            session.repair_reason.empty() ? "device reset" : session.repair_reason.c_str());
+                session.repair_remove_issued = true;
+                session.repair_awaiting_cache_removal = true;
+                session.repair_in_progress = true;
+                state_lock.unlock();
+                clear_peer_runtime(mac);
+                state_lock.lock();
+                session.phase = "recovering";
+                session.detail = session.repair_reason.empty() ? "resetting peer device state" : session.repair_reason;
+                session.last_repair_monotonic = now;
+                session.last_connect_attempt_monotonic = 0.0;
+                session.connect_started_monotonic = 0.0;
+                session.connected_since_monotonic = 0.0;
+                session.last_security_attempt_monotonic = 0.0;
+                session.services_wait_started_monotonic = 0.0;
+                session.bridge_wait_started_monotonic = 0.0;
+                session.bridge_wait_reason.clear();
+                session.remote_gatt_missing_since_monotonic = 0.0;
+                session.remote_gatt_missing_checks = 0;
+                continue;
+            }
+
+            if (session.phase == "recovering") {
+                session.phase = device ? "discovered" : "stale";
+                session.detail = device ? "awaiting fresh connection after security reset"
+                                        : "awaiting fresh discovery after security reset";
+            }
+        }
+
+        if (session.repair_in_progress) {
+            continue;
+        }
+
+        if (!active_config_.auto_pair && session.desired && device && device_has_recorded_bond(*device)) {
+            peers_->request_device_reset(session,
+                                         "pairing disabled by config, removing unexpected peer bond",
+                                         true);
+            continue;
+        }
+
+        if (is_connected && device &&
+            peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
+            if (run_peer_task_once(mac, "trust", [this, mac]() {
+                    (void)client_->trust(mac);
+                })) {
+                RCLCPP_INFO(get_logger(),
+                            "[reconcile] %s: attempting trust repair (phase=%s paired=%s bonded=%s trusted=%s)",
+                            device_label.c_str(),
+                            session.phase.c_str(),
+                            device->paired ? "Y" : "N",
+                            device->bonded ? "Y" : "N",
+                            device->trusted ? "Y" : "N");
+                session.detail = session.phase == "ready"
+                    ? "peer time bridge active, trust requested"
+                    : "trust requested";
+                session.last_security_attempt_monotonic = now;
+                continue;
+            }
+        }
+
+        if (is_connected && device && !device_has_required_pairing(*device, active_config_)) {
+            if (session.pairing_in_progress &&
+                session.last_security_attempt_monotonic > 0.0 &&
+                (now - session.last_security_attempt_monotonic) >= kPeerPairTimeout) {
+                peers_->request_device_reset(session,
+                                             "pairing stalled, resetting peer device state",
+                                             true);
+                continue;
+            }
+
+            if (peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
+                if (run_peer_task_once(mac, "pair", [this, mac]() {
+                        std::string error_detail;
+                        const bool success = client_->pair(mac, kPeerPairTimeout, &error_detail);
+                        note_pair_attempt_result(mac, success, error_detail);
+                    })) {
+                    RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting pair as blocking post-connect step",
+                                device_label.c_str());
+                    session.phase = "securing";
+                    session.detail = "pair requested";
+                    session.pairing_in_progress = true;
+                    session.last_security_attempt_monotonic = now;
+                    continue;
+                }
+            }
+
+            session.phase = session.pairing_in_progress ? "securing" : "connected_unready";
+            if (session.detail.empty() ||
+                session.detail == "connected, waiting for services" ||
+                session.detail == "connected, services resolved, awaiting peer time bridge") {
+                session.detail = session.pairing_in_progress
+                    ? "awaiting pairing completion"
+                    : "connected, waiting for pairing";
+            }
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            continue;
+        }
+
+        if (!is_connected) {
+            const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
+            if (local_server_rebuild_in_progress_.load() ||
+                (local_server_rebuild_monotonic_ > 0.0 &&
+                 (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s)) {
+                session.phase = session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered";
+                session.detail = "waiting for local GATT rebuild";
+                continue;
+            }
+            if (peers_->should_attempt_connect(session, now, retry_period_s)) {
+                if (run_peer_task_once(mac, "connect", [this, mac, retry_period_s]() {
+                        if (local_server_rebuild_in_progress_.load()) {
+                            return;
+                        }
+                        (void)client_->connect(mac, retry_period_s, true);
+                    })) {
+                    RCLCPP_INFO(get_logger(), "[reconcile] %s: attempting connect (phase=%s)",
+                                device_label.c_str(), session.phase.c_str());
+                    peers_->note_local_connect_attempt(session, now);
+                    session.phase = "connecting";
+                    session.detail = "auto-connect requested (explicit LE when available)";
+                }
+            }
+            continue;
+        }
+
+        if (is_connected && device && !device->services_resolved) {
+            const auto bridge_it = peers_->time_bridges().find(mac);
+            const bool preserve_bridge_runtime =
+                should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
+            const bool preserve_ready_runtime =
+                should_preserve_ready_bridge_during_expected_services_rediscovery(*device);
+            const bool preserve_manual_security_runtime =
+                !active_config_.auto_pair && session.local_time_notify_active_this_connection;
+            if (preserve_bridge_runtime && session.service_regression_started_monotonic <= 0.0) {
+                session.service_regression_started_monotonic = now;
+            }
+            const double healthy_bridge_activity_monotonic = preserve_ready_runtime
+                ? healthy_peer_time_bridge_last_activity_monotonic(mac, session.services_wait_grace_s)
+                : 0.0;
+            if (healthy_bridge_activity_monotonic > session.service_regression_started_monotonic) {
+                session.service_regression_started_monotonic = healthy_bridge_activity_monotonic;
+            }
+            const bool handshake_complete =
+                bridge_it != peers_->time_bridges().end() &&
+                bridge_it->second.time_notification_received &&
+                bridge_it->second.time_writeback_received;
+            const bool notify_handshake_timed_out =
+                preserve_bridge_runtime &&
+                !handshake_complete &&
+                (session.bridge_wait_reason == "notify" ||
+                 session.bridge_wait_reason == "writeback") &&
+                session.bridge_wait_started_monotonic > 0.0 &&
+                (now - session.bridge_wait_started_monotonic) >= kPeerNotifyHandshakeTimeout;
+            if (notify_handshake_timed_out) {
+                const bool missing_writeback =
+                    bridge_it != peers_->time_bridges().end() &&
+                    bridge_it->second.time_notification_received &&
+                    !bridge_it->second.time_writeback_received;
+                peers_->request_device_reset(session,
+                                             missing_writeback
+                                                 ? "peer time writeback missing, resetting peer device state"
+                                                 : "peer time notifications missing, resetting peer device state",
+                                             false);
+                continue;
+            }
+
+            const double services_wait_started_monotonic = (preserve_bridge_runtime || preserve_manual_security_runtime)
+                ? 0.0
+                : session.services_wait_started_monotonic;
+            const double services_wait_grace_s = session.services_wait_grace_s;
+            const bool services_wait_expired =
+                services_wait_started_monotonic > 0.0 &&
+                services_wait_grace_s > 0.0 &&
+                (now - services_wait_started_monotonic) >= services_wait_grace_s;
+
+            if (services_wait_expired) {
+                if (run_peer_task_once(mac, "recover unresolved services", [this, mac, retry_period_s]() {
+                        (void)client_->disconnect(mac, retry_period_s);
+                    })) {
+                    expected_disconnect_reasons_[mac] = "services unresolved too long, reconnecting";
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: services unresolved for %.1fs, forcing reconnect",
+                                device_label.c_str(),
+                                now - services_wait_started_monotonic);
+                    session.phase = "recovering";
+                    session.detail = "services unresolved too long, reconnecting";
+                }
+                continue;
+            }
+
+            schedule_peer_reconcile(kPeerWaitReconcileDelay);
+            if (preserve_ready_runtime) {
+                session.phase = "ready";
+                session.detail = "peer time bridge active during expected services rediscovery";
+            } else if (preserve_manual_security_runtime) {
+                session.phase = "connected_unready";
+                session.detail = "local time notifications active during expected services rediscovery";
+            } else if (preserve_bridge_runtime) {
+                session.phase = "connected_unready";
+                session.detail = bridge_it != peers_->time_bridges().end() &&
+                        !bridge_it->second.detail.empty()
+                    ? bridge_it->second.detail + " during expected services rediscovery"
+                    : "peer time bridge runtime active during expected services rediscovery";
+            } else {
+                session.phase = "connected_unready";
+                session.detail = "connected, waiting for services";
+            }
+            continue;
+        }
+
+        if (is_connected && device && device->services_resolved) {
+            const auto device_copy = *device;
+            state_lock.unlock();
+            (void)update_peer_time_bridge(mac, device_copy, session);
+            state_lock.lock();
+
+            const auto bridge_it = peers_->time_bridges().find(mac);
+            const bool handshake_complete =
+                bridge_it != peers_->time_bridges().end() &&
+                bridge_it->second.time_notification_received &&
+                bridge_it->second.time_writeback_received;
+            const bool notify_handshake_timed_out =
+                (session.bridge_wait_reason == "notify" ||
+                 session.bridge_wait_reason == "writeback") &&
+                session.bridge_wait_started_monotonic > 0.0 &&
+                !handshake_complete &&
+                (now - session.bridge_wait_started_monotonic) >= kPeerNotifyHandshakeTimeout;
+            if (notify_handshake_timed_out) {
+                const bool missing_writeback =
+                    bridge_it != peers_->time_bridges().end() &&
+                    bridge_it->second.time_notification_received &&
+                    !bridge_it->second.time_writeback_received;
+                peers_->request_device_reset(session,
+                                             missing_writeback
+                                                 ? "peer time writeback missing, resetting peer device state"
+                                                 : "peer time notifications missing, resetting peer device state",
+                                             false);
+                continue;
+            }
+
+            const bool repeated_notify_failures =
+                session.notify_failure_count >= kPeerNotifyFailureReconnectThreshold &&
+                session.last_notify_failure_monotonic > 0.0 &&
+                (now - session.last_notify_failure_monotonic) < std::max(3.0, retry_period_s * 2.0);
+            const bool repeated_init_notify_failures =
+                session.time_bridge_init_notify_failure_count >= kPeerNotifyFailureReconnectThreshold &&
+                session.time_bridge_init_notify_failure_monotonic > 0.0 &&
+                (now - session.time_bridge_init_notify_failure_monotonic) < kPeerInitNotifyFailureResetWindow;
+            if (repeated_notify_failures) {
+                const bool notify_failures_during_time_bridge_init =
+                    !session.time_bridge_healthy_this_connection;
+                if (notify_failures_during_time_bridge_init && device_has_recorded_bond(*device)) {
+                    peers_->request_device_reset(session,
+                                                 "bonded peer repeatedly rejected time notifications, resetting peer device state",
+                                                 true);
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: repeated notify failures during initial bonded time-bridge bring-up, resetting BlueZ device state",
+                                device_label.c_str());
+                    schedule_peer_reconcile(std::chrono::milliseconds(1));
+                    continue;
+                }
+                if (run_peer_task_once(mac, "recover failed notify", [this, mac, retry_period_s]() {
+                        (void)client_->disconnect(mac, retry_period_s);
+                    })) {
+                    expected_disconnect_reasons_[mac] = "peer time notifications failing, reconnecting";
+                    RCLCPP_WARN(get_logger(),
+                                "[reconcile] %s: repeated notify failures on peer time bridge after health or without bond evidence, forcing reconnect",
+                                device_label.c_str());
+                    session.phase = "recovering";
+                    session.detail = "peer time notifications failing, reconnecting";
+                }
+                continue;
+            }
+
+            if (repeated_init_notify_failures &&
+                !session.time_bridge_healthy_this_connection &&
+                device_has_recorded_bond(*device)) {
+                peers_->request_device_reset(session,
+                                             "bonded peer repeatedly rejected time notifications, resetting peer device state",
+                                             true);
+                RCLCPP_WARN(get_logger(),
+                            "[reconcile] %s: repeated init-time notify failures persisted across reconnect churn, resetting BlueZ device state",
+                            device_label.c_str());
+                schedule_peer_reconcile(std::chrono::milliseconds(1));
+                continue;
+            }
+
+            continue;
+        }
+
+        RCLCPP_DEBUG(get_logger(), "[reconcile] %s: desired but pending (phase=%s conn=%s paired=%s trusted=%s svc_resolved=%s)",
+                     device_label.c_str(), session.phase.c_str(),
+                     is_connected ? "Y" : "N",
+                     device ? (device->paired ? "Y" : "N") : "?",
+                     device ? (device->trusted ? "Y" : "N") : "?",
+                     device ? (device->services_resolved ? "Y" : "N") : "?");
+    }
+
+    const bool should_scan = active_config_.enable_scan && !should_suspend_scan;
+    state_lock.unlock();
+    if (should_scan) {
+        if (!client_->is_scanning()) {
+            client_->start_scan(active_config_.scan_mode, active_config_.enable_server);
+        }
+    } else {
+        if (client_->is_scanning()) {
+            client_->stop_scan();
+        }
+    }
+}
+
+}  // namespace mrs_uav_bluetooth::app

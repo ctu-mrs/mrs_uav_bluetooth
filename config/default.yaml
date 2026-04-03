@@ -21,11 +21,12 @@ wifi_refresh_period: 2.0
 # Retry interval used by the automatic peer connector.
 auto_connect_period: 3.0
 
-# When non-zero, make the adapter discoverable for this many seconds.
+# When the BLE server is enabled, the adapter is made explicitly discoverable.
+# This timeout controls how long it stays discoverable. 0 means indefinitely.
 discoverable_timeout: 0
 
-# BlueZ pairing agent behaviour.
-auto_accept_pairing: true
+# BlueZ pairing agent and peer-security behaviour.
+auto_pair: true
 auto_trust: true
 
 # Enable the built-in services hosted by the system node.
@@ -44,7 +45,10 @@ auto_connect_whitelist: []
 auto_connect_pattern: "^uav[0-9]{2}$"
 
 # Disconnect a peer if the time bridge stays inactive for too long.
-peer_connection_timeout: 30.0
+peer_connection_timeout: 15.0
+
+# Netplan file updated by the BLE Wi-Fi service.
+wifi_netplan_config_path: /etc/netplan/01-netcfg.yaml
 
 # Allowed Wi-Fi SSIDs that may be selected over BLE.
 allowed_wifi_networks:
@@ -85,8 +89,6 @@ pairing_agent: NoInputNoOutput
 enable_server: true
 enable_scan: true
 scan_mode: le
-netplan_config_file: /etc/netplan/01-netcfg.yaml
-netplan_scripts_dir: /etc/ctu-mrs/uav-bluetooth/netplan-scripts
 
 # Declarative bridge setup.
 # Each entry defines one BLE bridge that the node may export, import, or both.
@@ -104,7 +106,6 @@ netplan_scripts_dir: /etc/ctu-mrs/uav-bluetooth/netplan-scripts
 #   /uavYY/ble/peers/uavXX/mavros/odometry/local.
 # - message_type: ROS interface type, for example nav_msgs/msg/Odometry.
 # - rate_hz: Publish/poll rate. 0 means send on every received sample.
-# - transport_endpoint: characteristic | descriptor.
 # - members: Ordered packet layout for the compact BLE payload. Each member is
 #   packed little-endian and must use a fixed-width scalar type.
 #   Keep the total payload size at most 244 bytes (BLE message limit).

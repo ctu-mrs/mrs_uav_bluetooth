@@ -2,5 +2,5 @@ Package: mrs-uav-bluetooth-service
 Version: 1.0.0
 Architecture: all
 Maintainer: Vojtech Vrba <vojtech.vrba@fel.cvut.cz>
-Description: System service for ROS 2 MRS UAV Bluetooth node.
+Description: System service for ROS 2 MRS UAV BLE service node.
 Depends: ros-jazzy-mrs-uav-bluetooth

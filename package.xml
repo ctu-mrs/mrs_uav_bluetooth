@@ -1,30 +1,35 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>mrs_uav_bluetooth</name>
-  <version>0.1.0</version>
-  <description>ROS 2 Bluetooth node for MRS UAV BLE server and client control.</description>
+  <version>0.2.0</version>
+  <description>ROS 2 Bluetooth for MRS UAV System (server and client).</description>
   <maintainer email="vojtech.vrba@fel.cvut.cz">Vojtech Vrba</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>ament_cmake_python</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
-  <depend>launch</depend>
-  <depend>launch_ros</depend>
-  <depend>ament_index_python</depend>
-  <depend>nav_msgs</depend>
-  <depend>rcl_interfaces</depend>
-  <depend>rclpy</depend>
-  <depend>rosidl_runtime_py</depend>
+  <depend>rclcpp</depend>
+  <depend>ament_index_cpp</depend>
+  <depend>rcpputils</depend>
+  <depend>rosidl_runtime_cpp</depend>
+  <depend>rosidl_typesupport_introspection_cpp</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>builtin_interfaces</depend>
+  <depend>nav_msgs</depend>
+  <depend>rcl_interfaces</depend>
+
+  <build_depend>yaml-cpp</build_depend>
+  <build_depend>mrs-libsdbus-c++</build_depend>
+  <exec_depend>yaml-cpp</exec_depend>
+  <exec_depend>mrs-libsdbus-c++</exec_depend>
+  <!--<exec_depend>mrs-bluez</exec_depend>-->
+
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
-  <exec_depend>python3-dbus</exec_depend>
-  <exec_depend>python3-gi</exec_depend>
-  <exec_depend>python3-yaml</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>

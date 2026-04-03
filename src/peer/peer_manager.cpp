@@ -1,0 +1,686 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include "mrs_uav_bluetooth/peer/peer_manager.hpp"
+
+#include "mrs_uav_bluetooth/util/hostname_utils.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <functional>
+
+namespace {
+
+constexpr double kConnectAttemptGraceMin = 15.0;
+constexpr double kConnectAttemptGraceMultiplier = 5.0;
+constexpr double kServicesWaitGraceMin = 15.0;
+constexpr double kPairCooldownMin = 10.0;
+constexpr double kPairAfterConnectGraceMin = 5.0;
+constexpr double kTrustCooldownMin = 0.5;
+
+bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
+              std::initializer_list<const char*> values) {
+    for (const char* value : values) {
+        if (session.phase == value) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string trim_copy(std::string value) {
+    const auto start = value.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return {};
+    }
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(start, end - start + 1);
+}
+
+std::string lower_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+bool looks_like_mac_address(std::string_view value) {
+    if (value.size() != 17) {
+        return false;
+    }
+    for (size_t index = 0; index < value.size(); ++index) {
+        const unsigned char ch = static_cast<unsigned char>(value[index]);
+        if (index % 3 == 2) {
+            if (ch != ':') {
+                return false;
+            }
+            continue;
+        }
+        if (std::isxdigit(ch) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string normalize_mac(std::string value) {
+    value = trim_copy(std::move(value));
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::toupper(ch));
+    });
+    return value;
+}
+
+std::string normalize_whitelist_token(std::string value) {
+    value = trim_copy(std::move(value));
+    if (looks_like_mac_address(value)) {
+        return normalize_mac(std::move(value));
+    }
+    return lower_copy(std::move(value));
+}
+
+bool whitelist_contains(const std::vector<std::string>& whitelist,
+                        const std::string& mac,
+                        const std::string& peer_name) {
+    const auto normalized_mac = normalize_mac(mac);
+    const auto normalized_peer_name = lower_copy(trim_copy(peer_name));
+    for (const auto& entry : whitelist) {
+        const auto normalized_entry = normalize_whitelist_token(entry);
+        if (normalized_entry.empty()) {
+            continue;
+        }
+        if (normalized_entry == normalized_mac) {
+            return true;
+        }
+        if (!normalized_peer_name.empty() && normalized_entry == normalized_peer_name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.paired || device.bonded || device.trusted;
+}
+
+bool pairing_required(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return config.auto_pair;
+}
+
+bool trust_required(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return config.auto_trust;
+}
+
+bool device_has_required_pairing(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                                 const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return !pairing_required(config) || device.paired || device.bonded;
+}
+
+bool device_has_required_trust(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+                               const mrs_uav_bluetooth::config::NodeConfig& config) {
+    return !trust_required(config) || device.trusted;
+}
+
+bool device_needs_forget(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    return device.connected || device.services_resolved || device_has_local_security(device);
+}
+
+bool repair_blocks_regular_actions(const mrs_uav_bluetooth::peer::PeerConnectionSession& session) {
+    return session.repair_requested &&
+           (!session.repair_remove_issued || session.repair_awaiting_cache_removal);
+}
+
+}  // namespace
+
+namespace mrs_uav_bluetooth::peer {
+
+PeerManager::PeerManager(rclcpp::Node& node, rclcpp::Logger logger)
+    : node_(node), logger_(logger) {}
+
+double PeerManager::now_monotonic() const {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+PeerConnectionSession& PeerManager::get_or_create_session(const std::string& mac,
+                                                          const std::string& peer_name) {
+    auto it = sessions_.find(mac);
+    if (it == sessions_.end()) {
+        PeerConnectionSession session;
+        session.mac = mac;
+        const auto now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        session.first_seen_monotonic = now;
+        session.last_seen_monotonic = now;
+        session.peer_name = peer_name;
+        it = sessions_.emplace(mac, std::move(session)).first;
+    } else {
+        const auto now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        it->second.last_seen_monotonic = now;
+        if (!peer_name.empty()) {
+            it->second.peer_name = peer_name;
+        }
+    }
+    return it->second;
+}
+
+bool PeerManager::matches_auto_connect_policy(const bluez::DeviceInfo& device,
+                                              const config::NodeConfig& config,
+                                              const std::string& peer_name) const {
+    (void)device;
+    const auto normalized_peer_name = lower_copy(trim_copy(peer_name));
+    return !normalized_peer_name.empty() &&
+           util::is_uav_hostname(normalized_peer_name, config.auto_connect_pattern);
+}
+
+void PeerManager::set_session_phase(PeerConnectionSession& session,
+                                    const std::string& phase,
+                                    const std::string& detail) const {
+    session.phase = phase;
+    session.detail = detail;
+}
+
+void PeerManager::note_local_connect_attempt(PeerConnectionSession& session,
+                                             double now_mono) const {
+    session.last_connect_attempt_monotonic = now_mono;
+    session.connect_started_monotonic = now_mono;
+}
+
+void PeerManager::request_device_reset(PeerConnectionSession& session,
+                                       const std::string& reason,
+                                       bool reset_pairing_state) {
+    if (session.repair_requested) {
+        if (session.repair_reason.empty() && !reason.empty()) {
+            session.repair_reason = reason;
+        }
+        if (reset_pairing_state) {
+            session.pairing_reset_pending = true;
+        }
+        if (session.detail.empty()) {
+            session.detail = session.repair_reason.empty() ? "resetting peer device state"
+                                                           : session.repair_reason;
+        }
+        return;
+    }
+
+    session.repair_requested = true;
+    session.pairing_reset_pending = reset_pairing_state;
+    session.repair_in_progress = false;
+    session.repair_remove_issued = false;
+    session.repair_awaiting_cache_removal = false;
+    session.repair_requested_monotonic = now_monotonic();
+    session.repair_reason = reason;
+    session.services_wait_started_monotonic = 0.0;
+    session.bridge_wait_started_monotonic = 0.0;
+    session.bridge_wait_reason.clear();
+    session.last_notify_failure_monotonic = 0.0;
+    session.notify_failure_count = 0;
+    session.last_notify_failure_characteristic_path.clear();
+    session.time_bridge_init_notify_failure_monotonic = 0.0;
+    session.time_bridge_init_notify_failure_count = 0;
+    session.service_regression_started_monotonic = 0.0;
+    session.local_time_notify_active_this_connection = false;
+    session.remote_gatt_missing_since_monotonic = 0.0;
+    session.remote_gatt_missing_checks = 0;
+    set_session_phase(session,
+                      "recovering",
+                      reason.empty() ? "resetting peer device state" : reason);
+}
+
+void PeerManager::clear_device_reset(PeerConnectionSession& session,
+                                     bool clear_pairing_reset_pending) {
+    session.repair_requested = false;
+    session.repair_in_progress = false;
+    session.repair_remove_issued = false;
+    session.repair_awaiting_cache_removal = false;
+    session.repair_requested_monotonic = 0.0;
+    if (clear_pairing_reset_pending) {
+        session.pairing_reset_pending = false;
+    }
+    session.forget_pending = false;
+    session.repair_reason.clear();
+    session.remote_gatt_missing_since_monotonic = 0.0;
+    session.remote_gatt_missing_checks = 0;
+    session.last_service_retry_monotonic = 0.0;
+    session.services_resolved_since_monotonic = 0.0;
+    session.last_notify_failure_monotonic = 0.0;
+    session.notify_failure_count = 0;
+    session.last_notify_failure_characteristic_path.clear();
+    session.time_bridge_init_notify_failure_monotonic = 0.0;
+    session.time_bridge_init_notify_failure_count = 0;
+    session.service_regression_started_monotonic = 0.0;
+}
+
+void PeerManager::sync_device(const bluez::DeviceInfo& device,
+                              const config::NodeConfig& config,
+                              const std::string& peer_name,
+                              bool preserve_ready_runtime,
+                              bool preserve_active_bridge_runtime) {
+    auto& session = get_or_create_session(device.mac, peer_name);
+    const auto now = now_monotonic();
+    const bool was_desired = session.desired;
+
+    session.missing_since_monotonic = 0.0;
+
+    const bool whitelist_enabled = !config.auto_connect_whitelist.empty();
+    session.explicit_target = whitelist_contains(config.auto_connect_whitelist,
+                                                 device.mac,
+                                                 session.peer_name);
+    session.peer_candidate = matches_auto_connect_policy(device, config, session.peer_name);
+
+    // When whitelist is enabled, only explicit targets are desired among peer candidates.
+    // When whitelist is empty, any matching peer candidate is desired (if auto_connect is on).
+    session.desired = session.explicit_target ||
+                      (config.auto_connect_enable && session.peer_candidate && !whitelist_enabled);
+    if (session.desired) {
+        if (!was_desired || session.desired_since_monotonic <= 0.0) {
+            session.desired_since_monotonic = now;
+        }
+        session.forget_pending = false;
+    } else {
+        session.desired_since_monotonic = 0.0;
+        session.forget_pending = session.peer_candidate && device_has_local_security(device);
+    }
+    session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
+
+    if (!device.paired && !device.bonded) {
+        session.time_bridge_init_notify_failure_monotonic = 0.0;
+        session.time_bridge_init_notify_failure_count = 0;
+    }
+
+    if (!device.connected && !device_has_local_security(device) && !device.services_resolved &&
+        !session.repair_requested) {
+        session.forget_pending = false;
+        if (session.repair_in_progress) {
+            session.repair_in_progress = false;
+        }
+    }
+
+    if (!session.desired) {
+        session.pairing_in_progress = false;
+        session.time_bridge_healthy_this_connection = false;
+        session.local_time_notify_active_this_connection = false;
+        session.connected_since_monotonic = 0.0;
+        session.services_wait_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
+        session.time_bridge_init_notify_failure_monotonic = 0.0;
+        session.time_bridge_init_notify_failure_count = 0;
+        session.last_service_retry_monotonic = 0.0;
+        session.services_resolved_since_monotonic = 0.0;
+        session.service_regression_started_monotonic = 0.0;
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        if (!device_needs_forget(device)) {
+            session.forget_pending = false;
+            clear_device_reset(session);
+        }
+        if (session.peer_candidate) {
+            set_session_phase(session,
+                              "policy_blocked",
+                              whitelist_enabled && !session.explicit_target
+                                  ? "peer not present in whitelist"
+                                  : "peer not allowed by current config");
+        } else if (!session.peer_candidate) {
+            set_session_phase(session, "idle",
+                              session.peer_name.empty() ? "device does not match peer policy"
+                                                        : "not a peer candidate");
+        } else {
+            set_session_phase(session, "idle", "auto-connect disabled");
+        }
+        return;
+    }
+
+    if (device.blocked) {
+        set_session_phase(session, "blocked", "device is blocked by BlueZ");
+        return;
+    }
+
+    if (!device.connected) {
+        session.pairing_in_progress = false;
+        session.time_bridge_healthy_this_connection = false;
+        session.local_time_notify_active_this_connection = false;
+        session.connected_since_monotonic = 0.0;
+        session.services_wait_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
+        session.last_service_retry_monotonic = 0.0;
+        session.services_resolved_since_monotonic = 0.0;
+        session.service_regression_started_monotonic = 0.0;
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+
+        if (is_phase(session, {"connecting", "connect_pending"})) {
+            set_session_phase(session, "connect_pending", "awaiting connection");
+            return;
+        }
+
+        set_session_phase(session,
+                          session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered",
+                          "awaiting connection");
+        return;
+    }
+
+    const bool first_connection_observed = session.connected_since_monotonic <= 0.0;
+    const double connect_grace_s = std::max(kConnectAttemptGraceMin,
+                                            config.auto_connect_period * kConnectAttemptGraceMultiplier);
+    const bool local_connect_in_flight = session.connect_started_monotonic > 0.0 &&
+        (now - session.connect_started_monotonic) < connect_grace_s;
+
+    session.connected_since_monotonic = session.connected_since_monotonic > 0.0
+        ? session.connected_since_monotonic : now;
+    (void)first_connection_observed;
+    (void)local_connect_in_flight;
+
+    if (device_has_required_pairing(device, config)) {
+        session.pairing_in_progress = false;
+    } else {
+        session.last_service_retry_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        if (session.pairing_in_progress) {
+            if (session.detail.empty() || session.detail == "connected, waiting for pairing") {
+                session.detail = "awaiting pairing completion";
+            }
+            session.phase = "securing";
+        } else {
+            set_session_phase(session, "connected_unready", "connected, waiting for pairing");
+        }
+        return;
+    }
+
+    if (!device.services_resolved) {
+        session.last_service_retry_monotonic = 0.0;
+        if (preserve_ready_runtime) {
+            if (session.service_regression_started_monotonic <= 0.0) {
+                session.service_regression_started_monotonic = now;
+            }
+            session.services_wait_started_monotonic = 0.0;
+            session.bridge_wait_started_monotonic = 0.0;
+            session.bridge_wait_reason.clear();
+            session.last_notify_failure_monotonic = 0.0;
+            session.notify_failure_count = 0;
+            session.last_notify_failure_characteristic_path.clear();
+            session.remote_gatt_missing_since_monotonic = 0.0;
+            session.remote_gatt_missing_checks = 0;
+            set_session_phase(session,
+                              "ready",
+                              "peer time bridge active during expected services rediscovery");
+            return;
+        }
+
+        if (preserve_active_bridge_runtime) {
+            if (session.service_regression_started_monotonic <= 0.0) {
+                session.service_regression_started_monotonic = now;
+            }
+            session.services_wait_started_monotonic = 0.0;
+            session.last_service_retry_monotonic = 0.0;
+            session.remote_gatt_missing_since_monotonic = 0.0;
+            session.remote_gatt_missing_checks = 0;
+            session.phase = "connected_unready";
+            if (session.detail.empty()) {
+                session.detail = "peer time bridge active during expected services rediscovery";
+            }
+            return;
+        }
+
+        session.services_resolved_since_monotonic = 0.0;
+        session.service_regression_started_monotonic = 0.0;
+        session.bridge_wait_started_monotonic = 0.0;
+        session.bridge_wait_reason.clear();
+        session.last_notify_failure_monotonic = 0.0;
+        session.notify_failure_count = 0;
+        session.last_notify_failure_characteristic_path.clear();
+        session.remote_gatt_missing_since_monotonic = 0.0;
+        session.remote_gatt_missing_checks = 0;
+        if (session.services_wait_started_monotonic <= 0.0) {
+            session.services_wait_started_monotonic = now;
+        }
+
+        set_session_phase(session, "connected_unready", "connected, waiting for services");
+        return;
+    }
+
+    if (session.services_resolved_since_monotonic <= 0.0) {
+        session.services_resolved_since_monotonic = now;
+    }
+    session.service_regression_started_monotonic = 0.0;
+    if (preserve_ready_runtime) {
+        set_session_phase(session, "ready", "peer time bridge active");
+        session.services_wait_started_monotonic = 0.0;
+        return;
+    }
+    set_session_phase(session, "connected_unready", "connected, services resolved, awaiting peer time bridge");
+    session.services_wait_started_monotonic = 0.0;
+}
+
+void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
+    auto it = sessions_.find(mac);
+    if (it == sessions_.end()) {
+        return;
+    }
+    if (it->second.missing_since_monotonic <= 0.0) {
+        it->second.missing_since_monotonic = now_mono;
+    }
+    it->second.forget_pending = false;
+    it->second.time_bridge_healthy_this_connection = false;
+    it->second.local_time_notify_active_this_connection = false;
+    it->second.connected_since_monotonic = 0.0;
+    it->second.pairing_in_progress = false;
+    it->second.services_wait_started_monotonic = 0.0;
+    it->second.bridge_wait_started_monotonic = 0.0;
+    it->second.bridge_wait_reason.clear();
+    it->second.last_notify_failure_monotonic = 0.0;
+    it->second.notify_failure_count = 0;
+    it->second.last_notify_failure_characteristic_path.clear();
+    it->second.last_service_retry_monotonic = 0.0;
+    it->second.services_resolved_since_monotonic = 0.0;
+    it->second.service_regression_started_monotonic = 0.0;
+    it->second.remote_gatt_missing_since_monotonic = 0.0;
+    it->second.remote_gatt_missing_checks = 0;
+    if (it->second.repair_requested && it->second.repair_awaiting_cache_removal) {
+        const auto repair_detail = it->second.repair_reason.empty()
+            ? std::string{"awaiting fresh discovery after security reset"}
+            : it->second.repair_reason;
+        clear_device_reset(it->second);
+        set_session_phase(it->second,
+                          "stale",
+                          repair_detail);
+        return;
+    }
+    set_session_phase(it->second, "stale", "device missing from cache");
+}
+
+void PeerManager::note_pairing_event(const std::string& device_path,
+                                     const std::string& event,
+                                     const bluez::ObjectManagerCache& cache) {
+    auto device = cache.device(device_path);
+    if (!device) {
+        return;
+    }
+
+    auto& session = get_or_create_session(device->mac);
+    const auto now = now_monotonic();
+    session.last_security_attempt_monotonic = now;
+
+    if (event == "request_authorization") {
+        if (is_phase(session, {"ready"}) && session.detail.empty()) {
+            session.detail = event;
+        }
+        return;
+    }
+
+    if (event == "request_confirmation" ||
+        event == "request_passkey" || event == "request_pin") {
+        session.pairing_in_progress = true;
+        session.last_pairing_request_monotonic = now;
+        if (device_has_local_security(*device)) {
+            if (!is_phase(session, {"ready", "connected_unready"})) {
+                set_session_phase(session, "securing", event);
+            } else if (session.detail.empty()) {
+                session.detail = event;
+            }
+            return;
+        }
+        if (is_phase(session, {"ready"})) {
+            session.detail = event;
+            return;
+        }
+        set_session_phase(session, "securing", event);
+        return;
+    }
+
+    if (event == "cancel") {
+        session.pairing_in_progress = false;
+        session.pairing_failures += 1;
+        set_session_phase(session, "recovering", "pairing cancelled");
+        return;
+    }
+
+    if (event == "agent_release") {
+        session.pairing_in_progress = false;
+        session.detail = "pairing agent released";
+    }
+}
+
+bool PeerManager::should_attempt_trust(const PeerConnectionSession& session,
+                                       const bluez::DeviceInfo& device,
+                                       const config::NodeConfig& config,
+                                       double now_mono,
+                                       double retry_period_s) const {
+    if (!config.auto_trust) {
+        return false;
+    }
+    if (!session.desired) {
+        return false;
+    }
+    if (repair_blocks_regular_actions(session) || session.repair_in_progress) {
+        return false;
+    }
+    if (!device.connected || device.blocked || device.trusted) {
+        return false;
+    }
+    if (session.connected_since_monotonic <= 0.0) {
+        return false;
+    }
+    if (session.pairing_in_progress) {
+        return false;
+    }
+    if (pairing_required(config) && !device_has_required_pairing(device, config)) {
+        return false;
+    }
+    if (is_phase(session, {"connecting", "connect_pending", "discovered", "disconnected",
+                           "blocked", "policy_blocked", "recovering", "stale"})) {
+        return false;
+    }
+    if ((now_mono - session.connected_since_monotonic) < kTrustCooldownMin) {
+        return false;
+    }
+    return session.last_security_attempt_monotonic <= 0.0 ||
+           now_mono - session.last_security_attempt_monotonic >= std::max(kTrustCooldownMin, retry_period_s * 0.25);
+}
+
+bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
+                                         double now_mono,
+                                         double retry_period_s) const {
+    if (!session.desired) {
+        return false;
+    }
+    if (repair_blocks_regular_actions(session) || session.repair_in_progress) {
+        return false;
+    }
+    if (session.missing_since_monotonic > 0.0) {
+        return false;
+    }
+    if (is_phase(session, {"ready", "connected_unready", "securing", "blocked", "policy_blocked"})) {
+        return false;
+    }
+
+    if (session.connect_started_monotonic > 0.0 &&
+        is_phase(session, {"connecting", "connect_pending"}) &&
+        now_mono - session.connect_started_monotonic <
+            std::max(kConnectAttemptGraceMin, retry_period_s * kConnectAttemptGraceMultiplier)) {
+        return false;
+    }
+
+    return session.last_connect_attempt_monotonic <= 0.0 ||
+           now_mono - session.last_connect_attempt_monotonic >= retry_period_s;
+}
+
+bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
+                                      const bluez::DeviceInfo& device,
+                                      const config::NodeConfig& config,
+                                      double now_mono,
+                                      double retry_period_s) const {
+    if (!config.auto_pair) {
+        return false;
+    }
+    if (!session.desired) {
+        return false;
+    }
+    if (repair_blocks_regular_actions(session) || session.repair_in_progress) {
+        return false;
+    }
+    if (session.pairing_in_progress) {
+        return false;
+    }
+    if (device.blocked) {
+        return false;
+    }
+    if (!device.connected) {
+        return false;
+    }
+    if (session.connected_since_monotonic <= 0.0) {
+        return false;
+    }
+    if (device_has_required_pairing(device, config)) {
+        return false;
+    }
+
+    const double pair_grace_s = std::max(kPairAfterConnectGraceMin, retry_period_s);
+    const double services_wait_started = session.services_wait_started_monotonic > 0.0
+        ? session.services_wait_started_monotonic
+        : session.connected_since_monotonic;
+    if (services_wait_started <= 0.0 || (now_mono - services_wait_started) < pair_grace_s) {
+        return false;
+    }
+
+    const double cooldown = std::max(kPairCooldownMin,
+                                     retry_period_s * std::max(1, session.pairing_failures + 1));
+    return session.last_security_attempt_monotonic <= 0.0 ||
+           now_mono - session.last_security_attempt_monotonic >= cooldown;
+}
+
+void PeerManager::prune_sessions(const std::set<std::string>& current_macs,
+                                 double now_mono,
+                                 double ttl_s) {
+    for (auto it = sessions_.begin(); it != sessions_.end();) {
+        if (current_macs.find(it->first) != current_macs.end() ||
+            time_bridges_.find(it->first) != time_bridges_.end() ||
+            now_mono - it->second.last_seen_monotonic <= ttl_s) {
+            ++it;
+            continue;
+        }
+        it = sessions_.erase(it);
+    }
+}
+
+void PeerManager::remove_time_bridge(const std::string& mac) {
+    auto it = time_bridges_.find(mac);
+    if (it == time_bridges_.end()) {
+        return;
+    }
+    it->second.publisher.reset();
+    time_bridges_.erase(it);
+}
+
+}  // namespace mrs_uav_bluetooth::peer

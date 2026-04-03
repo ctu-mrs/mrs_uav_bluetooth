@@ -19,7 +19,7 @@ chmod +x /etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
 touch /etc/systemd/system/mrs-uav-bluetooth.service
 > /etc/systemd/system/mrs-uav-bluetooth.service
 echo "[Unit]
-Description=ROS 2 MRS UAV Bluetooth node service
+Description=ROS 2 MRS UAV BLE service node
 After=network.target
 StartLimitIntervalSec=0
 [Service]
