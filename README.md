@@ -2,10 +2,11 @@
 
 This repository contains the MRS UAV Bluetooth tool. It is a ROS 2 system service that manages Bluetooth Low Energy (BLE) server and client behavior for automatic discovery and connection management among peer UAVs in a swarm.
 
-The package has two entrypoints:
+The package has these entrypoints:
 
 - `service_node`: the long-running system-side node that owns the BLE adapter, publishes status, hosts built-in BLE services, and exposes ROS 2 service calls.
 - `user_node`: an experiment-side helper that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
+- `tui_node`: a standalone node with a simple text user interface, to be used on your laptop for a quick access to nearby Bluetooth-enabled UAVs.
 
 Main capabilities:
 
@@ -19,8 +20,10 @@ Main capabilities:
 
 ```bash
 sudo apt update
-sudo apt install mrs-bluez # required due to the experimental mode
-sudo apt install ros-jazzy-mrs-uav-bluetooth mrs-uav-bluetooth-service
+sudo apt install mrs-bluez # has experimental mode enabled
+sudo apt install mrs-libsdbus-c++ # our build of the newest version
+sudo apt install ros-jazzy-mrs-uav-bluetooth # the ROS 2 package
+sudo apt install mrs-uav-bluetooth-service # for UAVs only
 ```
 
 Then verify the service status using `service mrs-uav-bluetooth status`, for a full log use `journalctl -u mrs-uav-bluetooth.service`.
