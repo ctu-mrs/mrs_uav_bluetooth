@@ -9,6 +9,7 @@ fi
 
 # load the architecture string ("amd64" or "arm64" is expected)
 ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
+DEB_HOST_MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH) ;
 
 ###################################
 ### CONFIGURATION SECTION START ###
@@ -53,7 +54,11 @@ mkdir build ;
 cd build ;
 
 # compile everything
-cmake .. -DCMAKE_BUILD_TYPE=Release ${OTHER_CONFIG_FLAGS} ;
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib/$DEB_HOST_MULTIARCH \
+    ${OTHER_CONFIG_FLAGS} ;
 cmake --build . ;
 
 # stage installation into a package root
@@ -74,6 +79,11 @@ Provides: $PACKAGE_PROVIDES
 Conflicts: $PACKAGE_CONFLICTS
 Replaces: $PACKAGE_REPLACES
 Description: Custom sdbus-cpp build for MRS UAV system
+EOT
+
+# expose shared-library dependency metadata for downstream Debian packages
+cat > "$PACKAGE_ROOT/DEBIAN/shlibs" <<EOT
+libsdbus-c++ 2 $PACKAGE_NAME (>= $SDBUS_VERSION)
 EOT
 
 # mark files under /etc as configuration so upgrades preserve local edits
