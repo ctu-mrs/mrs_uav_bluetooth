@@ -4,6 +4,8 @@ project(mrs_uav_bluetooth)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(GNUInstallDirs)
+
 # ---- ROS 2 / ament dependencies ----
 find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
@@ -20,7 +22,52 @@ find_package(rcl_interfaces REQUIRED)
 
 # ---- External dependencies ----
 find_package(yaml-cpp REQUIRED)
-find_package(sdbus-c++ REQUIRED)
+
+# Debian/Bloom package builds need the packaged sdbus-c++ from /usr. Both
+# CMake and pkg-config usually search /usr/local first, which can make the
+# binaries link against an unpackaged local copy that dh_shlibdeps rejects.
+set(_sdbus_system_cmake_paths)
+if(CMAKE_LIBRARY_ARCHITECTURE)
+  list(APPEND _sdbus_system_cmake_paths
+    "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/sdbus-c++")
+endif()
+list(APPEND _sdbus_system_cmake_paths
+  "/usr/${CMAKE_INSTALL_LIBDIR}/cmake/sdbus-c++"
+  "/usr/lib/cmake/sdbus-c++")
+
+find_package(sdbus-c++ CONFIG QUIET
+  PATHS ${_sdbus_system_cmake_paths}
+  NO_DEFAULT_PATH
+)
+
+if(NOT TARGET SDBusCpp::sdbus-c++)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    set(_sdbus_saved_pkg_config_libdir "$ENV{PKG_CONFIG_LIBDIR}")
+    set(_sdbus_system_pkgconfig_dirs "/usr/share/pkgconfig:/usr/lib/pkgconfig")
+    if(CMAKE_LIBRARY_ARCHITECTURE)
+      string(PREPEND _sdbus_system_pkgconfig_dirs
+        "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/pkgconfig:")
+    endif()
+
+    set(ENV{PKG_CONFIG_LIBDIR} "${_sdbus_system_pkgconfig_dirs}")
+    pkg_check_modules(SDBUSCPP QUIET IMPORTED_TARGET sdbus-c++)
+
+    if(DEFINED _sdbus_saved_pkg_config_libdir)
+      set(ENV{PKG_CONFIG_LIBDIR} "${_sdbus_saved_pkg_config_libdir}")
+    else()
+      unset(ENV{PKG_CONFIG_LIBDIR})
+    endif()
+
+    if(SDBUSCPP_FOUND AND NOT TARGET SDBusCpp::sdbus-c++)
+      add_library(SDBusCpp::sdbus-c++ ALIAS PkgConfig::SDBUSCPP)
+    endif()
+  endif()
+endif()
+
+if(NOT TARGET SDBusCpp::sdbus-c++)
+  find_package(sdbus-c++ REQUIRED)
+endif()
 
 # =====================================================================
 # ROS interface generation (msg / srv) – unchanged
