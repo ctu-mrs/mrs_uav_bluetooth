@@ -82,10 +82,12 @@ std::string format_remote_time(uint64_t remote_time_ns) {
         return "-";
     }
     const auto seconds = static_cast<std::time_t>(remote_time_ns / 1000000000ULL);
+    const auto milliseconds = (remote_time_ns % 1000000000ULL) / 1000000ULL;
     std::tm tm{};
     localtime_r(&seconds, &tm);
     std::ostringstream out;
-    out << std::put_time(&tm, "%F %T");
+    out << std::put_time(&tm, "%F %T")
+        << '.' << std::setw(3) << std::setfill('0') << milliseconds;
     return out.str();
 }
 
@@ -504,8 +506,8 @@ void TuiNode::collect_wifi_results() {
         }
         const auto result = entry.future.get();
         entry.ssid = std::get<0>(result);
-        entry.status = std::get<1>(result);
-        entry.password_configured = std::get<2>(result);
+        entry.password = std::get<1>(result);
+        entry.status = std::get<2>(result);
         entry.error = std::get<3>(result);
         entry.available = entry.error.empty();
         entry.config_known = entry.error.empty();
@@ -606,35 +608,39 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
 
     const auto mac = device.mac;
     entry.pending = false;
+    entry.error.clear();
     entry.future = {};
     try {
+        (void)runtime_->client().refresh_gatt_snapshot(mac);
+
         const auto paths = inspector_->resolve_builtin_paths(mac);
         if (!paths.has_wifi()) {
             entry.available = false;
-            entry.config_known = false;
+            entry.config_known = true;
             entry.error = "wifi service not found";
             return;
         }
 
-        const auto ssid_characteristic = runtime_->cache().characteristic(paths.wifi_ssid_characteristic_path);
-        const auto password_characteristic = runtime_->cache().characteristic(paths.wifi_password_characteristic_path);
-        const auto status_characteristic = runtime_->cache().characteristic(paths.wifi_status_characteristic_path);
-        if (!ssid_characteristic || !password_characteristic || !status_characteristic) {
-            entry.available = false;
-            entry.config_known = false;
-            entry.error = "awaiting remote wifi cache";
-            return;
-        }
+        const auto read_ascii = [this](const std::string& path) {
+            const auto payload = runtime_->client().read_characteristic(path);
+            if (!payload.empty()) {
+                return util::trim_ascii_copy(std::string(payload.begin(), payload.end()));
+            }
+            return cached_ascii_value(runtime_->cache().characteristic(path));
+        };
 
-        entry.ssid = cached_ascii_value(ssid_characteristic);
-        entry.status = cached_ascii_value(status_characteristic);
-        entry.password_configured = !password_characteristic->value.empty();
+        entry.ssid = read_ascii(paths.wifi_ssid_characteristic_path);
+        entry.password = read_ascii(paths.wifi_password_characteristic_path);
+        entry.status = read_ascii(paths.wifi_status_characteristic_path);
         entry.available = true;
         entry.config_known = true;
-        entry.error.clear();
+        if (entry.ssid.empty() && entry.status.empty() && entry.password.empty()) {
+            entry.available = false;
+            entry.error = "wifi ReadValue returned no data";
+        }
     } catch (const std::exception& e) {
         entry.available = false;
-        entry.config_known = false;
+        entry.config_known = true;
         entry.error = e.what();
     }
 }
@@ -704,6 +710,10 @@ void TuiNode::trigger_wifi_write(PromptMode mode, std::string value) {
     action_label_ = mode == PromptMode::WifiSsid ? "set ssid" : "set password";
     status_message_ = action_label_ + " requested for " + mac;
     wifi_state_[mac].available = false;
+    wifi_state_[mac].config_known = false;
+    wifi_state_[mac].pending = false;
+    wifi_state_[mac].future = {};
+    wifi_state_[mac].error.clear();
 
     action_future_ = std::async(std::launch::async, [this, mac, mode, value = std::move(value)]() {
         try {
@@ -1044,19 +1054,6 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
                     std::ostringstream line;
                     line << "peer:  " << format_remote_time(it->second.remote_time_ns);
                     right_lines.push_back(line.str());
-                    if (it->second.metrics_available) {
-                        line.str("");
-                        line.clear();
-                        line << std::fixed << std::setprecision(2) << "rtt:   " << it->second.rtt_ms << " ms";
-                        right_lines.push_back(line.str());
-                        line.str("");
-                        line.clear();
-                        line << std::fixed << std::setprecision(2) << "offset:" << ' ' << it->second.offset_ms << " ms";
-                        right_lines.push_back(line.str());
-                    } else {
-                        right_lines.push_back("rtt:   n/a (notify)");
-                        right_lines.push_back("offset:n/a (notify)");
-                    }
                 } else {
                     right_lines.push_back("state: press t to sample");
                 }
@@ -1076,7 +1073,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
                         ? (it->second.ssid.empty() ? std::string{"-"} : it->second.ssid)
                         : std::string{"(awaiting read)"}));
                     right_lines.push_back("pass:   " + std::string(it->second.config_known
-                        ? (it->second.password_configured ? "configured" : "empty")
+                        ? (it->second.password.empty() ? std::string{"-"} : it->second.password)
                         : "(awaiting read)"));
                     const size_t wifi_status_width = right_width > 8 ? right_width - 8 : size_t{0};
                     right_lines.push_back("status: " + shorten(

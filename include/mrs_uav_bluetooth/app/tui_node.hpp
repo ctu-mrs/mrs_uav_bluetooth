@@ -40,10 +40,10 @@ private:
         bool pending{false};
         bool config_known{false};
         std::string ssid;
+        std::string password;
         std::string status;
-        bool password_configured{false};
         std::string error;
-        std::shared_future<std::tuple<std::string, std::string, bool, std::string>> future;
+        std::shared_future<std::tuple<std::string, std::string, std::string, std::string>> future;
     };
 
     struct TopicCountCacheEntry {
