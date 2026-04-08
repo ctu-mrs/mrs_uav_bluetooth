@@ -20,6 +20,9 @@ CentralClientRuntime::CentralClientRuntime(rclcpp::Logger logger,
 
     adapter_ = std::make_unique<bluez::AdapterController>(*dbus_, adapter_path_, logger_);
     adapter_->power_on();
+    adapter_->set_connectable(true);
+    adapter_->set_pairable(false);
+    adapter_->set_pairable_timeout(0);
     if (!options_.adapter_alias.empty()) {
         adapter_->set_alias(options_.adapter_alias);
     }

@@ -2,8 +2,8 @@
 #include "mrs_uav_bluetooth/app/tui_node.hpp"
 
 #include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
-#include "mrs_uav_bluetooth/util/string_utils.hpp"
 #include "mrs_uav_bluetooth/util/device_utils.hpp"
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <thread>
 
 namespace mrs_uav_bluetooth::app {
 
@@ -49,6 +50,33 @@ std::string frame_line(std::string value, size_t width) {
     return pad_right(shorten(std::move(value), width), width) + "\n";
 }
 
+std::string pad_left(std::string value, size_t width) {
+    if (value.size() < width) {
+        value.insert(value.begin(), width - value.size(), ' ');
+    }
+    return value;
+}
+
+std::vector<std::string> window_lines(const std::vector<std::string>& lines,
+                                      size_t rows,
+                                      size_t focus_row) {
+    if (lines.size() <= rows) {
+        return lines;
+    }
+
+    size_t start = 0;
+    if (focus_row >= rows) {
+        const auto half_window = rows / 2;
+        start = focus_row > half_window ? focus_row - half_window : 0;
+    }
+    if (start + rows > lines.size()) {
+        start = lines.size() - rows;
+    }
+
+    return std::vector<std::string>(lines.begin() + static_cast<std::ptrdiff_t>(start),
+                                    lines.begin() + static_cast<std::ptrdiff_t>(start + rows));
+}
+
 std::string format_remote_time(uint64_t remote_time_ns) {
     if (remote_time_ns == 0) {
         return "-";
@@ -59,6 +87,42 @@ std::string format_remote_time(uint64_t remote_time_ns) {
     std::ostringstream out;
     out << std::put_time(&tm, "%F %T");
     return out.str();
+}
+
+std::string cached_ascii_value(const std::optional<bluez::GattCharacteristicInfo>& characteristic) {
+    if (!characteristic.has_value()) {
+        return {};
+    }
+    return util::trim_ascii_copy(std::string(characteristic->value.begin(), characteristic->value.end()));
+}
+
+bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
+                                const std::string& mac,
+                                std::chrono::milliseconds timeout) {
+    const auto has_remote_gatt = [&client, &mac]() {
+        return !client.list_services(mac).empty() || !client.list_characteristics(mac).empty();
+    };
+
+    if (has_remote_gatt()) {
+        return true;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        (void)client.refresh_gatt_snapshot(mac);
+        if (has_remote_gatt()) {
+            return true;
+        }
+
+        const auto device = client.get_device(mac);
+        if (!device || !device->connected || !device->services_resolved) {
+            return false;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    return has_remote_gatt();
 }
 
 }  // namespace
@@ -113,7 +177,7 @@ TuiNode::~TuiNode() {
 void TuiNode::configure_parameters() {
     declare_parameter<std::string>("adapter_alias", "");
     declare_parameter<std::string>("scan_mode", "le");
-    declare_parameter<std::string>("uav_name_pattern", "^uav[0-9]{2}$");
+    declare_parameter<std::string>("uav_name_pattern", "^uav[0-9]{1,2}$");
     declare_parameter<double>("refresh_period_sec", 1.0);
     declare_parameter<double>("render_period_sec", 0.1);
     declare_parameter<double>("topic_count_refresh_sec", 5.0);
@@ -294,6 +358,26 @@ void TuiNode::refresh_device_cache(bool force) {
     }
 
     current_devices_ = runtime_->client().get_devices();
+    std::vector<std::string> current_macs;
+    current_macs.reserve(current_devices_.size());
+    for (const auto& device : current_devices_) {
+        current_macs.push_back(device.mac);
+        if (!device.connected) {
+            resolved_service_latch_.erase(device.mac);
+            continue;
+        }
+        if (device.services_resolved) {
+            resolved_service_latch_[device.mac] = true;
+        }
+    }
+    for (auto it = resolved_service_latch_.begin(); it != resolved_service_latch_.end();) {
+        if (std::find(current_macs.begin(), current_macs.end(), it->first) == current_macs.end()) {
+            it = resolved_service_latch_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+
     std::sort(current_devices_.begin(), current_devices_.end(), [this](const auto& lhs, const auto& rhs) {
         const bool lhs_is_uav = !util::device_hostname_guess(lhs, uav_name_pattern_).empty();
         const bool rhs_is_uav = !util::device_hostname_guess(rhs, uav_name_pattern_).empty();
@@ -323,7 +407,7 @@ void TuiNode::refresh_device_cache(bool force) {
     });
     if (it == current_devices_.end()) {
         select_first_visible_device();
-    } else if (!it->connected || !it->services_resolved) {
+    } else if (!it->connected || !effective_services_resolved(*it)) {
         auto time_it = time_samples_.find(it->mac);
         if (time_it != time_samples_.end()) {
             time_it->second.available = false;
@@ -446,7 +530,7 @@ void TuiNode::collect_action_result() {
 
 void TuiNode::request_topic_count_refresh(const bluez::DeviceInfo& device) {
     auto& entry = topic_counts_[device.mac];
-    if (!device.connected || !device.services_resolved) {
+    if (!device.connected || !effective_services_resolved(device)) {
         entry.pending = false;
         entry.available = false;
         return;
@@ -467,7 +551,7 @@ void TuiNode::request_topic_count_refresh(const bluez::DeviceInfo& device) {
 
 void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
     auto& entry = time_samples_[device.mac];
-    if (!device.connected || !device.services_resolved) {
+    if (!device.connected || !effective_services_resolved(device)) {
         entry.available = false;
         entry.pending = false;
         entry.error = "device not connected";
@@ -508,36 +592,51 @@ void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
 
 void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) {
     auto& entry = wifi_state_[device.mac];
-    if (!device.connected || !device.services_resolved) {
+    if (!device.connected || !effective_services_resolved(device)) {
         entry.available = false;
         entry.pending = false;
+        entry.config_known = false;
+        entry.future = {};
         entry.error = "device not connected";
         return;
     }
-    if (entry.pending || (entry.available && !force)) {
+    if (entry.pending || (entry.config_known && !force)) {
         return;
     }
 
     const auto mac = device.mac;
-    entry.pending = true;
-    entry.future = std::async(std::launch::async, [this, mac]() {
-        try {
-            const auto paths = inspector_->resolve_builtin_paths(mac);
-            if (!paths.has_wifi()) {
-                return std::make_tuple(std::string{}, std::string{}, false, std::string{"wifi service not found"});
-            }
-
-            const auto to_text = [](const std::vector<uint8_t>& payload) {
-                return std::string(payload.begin(), payload.end());
-            };
-            const auto ssid = to_text(runtime_->client().read_characteristic(paths.wifi_ssid_characteristic_path));
-            const auto password = to_text(runtime_->client().read_characteristic(paths.wifi_password_characteristic_path));
-            const auto status = to_text(runtime_->client().read_characteristic(paths.wifi_status_characteristic_path));
-            return std::make_tuple(ssid, status, !password.empty(), std::string{});
-        } catch (const std::exception& e) {
-            return std::make_tuple(std::string{}, std::string{}, false, std::string{e.what()});
+    entry.pending = false;
+    entry.future = {};
+    try {
+        const auto paths = inspector_->resolve_builtin_paths(mac);
+        if (!paths.has_wifi()) {
+            entry.available = false;
+            entry.config_known = false;
+            entry.error = "wifi service not found";
+            return;
         }
-    }).share();
+
+        const auto ssid_characteristic = runtime_->cache().characteristic(paths.wifi_ssid_characteristic_path);
+        const auto password_characteristic = runtime_->cache().characteristic(paths.wifi_password_characteristic_path);
+        const auto status_characteristic = runtime_->cache().characteristic(paths.wifi_status_characteristic_path);
+        if (!ssid_characteristic || !password_characteristic || !status_characteristic) {
+            entry.available = false;
+            entry.config_known = false;
+            entry.error = "awaiting remote wifi cache";
+            return;
+        }
+
+        entry.ssid = cached_ascii_value(ssid_characteristic);
+        entry.status = cached_ascii_value(status_characteristic);
+        entry.password_configured = !password_characteristic->value.empty();
+        entry.available = true;
+        entry.config_known = true;
+        entry.error.clear();
+    } catch (const std::exception& e) {
+        entry.available = false;
+        entry.config_known = false;
+        entry.error = e.what();
+    }
 }
 
 void TuiNode::trigger_connect_toggle() {
@@ -552,24 +651,35 @@ void TuiNode::trigger_connect_toggle() {
     status_message_ = action_label_ + " requested for " + mac;
     action_future_ = std::async(std::launch::async, [this, mac, connected]() {
         try {
+            auto& client = runtime_->client();
             if (connected) {
-                const bool ok = runtime_->client().disconnect(mac, 10.0);
+                const bool ok = client.disconnect(mac, 10.0);
                 return ok ? std::string{"disconnected "} + mac
                           : std::string{"disconnect failed for "} + mac;
             }
 
-            const bool connected_ok = runtime_->client().connect(mac, 15.0);
+            const bool scan_was_active = runtime_->is_scanning();
+            if (scan_was_active) {
+                (void)client.stop_scan();
+            }
+
+            (void)client.set_preferred_bearer(mac, "le");
+            const bool connected_ok = client.connect(mac, 15.0, true);
             if (!connected_ok) {
                 return std::string{"connect failed for "} + mac;
             }
 
-            const bool services_ok = runtime_->client().wait_services_resolved(mac, 15.0);
+            const bool services_ok = client.wait_services_resolved(mac, 15.0);
             if (services_ok) {
-                return std::string{"connected "} + mac;
+                if (wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
+                    return std::string{"connected over LE "} + mac;
+                }
+
+                return std::string{"connected, remote GATT cache still populating for "} + mac;
             }
 
-            const auto device = runtime_->client().get_device(mac);
-            if (device && device->connected) {
+            const auto current = client.get_device(mac);
+            if (current && current->connected) {
                 return std::string{"connected but services unresolved for "} + mac;
             }
             return std::string{"connection dropped before services resolved for "} + mac;
@@ -660,6 +770,16 @@ std::vector<const bluez::DeviceInfo*> TuiNode::visible_other_devices() const {
     return result;
 }
 
+bool TuiNode::effective_services_resolved(const bluez::DeviceInfo& device) const {
+    if (!device.connected) {
+        return false;
+    }
+    if (device.services_resolved) {
+        return true;
+    }
+    return resolved_service_latch_.find(device.mac) != resolved_service_latch_.end();
+}
+
 void TuiNode::ensure_builtin_subscriptions() {
     std::vector<std::string> active_macs;
     active_macs.reserve(current_devices_.size());
@@ -668,7 +788,7 @@ void TuiNode::ensure_builtin_subscriptions() {
         if (util::device_hostname_guess(device, uav_name_pattern_).empty()) {
             continue;
         }
-        if (!device.connected || !device.services_resolved) {
+        if (!device.connected || !effective_services_resolved(device)) {
             continue;
         }
         active_macs.push_back(device.mac);
@@ -770,17 +890,73 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     (void)devices;
     const auto size = terminal_.size();
     const size_t frame_width = static_cast<size_t>(std::max(20, size.columns));
-    const size_t left_width = static_cast<size_t>(std::max(46, std::min(size.columns / 2, 68)));
-    const size_t right_width = static_cast<size_t>(std::max(28, size.columns - static_cast<int>(left_width) - 3));
+    constexpr size_t pane_separator_width = 3;
+    constexpr size_t min_right_width = 24;
+    constexpr size_t min_name_width = 8;
+    constexpr size_t uav_id_preferred_width = 10;
+    constexpr size_t other_id_preferred_width = 17;
+    const auto table_width = [min_name_width](size_t id_width) {
+        return size_t{3} + id_width + size_t{1} + min_name_width + size_t{1} +
+            size_t{4} + size_t{1} + size_t{4} + size_t{1} + size_t{3} + size_t{1} + size_t{4};
+    };
+    const size_t required_left_width = std::max(table_width(uav_id_preferred_width),
+                                                table_width(other_id_preferred_width));
+
+    size_t left_width = frame_width;
+    size_t right_width = 0;
+    if (frame_width > required_left_width + pane_separator_width + min_right_width) {
+        right_width = std::max(min_right_width, frame_width / 3);
+        const size_t max_right_width = frame_width - required_left_width - pane_separator_width;
+        right_width = std::min(right_width, max_right_width);
+        left_width = frame_width - pane_separator_width - right_width;
+    }
+
+    const auto format_left_header = [&](std::string id_label, size_t id_width, size_t name_width) {
+        return std::string{"sel "} + pad_right(shorten(std::move(id_label), id_width), id_width) + " " +
+            pad_right("name", name_width) + " " + pad_left("rssi", 4) + " " +
+            pad_right("conn", 4) + " " + pad_right("srv", 3) + " " + pad_left("exp", 4);
+    };
+    const auto format_left_row = [&](std::string marker,
+                                     std::string id_value,
+                                     std::string name_value,
+                                     std::string rssi_value,
+                                     std::string connected_value,
+                                     std::string services_value,
+                                     std::string exports_value,
+                                     size_t id_width,
+                                     size_t name_width) {
+        return pad_right(shorten(std::move(marker), 3), 3) +
+            pad_right(shorten(std::move(id_value), id_width), id_width) + " " +
+            pad_right(shorten(std::move(name_value), name_width), name_width) + " " +
+            pad_left(shorten(std::move(rssi_value), 4), 4) + " " +
+            pad_right(shorten(std::move(connected_value), 4), 4) + " " +
+            pad_right(shorten(std::move(services_value), 3), 3) + " " +
+            pad_left(shorten(std::move(exports_value), 4), 4);
+    };
+
+    const auto compute_name_width = [&](size_t id_width) {
+        const size_t reserved = table_width(id_width) - min_name_width;
+        if (left_width <= reserved) {
+            return size_t{0};
+        }
+        return left_width - reserved;
+    };
+
+    const size_t uav_id_width = uav_id_preferred_width;
+    const size_t other_id_width = other_id_preferred_width;
+    const size_t uav_name_width = compute_name_width(uav_id_width);
+    const size_t other_name_width = compute_name_width(other_id_width);
 
     std::vector<std::string> left_lines;
+    size_t selected_left_row = 0;
     left_lines.push_back("UAVs");
-    left_lines.push_back("sel host      name                  rssi  conn srv exp");
+    left_lines.push_back(format_left_header("host", uav_id_width, uav_name_width));
 
     for (const auto* device : visible_uav_devices()) {
         const auto guessed = util::device_hostname_guess(*device, uav_name_pattern_);
+        const bool services_resolved = effective_services_resolved(*device);
         std::string exports = "-";
-        if (device->connected && device->services_resolved) {
+        if (device->connected && services_resolved) {
             const auto it = topic_counts_.find(device->mac);
             if (it == topic_counts_.end() || it->second.pending) {
                 exports = "...";
@@ -791,15 +967,19 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
             }
         }
 
-        std::ostringstream line;
-        line << (device->mac == selected_mac_ ? ">  " : "   ")
-             << std::left << std::setw(9) << shorten(guessed.empty() ? std::string{"-"} : guessed, 9)
-             << std::setw(22) << shorten(util::device_display_name(*device), 22)
-             << std::setw(6) << device->rssi
-             << std::setw(5) << (device->connected ? "Y" : "N")
-             << std::setw(4) << (device->services_resolved ? "Y" : "N")
-             << exports;
-        left_lines.push_back(line.str());
+        if (device->mac == selected_mac_) {
+            selected_left_row = left_lines.size();
+        }
+        left_lines.push_back(format_left_row(
+            device->mac == selected_mac_ ? ">" : "",
+            guessed.empty() ? std::string{"-"} : guessed,
+            util::device_display_name(*device),
+            std::to_string(device->rssi),
+            device->connected ? "Y" : "N",
+            services_resolved ? "Y" : "N",
+            exports,
+            uav_id_width,
+            uav_name_width));
     }
     if (left_lines.size() == 2) {
         left_lines.push_back("(no matching uavs)");
@@ -807,20 +987,25 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
 
     left_lines.push_back("");
     left_lines.push_back(hide_non_uav_ ? "Other devices (hidden by filter)" : "Other devices");
-    left_lines.push_back("sel id        name                  rssi  conn srv exp");
+    left_lines.push_back(format_left_header("id", other_id_width, other_name_width));
     const auto other_section_start = left_lines.size();
 
     if (!hide_non_uav_) {
         for (const auto* device : visible_other_devices()) {
-            std::ostringstream line;
-            line << (device->mac == selected_mac_ ? ">  " : "   ")
-                 << std::left << std::setw(9) << shorten(device->mac, 9)
-                 << std::setw(22) << shorten(util::device_display_name(*device), 22)
-                 << std::setw(6) << device->rssi
-                 << std::setw(5) << (device->connected ? "Y" : "N")
-                 << std::setw(4) << (device->services_resolved ? "Y" : "N")
-                 << "-";
-            left_lines.push_back(line.str());
+            const bool services_resolved = effective_services_resolved(*device);
+            if (device->mac == selected_mac_) {
+                selected_left_row = left_lines.size();
+            }
+            left_lines.push_back(format_left_row(
+                device->mac == selected_mac_ ? ">" : "",
+                device->mac,
+                util::device_display_name(*device),
+                std::to_string(device->rssi),
+                device->connected ? "Y" : "N",
+                services_resolved ? "Y" : "N",
+                "-",
+                other_id_width,
+                other_name_width));
         }
     }
     if (left_lines.size() == other_section_start) {
@@ -828,92 +1013,98 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     }
 
     std::vector<std::string> right_lines;
-    right_lines.push_back("Selection");
-    if (const auto* device = selected_device()) {
-        const auto guessed = util::device_hostname_guess(*device, uav_name_pattern_);
-        right_lines.push_back("host:   " + (guessed.empty() ? std::string{"-"} : guessed));
-        right_lines.push_back("name:   " + util::device_display_name(*device));
-        right_lines.push_back("mac:    " + device->mac);
-        right_lines.push_back("link:   connected=" + yes_no(device->connected) +
-                              " services=" + yes_no(device->services_resolved));
-        right_lines.push_back("trust:  paired=" + yes_no(device->paired || device->bonded) +
-                              " trusted=" + yes_no(device->trusted));
+    if (right_width > 0) {
+        right_lines.push_back("Selection");
+        if (const auto* device = selected_device()) {
+            const auto guessed = util::device_hostname_guess(*device, uav_name_pattern_);
+            const bool services_resolved = effective_services_resolved(*device);
+            right_lines.push_back("host:   " + (guessed.empty() ? std::string{"-"} : guessed));
+            right_lines.push_back("name:   " + util::device_display_name(*device));
+            right_lines.push_back("mac:    " + device->mac);
+            right_lines.push_back("link:   connected=" + yes_no(device->connected) +
+                                  " services=" + yes_no(services_resolved));
+            right_lines.push_back("trust:  paired=" + yes_no(device->paired || device->bonded) +
+                                  " trusted=" + yes_no(device->trusted));
 
-        std::string export_count = "-";
-        if (const auto it = topic_counts_.find(device->mac); it != topic_counts_.end()) {
-            export_count = it->second.pending ? "refreshing" :
-                (it->second.available ? std::to_string(it->second.count) : "-");
-        }
-        right_lines.push_back("exports: " + export_count + " discovered topics");
-        right_lines.push_back("");
+            std::string export_count = "-";
+            if (const auto it = topic_counts_.find(device->mac); it != topic_counts_.end()) {
+                export_count = it->second.pending ? "refreshing" :
+                    (it->second.available ? std::to_string(it->second.count) : "-");
+            }
+            right_lines.push_back("exports: " + export_count + " discovered topics");
+            right_lines.push_back("");
 
-        right_lines.push_back("Time");
-        if (const auto it = time_samples_.find(device->mac); it != time_samples_.end()) {
-            if (it->second.pending) {
-                right_lines.push_back("state: refreshing");
-            } else if (!it->second.error.empty()) {
-                right_lines.push_back("error: " + it->second.error);
-            } else if (it->second.available) {
-                std::ostringstream line;
-                line << "peer:  " << format_remote_time(it->second.remote_time_ns);
-                right_lines.push_back(line.str());
-                if (it->second.metrics_available) {
-                    line.str("");
-                    line.clear();
-                    line << std::fixed << std::setprecision(2) << "rtt:   " << it->second.rtt_ms << " ms";
+            right_lines.push_back("Time");
+            if (const auto it = time_samples_.find(device->mac); it != time_samples_.end()) {
+                if (it->second.pending) {
+                    right_lines.push_back("state: refreshing");
+                } else if (!it->second.error.empty()) {
+                    right_lines.push_back("error: " + it->second.error);
+                } else if (it->second.available) {
+                    std::ostringstream line;
+                    line << "peer:  " << format_remote_time(it->second.remote_time_ns);
                     right_lines.push_back(line.str());
-                    line.str("");
-                    line.clear();
-                    line << std::fixed << std::setprecision(2) << "offset:" << ' ' << it->second.offset_ms << " ms";
-                    right_lines.push_back(line.str());
+                    if (it->second.metrics_available) {
+                        line.str("");
+                        line.clear();
+                        line << std::fixed << std::setprecision(2) << "rtt:   " << it->second.rtt_ms << " ms";
+                        right_lines.push_back(line.str());
+                        line.str("");
+                        line.clear();
+                        line << std::fixed << std::setprecision(2) << "offset:" << ' ' << it->second.offset_ms << " ms";
+                        right_lines.push_back(line.str());
+                    } else {
+                        right_lines.push_back("rtt:   n/a (notify)");
+                        right_lines.push_back("offset:n/a (notify)");
+                    }
                 } else {
-                    right_lines.push_back("rtt:   n/a (notify)");
-                    right_lines.push_back("offset:n/a (notify)");
+                    right_lines.push_back("state: press t to sample");
                 }
             } else {
                 right_lines.push_back("state: press t to sample");
             }
-        } else {
-            right_lines.push_back("state: press t to sample");
-        }
-        right_lines.push_back("");
+            right_lines.push_back("");
 
-        right_lines.push_back("Wi-Fi");
-        if (const auto it = wifi_state_.find(device->mac); it != wifi_state_.end()) {
-            if (it->second.pending) {
-                right_lines.push_back("state: refreshing");
-            } else if (!it->second.error.empty()) {
-                right_lines.push_back("error: " + it->second.error);
-            } else if (it->second.available) {
-                right_lines.push_back("ssid:   " + (it->second.config_known
-                    ? (it->second.ssid.empty() ? std::string{"-"} : it->second.ssid)
-                    : std::string{"(awaiting read)"}));
-                right_lines.push_back("pass:   " + std::string(it->second.config_known
-                    ? (it->second.password_configured ? "configured" : "empty")
-                    : "(awaiting read)"));
-                right_lines.push_back("status: " + shorten(it->second.status.empty() ? std::string{"-"} : it->second.status, right_width - 8));
+            right_lines.push_back("Wi-Fi");
+            if (const auto it = wifi_state_.find(device->mac); it != wifi_state_.end()) {
+                if (it->second.pending) {
+                    right_lines.push_back("state: refreshing");
+                } else if (!it->second.error.empty()) {
+                    right_lines.push_back("error: " + it->second.error);
+                } else if (it->second.available) {
+                    right_lines.push_back("ssid:   " + (it->second.config_known
+                        ? (it->second.ssid.empty() ? std::string{"-"} : it->second.ssid)
+                        : std::string{"(awaiting read)"}));
+                    right_lines.push_back("pass:   " + std::string(it->second.config_known
+                        ? (it->second.password_configured ? "configured" : "empty")
+                        : "(awaiting read)"));
+                    const size_t wifi_status_width = right_width > 8 ? right_width - 8 : size_t{0};
+                    right_lines.push_back("status: " + shorten(
+                        it->second.status.empty() ? std::string{"-"} : it->second.status,
+                        wifi_status_width));
+                } else {
+                    right_lines.push_back("state: press w to refresh");
+                }
             } else {
                 right_lines.push_back("state: press w to refresh");
             }
         } else {
-            right_lines.push_back("state: press w to refresh");
+            right_lines.push_back("no device selected");
         }
-    } else {
-        right_lines.push_back("no device selected");
-    }
 
-    right_lines.push_back("");
-    right_lines.push_back("Controls");
-    right_lines.push_back("j/k or arrows: move");
-    right_lines.push_back("c connect/disconnect");
-    right_lines.push_back("s toggle scan");
-    right_lines.push_back("t refresh time");
-    right_lines.push_back("w refresh Wi-Fi");
-    right_lines.push_back("i set SSID");
-    right_lines.push_back("p set password");
-    right_lines.push_back("f toggle UAV filter");
-    right_lines.push_back("r refresh list");
-    right_lines.push_back("q quit");
+        right_lines.push_back("");
+        right_lines.push_back("Controls");
+        right_lines.push_back("j/k or arrows: move");
+        right_lines.push_back("c connect/disconnect");
+        right_lines.push_back("s toggle scan");
+        right_lines.push_back("t refresh time");
+        right_lines.push_back("w refresh Wi-Fi");
+        right_lines.push_back("i set SSID");
+        right_lines.push_back("p set password");
+        right_lines.push_back("f toggle UAV filter");
+        right_lines.push_back("r refresh list");
+        right_lines.push_back("q quit");
+    }
 
     std::ostringstream out;
     out << "\x1b[H";
@@ -940,8 +1131,14 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     out << frame_line(std::string(frame_width, '='), frame_width);
 
     const size_t body_rows = static_cast<size_t>(std::max(10, size.rows - 4));
+    const auto left_view = window_lines(left_lines, body_rows, selected_left_row);
     for (size_t row = 0; row < body_rows; ++row) {
-        const auto left = row < left_lines.size() ? left_lines[row] : std::string{};
+        const auto left = row < left_view.size() ? left_view[row] : std::string{};
+        if (right_width == 0) {
+            out << frame_line(left, frame_width);
+            continue;
+        }
+
         const auto right = row < right_lines.size() ? right_lines[row] : std::string{};
         out << frame_line(
             pad_right(shorten(left, left_width), left_width) + " | " + shorten(right, right_width),

@@ -11,6 +11,6 @@ namespace mrs_uav_bluetooth::util {
 std::string device_display_name(const bluez::DeviceInfo& device);
 
 std::string device_hostname_guess(const bluez::DeviceInfo& device,
-                                  std::string_view pattern = "^uav[0-9]{2}$");
+                                  std::string_view pattern = "^uav[0-9]{1,2}$");
 
 }  // namespace mrs_uav_bluetooth::util
