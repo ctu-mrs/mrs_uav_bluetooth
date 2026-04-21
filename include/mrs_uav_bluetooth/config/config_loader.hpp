@@ -21,7 +21,7 @@ YAML::Node deep_merge(const YAML::Node& base, const YAML::Node& override_node);
 /// \param auto_connect_pattern  The pattern used to strip UAV hostname prefixes.
 NodeConfig parse_node_config(const YAML::Node& doc,
                              const std::string& hostname,
-                             const std::string& auto_connect_pattern = "^uav[0-9]{2}$");
+                             const std::string& auto_connect_pattern = "^uav[0-9]{1,2}$");
 
 /// Load the effective config from a default YAML file, optionally overlaid
 /// with an overlay YAML file.

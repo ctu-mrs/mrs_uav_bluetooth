@@ -20,13 +20,15 @@ Main capabilities:
 
 ```bash
 sudo apt update
-sudo apt install mrs-bluez # has experimental mode enabled
-sudo apt install mrs-libsdbus-c++ # our build of the newest version
+sudo apt install mrs-bluez # optional, the newest version
+sudo apt install mrs-libsdbus-c++ # required
 sudo apt install ros-jazzy-mrs-uav-bluetooth # the ROS 2 package
 sudo apt install mrs-uav-bluetooth-service # for UAVs only
 ```
 
 Then verify the service status using `service mrs-uav-bluetooth status`, for a full log use `journalctl -u mrs-uav-bluetooth.service`.
+
+To be able to load GATT services of nearby UAVs from the TUI on your laptop, you may need to enable `Experimental = true` in `/etc/bluetooth/main.conf` (and then run `sudo service bluetooth restart`).
 
 
 ## Configuration Files

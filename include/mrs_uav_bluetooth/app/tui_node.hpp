@@ -40,10 +40,10 @@ private:
         bool pending{false};
         bool config_known{false};
         std::string ssid;
+        std::string password;
         std::string status;
-        bool password_configured{false};
         std::string error;
-        std::shared_future<std::tuple<std::string, std::string, bool, std::string>> future;
+        std::shared_future<std::tuple<std::string, std::string, std::string, std::string>> future;
     };
 
     struct TopicCountCacheEntry {
@@ -100,6 +100,7 @@ private:
     void on_notification(const std::vector<uint8_t>& data,
                          const std::string& uuid,
                          const std::string& characteristic_path);
+    bool effective_services_resolved(const bluez::DeviceInfo& device) const;
     std::string adapter_local_mac();
     const bluez::DeviceInfo* selected_device() const;
     std::vector<const bluez::DeviceInfo*> visible_devices() const;
@@ -116,6 +117,7 @@ private:
     std::map<std::string, TimeSampleCacheEntry> time_samples_;
     std::map<std::string, WifiCacheEntry> wifi_state_;
     std::map<std::string, BuiltinSubscriptionState> builtin_subscriptions_;
+    std::map<std::string, bool> resolved_service_latch_;
     std::string adapter_alias_;
     std::string scan_mode_;
     std::string uav_name_pattern_;

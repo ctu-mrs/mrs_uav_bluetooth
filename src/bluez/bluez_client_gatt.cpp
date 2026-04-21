@@ -8,6 +8,8 @@ namespace mrs_uav_bluetooth::bluez {
 
 namespace {
 
+constexpr auto kGattReadTimeout = std::chrono::seconds(2);
+
 bool message_contains(const std::string& message,
                       std::initializer_list<const char*> needles) {
     for (const char* needle : needles) {
@@ -60,6 +62,7 @@ std::vector<uint8_t> BluezClient::read_characteristic(const std::string& chrc_pa
         std::vector<uint8_t> value;
         proxy->callMethod("ReadValue")
             .onInterface(std::string(kGattCharacteristicIface))
+            .withTimeout(kGattReadTimeout)
             .withArguments(options)
             .storeResultsTo(value);
         emit_gatt("client_read", chrc_path);
@@ -122,6 +125,7 @@ std::vector<uint8_t> BluezClient::read_descriptor(const std::string& desc_path) 
         std::vector<uint8_t> value;
         proxy->callMethod("ReadValue")
             .onInterface(std::string(kGattDescriptorIface))
+            .withTimeout(kGattReadTimeout)
             .withArguments(options)
             .storeResultsTo(value);
         emit_gatt("client_descriptor_read", desc_path);

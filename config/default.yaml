@@ -42,7 +42,7 @@ auto_connect_enable: false
 auto_connect_whitelist: []
 
 # Hostname pattern used to identify UAV peers.
-auto_connect_pattern: "^uav[0-9]{2}$"
+auto_connect_pattern: "^uav[0-9]{1,2}$"
 
 # Disconnect a peer if the time bridge stays inactive for too long.
 peer_connection_timeout: 15.0
