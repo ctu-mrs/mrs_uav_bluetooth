@@ -5,7 +5,9 @@
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -113,6 +115,190 @@ BridgeMemberSpec parse_member_spec(const YAML::Node& item) {
     return spec;
 }
 
+std::string trim_copy(const std::string& raw) {
+    const auto begin = raw.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const auto end = raw.find_last_not_of(" \t\r\n");
+    return raw.substr(begin, end - begin + 1);
+}
+
+uint64_t parse_integer_value(const YAML::Node& node,
+                             uint64_t max_value,
+                             const std::string& context) {
+    if (!node || node.IsNull()) {
+        throw std::runtime_error(context + " must not be null");
+    }
+
+    if (node.IsScalar()) {
+        try {
+            const auto numeric_value = node.as<uint64_t>();
+            if (numeric_value > max_value) {
+                throw std::runtime_error(context + " is out of range");
+            }
+            return numeric_value;
+        } catch (const YAML::BadConversion&) {
+        }
+
+        std::string token = trim_copy(node.as<std::string>(""));
+        if (token.empty()) {
+            throw std::runtime_error(context + " must not be empty");
+        }
+        int base = 10;
+        if (token.size() > 2 && token[0] == '0' &&
+            (token[1] == 'x' || token[1] == 'X')) {
+            base = 16;
+        }
+        size_t parsed = 0;
+        const auto numeric_value = std::stoull(token, &parsed, base);
+        if (parsed != token.size() || numeric_value > max_value) {
+            throw std::runtime_error(context + " is out of range");
+        }
+        return numeric_value;
+    }
+
+    throw std::runtime_error(context + " must be a scalar integer");
+}
+
+int64_t parse_signed_integer_value(const YAML::Node& node,
+                                   int64_t min_value,
+                                   int64_t max_value,
+                                   const std::string& context) {
+    if (!node || node.IsNull()) {
+        throw std::runtime_error(context + " must not be null");
+    }
+
+    if (node.IsScalar()) {
+        try {
+            const auto numeric_value = node.as<int64_t>();
+            if (numeric_value < min_value || numeric_value > max_value) {
+                throw std::runtime_error(context + " is out of range");
+            }
+            return numeric_value;
+        } catch (const YAML::BadConversion&) {
+        }
+
+        std::string token = trim_copy(node.as<std::string>(""));
+        if (token.empty()) {
+            throw std::runtime_error(context + " must not be empty");
+        }
+        int base = 10;
+        if (token.size() > 2 && token[0] == '0' &&
+            (token[1] == 'x' || token[1] == 'X')) {
+            base = 16;
+        }
+        size_t parsed = 0;
+        const auto numeric_value = std::stoll(token, &parsed, base);
+        if (parsed != token.size() || numeric_value < min_value || numeric_value > max_value) {
+            throw std::runtime_error(context + " is out of range");
+        }
+        return numeric_value;
+    }
+
+    throw std::runtime_error(context + " must be a scalar integer");
+}
+
+std::vector<std::string> split_scalar_tokens(const std::string& raw) {
+    std::string normalized = raw;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+    std::istringstream stream(normalized);
+    std::vector<std::string> tokens;
+    std::string token;
+    while (stream >> token) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+std::vector<uint8_t> parse_byte_sequence(const YAML::Node& node,
+                                         const std::string& context) {
+    std::vector<uint8_t> bytes;
+    if (!node || node.IsNull()) {
+        return bytes;
+    }
+
+    if (node.IsSequence()) {
+        bytes.reserve(node.size());
+        size_t index = 0;
+        for (const auto& item : node) {
+            bytes.push_back(static_cast<uint8_t>(parse_integer_value(
+                item, std::numeric_limits<uint8_t>::max(),
+                context + "[" + std::to_string(index) + "]")));
+            ++index;
+        }
+        return bytes;
+    }
+
+    if (node.IsScalar()) {
+        const auto scalar_value = trim_copy(node.as<std::string>(""));
+        if (scalar_value.empty()) {
+            return bytes;
+        }
+        const auto tokens = split_scalar_tokens(scalar_value);
+        bytes.reserve(tokens.size());
+        for (size_t index = 0; index < tokens.size(); ++index) {
+            bytes.push_back(static_cast<uint8_t>(parse_integer_value(
+                YAML::Node(tokens[index]), std::numeric_limits<uint8_t>::max(),
+                context + "[" + std::to_string(index) + "]")));
+        }
+        return bytes;
+    }
+
+    throw std::runtime_error(context + " must be a scalar or sequence of bytes");
+}
+
+template<typename KeyT, typename KeyParserT>
+std::map<KeyT, std::vector<uint8_t>> parse_byte_map(const YAML::Node& node,
+                                                    KeyParserT&& parse_key,
+                                                    const std::string& context) {
+    std::map<KeyT, std::vector<uint8_t>> out;
+    if (!node || node.IsNull()) {
+        return out;
+    }
+    if (!node.IsMap()) {
+        throw std::runtime_error(context + " must be a mapping");
+    }
+
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        const auto raw_key = trim_copy(it->first.as<std::string>(""));
+        if (raw_key.empty()) {
+            throw std::runtime_error(context + " contains an empty key");
+        }
+        out.emplace(parse_key(raw_key, context),
+                    parse_byte_sequence(it->second, context + "." + raw_key));
+    }
+    return out;
+}
+
+std::optional<bool> parse_optional_bool(const YAML::Node& parent, const std::string& key) {
+    if (!parent[key] || parent[key].IsNull()) {
+        return std::nullopt;
+    }
+    return parent[key].as<bool>();
+}
+
+template<typename IntegerT>
+std::optional<IntegerT> parse_optional_integer(const YAML::Node& parent,
+                                               const std::string& key,
+                                               uint64_t max_value) {
+    if (!parent[key] || parent[key].IsNull()) {
+        return std::nullopt;
+    }
+    return static_cast<IntegerT>(parse_integer_value(parent[key], max_value, key));
+}
+
+template<typename IntegerT>
+std::optional<IntegerT> parse_optional_signed_integer(const YAML::Node& parent,
+                                                      const std::string& key,
+                                                      int64_t min_value,
+                                                      int64_t max_value) {
+    if (!parent[key] || parent[key].IsNull()) {
+        return std::nullopt;
+    }
+    return static_cast<IntegerT>(parse_signed_integer_value(parent[key], min_value, max_value, key));
+}
+
 }  // namespace
 
 YAML::Node load_yaml_file(const std::string& path) {
@@ -200,6 +386,75 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.overlay_keepalive_topic_suffix = str("overlay_keepalive_topic_suffix", cfg.overlay_keepalive_topic_suffix);
     cfg.verbose_log_file = str("verbose_log_file", cfg.verbose_log_file);
     cfg.advertise_mode = str("advertise_mode", cfg.advertise_mode);
+    cfg.advertise_local_name = expand_hostname(str("advertise_local_name", cfg.advertise_local_name), hostname);
+    cfg.advertise_discoverable = parse_optional_bool(doc, "advertise_discoverable");
+    cfg.advertise_includes = str_list("advertise_includes");
+    cfg.advertise_service_uuids = str_list("advertise_service_uuids");
+    cfg.advertise_solicit_uuids = str_list("advertise_solicit_uuids");
+    cfg.advertise_manufacturer_data = parse_byte_map<uint16_t>(
+        doc["advertise_manufacturer_data"],
+        [](const std::string& raw_key, const std::string& context) {
+            return static_cast<uint16_t>(parse_integer_value(
+                YAML::Node(raw_key), std::numeric_limits<uint16_t>::max(),
+                context + ".key=" + raw_key));
+        },
+        "advertise_manufacturer_data");
+    cfg.advertise_service_data = parse_byte_map<std::string>(
+        doc["advertise_service_data"],
+        [](const std::string& raw_key, const std::string&) { return raw_key; },
+        "advertise_service_data");
+    cfg.advertise_data = parse_byte_map<uint8_t>(
+        doc["advertise_data"],
+        [](const std::string& raw_key, const std::string& context) {
+            return static_cast<uint8_t>(parse_integer_value(
+                YAML::Node(raw_key), std::numeric_limits<uint8_t>::max(),
+                context + ".key=" + raw_key));
+        },
+        "advertise_data");
+    cfg.advertise_scan_response_service_uuids = str_list("advertise_scan_response_service_uuids");
+    cfg.advertise_scan_response_manufacturer_data = parse_byte_map<uint16_t>(
+        doc["advertise_scan_response_manufacturer_data"],
+        [](const std::string& raw_key, const std::string& context) {
+            return static_cast<uint16_t>(parse_integer_value(
+                YAML::Node(raw_key), std::numeric_limits<uint16_t>::max(),
+                context + ".key=" + raw_key));
+        },
+        "advertise_scan_response_manufacturer_data");
+    cfg.advertise_scan_response_solicit_uuids = str_list("advertise_scan_response_solicit_uuids");
+    cfg.advertise_scan_response_service_data = parse_byte_map<std::string>(
+        doc["advertise_scan_response_service_data"],
+        [](const std::string& raw_key, const std::string&) { return raw_key; },
+        "advertise_scan_response_service_data");
+    cfg.advertise_scan_response_data = parse_byte_map<uint8_t>(
+        doc["advertise_scan_response_data"],
+        [](const std::string& raw_key, const std::string& context) {
+            return static_cast<uint8_t>(parse_integer_value(
+                YAML::Node(raw_key), std::numeric_limits<uint8_t>::max(),
+                context + ".key=" + raw_key));
+        },
+        "advertise_scan_response_data");
+    cfg.advertise_appearance = parse_optional_integer<uint16_t>(
+        doc, "advertise_appearance", std::numeric_limits<uint16_t>::max());
+    cfg.advertise_duration = parse_optional_integer<uint16_t>(
+        doc, "advertise_duration", std::numeric_limits<uint16_t>::max());
+    cfg.advertise_timeout = parse_optional_integer<uint16_t>(
+        doc, "advertise_timeout", std::numeric_limits<uint16_t>::max());
+    cfg.advertise_secondary_channel = str("advertise_secondary_channel", cfg.advertise_secondary_channel);
+    cfg.advertise_min_interval = parse_optional_integer<uint32_t>(
+        doc, "advertise_min_interval", std::numeric_limits<uint32_t>::max());
+    cfg.advertise_max_interval = parse_optional_integer<uint32_t>(
+        doc, "advertise_max_interval", std::numeric_limits<uint32_t>::max());
+    cfg.advertise_tx_power = parse_optional_signed_integer<int16_t>(
+        doc, "advertise_tx_power",
+        static_cast<int64_t>(std::numeric_limits<int16_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int16_t>::max()));
+    const auto advertise_extra_data_topic = str("advertise_extra_data_topic", cfg.advertise_extra_data_topic);
+    cfg.advertise_extra_data_topic = advertise_extra_data_topic.empty()
+        ? std::string{}
+        : util::normalize_ros_topic(expand_hostname(advertise_extra_data_topic, hostname));
+    cfg.advertise_extra_data_type = parse_optional_integer<uint8_t>(
+        doc, "advertise_extra_data_type", std::numeric_limits<uint8_t>::max())
+        .value_or(cfg.advertise_extra_data_type.value_or(static_cast<uint8_t>(0x26)));
     cfg.pairing_agent = str("pairing_agent", cfg.pairing_agent);
     cfg.enable_server = b("enable_server", cfg.enable_server);
     cfg.enable_scan = b("enable_scan", cfg.enable_scan);

@@ -37,6 +37,7 @@
 #include "mrs_uav_bluetooth/srv/write_gatt_value.hpp"
 
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/u_int8_multi_array.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 #include <chrono>
@@ -70,6 +71,7 @@ private:
     void apply_adapter_state(const config::NodeConfig& cfg);
     void rebuild_server_objects();
     void publish_periodic_status();
+    void publish_scan_snapshot();
     std::string build_detailed_status_report(const std::map<std::string, bluez::DeviceInfo>& devices_map) const;
     void on_cache_event(bluez::CacheEvent event, const std::string& object_path);
     void on_gatt_event(const std::string& event_type,
@@ -81,6 +83,9 @@ private:
     void handle_time_writeback(const std::vector<uint8_t>& payload,
                                const std::string& device_path,
                                uint64_t received_time_ns);
+    void refresh_advertisement_registration();
+    void refresh_advertisement_topic_subscription();
+    void handle_advertisement_payload(const std_msgs::msg::UInt8MultiArray::SharedPtr message);
     void note_local_time_notify_state(bool enabled);
     void on_pairing_event(const std::string& event_type, const std::string& device_path);
     void note_pair_attempt_result(const std::string& mac,
@@ -201,6 +206,7 @@ private:
     rclcpp::TimerBase::SharedPtr peer_timer_;
     rclcpp::TimerBase::SharedPtr time_service_timer_;
     rclcpp::TimerBase::SharedPtr wifi_service_timer_;
+    rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr advertisement_payload_sub_;
     std::chrono::steady_clock::time_point peer_reconcile_deadline_{};
     std::atomic_bool shutting_down_{false};
     mutable std::recursive_mutex state_mutex_;
@@ -211,6 +217,7 @@ private:
     mutable std::mutex log_state_mutex_;
     std::string last_status_log_summary_;
     std::chrono::steady_clock::time_point last_status_log_time_{};
+    std::optional<std::vector<uint8_t>> advertisement_extra_payload_;
     std::map<std::string, std::string> last_peer_status_log_;
     std::chrono::steady_clock::time_point last_peer_status_log_time_{};
     mutable std::mutex repeated_log_mutex_;

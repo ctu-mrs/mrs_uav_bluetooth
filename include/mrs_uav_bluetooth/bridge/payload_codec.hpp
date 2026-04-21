@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -24,9 +25,19 @@ using ScalarValue = std::variant<
 struct PathSegment {
     std::string name;
     int index{-1};  // -1 means no array index
+    bool has_slice{false};
+    std::optional<int> slice_start;
+    std::optional<int> slice_stop;
+    int slice_step{1};
 };
 
 /// Parse a dotted member path into segments.
+/// Supported array selectors:
+/// - field[3]
+/// - field[1:4]
+/// - field[:4]
+/// - field[2:]
+/// - field[:] (for fixed-size arrays, or one open-ended dynamic leaf per bridge)
 /// Throws std::invalid_argument if any segment is malformed.
 std::vector<PathSegment> parse_member_path(const std::string& path);
 

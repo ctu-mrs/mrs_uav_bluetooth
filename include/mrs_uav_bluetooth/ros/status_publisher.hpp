@@ -38,6 +38,7 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr log_pub_;
     rclcpp::Publisher<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr devices_pub_;
+    rclcpp::Publisher<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr advertisements_pub_;
     rclcpp::Publisher<mrs_uav_bluetooth::msg::BleNotification>::SharedPtr notifications_pub_;
 };
 

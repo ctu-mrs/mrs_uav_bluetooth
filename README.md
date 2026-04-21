@@ -46,6 +46,7 @@ Important configuration keys in `config/default.yaml`:
 - `node_topics_prefix`: root of all node-created topics, usually `/{hostname}/ble`.
 - `enable_scan`, `scan_mode`, `scan_publish_period`: BLE discovery behavior.
 - `enable_server`, `enable_time_service`, `enable_wifi_service`: built-in BLE server features.
+- `advertise_mode`, `advertise_extra_data_topic`: common advertisement settings kept in the base config. Additional BlueZ advertisement fields are also accepted in overlay YAMLs when needed.
 - `auto_connect_enable`, `auto_connect_whitelist`, `auto_connect_pattern`, `peer_connection_timeout`: automatic peer management.
 - `wifi_netplan_config_path`: netplan file updated by the BLE Wi-Fi service.
 - `allowed_wifi_networks`: Wi-Fi SSIDs that may be selected over BLE.
@@ -58,7 +59,7 @@ Each `shared_topics` entry may define:
 - `export_topic`: local ROS topic used as the logical identity of the bridge.
 - `message_type`: ROS message type, for example `nav_msgs/msg/Odometry`.
 - `rate_hz`: bridge publish or poll rate. `0` means unthrottled.
-- `members`: ordered fixed-width field mapping packed into the BLE payload.
+- `members`: ordered fixed-width field mapping packed into the BLE payload. Array leaves support index and slice syntax such as `data[0]`, `data[2:6]`, and `covariance[:]` for fixed-size arrays.
 - `name`, `key`, `import_topic_suffix`: optional overrides for logging and imported topic naming.
 
 ## Usage
@@ -78,12 +79,21 @@ Core published topics:
 | Topic | Type | Purpose |
 | --- | --- | --- |
 | `/{hostname}/ble/devices` | `mrs_uav_bluetooth/msg/BleDeviceArray` | Current BLE device snapshot from scanning and cached device state. |
+| `/{hostname}/ble/advertisements` | `mrs_uav_bluetooth/msg/BleDeviceArray` | Scan-side view of remote devices that currently expose advertisement user data through manufacturer data, service data, or safe raw advertising data. |
 | `/{hostname}/ble/notifications` | `mrs_uav_bluetooth/msg/BleNotification` | Raw notifications received from peer GATT characteristics. |
 | `/{hostname}/ble/status` | `std_msgs/msg/String` | Human-readable periodic status report. |
 | `/{hostname}/ble/log` | `std_msgs/msg/String` | Optional verbose log stream when `log_topic_enable` is enabled. |
+| `/{hostname}/ble/adv` | `std_msgs/msg/UInt8MultiArray` | Optional raw extra advertisement payload. The node subscribes only while publishers exist and advertises the bytes as an extra BlueZ AD block. |
 | `/{hostname}/ble/overlay_keepalive` | `std_msgs/msg/Empty` | Keep-alive heartbeat for the user node configuration overlay. |
 | `/{hostname}/ble/peers/<peer>/time_status` | `mrs_uav_bluetooth/msg/BlePeerTimeStatus` | Per-peer time sharing status including the latest peer timestamp and RTT estimate. |
 | Derived imported topics | configured ROS message type | Auto-created publishers for bridges declared in `shared_topics`. |
+
+
+
+## Known issues
+
+- When `auto_pair` is disabled, peer connections may reset after few minutes for no apparent reason. Thus, it is recommended to keep pairing enabled.
+
 
 ### UAV Wi-Fi configuration
 
@@ -115,6 +125,8 @@ Topic sharing is configured declaratively in `shared_topics`. Each bridge packs 
 - `mode: both` configures both directions for the same logical bridge.
 - Each exported bridge uses a service named `bridge:/{hostname}/...` and a single read/notify characteristic named `/{hostname}/...`.
 - Bridge payloads live directly in the characteristic value; metadata stays in a small descriptor set.
+- Compact bridge members may target array elements and slices, for example `position[0]`, `position[1:3]`, or `covariance[:]` for fixed-size arrays.
+- Open-ended dynamic-array mappings are supported for one final array member per compact bridge payload. For full dynamic ROS messages, use `payload_format: ros2`.
 
 By default, imported topics are published under the peer namespace rooted at `/{hostname}/ble/peers/<peer>/...`. The rest of the topic name remains the same as on the origin device unless `import_topic_suffix` overrides it.
 
@@ -155,7 +167,7 @@ The node exposes the following service interfaces.
 
 | Message | Fields | Meaning |
 | --- | --- | --- |
-| `mrs_uav_bluetooth/msg/BleDevice` | `mac`, `path`, `adapter`, `address_type`, `name`, `alias`, `hostname`, `icon`, `appearance`, `rssi`, `tx_power`, `pathloss`, `connected`, `paired`, `bonded`, `trusted`, `blocked`, `services_resolved`, `uuids`, `manufacturer_data_hex`, `service_data_hex`, `last_seen` | Complete snapshot of one BLE device as seen through BlueZ and the local hostname heuristics. |
+| `mrs_uav_bluetooth/msg/BleDevice` | `mac`, `path`, `adapter`, `address_type`, `name`, `alias`, `hostname`, `icon`, `appearance`, `rssi`, `tx_power`, `pathloss`, `connected`, `paired`, `bonded`, `trusted`, `blocked`, `services_resolved`, `uuids`, `manufacturer_data_hex`, `service_data_hex`, `advertising_flags`, `advertising_data_hex`, `last_seen` | Complete snapshot of one BLE device as seen through BlueZ and the local hostname heuristics, including safe remote advertisement data. |
 | `mrs_uav_bluetooth/msg/BleDeviceArray` | `header`, `devices` | Timestamped collection of discovered or connected BLE devices. |
 | `mrs_uav_bluetooth/msg/BleGattService` | `path`, `uuid`, `primary`, `device_path`, `includes` | One remote GATT service entry. |
 | `mrs_uav_bluetooth/msg/BleGattCharacteristic` | `path`, `service_path`, `uuid`, `flags`, `notifying`, `mtu` | One remote GATT characteristic entry. |

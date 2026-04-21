@@ -31,6 +31,8 @@ struct DeviceInfo {
     std::vector<std::string> uuids;
     std::map<uint16_t, std::vector<uint8_t>> manufacturer_data;
     std::map<std::string, std::vector<uint8_t>> service_data;
+    std::vector<uint8_t> advertising_flags;
+    std::map<uint8_t, std::vector<uint8_t>> advertising_data;
     std::chrono::steady_clock::time_point last_seen;
 };
 

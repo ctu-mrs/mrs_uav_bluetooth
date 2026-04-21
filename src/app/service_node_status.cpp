@@ -199,6 +199,18 @@ std::string overall_status_word(
 
 namespace mrs_uav_bluetooth::app {
 
+void ServiceNode::publish_scan_snapshot() {
+    if (!ros_ || !client_) {
+        return;
+    }
+
+    std::map<std::string, bluez::DeviceInfo> devices_map;
+    for (const auto& device : client_->get_devices()) {
+        devices_map[device.mac] = device;
+    }
+    ros_->status_publisher().publish_devices(devices_map);
+}
+
 void ServiceNode::publish_periodic_status() {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     std::map<std::string, bluez::DeviceInfo> devices_map;
@@ -684,6 +696,16 @@ mrs_uav_bluetooth::msg::BleDevice ServiceNode::to_device_msg(const bluez::Device
             hex << kHex[(byte >> 4) & 0xF] << kHex[byte & 0xF];
         }
         msg.service_data_hex.push_back(hex.str());
+    }
+    msg.advertising_flags = device.advertising_flags;
+    for (const auto& [key, value] : device.advertising_data) {
+        std::ostringstream hex;
+        hex << static_cast<int>(key) << ":";
+        for (uint8_t byte : value) {
+            constexpr char kHex[] = "0123456789abcdef";
+            hex << kHex[(byte >> 4) & 0xF] << kHex[byte & 0xF];
+        }
+        msg.advertising_data_hex.push_back(hex.str());
     }
     msg.last_seen = get_clock()->now();
     return msg;

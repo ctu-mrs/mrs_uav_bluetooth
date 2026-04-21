@@ -393,6 +393,12 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         refresh_import_bridges_for_device(*refresh_device);
     }
 
+    if (event == bluez::CacheEvent::DeviceAdded ||
+        event == bluez::CacheEvent::DeviceRemoved ||
+        event == bluez::CacheEvent::DevicePropertyChanged) {
+        publish_scan_snapshot();
+    }
+
     schedule_peer_reconcile();
 }
 

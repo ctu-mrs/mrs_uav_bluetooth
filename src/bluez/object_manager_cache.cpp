@@ -705,6 +705,22 @@ void ObjectManagerCache::update_device_props(
             }
         } catch (...) {}
     }
+    if (props.count("AdvertisingFlags")) {
+        try {
+            dev.advertising_flags = props.at("AdvertisingFlags").get<std::vector<uint8_t>>();
+        } catch (...) {}
+    }
+    if (props.count("AdvertisingData")) {
+        try {
+            auto raw = props.at("AdvertisingData").get<std::map<uint8_t, sdbus::Variant>>();
+            dev.advertising_data.clear();
+            for (const auto& [key, variant] : raw) {
+                try {
+                    dev.advertising_data[key] = variant.get<std::vector<uint8_t>>();
+                } catch (...) {}
+            }
+        } catch (...) {}
+    }
     if (props.count("Adapter")) {
         try {
             dev.adapter = static_cast<std::string>(props.at("Adapter").get<sdbus::ObjectPath>());

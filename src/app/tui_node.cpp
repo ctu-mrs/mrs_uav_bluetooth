@@ -61,6 +61,40 @@ std::string format_remote_time(uint64_t remote_time_ns) {
     return out.str();
 }
 
+std::string format_hex_bytes(const std::vector<uint8_t>& data) {
+    if (data.empty()) {
+        return "-";
+    }
+
+    std::ostringstream out;
+    for (size_t index = 0; index < data.size(); ++index) {
+        if (index != 0) {
+            out << ' ';
+        }
+        out << std::hex << std::setw(2) << std::setfill('0')
+            << static_cast<int>(data[index]);
+    }
+    return out.str();
+}
+
+void append_wrapped_block(std::vector<std::string>& lines,
+                          const std::string& label,
+                          const std::string& value,
+                          size_t width) {
+    lines.push_back(label);
+
+    const std::string prefix = "  ";
+    const size_t content_width = std::max<size_t>(1, width > prefix.size() ? width - prefix.size() : 1);
+    if (value.empty()) {
+        lines.push_back(prefix + "-");
+        return;
+    }
+
+    for (size_t offset = 0; offset < value.size(); offset += content_width) {
+        lines.push_back(prefix + value.substr(offset, content_width));
+    }
+}
+
 }  // namespace
 
 TuiNode::TuiNode()
@@ -770,7 +804,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     (void)devices;
     const auto size = terminal_.size();
     const size_t frame_width = static_cast<size_t>(std::max(20, size.columns));
-    const size_t left_width = static_cast<size_t>(std::max(46, std::min(size.columns / 2, 68)));
+    const size_t left_width = static_cast<size_t>(std::max(42, std::min(size.columns / 2, 56)));
     const size_t right_width = static_cast<size_t>(std::max(28, size.columns - static_cast<int>(left_width) - 3));
 
     std::vector<std::string> left_lines;
@@ -845,6 +879,40 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
                 (it->second.available ? std::to_string(it->second.count) : "-");
         }
         right_lines.push_back("exports: " + export_count + " discovered topics");
+
+        const bool has_advertisement_payload =
+            !device->advertising_flags.empty() ||
+            !device->manufacturer_data.empty() ||
+            !device->service_data.empty() ||
+            !device->advertising_data.empty();
+        if (has_advertisement_payload) {
+            right_lines.push_back("");
+            right_lines.push_back("Advertisement");
+            if (!device->advertising_flags.empty()) {
+                append_wrapped_block(right_lines, "flags:", format_hex_bytes(device->advertising_flags), right_width);
+            }
+            for (const auto& [key, value] : device->manufacturer_data) {
+                append_wrapped_block(
+                    right_lines,
+                    "mfg " + std::to_string(key) + ":",
+                    format_hex_bytes(value),
+                    right_width);
+            }
+            for (const auto& [key, value] : device->service_data) {
+                append_wrapped_block(
+                    right_lines,
+                    "svc " + key + ":",
+                    format_hex_bytes(value),
+                    right_width);
+            }
+            for (const auto& [key, value] : device->advertising_data) {
+                append_wrapped_block(
+                    right_lines,
+                    "ad " + std::to_string(static_cast<int>(key)) + ":",
+                    format_hex_bytes(value),
+                    right_width);
+            }
+        }
         right_lines.push_back("");
 
         right_lines.push_back("Time");

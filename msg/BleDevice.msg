@@ -19,4 +19,6 @@ bool services_resolved
 string[] uuids
 string[] manufacturer_data_hex
 string[] service_data_hex
+uint8[] advertising_flags
+string[] advertising_data_hex
 builtin_interfaces/Time last_seen

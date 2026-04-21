@@ -2,6 +2,8 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -58,6 +60,28 @@ struct NodeConfig {
 
     // Static / rarely changing.
     std::string advertise_mode = "peripheral";
+    std::string advertise_local_name;
+    std::optional<bool> advertise_discoverable;
+    std::vector<std::string> advertise_includes;
+    std::vector<std::string> advertise_service_uuids;
+    std::vector<std::string> advertise_solicit_uuids;
+    std::map<uint16_t, std::vector<uint8_t>> advertise_manufacturer_data;
+    std::map<std::string, std::vector<uint8_t>> advertise_service_data;
+    std::map<uint8_t, std::vector<uint8_t>> advertise_data;
+    std::vector<std::string> advertise_scan_response_service_uuids;
+    std::map<uint16_t, std::vector<uint8_t>> advertise_scan_response_manufacturer_data;
+    std::vector<std::string> advertise_scan_response_solicit_uuids;
+    std::map<std::string, std::vector<uint8_t>> advertise_scan_response_service_data;
+    std::map<uint8_t, std::vector<uint8_t>> advertise_scan_response_data;
+    std::optional<uint16_t> advertise_appearance;
+    std::optional<uint16_t> advertise_duration;
+    std::optional<uint16_t> advertise_timeout;
+    std::string advertise_secondary_channel;
+    std::optional<uint32_t> advertise_min_interval;
+    std::optional<uint32_t> advertise_max_interval;
+    std::optional<int16_t> advertise_tx_power;
+    std::string advertise_extra_data_topic = "/{hostname}/ble/adv";
+    std::optional<uint8_t> advertise_extra_data_type = static_cast<uint8_t>(0x26);
     std::string pairing_agent = "NoInputNoOutput";
     bool enable_server{true};
     bool enable_scan{true};

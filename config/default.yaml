@@ -85,6 +85,10 @@ verbose_log_file: ""
 
 # Static runtime settings for the system service.
 advertise_mode: peripheral
+
+# Optional subscribed ROS topic carrying an extra raw advertisement payload.
+advertise_extra_data_topic: "/{hostname}/ble/adv_local_extra"
+
 pairing_agent: NoInputNoOutput
 enable_server: true
 enable_scan: true
@@ -108,6 +112,8 @@ scan_mode: le
 # - rate_hz: Publish/poll rate. 0 means send on every received sample.
 # - members: Ordered packet layout for the compact BLE payload. Each member is
 #   packed little-endian and must use a fixed-width scalar type.
+#   Array leaves may use selectors such as data[0], data[2:6], or
+#   covariance[:] for fixed-size arrays.
 #   Keep the total payload size at most 244 bytes (BLE message limit).
 #
 # Supported member types: bool, int8, uint8, int16, uint16, int32, uint32,

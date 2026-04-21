@@ -149,6 +149,18 @@ std::vector<std::string> select_advertised_service_uuids(
     return advertised;
 }
 
+std::vector<std::string> merge_service_uuids(const std::vector<std::string>& runtime_uuids,
+                                             const std::vector<std::string>& configured_uuids) {
+    std::vector<std::string> merged = runtime_uuids;
+    merged.reserve(runtime_uuids.size() + configured_uuids.size());
+    for (const auto& uuid : configured_uuids) {
+        if (std::find(merged.begin(), merged.end(), uuid) == merged.end()) {
+            merged.push_back(uuid);
+        }
+    }
+    return merged;
+}
+
 std::string gatt_layout_signature_for_config(const mrs_uav_bluetooth::config::NodeConfig& cfg) {
     std::vector<std::string> tokens;
     tokens.reserve(cfg.shared_topics.size() + 3);
@@ -346,6 +358,7 @@ void ServiceNode::build_runtime() {
             return;
         }
         overlay_config_->check_lease();
+        refresh_advertisement_topic_subscription();
     }, timer_callback_group_);
 
     overlay_config_->load_initial();
@@ -361,7 +374,7 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
     }
 
     const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
-    const bool should_be_discoverable = cfg.enable_server;
+    const bool should_be_discoverable = cfg.advertise_discoverable.value_or(cfg.enable_server);
     const bool should_be_pairable = cfg.auto_pair;
 
     if (!adapter_info || !adapter_info->powered) {
@@ -382,6 +395,178 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
         adapter_info->discoverable != should_be_discoverable ||
         (should_be_discoverable && adapter_info->discoverable_timeout != cfg.discoverable_timeout)) {
         adapter_->set_discoverable(should_be_discoverable, cfg.discoverable_timeout);
+    }
+}
+
+void ServiceNode::refresh_advertisement_registration() {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (!advertisement_ || !gatt_app_ || adapter_path_.empty()) {
+        return;
+    }
+
+    const auto local_name = active_config_.advertise_local_name.empty()
+        ? hostname_
+        : active_config_.advertise_local_name;
+    std::vector<std::string> service_uuids;
+    service_uuids.reserve(gatt_app_->services().size());
+    for (const auto& service : gatt_app_->services()) {
+        service_uuids.push_back(service->uuid());
+    }
+    service_uuids = merge_service_uuids(service_uuids, active_config_.advertise_service_uuids);
+
+    advertisement_->set_local_name(local_name);
+    advertisement_->set_discoverable(active_config_.advertise_discoverable.value_or(active_config_.enable_server));
+    advertisement_->set_discoverable_timeout(
+        static_cast<uint16_t>(std::min<uint32_t>(active_config_.discoverable_timeout,
+                                                 std::numeric_limits<uint16_t>::max())));
+    advertisement_->set_includes(active_config_.advertise_includes);
+    advertisement_->set_solicit_uuids(active_config_.advertise_solicit_uuids);
+    advertisement_->set_manufacturer_data(active_config_.advertise_manufacturer_data);
+    advertisement_->set_service_data(active_config_.advertise_service_data);
+    auto advertise_data = active_config_.advertise_data;
+    if (advertisement_extra_payload_ && active_config_.advertise_extra_data_type) {
+        advertise_data[*active_config_.advertise_extra_data_type] = *advertisement_extra_payload_;
+    }
+    advertisement_->set_data(advertise_data);
+    advertisement_->set_scan_response_service_uuids(active_config_.advertise_scan_response_service_uuids);
+    advertisement_->set_scan_response_manufacturer_data(
+        active_config_.advertise_scan_response_manufacturer_data);
+    advertisement_->set_scan_response_solicit_uuids(
+        active_config_.advertise_scan_response_solicit_uuids);
+    advertisement_->set_scan_response_service_data(
+        active_config_.advertise_scan_response_service_data);
+    advertisement_->set_scan_response_data(active_config_.advertise_scan_response_data);
+    advertisement_->set_appearance(active_config_.advertise_appearance);
+    advertisement_->set_duration(active_config_.advertise_duration);
+    advertisement_->set_timeout(active_config_.advertise_timeout);
+    advertisement_->set_secondary_channel(active_config_.advertise_secondary_channel);
+    advertisement_->set_min_interval(active_config_.advertise_min_interval);
+    advertisement_->set_max_interval(active_config_.advertise_max_interval);
+    advertisement_->set_tx_power(active_config_.advertise_tx_power);
+
+    const auto advertised_service_uuids = select_advertised_service_uuids(service_uuids, local_name);
+    if (advertised_service_uuids.size() != service_uuids.size()) {
+        RCLCPP_INFO(get_logger(),
+                    "Prepared legacy BLE advertisement fallback trimmed from %zu to %zu service UUIDs",
+                    service_uuids.size(), advertised_service_uuids.size());
+    }
+
+    std::vector<std::vector<std::string>> attempts;
+    attempts.push_back(service_uuids);
+    if (advertised_service_uuids != service_uuids) {
+        attempts.push_back(advertised_service_uuids);
+    }
+    if (!advertised_service_uuids.empty()) {
+        attempts.push_back({});
+    }
+
+    advertisement_->unregister_advertisement(adapter_path_);
+
+    bool advertisement_registered = false;
+    std::string last_error_message;
+    for (const auto& advertised_uuids : attempts) {
+        advertisement_->set_service_uuids(advertised_uuids);
+        try {
+            RCLCPP_INFO(get_logger(),
+                        "Registering BLE advertisement (name=%s, uuids=%zu)",
+                        local_name.c_str(), advertised_uuids.size());
+            advertisement_->register_advertisement(adapter_path_);
+            advertisement_registered = true;
+            break;
+        } catch (const sdbus::Error& error) {
+            last_error_message = error.what();
+            RCLCPP_WARN(get_logger(),
+                        "BLE advertisement registration attempt failed (uuids=%zu): %s",
+                        advertised_uuids.size(), error.what());
+        }
+    }
+
+    if (!advertisement_registered) {
+        throw std::runtime_error(last_error_message.empty()
+                                     ? "Failed to register advertisement"
+                                     : last_error_message);
+    }
+}
+
+void ServiceNode::refresh_advertisement_topic_subscription() {
+    if (!can_run_callbacks()) {
+        return;
+    }
+
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    const auto topic = active_config_.advertise_extra_data_topic;
+    const bool topic_enabled = active_config_.enable_server &&
+        !topic.empty() &&
+        active_config_.advertise_extra_data_type.has_value();
+
+    if (!topic_enabled) {
+        if (advertisement_payload_sub_) {
+            RCLCPP_INFO(get_logger(), "Stopped monitoring advertisement payload topic");
+            advertisement_payload_sub_.reset();
+        }
+        if (advertisement_extra_payload_) {
+            advertisement_extra_payload_.reset();
+            if (advertisement_) {
+                refresh_advertisement_registration();
+            }
+        }
+        return;
+    }
+
+    bool has_publishers = false;
+    try {
+        has_publishers = !get_publishers_info_by_topic(topic).empty();
+    } catch (const std::exception&) {
+        has_publishers = false;
+    }
+
+    const bool matching_subscription = advertisement_payload_sub_ &&
+        util::normalize_ros_topic(advertisement_payload_sub_->get_topic_name()) == topic;
+    if (!has_publishers) {
+        if (advertisement_payload_sub_) {
+            RCLCPP_INFO(get_logger(), "Advertisement payload topic has no publishers, disabling dynamic payload");
+            advertisement_payload_sub_.reset();
+        }
+        if (advertisement_extra_payload_) {
+            advertisement_extra_payload_.reset();
+            if (advertisement_) {
+                refresh_advertisement_registration();
+            }
+        }
+        return;
+    }
+
+    if (matching_subscription) {
+        return;
+    }
+
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = service_callback_group_;
+    advertisement_payload_sub_.reset();
+    advertisement_payload_sub_ = create_subscription<std_msgs::msg::UInt8MultiArray>(
+        topic,
+        rclcpp::QoS(10),
+        [this](const std_msgs::msg::UInt8MultiArray::SharedPtr message) {
+            handle_advertisement_payload(message);
+        },
+        options);
+    RCLCPP_INFO(get_logger(), "Monitoring advertisement payload topic: %s", topic.c_str());
+}
+
+void ServiceNode::handle_advertisement_payload(const std_msgs::msg::UInt8MultiArray::SharedPtr message) {
+    if (!message) {
+        return;
+    }
+
+    std::vector<uint8_t> payload(message->data.begin(), message->data.end());
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    if (advertisement_extra_payload_ && *advertisement_extra_payload_ == payload) {
+        return;
+    }
+
+    advertisement_extra_payload_ = std::move(payload);
+    if (advertisement_) {
+        refresh_advertisement_registration();
     }
 }
 
@@ -426,6 +611,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         pairing_agent_->set_auto_trust(cfg.auto_trust);
     }
     ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
+    publish_scan_snapshot();
     apply_adapter_state(cfg);
 
     if (status_timer_) {
@@ -551,6 +737,8 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                                                        std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     local_gatt_layout_signature_ = new_gatt_layout_signature;
+
+    refresh_advertisement_topic_subscription();
 
     if (!can_run_callbacks()) {
         return;
@@ -680,58 +868,7 @@ void ServiceNode::rebuild_server_objects() {
     RCLCPP_INFO(get_logger(), "[node] GATT server registered, setting up advertisement");
     advertisement_ = std::make_unique<gatt::Advertisement>(
         *server_dbus_, "/org/bluez/advertisement0", active_config_.advertise_mode);
-    advertisement_->set_local_name(hostname_);
-    advertisement_->set_discoverable(active_config_.enable_server);
-    advertisement_->set_discoverable_timeout(
-        static_cast<uint16_t>(std::min<uint32_t>(active_config_.discoverable_timeout,
-                                                 std::numeric_limits<uint16_t>::max())));
-
-    std::vector<std::string> service_uuids;
-    service_uuids.reserve(gatt_app_->services().size());
-    for (const auto& service : gatt_app_->services()) {
-        service_uuids.push_back(service->uuid());
-    }
-
-    const auto advertised_service_uuids = select_advertised_service_uuids(service_uuids, hostname_);
-    if (advertised_service_uuids.size() != service_uuids.size()) {
-        RCLCPP_INFO(get_logger(),
-                    "Prepared legacy BLE advertisement fallback trimmed from %zu to %zu service UUIDs",
-                    service_uuids.size(), advertised_service_uuids.size());
-    }
-
-    std::vector<std::vector<std::string>> attempts;
-    attempts.push_back(service_uuids);
-    if (advertised_service_uuids != service_uuids) {
-        attempts.push_back(advertised_service_uuids);
-    }
-    if (!advertised_service_uuids.empty()) {
-        attempts.push_back({});
-    }
-
-    bool advertisement_registered = false;
-    std::string last_error_message;
-    for (const auto& advertised_uuids : attempts) {
-        advertisement_->set_service_uuids(advertised_uuids);
-        try {
-            RCLCPP_INFO(get_logger(),
-                        "Registering BLE advertisement (name=%s, uuids=%zu)",
-                        hostname_.c_str(), advertised_uuids.size());
-            advertisement_->register_advertisement(adapter_path_);
-            advertisement_registered = true;
-            break;
-        } catch (const sdbus::Error& error) {
-            last_error_message = error.what();
-            RCLCPP_WARN(get_logger(),
-                        "BLE advertisement registration attempt failed (uuids=%zu): %s",
-                        advertised_uuids.size(), error.what());
-        }
-    }
-
-    if (!advertisement_registered) {
-        throw std::runtime_error(last_error_message.empty() ?
-                                     "Failed to register advertisement" :
-                                     last_error_message);
-    }
+    refresh_advertisement_registration();
 }
 
 void ServiceNode::handle_configure_notification_bridge(const std::shared_ptr<mrs_uav_bluetooth::srv::ConfigureNotificationBridge::Request> request,

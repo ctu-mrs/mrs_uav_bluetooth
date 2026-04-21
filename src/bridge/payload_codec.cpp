@@ -2,15 +2,12 @@
 #include "mrs_uav_bluetooth/bridge/payload_codec.hpp"
 
 #include <cstring>
-#include <regex>
 #include <stdexcept>
 #include <unordered_map>
 
 namespace mrs_uav_bluetooth::bridge {
 
 namespace {
-
-const std::regex kPathSegmentRe(R"(^([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$)");
 
 struct TypeInfo {
     size_t size;
@@ -130,6 +127,28 @@ ScalarValue unpack_value(const std::vector<uint8_t>& buf, size_t off,
     throw std::runtime_error("Unhandled value type: " + value_type);
 }
 
+std::string trim_copy(const std::string& raw) {
+    const auto begin = raw.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const auto end = raw.find_last_not_of(" \t\r\n");
+    return raw.substr(begin, end - begin + 1);
+}
+
+int parse_non_negative_int(const std::string& raw, const std::string& context) {
+    const auto token = trim_copy(raw);
+    if (token.empty()) {
+        throw std::invalid_argument("Missing integer in member path segment: " + context);
+    }
+    size_t parsed = 0;
+    const auto value = std::stoi(token, &parsed, 10);
+    if (parsed != token.size() || value < 0) {
+        throw std::invalid_argument("Invalid non-negative integer in member path segment: " + context);
+    }
+    return value;
+}
+
 }  // namespace
 
 std::vector<PathSegment> parse_member_path(const std::string& path) {
@@ -145,14 +164,53 @@ std::vector<PathSegment> parse_member_path(const std::string& path) {
                               : path.substr(start, dot - start);
         start = (dot == std::string::npos) ? path.size() : dot + 1;
 
-        std::smatch m;
-        if (!std::regex_match(raw, m, kPathSegmentRe)) {
-            throw std::invalid_argument("Invalid member path segment: " + raw);
-        }
         PathSegment seg;
-        seg.name = m[1].str();
-        if (m[2].matched) {
-            seg.index = std::stoi(m[2].str());
+        const auto bracket_open = raw.find('[');
+        if (bracket_open == std::string::npos) {
+            seg.name = raw;
+        } else {
+            const auto bracket_close = raw.find(']', bracket_open);
+            if (bracket_close == std::string::npos || bracket_close + 1 != raw.size()) {
+                throw std::invalid_argument("Invalid member path segment: " + raw);
+            }
+            seg.name = raw.substr(0, bracket_open);
+            const auto selector = raw.substr(bracket_open + 1, bracket_close - bracket_open - 1);
+            if (selector.find(':') == std::string::npos) {
+                seg.index = parse_non_negative_int(selector, raw);
+            } else {
+                seg.has_slice = true;
+                std::vector<std::string> parts;
+                size_t selector_start = 0;
+                while (selector_start <= selector.size()) {
+                    const auto colon = selector.find(':', selector_start);
+                    parts.push_back(selector.substr(
+                        selector_start,
+                        colon == std::string::npos ? std::string::npos : colon - selector_start));
+                    if (colon == std::string::npos) {
+                        break;
+                    }
+                    selector_start = colon + 1;
+                }
+                if (parts.size() > 3) {
+                    throw std::invalid_argument("Invalid slice syntax in member path segment: " + raw);
+                }
+                if (!trim_copy(parts[0]).empty()) {
+                    seg.slice_start = parse_non_negative_int(parts[0], raw);
+                }
+                if (parts.size() >= 2 && !trim_copy(parts[1]).empty()) {
+                    seg.slice_stop = parse_non_negative_int(parts[1], raw);
+                }
+                if (parts.size() == 3 && !trim_copy(parts[2]).empty()) {
+                    seg.slice_step = parse_non_negative_int(parts[2], raw);
+                    if (seg.slice_step <= 0) {
+                        throw std::invalid_argument("Slice step must be positive in member path segment: " + raw);
+                    }
+                }
+            }
+        }
+
+        if (seg.name.empty()) {
+            throw std::invalid_argument("Invalid member path segment: " + raw);
         }
         segments.push_back(std::move(seg));
     }
