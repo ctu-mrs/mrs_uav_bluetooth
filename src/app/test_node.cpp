@@ -234,15 +234,18 @@ void TestNode::log_observed_advertisements() {
     std::ostringstream stream;
     stream << "Observed devices with custom advertisement data:";
     for (const auto& device : devices) {
+        const auto matching_entries = matching_custom_data_entries(device);
+        if (matching_entries.empty()) {
+            continue;
+        }
+
         stream << " [name='" << device.name << "' mac=" << device.mac;
-        if (!device.advertising_data_hex.empty()) {
-            stream << " adv=";
-            for (std::size_t index = 0; index < device.advertising_data_hex.size(); ++index) {
-                if (index != 0) {
+        stream << " adv=";
+        for (std::size_t index = 0; index < matching_entries.size(); ++index) {
+            if (index != 0) {
                     stream << ",";
-                }
-                stream << device.advertising_data_hex[index];
             }
+            stream << matching_entries[index];
         }
         stream << "]";
     }
@@ -250,9 +253,23 @@ void TestNode::log_observed_advertisements() {
 }
 
 bool TestNode::has_non_empty_custom_data(const mrs_uav_bluetooth::msg::BleDevice& device) const {
-    return !device.advertising_data_hex.empty() ||
-           !device.manufacturer_data_hex.empty() ||
-           !device.service_data_hex.empty();
+    return !matching_custom_data_entries(device).empty();
+}
+
+std::vector<std::string> TestNode::matching_custom_data_entries(
+    const mrs_uav_bluetooth::msg::BleDevice& device) const {
+    std::vector<std::string> matches;
+    matches.reserve(device.advertising_data_hex.size());
+    for (const auto& entry : device.advertising_data_hex) {
+        if (entry.rfind("38:", 0) != 0) {
+            continue;
+        }
+        if (entry.size() <= 3) {
+            continue;
+        }
+        matches.push_back(entry);
+    }
+    return matches;
 }
 
 std::string TestNode::normalize_mode(std::string value) {

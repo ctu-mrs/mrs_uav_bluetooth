@@ -34,6 +34,8 @@ private:
     void handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message);
     void log_observed_advertisements();
     bool has_non_empty_custom_data(const mrs_uav_bluetooth::msg::BleDevice& device) const;
+    std::vector<std::string> matching_custom_data_entries(
+        const mrs_uav_bluetooth::msg::BleDevice& device) const;
 
     static std::string normalize_mode(std::string value);
     static std::string expand_hostname(std::string value, const std::string& hostname);
