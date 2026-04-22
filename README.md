@@ -66,17 +66,42 @@ Each `shared_topics` entry may define:
 
 ## Usage
 
-Typical experiment workflow is putting the following line into the tmux script (with your own custom yaml config):
+The common usage expects that the service node is running, either started automatically in the systemd service or manually by the user (e.g. when built from sources in your workspace).
+
+### Advertisement-based communication
+
+The simplest use case is creating your own publisher of `std_msgs/UInt8MultiArray` at `/{hostname}/ble/adv_local_extra`. These bytes are used to update user data in the BLE advertisement of the local device. At the same time, the custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter, and data rate also depends on the scan period of the other devices. 
+
+To test this functionality, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and log custom data advertised by the other devices:
+
+```bash
+ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=advertisement rate_hz:=1.0
+```
+
+### Connection-based communication
+
+This is the fully-featured use case of the BLE package. Whitelisted devices get connected automatically, while establishing a two-way handshake and producing custom ROS 2 topics. Typical experiment workflow is putting the following line into the tmux script (with your own custom yaml config):
 
 ```bash
 ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
 ```
 
-The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing of a topic with `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members.
+The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing of a topic with `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members. You can run a test node containing a random odometry publisher like this to test the example functionality (by echoing the topic on the other side):
+
+```bash
+ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=odometry rate_hz:=10.0
+```
 
 While `user_node` is running, it keeps renewing the overlay lease and prints either the bluetooth status stream (default) or log stream from `/{hostname}/ble/status` or `/{hostname}/ble/log`.
 
-Core published topics:
+Note that when two BLE devices get connected, the advertisement-based communication stops working as the LE device discovery no longer provides the advertising information for them (data, RSSI etc.).
+
+### Known issues
+
+- When `auto_pair` is disabled, peer connections may reset after few minutes for no apparent reason. Thus, it is recommended to keep pairing enabled.
+- The devices usually don't connect successfully on the first attempt. However, after one ore more automatic retries they should end up connected and paired successfully. It can take several minutes.
+
+### Core published topics
 
 | Topic | Type | Purpose |
 | --- | --- | --- |
@@ -89,13 +114,6 @@ Core published topics:
 | `/{hostname}/ble/overlay_keepalive` | `std_msgs/msg/Empty` | Keep-alive heartbeat for the user node configuration overlay. |
 | `/{hostname}/ble/peers/<peer>/time_status` | `mrs_uav_bluetooth/msg/BlePeerTimeStatus` | Per-peer time sharing status including the latest peer timestamp and RTT estimate. |
 | Derived imported topics | configured ROS message type | Auto-created publishers for bridges declared in `shared_topics`. |
-
-
-
-## Known issues
-
-- When `auto_pair` is disabled, peer connections may reset after few minutes for no apparent reason. Thus, it is recommended to keep pairing enabled.
-
 
 ### UAV Wi-Fi configuration
 
