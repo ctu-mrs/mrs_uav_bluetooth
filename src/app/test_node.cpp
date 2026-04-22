@@ -6,9 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -132,9 +132,10 @@ void TestNode::publish_advertisement_payload() {
         return;
     }
 
-    const auto now_ns = now().nanoseconds();
     const auto timestamp_ns = static_cast<uint64_t>(
-        std::max<int64_t>(0, std::min<int64_t>(now_ns, std::numeric_limits<uint64_t>::max())));
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
 
     std_msgs::msg::UInt8MultiArray message;
     message.data.resize(sizeof(timestamp_ns));
