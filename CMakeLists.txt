@@ -402,11 +402,25 @@ ament_target_dependencies(tui_node
   rclcpp
 )
 
+add_executable(test_node
+  src/app/main_test_node.cpp
+  src/app/test_node.cpp
+)
+target_include_directories(test_node PRIVATE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_link_libraries(test_node
+  ${PROJECT_NAME}_util
+)
+ament_target_dependencies(test_node
+  rclcpp std_msgs nav_msgs
+)
+
 # =====================================================================
 # Install targets
 # =====================================================================
 
-install(TARGETS service_node user_node tui_node
+install(TARGETS service_node user_node tui_node test_node
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/
