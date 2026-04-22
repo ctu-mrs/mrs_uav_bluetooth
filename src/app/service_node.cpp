@@ -32,6 +32,10 @@ constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr size_t kLegacyAdvMaxBytes = 31;
 constexpr size_t kAdvFlagsBytes = 3;
 
+size_t advertising_structure_size(size_t payload_bytes) {
+    return payload_bytes == 0 ? 0 : 2 + payload_bytes;
+}
+
 std::string normalize_direction(const std::string& raw_direction) {
     auto direction = mrs_uav_bluetooth::util::lower_trim_copy(raw_direction);
     if (direction == "in" || direction == "import" || direction == "rx") {
@@ -124,23 +128,103 @@ size_t advertising_uuid_size(const std::string& uuid) {
     return 16;
 }
 
+size_t advertising_uuid_list_size(const std::vector<std::string>& uuids) {
+    size_t total = 0;
+    size_t short_uuid_bytes = 0;
+    size_t medium_uuid_bytes = 0;
+    size_t long_uuid_bytes = 0;
+    for (const auto& uuid : uuids) {
+        switch (advertising_uuid_size(uuid)) {
+        case 2:
+            short_uuid_bytes += 2;
+            break;
+        case 4:
+            medium_uuid_bytes += 4;
+            break;
+        default:
+            long_uuid_bytes += 16;
+            break;
+        }
+    }
+
+    total += advertising_structure_size(short_uuid_bytes);
+    total += advertising_structure_size(medium_uuid_bytes);
+    total += advertising_structure_size(long_uuid_bytes);
+    return total;
+}
+
+size_t advertising_service_data_size(const std::map<std::string, std::vector<uint8_t>>& service_data) {
+    size_t total = 0;
+    for (const auto& [uuid, payload] : service_data) {
+        total += advertising_structure_size(advertising_uuid_size(uuid) + payload.size());
+    }
+    return total;
+}
+
+size_t advertising_manufacturer_data_size(
+    const std::map<uint16_t, std::vector<uint8_t>>& manufacturer_data) {
+    size_t total = 0;
+    for (const auto& [company_id, payload] : manufacturer_data) {
+        static_cast<void>(company_id);
+        total += advertising_structure_size(sizeof(uint16_t) + payload.size());
+    }
+    return total;
+}
+
+size_t advertising_generic_data_size(const std::map<uint8_t, std::vector<uint8_t>>& advertising_data) {
+    size_t total = 0;
+    for (const auto& [type, payload] : advertising_data) {
+        static_cast<void>(type);
+        total += advertising_structure_size(payload.size());
+    }
+    return total;
+}
+
+size_t estimate_primary_advertisement_bytes(
+    const std::string& local_name,
+    const mrs_uav_bluetooth::config::NodeConfig& cfg,
+    const std::map<uint8_t, std::vector<uint8_t>>& advertising_data) {
+    size_t total = kAdvFlagsBytes;
+
+    if (!local_name.empty()) {
+        total += advertising_structure_size(local_name.size());
+    }
+    total += advertising_uuid_list_size(cfg.advertise_solicit_uuids);
+    total += advertising_manufacturer_data_size(cfg.advertise_manufacturer_data);
+    total += advertising_service_data_size(cfg.advertise_service_data);
+    total += advertising_generic_data_size(advertising_data);
+
+    const bool include_tx_power = std::find(cfg.advertise_includes.begin(),
+                                            cfg.advertise_includes.end(),
+                                            "tx-power") != cfg.advertise_includes.end();
+    if (include_tx_power) {
+        total += advertising_structure_size(1);
+    }
+
+    const bool include_appearance = cfg.advertise_appearance.has_value() ||
+        std::find(cfg.advertise_includes.begin(),
+                  cfg.advertise_includes.end(),
+                  "appearance") != cfg.advertise_includes.end();
+    if (include_appearance) {
+        total += advertising_structure_size(sizeof(uint16_t));
+    }
+
+    return total;
+}
+
 std::vector<std::string> select_advertised_service_uuids(
     const std::vector<std::string>& service_uuids,
-    const std::string& local_name) {
-    int remaining_bytes = static_cast<int>(kLegacyAdvMaxBytes - kAdvFlagsBytes);
-    if (!local_name.empty()) {
-        remaining_bytes -= static_cast<int>(2 + local_name.size());
-    }
-    if (remaining_bytes <= 2) {
+    size_t remaining_uuid_payload_bytes) {
+    if (remaining_uuid_payload_bytes == 0) {
         return {};
     }
 
     std::vector<std::string> advertised;
     advertised.reserve(service_uuids.size());
-    int used_bytes = 2;
+    size_t used_bytes = 0;
     for (const auto& uuid : service_uuids) {
-        const int uuid_size = static_cast<int>(advertising_uuid_size(uuid));
-        if (used_bytes + uuid_size > remaining_bytes) {
+        const size_t uuid_size = advertising_uuid_size(uuid);
+        if (used_bytes + uuid_size > remaining_uuid_payload_bytes) {
             break;
         }
         advertised.push_back(uuid);
@@ -444,7 +528,13 @@ void ServiceNode::refresh_advertisement_registration() {
     advertisement_->set_max_interval(active_config_.advertise_max_interval);
     advertisement_->set_tx_power(active_config_.advertise_tx_power);
 
-    const auto advertised_service_uuids = select_advertised_service_uuids(service_uuids, local_name);
+    const auto estimated_primary_bytes = estimate_primary_advertisement_bytes(
+        local_name, active_config_, advertise_data);
+    const size_t remaining_uuid_payload_bytes = estimated_primary_bytes + 2 >= kLegacyAdvMaxBytes
+        ? 0
+        : (kLegacyAdvMaxBytes - estimated_primary_bytes - 2);
+    const auto advertised_service_uuids = select_advertised_service_uuids(
+        service_uuids, remaining_uuid_payload_bytes);
     if (advertised_service_uuids.size() != service_uuids.size()) {
         RCLCPP_INFO(get_logger(),
                     "Prepared legacy BLE advertisement fallback trimmed from %zu to %zu service UUIDs",
@@ -452,13 +542,14 @@ void ServiceNode::refresh_advertisement_registration() {
     }
 
     std::vector<std::vector<std::string>> attempts;
-    attempts.push_back(service_uuids);
-    if (advertised_service_uuids != service_uuids) {
-        attempts.push_back(advertised_service_uuids);
-    }
-    if (!advertised_service_uuids.empty()) {
-        attempts.push_back({});
-    }
+    auto add_attempt = [&attempts](const std::vector<std::string>& advertised_uuids) {
+        if (std::find(attempts.begin(), attempts.end(), advertised_uuids) == attempts.end()) {
+            attempts.push_back(advertised_uuids);
+        }
+    };
+    add_attempt(advertised_service_uuids);
+    add_attempt(service_uuids);
+    add_attempt({});
 
     advertisement_->unregister_advertisement(adapter_path_);
 

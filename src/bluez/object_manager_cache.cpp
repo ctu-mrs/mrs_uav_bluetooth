@@ -364,12 +364,12 @@ void ObjectManagerCache::on_properties_changed(
     const sdbus::ObjectPath& path_obj,
     const std::string& interface,
     const std::map<std::string, sdbus::Variant>& changed,
-    const std::vector<std::string>& /*invalidated*/) {
+    const std::vector<std::string>& invalidated) {
     std::string path = std::string(path_obj);
     PendingNotifications notifications;
 
-    RCLCPP_DEBUG(logger_, "[cache] PropertiesChanged path=%s iface=%s changed_keys=%zu",
-                path.c_str(), interface.c_str(), changed.size());
+    RCLCPP_DEBUG(logger_, "[cache] PropertiesChanged path=%s iface=%s changed_keys=%zu invalidated_keys=%zu",
+                path.c_str(), interface.c_str(), changed.size(), invalidated.size());
 
     {
         std::lock_guard lock(mutex_);
@@ -377,6 +377,7 @@ void ObjectManagerCache::on_properties_changed(
         if (interface == std::string(kDeviceIface)) {
             auto it = devices_.find(path);
             if (it != devices_.end()) {
+                bool changed_metadata = !changed.empty();
                 // Log key property changes at INFO level
                 if (changed.count("Connected")) {
                     RCLCPP_INFO(logger_, "[cache] Device %s (%s) Connected=%s",
@@ -404,7 +405,26 @@ void ObjectManagerCache::on_properties_changed(
                                 get_or<int16_t>(changed, "RSSI", 0));
                 }
                 update_device_props(it->second, changed);
-                notifications.emplace_back(CacheEvent::DevicePropertyChanged, path);
+
+                for (const auto& key : invalidated) {
+                    if (key == "ManufacturerData") {
+                        it->second.manufacturer_data.clear();
+                        changed_metadata = true;
+                    } else if (key == "ServiceData") {
+                        it->second.service_data.clear();
+                        changed_metadata = true;
+                    } else if (key == "AdvertisingData") {
+                        it->second.advertising_data.clear();
+                        changed_metadata = true;
+                    } else if (key == "AdvertisingFlags") {
+                        it->second.advertising_flags.clear();
+                        changed_metadata = true;
+                    }
+                }
+
+                if (changed_metadata) {
+                    notifications.emplace_back(CacheEvent::DevicePropertyChanged, path);
+                }
             }
         } else if (interface == std::string(kAdapterIface)) {
             auto it = adapters_.find(path);
