@@ -655,8 +655,19 @@ void ServiceNode::handle_advertisement_payload(const std_msgs::msg::UInt8MultiAr
         return;
     }
 
+    const bool can_update_in_place = advertisement_ &&
+        advertisement_->is_registered() &&
+        advertisement_extra_payload_.has_value() &&
+        active_config_.advertise_extra_data_type.has_value() &&
+        advertisement_extra_payload_->size() == payload.size();
+
     advertisement_extra_payload_ = std::move(payload);
-    if (advertisement_) {
+    if (can_update_in_place) {
+        auto advertise_data = active_config_.advertise_data;
+        advertise_data[*active_config_.advertise_extra_data_type] = *advertisement_extra_payload_;
+        advertisement_->set_data(advertise_data);
+        advertisement_->emit_property_changed("Data");
+    } else if (advertisement_) {
         refresh_advertisement_registration();
     }
 }

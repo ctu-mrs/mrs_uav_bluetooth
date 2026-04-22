@@ -14,6 +14,15 @@ Advertisement::Advertisement(DbusConnection& dbus,
 
 namespace {
 
+void log_properties_changed_failure(const std::string& path,
+                                   const std::string& property,
+                                   const sdbus::Error& error) {
+    static rclcpp::Clock throttle_clock{RCL_STEADY_TIME};
+    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("mrs_uav_bluetooth"), throttle_clock, 5000,
+                         "[server] failed to emit PropertiesChanged for advertisement %s property %s: %s",
+                         path.c_str(), property.c_str(), error.what());
+}
+
 template<typename KeyT>
 std::map<KeyT, sdbus::Variant> to_variant_map(const std::map<KeyT, std::vector<uint8_t>>& data) {
     std::map<KeyT, sdbus::Variant> out;
@@ -227,6 +236,20 @@ void Advertisement::set_scan_response_service_data(
 
 void Advertisement::set_scan_response_data(const std::map<uint8_t, std::vector<uint8_t>>& data) {
     scan_response_data_ = to_variant_map(data);
+}
+
+void Advertisement::emit_property_changed(const std::string& property_name) {
+    if (!exported_) {
+        return;
+    }
+
+    try {
+        exported_->emitPropertiesChangedSignal(
+            sdbus::InterfaceName{std::string(kLeAdvertisementIface)},
+            std::vector<sdbus::PropertyName>{sdbus::PropertyName{property_name}});
+    } catch (const sdbus::Error& error) {
+        log_properties_changed_failure(path_, property_name, error);
+    }
 }
 
 void Advertisement::unregister_advertisement(const std::string& adapter_path) {

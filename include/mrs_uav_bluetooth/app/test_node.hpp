@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 
+#include "mrs_uav_bluetooth/msg/ble_device_array.hpp"
+
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/u_int8_multi_array.hpp>
 
+#include <chrono>
+#include <mutex>
 #include <random>
 #include <string>
+#include <vector>
 
 namespace mrs_uav_bluetooth::app {
 
@@ -22,9 +27,13 @@ private:
 
     void configure_parameters();
     void configure_publishers();
+    void configure_advertisement_watchers();
     void publish_once();
     void publish_odometry();
     void publish_advertisement_payload();
+    void handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message);
+    void log_observed_advertisements();
+    bool has_non_empty_custom_data(const mrs_uav_bluetooth::msg::BleDevice& device) const;
 
     static std::string normalize_mode(std::string value);
     static std::string expand_hostname(std::string value, const std::string& hostname);
@@ -35,14 +44,22 @@ private:
     std::string hostname_;
     std::string odometry_topic_;
     std::string advertisement_topic_;
+    std::string advertisement_observe_topic_;
+    std::string advertisement_observe_topic_compat_;
     std::string frame_id_{"map"};
     std::string child_frame_id_{"base_link"};
     double rate_hz_{10.0};
+    double advertisement_log_period_sec_{2.0};
 
     std::mt19937 random_engine_;
+    std::mutex observed_devices_mutex_;
+    std::vector<mrs_uav_bluetooth::msg::BleDevice> observed_devices_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
     rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr advertisement_pub_;
+    rclcpp::Subscription<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr advertisement_scan_sub_;
+    rclcpp::Subscription<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr advertisement_scan_sub_compat_;
     rclcpp::TimerBase::SharedPtr publish_timer_;
+    rclcpp::TimerBase::SharedPtr advertisement_log_timer_;
 };
 
 }  // namespace mrs_uav_bluetooth::app

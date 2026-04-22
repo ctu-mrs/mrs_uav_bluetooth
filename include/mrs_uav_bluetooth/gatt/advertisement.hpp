@@ -63,6 +63,9 @@ public:
     /// Unregister from BlueZ.
     void unregister_advertisement(const std::string& adapter_path);
 
+    bool is_registered() const { return registered_; }
+    void emit_property_changed(const std::string& property_name);
+
 private:
     bluez::DbusConnection& dbus_;
     std::string path_;
