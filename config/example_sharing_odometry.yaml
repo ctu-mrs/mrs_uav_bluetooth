@@ -30,7 +30,7 @@ auto_connect_whitelist:
 #   float32 angular.y
 #   float32 angular.z
 shared_topics:
-  - export_topic: /{hostname}/mavros/global_position/local
+  - export_topic: /{hostname}/mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
     rate_hz: 10.0
     members:
