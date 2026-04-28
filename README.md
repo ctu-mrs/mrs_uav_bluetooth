@@ -6,7 +6,7 @@ The package providese these standalone nodes:
 
 - `service_node`: a long-running background node that owns the BLE adapter, permorms periodic scans, hosts built-in GATT services, and exposes ROS 2 services and topics.
 - `user_node`: a node for experiment TMUX sessions that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
-- `tui_node`: a node with a keyboard-controllable text user interface, you can use it on your laptop for a quick access to nearby BLE-enabled UAVs and their Wi-Fi network settings.
+- `tui_node`: a node with a keyboard-controllable text user interface, which you can use on your laptop for a quick access to nearby BLE-enabled UAVs and their Wi-Fi network settings.
 - `test_node`: a testing node for advertisement-based and connection-based communication modes.
 
 Main capabilities:
@@ -29,16 +29,17 @@ sudo apt install mrs-uav-bluetooth-service # for UAVs only
 
 Then verify the service status using `service mrs-uav-bluetooth status`, for a full log use `journalctl -u mrs-uav-bluetooth.service`.
 
-The `mrs-bluez` package is pre-configured for running in an experimental mode which is required for proper functionality. This enables advanced BLE control needed to connect to nearby UAVs, which is required for both the TUI on your laptop and when using distro's bluez on the UAVs. This can be solved by enabling `Experimental = true` in `/etc/bluetooth/main.conf` (and then `sudo service bluetooth restart`).
+The `mrs-bluez` package is pre-configured for running in an experimental mode which is required for proper functionality. This enables advanced BLE control needed to connect using LE to nearby UAVs, which is required for the TUI on your laptop or when using distro's bluez on the UAVs. This can be solved by enabling `Experimental = true` in `/etc/bluetooth/main.conf` (and then running `sudo service bluetooth restart`).
 
 ## Usage
 
-The usage of the `tui_node` is straightforward:
+The `tui_node` can be started simply using its launch script:
 ```bash
 ros2 launch mrs_uav_bluetooth tui_node.launch.py
 ```
+and 
 
-The `user_node` additionally expects that the service node is running. The `service_node` might be launched either automatically in the systemd service, or manually by the user (e.g. when built from sources in your workspace). A ROS Middleware (RMW) must be also running (Zenoh connection configured by default).
+ROS-related usage documented below additionally expects that the service node is running and ROS Middleware (RMW) as well. The `service_node` might be launched either automatically in the systemd service, or manually by the user (e.g. when built from sources in your workspace).
 
 ### Advertisement-based communication
 
@@ -58,7 +59,7 @@ This is the fully-featured use case of the BLE package. Whitelisted devices get 
 ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
 ```
 
-The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing of a topic with `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members. You can run a test node containing a random odometry publisher like this to test the example functionality (by echoing the topic on the other side):
+The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing a topic with a message type `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members. You can run a test node containing a random odometry publisher like this to test the example functionality (by echoing the topic on the other side):
 
 ```bash
 ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=odometry rate_hz:=10.0
@@ -91,7 +92,7 @@ When `enable_time_service` is enabled, the service publishes the local system ti
 - Inactive peer time bridges are cleaned up after `peer_connection_timeout`.
 - The provided `tui_node` shows the decoded time of the connected UAV.
 
-### ROS 2 topic sharing
+### Declarative topic sharing
 
 Topic sharing is configured declaratively in `shared_topics`. Each bridge packs selected scalar members from a ROS message into a compact BLE payload and recreates a ROS message on the receiving side.
 
