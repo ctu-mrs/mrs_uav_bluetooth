@@ -19,7 +19,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "odometry_topic",
             default_value="",
-            description="Override for the odometry topic. Empty uses /{hostname}/mavros/global_position/local.",
+            description="Override for the odometry topic. Empty uses /{hostname}/mavros/local_position/odom.",
         ),
         DeclareLaunchArgument(
             "advertisement_topic",

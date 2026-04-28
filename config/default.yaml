@@ -106,8 +106,8 @@ scan_mode: le
 # - name: Optional human-readable label for logging only.
 # - key: Optional override for the derived logical key.
 # - import_topic_suffix: Optional override for the derived imported suffix.
-#   By default, a topic like /uavXX/mavros/odometry/local appears on a peer as
-#   /uavYY/ble/peers/uavXX/mavros/odometry/local.
+#   By default, a topic like /uavXX/mavros/local_position/odom appears on a peer as
+#   /uavYY/ble/peers/uavXX/mavros/local_position/odom.
 # - message_type: ROS interface type, for example nav_msgs/msg/Odometry.
 # - rate_hz: Publish/poll rate. 0 means send on every received sample.
 # - members: Ordered packet layout for the compact BLE payload. Each member is

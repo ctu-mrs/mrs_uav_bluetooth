@@ -13,7 +13,7 @@
 
 namespace {
 
-constexpr const char* kDefaultOdometryTopic = "/{hostname}/mavros/global_position/local";
+constexpr const char* kDefaultOdometryTopic = "/{hostname}/mavros/local_position/odom";
 constexpr const char* kDefaultAdvertisementTopic = "/{hostname}/ble/adv_local_extra";
 constexpr const char* kDefaultAdvertisementObserveTopic = "/{hostname}/ble/advertisement";
 constexpr const char* kDefaultAdvertisementObserveTopicCompat = "/{hostname}/ble/advertisements";

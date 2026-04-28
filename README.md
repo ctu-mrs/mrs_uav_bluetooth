@@ -6,7 +6,8 @@ The package has these entrypoints:
 
 - `service_node`: the long-running system-side node that owns the BLE adapter, publishes status, hosts built-in BLE services, and exposes ROS 2 service calls.
 - `user_node`: an experiment-side helper that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
-- `tui_node`: a standalone node with a simple text user interface, to be used on your laptop for a quick access to nearby Bluetooth-enabled UAVs.
+- `tui_node`: a standalone node with a simple text user interface, you can use it on your laptop for a quick access to nearby BLE-enabled UAVs.
+- `test_node`: a standalone testing node for advertisement-based and connection-based use cases.
 
 Main capabilities:
 
@@ -28,7 +29,7 @@ sudo apt install mrs-uav-bluetooth-service # for UAVs only
 
 Then verify the service status using `service mrs-uav-bluetooth status`, for a full log use `journalctl -u mrs-uav-bluetooth.service`.
 
-To be able to load GATT services of nearby UAVs from the TUI on your laptop, you may need to enable `Experimental = true` in `/etc/bluetooth/main.conf` (and then run `sudo service bluetooth restart`).
+The `mrs-bluez` package is pre-configured for running in an experimental mode which is required for proper functionality. This enables advanced BLE control needed to connect to nearby UAVs, which is required for both the TUI on your laptop and when using distro's bluez on the UAVs. This can be solved by enabling `Experimental = true` in `/etc/bluetooth/main.conf` (and then `sudo service bluetooth restart`).
 
 
 ## Configuration Files
@@ -66,7 +67,12 @@ Each `shared_topics` entry may define:
 
 ## Usage
 
-The common usage expects that the service node is running, either started automatically in the systemd service or manually by the user (e.g. when built from sources in your workspace).
+The usage of the `tui_node` is straightforward and requires you only to run:
+```bash
+ros2 launch mrs_uav_bluetooth tui_node.launch.py
+```
+
+The `user_node` also expects that the service node is running, either started automatically in the systemd service or manually by the user (e.g. when built from sources in your workspace). A RMW must be also running, which is fully configurable in the service startup config.
 
 ### Advertisement-based communication
 
