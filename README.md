@@ -1,13 +1,13 @@
 # MRS UAV Bluetooth
 
-This repository contains the MRS UAV Bluetooth tool. It is a ROS 2 system service that manages Bluetooth Low Energy (BLE) server and client behavior for automatic discovery and connection management among peer UAVs in a swarm.
+This repository contains the MRS UAV Bluetooth package. It contains custom implementations of Bluetooth Low Energy (BLE) server and client behavior, and provides ROS 2 compability interfaces for a simple use onboard UAVs.
 
-The package has these entrypoints:
+The package providese these standalone nodes:
 
-- `service_node`: the long-running system-side node that owns the BLE adapter, publishes status, hosts built-in BLE services, and exposes ROS 2 service calls.
-- `user_node`: an experiment-side helper that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
-- `tui_node`: a standalone node with a simple text user interface, you can use it on your laptop for a quick access to nearby BLE-enabled UAVs.
-- `test_node`: a standalone testing node for advertisement-based and connection-based use cases.
+- `service_node`: a long-running background node that owns the BLE adapter, permorms periodic scans, hosts built-in GATT services, and exposes ROS 2 services and topics.
+- `user_node`: a node for experiment TMUX sessions that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
+- `tui_node`: a node with a keyboard-controllable text user interface, you can use it on your laptop for a quick access to nearby BLE-enabled UAVs and their Wi-Fi network settings.
+- `test_node`: a testing node for advertisement-based and connection-based communication modes.
 
 Main capabilities:
 
@@ -21,8 +21,8 @@ Main capabilities:
 
 ```bash
 sudo apt update
-sudo apt install mrs-bluez # optional, the newest version
-sudo apt install mrs-libsdbus-c++ # required
+sudo apt install mrs-bluez # recommended for UAVs, optional
+sudo apt install mrs-libsdbus-c++ # v2 version, required
 sudo apt install ros-jazzy-mrs-uav-bluetooth # the ROS 2 package
 sudo apt install mrs-uav-bluetooth-service # for UAVs only
 ```
@@ -30,6 +30,93 @@ sudo apt install mrs-uav-bluetooth-service # for UAVs only
 Then verify the service status using `service mrs-uav-bluetooth status`, for a full log use `journalctl -u mrs-uav-bluetooth.service`.
 
 The `mrs-bluez` package is pre-configured for running in an experimental mode which is required for proper functionality. This enables advanced BLE control needed to connect to nearby UAVs, which is required for both the TUI on your laptop and when using distro's bluez on the UAVs. This can be solved by enabling `Experimental = true` in `/etc/bluetooth/main.conf` (and then `sudo service bluetooth restart`).
+
+## Usage
+
+The usage of the `tui_node` is straightforward:
+```bash
+ros2 launch mrs_uav_bluetooth tui_node.launch.py
+```
+
+The `user_node` additionally expects that the service node is running. The `service_node` might be launched either automatically in the systemd service, or manually by the user (e.g. when built from sources in your workspace). A ROS Middleware (RMW) must be also running (Zenoh connection configured by default).
+
+### Advertisement-based communication
+
+The simplest use case is creating your own publisher of `std_msgs/UInt8MultiArray` at `/{hostname}/ble/adv_local_extra`. These bytes are used to update user data in the BLE advertisement of the local device. At the same time, the custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter, and data rate also depends on the scan period of the other devices. 
+
+To test this functionality, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and log custom data advertised by the other devices:
+
+```bash
+ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=advertisement rate_hz:=1.0
+```
+
+### Connection-based communication
+
+This is the fully-featured use case of the BLE package. Whitelisted devices get connected automatically, while establishing a two-way handshake and producing custom ROS 2 topics. Typical experiment workflow is putting the following line into the tmux script (with your own custom yaml config):
+
+```bash
+ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
+```
+
+The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing of a topic with `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members. You can run a test node containing a random odometry publisher like this to test the example functionality (by echoing the topic on the other side):
+
+```bash
+ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=odometry rate_hz:=10.0
+```
+
+While `user_node` is running, it keeps renewing the overlay lease and prints either the bluetooth status stream (default) or log stream from `/{hostname}/ble/status` or `/{hostname}/ble/log`.
+
+Note that when two BLE devices get connected, the advertisement-based communication stops working as the LE device discovery no longer provides the advertising information for them (data, RSSI etc.).
+
+### UAV Wi-Fi configuration
+
+When `enable_wifi_service` is enabled, the service node exposes three BLE characteristics: readable/writable SSID and password characteristics plus a readable/notifiable status text characteristic. The node applies changes through the configured netplan backend.
+
+- The provided `tui_node` can be used for a simple Wi-Fi configuration of connected UAVs from your laptop.
+- Only SSIDs listed in `allowed_wifi_networks` are accepted.
+- The service writes `wifi_netplan_config_path` and then runs `netplan apply`.
+- Writing a non-empty password updates the stored password for the selected access point.
+- If writing the file or `netplan apply` fails, the previous netplan file is restored and re-applied.
+- The status characteristic reports the latest Wi-Fi provisioning success or error text.
+- The Wi-Fi service value is refreshed periodically according to `wifi_refresh_period`.
+- This feature is intended for BLE-side provisioning; there is no separate ROS topic API for Wi-Fi credentials.
+
+### System time sharing
+
+When `enable_time_service` is enabled, the service publishes the local system time through a BLE characteristic. When auto-connect is enabled and a peer matches `auto_connect_pattern`, the node attempts to connect, pair, trust, and subscribe to the peer time characteristic automatically.
+
+- Per-peer status is published on `/{hostname}/ble/peers/<peer>/time_status`.
+- `BlePeerTimeStatus.peer_stamp` carries the most recently observed peer timestamp.
+- `BlePeerTimeStatus.last_rtt_s` carries the round-trip estimate derived from the time writeback descriptor.
+- Inactive peer time bridges are cleaned up after `peer_connection_timeout`.
+- The provided `tui_node` shows the decoded time of the connected UAV.
+
+### ROS 2 topic sharing
+
+Topic sharing is configured declaratively in `shared_topics`. Each bridge packs selected scalar members from a ROS message into a compact BLE payload and recreates a ROS message on the receiving side.
+
+- `mode: export` subscribes to a local ROS topic and writes BLE payloads to a peer characteristic.
+- `mode: import` reads a peer BLE characteristic and republishes decoded ROS messages locally.
+- `mode: both` configures both directions for the same logical bridge.
+- Each exported bridge uses a service named `bridge:/{hostname}/...` and a single read/notify characteristic named `/{hostname}/...`.
+- Bridge payloads live directly in the characteristic value; metadata stays in a small descriptor set.
+- Compact bridge members may target array elements and slices, for example `position[0]`, `position[1:3]`, or `covariance[:]` for fixed-size arrays.
+- Open-ended dynamic-array mappings are supported for one final array member per compact bridge payload. For full dynamic ROS messages, use `payload_format: ros2`.
+
+By default, imported topics are published under the peer namespace rooted at `/{hostname}/ble/peers/<peer>/...`. The rest of the topic name remains the same as on the origin device unless `import_topic_suffix` overrides it.
+
+Useful service calls while testing topic bridges:
+
+```bash
+ros2 service call /uavXX/ble/set_scan_enabled mrs_uav_bluetooth/srv/SetScanEnabled "{enabled: true, transport: le}"
+ros2 service call /uavXX/ble/list_devices mrs_uav_bluetooth/srv/ListDevices "{connected_only: false}"
+ros2 service call /uavXX/ble/set_active_config mrs_uav_bluetooth/srv/SetActiveConfig "{config_path: '/path/to/overlay.yaml', hold_seconds: 3.0}"
+```
+
+### Known issues
+
+- When `auto_pair` is disabled, peer connections may reset after few minutes for no apparent reason. Thus, it is recommended to keep pairing enabled.
+- The devices usually don't connect successfully on the first attempt. However, after one ore more automatic retries they should end up connected and paired successfully. It can take several minutes.
 
 
 ## Configuration Files
@@ -65,49 +152,10 @@ Each `shared_topics` entry may define:
 - `members`: ordered fixed-width field mapping packed into the BLE payload. Array leaves support index and slice syntax such as `data[0]`, `data[2:6]`, and `covariance[:]` for fixed-size arrays.
 - `name`, `key`, `import_topic_suffix`: optional overrides for logging and imported topic naming.
 
-## Usage
 
-The usage of the `tui_node` is straightforward and requires you only to run:
-```bash
-ros2 launch mrs_uav_bluetooth tui_node.launch.py
-```
+## ROS 2
 
-The `user_node` also expects that the service node is running, either started automatically in the systemd service or manually by the user (e.g. when built from sources in your workspace). A RMW must be also running, which is fully configurable in the service startup config.
-
-### Advertisement-based communication
-
-The simplest use case is creating your own publisher of `std_msgs/UInt8MultiArray` at `/{hostname}/ble/adv_local_extra`. These bytes are used to update user data in the BLE advertisement of the local device. At the same time, the custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter, and data rate also depends on the scan period of the other devices. 
-
-To test this functionality, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and log custom data advertised by the other devices:
-
-```bash
-ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=advertisement rate_hz:=1.0
-```
-
-### Connection-based communication
-
-This is the fully-featured use case of the BLE package. Whitelisted devices get connected automatically, while establishing a two-way handshake and producing custom ROS 2 topics. Typical experiment workflow is putting the following line into the tmux script (with your own custom yaml config):
-
-```bash
-ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
-```
-
-The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing of a topic with `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members. You can run a test node containing a random odometry publisher like this to test the example functionality (by echoing the topic on the other side):
-
-```bash
-ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=odometry rate_hz:=10.0
-```
-
-While `user_node` is running, it keeps renewing the overlay lease and prints either the bluetooth status stream (default) or log stream from `/{hostname}/ble/status` or `/{hostname}/ble/log`.
-
-Note that when two BLE devices get connected, the advertisement-based communication stops working as the LE device discovery no longer provides the advertising information for them (data, RSSI etc.).
-
-### Known issues
-
-- When `auto_pair` is disabled, peer connections may reset after few minutes for no apparent reason. Thus, it is recommended to keep pairing enabled.
-- The devices usually don't connect successfully on the first attempt. However, after one ore more automatic retries they should end up connected and paired successfully. It can take several minutes.
-
-### Core published topics
+### Published topics
 
 | Topic | Type | Purpose |
 | --- | --- | --- |
@@ -121,50 +169,7 @@ Note that when two BLE devices get connected, the advertisement-based communicat
 | `/{hostname}/ble/peers/<peer>/time_status` | `mrs_uav_bluetooth/msg/BlePeerTimeStatus` | Per-peer time sharing status including the latest peer timestamp and RTT estimate. |
 | Derived imported topics | configured ROS message type | Auto-created publishers for bridges declared in `shared_topics`. |
 
-### UAV Wi-Fi configuration
-
-When `enable_wifi_service` is enabled, the service node exposes three BLE characteristics: readable/writable SSID and password characteristics plus a readable/notifiable status text characteristic. The node applies changes through the configured netplan backend.
-
-- Only SSIDs listed in `allowed_wifi_networks` are accepted.
-- The service writes `wifi_netplan_config_path` and then runs `netplan apply`.
-- Writing a non-empty password updates the stored password for the selected access point.
-- If writing the file or `netplan apply` fails, the previous netplan file is restored and re-applied.
-- The status characteristic reports the latest Wi-Fi provisioning success or error text.
-- The Wi-Fi service value is refreshed periodically according to `wifi_refresh_period`.
-- This feature is intended for BLE-side provisioning; there is no separate ROS topic API for Wi-Fi credentials.
-
-### System time sharing
-
-When `enable_time_service` is enabled, the service publishes the local system time through a BLE characteristic. When auto-connect is enabled and a peer matches `auto_connect_pattern`, the node attempts to connect, pair, trust, and subscribe to the peer time characteristic automatically.
-
-- Per-peer status is published on `/{hostname}/ble/peers/<peer>/time_status`.
-- `BlePeerTimeStatus.peer_stamp` carries the most recently observed peer timestamp.
-- `BlePeerTimeStatus.last_rtt_s` carries the round-trip estimate derived from the time writeback descriptor.
-- Inactive peer time bridges are cleaned up after `peer_connection_timeout`.
-
-### ROS 2 topic sharing
-
-Topic sharing is configured declaratively in `shared_topics`. Each bridge packs selected scalar members from a ROS message into a compact BLE payload and recreates a ROS message on the receiving side.
-
-- `mode: export` subscribes to a local ROS topic and writes BLE payloads to a peer characteristic.
-- `mode: import` reads a peer BLE characteristic and republishes decoded ROS messages locally.
-- `mode: both` configures both directions for the same logical bridge.
-- Each exported bridge uses a service named `bridge:/{hostname}/...` and a single read/notify characteristic named `/{hostname}/...`.
-- Bridge payloads live directly in the characteristic value; metadata stays in a small descriptor set.
-- Compact bridge members may target array elements and slices, for example `position[0]`, `position[1:3]`, or `covariance[:]` for fixed-size arrays.
-- Open-ended dynamic-array mappings are supported for one final array member per compact bridge payload. For full dynamic ROS messages, use `payload_format: ros2`.
-
-By default, imported topics are published under the peer namespace rooted at `/{hostname}/ble/peers/<peer>/...`. The rest of the topic name remains the same as on the origin device unless `import_topic_suffix` overrides it.
-
-Useful service calls while testing topic bridges:
-
-```bash
-ros2 service call /ble/set_scan_enabled mrs_uav_bluetooth/srv/SetScanEnabled "{enabled: true, transport: le}"
-ros2 service call /ble/list_devices mrs_uav_bluetooth/srv/ListDevices "{connected_only: false}"
-ros2 service call /ble/set_active_config mrs_uav_bluetooth/srv/SetActiveConfig "{config_path: '/path/to/overlay.yaml', hold_seconds: 3.0}"
-```
-
-## ROS 2 service calls
+### Service calls
 
 The node exposes the following service interfaces.
 
@@ -189,7 +194,7 @@ The node exposes the following service interfaces.
 | `/ble/reload_config` | `std_srvs/srv/Trigger` | none | `success: bool`, `message: string` | Reload the currently active configuration source. |
 | `/ble/set_active_config` | `mrs_uav_bluetooth/srv/SetActiveConfig` | `config_path: string`, `hold_seconds: float32` | `success: bool`, `message: string`, `active_config_path: string`, `overlay_active: bool` | Activate or clear an overlay config lease. |
 
-## ROS 2 message types
+### Message types
 
 | Message | Fields | Meaning |
 | --- | --- | --- |
