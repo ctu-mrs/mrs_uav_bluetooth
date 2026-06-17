@@ -8,8 +8,10 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 
+#include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace mrs_uav_bluetooth::ros {
 
@@ -18,6 +20,7 @@ public:
     explicit StatusPublisher(rclcpp::Node& node);
 
     void configure_topics(const std::string& node_topics_prefix);
+    void set_advertisement_user_data_type(uint8_t data_type);
 
     void publish_report(const std::string& report);
     void publish_log(const std::string& report);
@@ -35,6 +38,7 @@ public:
 private:
     rclcpp::Node& node_;
     std::string node_topics_prefix_;
+    uint8_t advertisement_user_data_type_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr log_pub_;
     rclcpp::Publisher<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr devices_pub_;

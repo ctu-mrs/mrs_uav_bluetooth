@@ -81,7 +81,6 @@ struct NodeConfig {
     std::optional<uint32_t> advertise_max_interval;
     std::optional<int16_t> advertise_tx_power;
     std::string advertise_extra_data_topic = "/{hostname}/ble/adv";
-    std::optional<uint8_t> advertise_extra_data_type = static_cast<uint8_t>(0x26);
     std::string pairing_agent = "NoInputNoOutput";
     bool enable_server{true};
     bool enable_scan{true};

@@ -39,7 +39,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "advertisement_log_period_sec",
             default_value="2.0",
-            description="Period for logging observed advertisement user data devices in advertisement mode.",
+            description="Compatibility parameter; advertisement updates are logged immediately when observed.",
         ),
         DeclareLaunchArgument(
             "frame_id",

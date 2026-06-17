@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
+#include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
 #include "mrs_uav_bluetooth/config/shared_topic_config.hpp"
 
 #include "mrs_uav_bluetooth/gatt/bridge_naming.hpp"
@@ -508,8 +509,8 @@ void ServiceNode::refresh_advertisement_registration() {
     advertisement_->set_manufacturer_data(active_config_.advertise_manufacturer_data);
     advertisement_->set_service_data(active_config_.advertise_service_data);
     auto advertise_data = active_config_.advertise_data;
-    if (advertisement_extra_payload_ && active_config_.advertise_extra_data_type) {
-        advertise_data[*active_config_.advertise_extra_data_type] = *advertisement_extra_payload_;
+    if (advertisement_extra_payload_) {
+        advertise_data[bluez::kDefaultAdvertisementExtraDataType] = *advertisement_extra_payload_;
     }
     advertisement_->set_data(advertise_data);
     advertisement_->set_scan_response_service_uuids(active_config_.advertise_scan_response_service_uuids);
@@ -587,8 +588,7 @@ void ServiceNode::refresh_advertisement_topic_subscription() {
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     const auto topic = active_config_.advertise_extra_data_topic;
     const bool topic_enabled = active_config_.enable_server &&
-        !topic.empty() &&
-        active_config_.advertise_extra_data_type.has_value();
+        !topic.empty();
 
     if (!topic_enabled) {
         if (advertisement_payload_sub_) {
@@ -658,13 +658,12 @@ void ServiceNode::handle_advertisement_payload(const std_msgs::msg::UInt8MultiAr
     const bool can_update_in_place = advertisement_ &&
         advertisement_->is_registered() &&
         advertisement_extra_payload_.has_value() &&
-        active_config_.advertise_extra_data_type.has_value() &&
         advertisement_extra_payload_->size() == payload.size();
 
     advertisement_extra_payload_ = std::move(payload);
     if (can_update_in_place) {
         auto advertise_data = active_config_.advertise_data;
-        advertise_data[*active_config_.advertise_extra_data_type] = *advertisement_extra_payload_;
+        advertise_data[bluez::kDefaultAdvertisementExtraDataType] = *advertisement_extra_payload_;
         advertisement_->set_data(advertise_data);
         advertisement_->emit_property_changed("Data");
     } else if (advertisement_) {
@@ -713,6 +712,8 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         pairing_agent_->set_auto_trust(cfg.auto_trust);
     }
     ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
+    ros_->status_publisher().set_advertisement_user_data_type(
+        bluez::kDefaultAdvertisementExtraDataType);
     publish_scan_snapshot();
     apply_adapter_state(cfg);
 

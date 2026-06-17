@@ -17,8 +17,8 @@ bool trusted
 bool blocked
 bool services_resolved
 string[] uuids
-string[] manufacturer_data_hex
-string[] service_data_hex
+uint8[] manufacturer_data
+uint8[] service_data
 uint8[] advertising_flags
-string[] advertising_data_hex
+uint8[] advertising_data
 builtin_interfaces/Time last_seen

@@ -1,29 +1,37 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/ros/status_publisher.hpp"
 
+#include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
 #include "mrs_uav_bluetooth/msg/ble_device.hpp"
 #include "mrs_uav_bluetooth/util/device_utils.hpp"
 #include "mrs_uav_bluetooth/util/topic_utils.hpp"
-
-#include <sstream>
 
 namespace mrs_uav_bluetooth::ros {
 
 namespace {
 
-template<typename KeyT>
-std::string to_hex_entry(const KeyT& key, const std::vector<uint8_t>& value) {
-    std::ostringstream hex;
-    hex << key << ":";
-    for (const uint8_t byte : value) {
-        constexpr char kHex[] = "0123456789abcdef";
-        hex << kHex[(byte >> 4) & 0xF] << kHex[byte & 0xF];
+template<typename MapT>
+std::vector<uint8_t> concatenate_byte_values(const MapT& values) {
+    std::vector<uint8_t> bytes;
+    for (const auto& [key, value] : values) {
+        (void)key;
+        bytes.insert(bytes.end(), value.begin(), value.end());
     }
-    return hex.str();
+    return bytes;
+}
+
+std::vector<uint8_t> advertisement_user_payload(const bluez::DeviceInfo& device,
+                                                uint8_t data_type) {
+    const auto it = device.advertising_data.find(data_type);
+    if (it == device.advertising_data.end()) {
+        return {};
+    }
+    return it->second;
 }
 
 mrs_uav_bluetooth::msg::BleDevice to_device_msg(rclcpp::Node& node,
-                                                const bluez::DeviceInfo& device) {
+                                                const bluez::DeviceInfo& device,
+                                                uint8_t advertisement_user_data_type) {
     mrs_uav_bluetooth::msg::BleDevice item;
     item.mac = device.mac;
     item.path = device.object_path;
@@ -44,31 +52,29 @@ mrs_uav_bluetooth::msg::BleDevice to_device_msg(rclcpp::Node& node,
     item.blocked = device.blocked;
     item.services_resolved = device.services_resolved;
     item.uuids = device.uuids;
-    for (const auto& [key, value] : device.manufacturer_data) {
-        item.manufacturer_data_hex.push_back(to_hex_entry(key, value));
-    }
-    for (const auto& [key, value] : device.service_data) {
-        item.service_data_hex.push_back(to_hex_entry(key, value));
-    }
+    item.manufacturer_data = concatenate_byte_values(device.manufacturer_data);
+    item.service_data = concatenate_byte_values(device.service_data);
     item.advertising_flags = device.advertising_flags;
-    for (const auto& [key, value] : device.advertising_data) {
-        item.advertising_data_hex.push_back(to_hex_entry(static_cast<int>(key), value));
-    }
+    item.advertising_data = advertisement_user_payload(device, advertisement_user_data_type);
     item.last_seen = node.get_clock()->now();
     return item;
 }
 
-bool has_advertisement_user_data(const bluez::DeviceInfo& device) {
-    return !device.manufacturer_data.empty() ||
-           !device.service_data.empty() ||
-           !device.advertising_data.empty();
+bool has_advertisement_user_data(const bluez::DeviceInfo& device,
+                                 uint8_t advertisement_user_data_type) {
+    return !advertisement_user_payload(device, advertisement_user_data_type).empty();
 }
 
 }  // namespace
 
 StatusPublisher::StatusPublisher(rclcpp::Node& node)
-    : node_(node) {
+    : node_(node),
+      advertisement_user_data_type_(bluez::kDefaultAdvertisementExtraDataType) {
     configure_topics("/ble");
+}
+
+void StatusPublisher::set_advertisement_user_data_type(uint8_t data_type) {
+    advertisement_user_data_type_ = data_type;
 }
 
 void StatusPublisher::configure_topics(const std::string& node_topics_prefix) {
@@ -104,9 +110,9 @@ void StatusPublisher::publish_devices(const std::map<std::string, bluez::DeviceI
     advertisement_msg.header = msg.header;
     for (const auto& [mac, device] : devices) {
         (void)mac;
-        auto item = to_device_msg(node_, device);
+        auto item = to_device_msg(node_, device, advertisement_user_data_type_);
         msg.devices.push_back(item);
-        if (has_advertisement_user_data(device)) {
+        if (has_advertisement_user_data(device, advertisement_user_data_type_)) {
             advertisement_msg.devices.push_back(std::move(item));
         }
     }

@@ -146,6 +146,39 @@ bool wait_for_connected_ssid(const std::string& expected_ssid) {
     }
 }
 
+void emit_yaml_node(YAML::Emitter& out,
+                    const YAML::Node& node,
+                    bool double_quote_map_keys = false) {
+    if (node.IsMap()) {
+        out << YAML::BeginMap;
+        for (auto item = node.begin(); item != node.end(); ++item) {
+            const auto key = item->first.as<std::string>("");
+            out << YAML::Key;
+            if (double_quote_map_keys) {
+                out << YAML::DoubleQuoted << key;
+            } else {
+                emit_yaml_node(out, item->first);
+            }
+
+            out << YAML::Value;
+            emit_yaml_node(out, item->second, key == "access-points");
+        }
+        out << YAML::EndMap;
+        return;
+    }
+
+    if (node.IsSequence()) {
+        out << YAML::BeginSeq;
+        for (const auto& item : node) {
+            emit_yaml_node(out, item);
+        }
+        out << YAML::EndSeq;
+        return;
+    }
+
+    out << node;
+}
+
 std::pair<bool, std::string> rollback_netplan_change(const std::string& path,
                                                      const FileSnapshot& snapshot,
                                                      std::string message) {
@@ -306,8 +339,14 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
     wifis["wlan0"] = iface_cfg;
 
     try {
+        YAML::Emitter emitter;
+        emit_yaml_node(emitter, config);
+        if (!emitter.good()) {
+            throw std::runtime_error(emitter.GetLastError());
+        }
+
         std::ofstream out(netplan_config_file_, std::ios::binary | std::ios::trunc);
-        out << config;
+        out << emitter.c_str();
         if (!out.good()) {
             throw std::runtime_error("failed to flush updated config to disk");
         }

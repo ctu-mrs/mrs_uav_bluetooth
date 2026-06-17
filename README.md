@@ -29,7 +29,7 @@ sudo apt install mrs-uav-bluetooth-service # for UAVs only
 
 Then verify the service status using `service mrs-uav-bluetooth status`, for a full log use `journalctl -u mrs-uav-bluetooth.service`.
 
-The `mrs-bluez` package is pre-configured for running in an experimental mode which is required for proper functionality. This enables advanced BLE control needed to connect using LE to nearby UAVs, which is required for the TUI on your laptop or when using distro's bluez on the UAVs. This can be solved by enabling `Experimental = true` in `/etc/bluetooth/main.conf` (and then running `sudo service bluetooth restart`).
+The `mrs-bluez` package has experimental mode enabled by default. It provides advanced Bluez control, which required for proper functionality of the connection-based communication between UAVs and of the TUI node on user laptops. If the official bluez package is used with this ROS package, the experimental mode must be enabled, usually by setting `Experimental = true` in `/etc/bluetooth/main.conf` and applying changes using `sudo service bluetooth restart`.
 
 ## Usage
 
@@ -37,15 +37,15 @@ The `tui_node` can be started simply using its launch script:
 ```bash
 ros2 launch mrs_uav_bluetooth tui_node.launch.py
 ```
-and 
+and does not require ROS Middleware (RMW) or Bluetooth service node running.
 
-ROS-related usage documented below additionally expects that the service node is running and ROS Middleware (RMW) as well. The `service_node` might be launched either automatically in the systemd service, or manually by the user (e.g. when built from sources in your workspace).
+All other uses of this package depend on both RMW and running service node. The `service_node` is launched automatically in the systemd service when `mrs-uav-bluetooth-service` package is installed (on UAVs), otherwise it can be launched manually by user.
 
 ### Advertisement-based communication
 
-The simplest use case is creating your own publisher of `std_msgs/UInt8MultiArray` at `/{hostname}/ble/adv_local_extra`. These bytes are used to update user data in the BLE advertisement of the local device. At the same time, the custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter, and data rate also depends on the scan period of the other devices. 
+The simplest use case is creating your own publisher of `std_msgs/UInt8MultiArray` at `/{hostname}/ble/adv_local_extra`. These bytes are used to update user data in the BLE advertisement of the local device. At the same time, the custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter, and data rate of this communication channel also depends on scan period of nearby devices discovery. 
 
-To test this functionality, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and log custom data advertised by the other devices:
+To test this functionality, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and immediately log decoded timestamps advertised by the other devices.
 
 ```bash
 ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=advertisement rate_hz:=1.0
@@ -199,7 +199,7 @@ The node exposes the following service interfaces.
 
 | Message | Fields | Meaning |
 | --- | --- | --- |
-| `mrs_uav_bluetooth/msg/BleDevice` | `mac`, `path`, `adapter`, `address_type`, `name`, `alias`, `hostname`, `icon`, `appearance`, `rssi`, `tx_power`, `pathloss`, `connected`, `paired`, `bonded`, `trusted`, `blocked`, `services_resolved`, `uuids`, `manufacturer_data_hex`, `service_data_hex`, `advertising_flags`, `advertising_data_hex`, `last_seen` | Complete snapshot of one BLE device as seen through BlueZ and the local hostname heuristics, including safe remote advertisement data. |
+| `mrs_uav_bluetooth/msg/BleDevice` | `mac`, `path`, `adapter`, `address_type`, `name`, `alias`, `hostname`, `icon`, `appearance`, `rssi`, `tx_power`, `pathloss`, `connected`, `paired`, `bonded`, `trusted`, `blocked`, `services_resolved`, `uuids`, `manufacturer_data`, `service_data`, `advertising_flags`, `advertising_data`, `last_seen` | Complete snapshot of one BLE device as seen through BlueZ and the local hostname heuristics, including advertisement bytes selected by the service node. |
 | `mrs_uav_bluetooth/msg/BleDeviceArray` | `header`, `devices` | Timestamped collection of discovered or connected BLE devices. |
 | `mrs_uav_bluetooth/msg/BleGattService` | `path`, `uuid`, `primary`, `device_path`, `includes` | One remote GATT service entry. |
 | `mrs_uav_bluetooth/msg/BleGattCharacteristic` | `path`, `service_path`, `uuid`, `flags`, `notifying`, `mtu` | One remote GATT characteristic entry. |

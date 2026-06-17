@@ -452,9 +452,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.advertise_extra_data_topic = advertise_extra_data_topic.empty()
         ? std::string{}
         : util::normalize_ros_topic(expand_hostname(advertise_extra_data_topic, hostname));
-    cfg.advertise_extra_data_type = parse_optional_integer<uint8_t>(
-        doc, "advertise_extra_data_type", std::numeric_limits<uint8_t>::max())
-        .value_or(cfg.advertise_extra_data_type.value_or(static_cast<uint8_t>(0x26)));
     cfg.pairing_agent = str("pairing_agent", cfg.pairing_agent);
     cfg.enable_server = b("enable_server", cfg.enable_server);
     cfg.enable_scan = b("enable_scan", cfg.enable_scan);

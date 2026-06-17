@@ -8,6 +8,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 
@@ -33,12 +35,6 @@ TestNode::TestNode()
     publish_timer_ = create_wall_timer(
         std::chrono::duration<double>(1.0 / rate_hz_),
         [this]() { publish_once(); });
-
-    if (mode_ == Mode::kAdvertisement) {
-        advertisement_log_timer_ = create_wall_timer(
-            std::chrono::duration<double>(advertisement_log_period_sec_),
-            [this]() { log_observed_advertisements(); });
-    }
 }
 
 void TestNode::configure_parameters() {
@@ -204,72 +200,88 @@ void TestNode::handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDevice
         return;
     }
 
-    std::vector<mrs_uav_bluetooth::msg::BleDevice> filtered_devices;
-    filtered_devices.reserve(message->devices.size());
-    for (const auto& device : message->devices) {
-        if (has_non_empty_custom_data(device)) {
-            filtered_devices.push_back(device);
-        }
-    }
+    const auto local_time_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
 
+    bool saw_matching_data = false;
     std::lock_guard<std::mutex> lock(observed_devices_mutex_);
-    observed_devices_ = std::move(filtered_devices);
-}
+    for (const auto& device : message->devices) {
+        if (device.advertising_data.empty()) {
+            continue;
+        }
 
-void TestNode::log_observed_advertisements() {
-    std::vector<mrs_uav_bluetooth::msg::BleDevice> devices;
-    {
-        std::lock_guard<std::mutex> lock(observed_devices_mutex_);
-        devices = observed_devices_;
+        saw_matching_data = true;
+        const auto key = device.mac;
+        auto last_it = last_logged_advertisements_.find(key);
+        if (last_it != last_logged_advertisements_.end() &&
+            last_it->second == device.advertising_data) {
+            continue;
+        }
+        last_logged_advertisements_[key] = device.advertising_data;
+        log_decoded_advertisement(device, device.advertising_data, local_time_ns);
     }
 
-    if (devices.empty()) {
+    if (!saw_matching_data) {
         RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 5000,
-                             "No devices with non-empty custom advertisement data observed on %s or %s",
+                             "No devices with user advertisement payload observed on %s or %s",
                              advertisement_observe_topic_.c_str(),
                              advertisement_observe_topic_compat_.c_str());
+    }
+}
+
+void TestNode::log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice& device,
+                                         const std::vector<uint8_t>& data,
+                                         uint64_t local_time_ns) const {
+    const auto decoded = decode_little_endian_uint64(data);
+    std::ostringstream stream;
+    stream << "Advertisement data"
+           << " name='" << device.name << "'"
+           << " mac=" << device.mac
+           << " bytes=" << data.size();
+
+    if (!decoded.has_value()) {
+        stream << " uint64=-";
+        RCLCPP_INFO(get_logger(), "%s", stream.str().c_str());
         return;
     }
 
-    std::ostringstream stream;
-    stream << "Observed devices with custom advertisement data:";
-    for (const auto& device : devices) {
-        const auto matching_entries = matching_custom_data_entries(device);
-        if (matching_entries.empty()) {
-            continue;
-        }
-
-        stream << " [name='" << device.name << "' mac=" << device.mac;
-        stream << " adv=";
-        for (std::size_t index = 0; index < matching_entries.size(); ++index) {
-            if (index != 0) {
-                    stream << ",";
-            }
-            stream << matching_entries[index];
-        }
-        stream << "]";
-    }
+    const long double remote_minus_local_ms =
+        (static_cast<long double>(*decoded) - static_cast<long double>(local_time_ns)) / 1000000.0L;
+    stream << " uint64=" << *decoded
+           << " time=" << format_system_time(*decoded)
+           << " remote-local-ms=" << std::fixed << std::setprecision(3)
+           << static_cast<double>(remote_minus_local_ms);
     RCLCPP_INFO(get_logger(), "%s", stream.str().c_str());
 }
 
-bool TestNode::has_non_empty_custom_data(const mrs_uav_bluetooth::msg::BleDevice& device) const {
-    return !matching_custom_data_entries(device).empty();
+std::optional<uint64_t> TestNode::decode_little_endian_uint64(const std::vector<uint8_t>& data) {
+    if (data.size() < sizeof(uint64_t)) {
+        return std::nullopt;
+    }
+
+    uint64_t value = 0;
+    const auto bytes_to_decode = std::min<std::size_t>(sizeof(value), data.size());
+    for (std::size_t index = 0; index < bytes_to_decode; ++index) {
+        value |= static_cast<uint64_t>(data[index]) << (8 * index);
+    }
+    return value;
 }
 
-std::vector<std::string> TestNode::matching_custom_data_entries(
-    const mrs_uav_bluetooth::msg::BleDevice& device) const {
-    std::vector<std::string> matches;
-    matches.reserve(device.advertising_data_hex.size());
-    for (const auto& entry : device.advertising_data_hex) {
-        if (entry.rfind("38:", 0) != 0) {
-            continue;
-        }
-        if (entry.size() <= 3) {
-            continue;
-        }
-        matches.push_back(entry);
+std::string TestNode::format_system_time(uint64_t timestamp_ns) {
+    if (timestamp_ns == 0) {
+        return "-";
     }
-    return matches;
+
+    const auto seconds = static_cast<std::time_t>(timestamp_ns / 1000000000ULL);
+    const auto milliseconds = (timestamp_ns % 1000000000ULL) / 1000000ULL;
+    std::tm tm{};
+    localtime_r(&seconds, &tm);
+    std::ostringstream out;
+    out << std::put_time(&tm, "%F %T")
+        << '.' << std::setw(3) << std::setfill('0') << milliseconds;
+    return out.str();
 }
 
 std::string TestNode::normalize_mode(std::string value) {

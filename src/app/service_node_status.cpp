@@ -44,6 +44,26 @@ bool is_interesting_peer_status(const mrs_uav_bluetooth::peer::PeerConnectionSes
            !phase_matches(session.phase, {"idle"});
 }
 
+template<typename MapT>
+std::vector<uint8_t> concatenate_byte_values(const MapT& values) {
+    std::vector<uint8_t> bytes;
+    for (const auto& [key, value] : values) {
+        (void)key;
+        bytes.insert(bytes.end(), value.begin(), value.end());
+    }
+    return bytes;
+}
+
+std::vector<uint8_t> advertisement_user_payload(
+    const mrs_uav_bluetooth::bluez::DeviceInfo& device,
+    uint8_t data_type) {
+    const auto it = device.advertising_data.find(data_type);
+    if (it == device.advertising_data.end()) {
+        return {};
+    }
+    return it->second;
+}
+
 std::string security_mode_summary(const mrs_uav_bluetooth::config::NodeConfig& config) {
     if (config.auto_pair) {
         return config.auto_trust ? "pair=auto trust=auto" : "pair=auto trust=manual";
@@ -679,34 +699,12 @@ mrs_uav_bluetooth::msg::BleDevice ServiceNode::to_device_msg(const bluez::Device
     msg.blocked = device.blocked;
     msg.services_resolved = device.services_resolved;
     msg.uuids = device.uuids;
-    for (const auto& [key, value] : device.manufacturer_data) {
-        std::ostringstream hex;
-        hex << key << ":";
-        for (uint8_t byte : value) {
-            constexpr char kHex[] = "0123456789abcdef";
-            hex << kHex[(byte >> 4) & 0xF] << kHex[byte & 0xF];
-        }
-        msg.manufacturer_data_hex.push_back(hex.str());
-    }
-    for (const auto& [key, value] : device.service_data) {
-        std::ostringstream hex;
-        hex << key << ":";
-        for (uint8_t byte : value) {
-            constexpr char kHex[] = "0123456789abcdef";
-            hex << kHex[(byte >> 4) & 0xF] << kHex[byte & 0xF];
-        }
-        msg.service_data_hex.push_back(hex.str());
-    }
+    msg.manufacturer_data = concatenate_byte_values(device.manufacturer_data);
+    msg.service_data = concatenate_byte_values(device.service_data);
     msg.advertising_flags = device.advertising_flags;
-    for (const auto& [key, value] : device.advertising_data) {
-        std::ostringstream hex;
-        hex << static_cast<int>(key) << ":";
-        for (uint8_t byte : value) {
-            constexpr char kHex[] = "0123456789abcdef";
-            hex << kHex[(byte >> 4) & 0xF] << kHex[byte & 0xF];
-        }
-        msg.advertising_data_hex.push_back(hex.str());
-    }
+    msg.advertising_data = advertisement_user_payload(
+        device,
+        bluez::kDefaultAdvertisementExtraDataType);
     msg.last_seen = get_clock()->now();
     return msg;
 }

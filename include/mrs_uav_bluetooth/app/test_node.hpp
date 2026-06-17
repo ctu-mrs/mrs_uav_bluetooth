@@ -8,7 +8,10 @@
 #include <std_msgs/msg/u_int8_multi_array.hpp>
 
 #include <chrono>
+#include <cstdint>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -32,13 +35,14 @@ private:
     void publish_odometry();
     void publish_advertisement_payload();
     void handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message);
-    void log_observed_advertisements();
-    bool has_non_empty_custom_data(const mrs_uav_bluetooth::msg::BleDevice& device) const;
-    std::vector<std::string> matching_custom_data_entries(
-        const mrs_uav_bluetooth::msg::BleDevice& device) const;
+    void log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice& device,
+                                   const std::vector<uint8_t>& data,
+                                   uint64_t local_time_ns) const;
 
     static std::string normalize_mode(std::string value);
     static std::string expand_hostname(std::string value, const std::string& hostname);
+    static std::optional<uint64_t> decode_little_endian_uint64(const std::vector<uint8_t>& data);
+    static std::string format_system_time(uint64_t timestamp_ns);
 
     double sample_uniform(double min, double max);
 
@@ -55,13 +59,12 @@ private:
 
     std::mt19937 random_engine_;
     std::mutex observed_devices_mutex_;
-    std::vector<mrs_uav_bluetooth::msg::BleDevice> observed_devices_;
+    std::map<std::string, std::vector<uint8_t>> last_logged_advertisements_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
     rclcpp::Publisher<std_msgs::msg::UInt8MultiArray>::SharedPtr advertisement_pub_;
     rclcpp::Subscription<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr advertisement_scan_sub_;
     rclcpp::Subscription<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr advertisement_scan_sub_compat_;
     rclcpp::TimerBase::SharedPtr publish_timer_;
-    rclcpp::TimerBase::SharedPtr advertisement_log_timer_;
 };
 
 }  // namespace mrs_uav_bluetooth::app
