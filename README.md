@@ -4,7 +4,7 @@ This repository contains the MRS UAV Bluetooth package. It contains custom imple
 
 The package providese these standalone nodes:
 
-- `service_node`: a node running at background that owns the BLE adapter, permorms periodic scans, hosts built-in GATT services, exposes ROS 2 services and topics, etc.
+- `service_node`: a node running at background that owns the BLE adapter, performs periodic scans, hosts built-in GATT services, exposes ROS 2 services and topics, etc.
 - `user_node`: a helper node for user TMUX sessions that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
 - `tui_node`: a node with a keyboard-controllable text user interface, which you can use on your laptop for a quick access to nearby BLE-enabled UAVs and their Wi-Fi network settings.
 - `test_node`: a testing node for advertisement-based and connection-based communication modes.
@@ -43,7 +43,7 @@ All other uses of this package depend on both RMW and running service node. The 
 
 ### Advertisement-based communication
 
-The simplest use case requires you to create your own publisher of `std_msgs/UInt8MultiArray` data (at `/{hostname}/ble/adv_local_extra`). These bytes are used to update user data in the BLE advertisement of the local device. Custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter (31 B in BLE 4.0, 254 B in BLE 5.0+), and data rate of this communication channel also depends on device scan availability. 
+The simplest use case requires you to create your own publisher of `std_msgs/UInt8MultiArray` data (at `/{hostname}/ble/adv_local_extra`). These bytes are used to update user data in the BLE advertisement of the local device. Custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter (31 B on Raspberry Pi 5, 251 B on NUCs), and data rate of this communication channel also depends on device scan availability.
 
 To test this mode, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and immediately log decoded timestamps advertised by the other devices.
 

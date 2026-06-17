@@ -46,6 +46,11 @@ def generate_launch_description():
             default_value="base_link",
             description="Odometry child_frame_id.",
         ),
+        DeclareLaunchArgument(
+            "odometry_timeout_sec",
+            default_value="2.5",
+            description="Seconds without local odometry before advertisement mode returns to timestamp keepalive.",
+        ),
         Node(
             package="mrs_uav_bluetooth",
             executable="test_node",
@@ -61,6 +66,7 @@ def generate_launch_description():
                     "peer_topic_prefix": LaunchConfiguration("peer_topic_prefix"),
                     "frame_id": LaunchConfiguration("frame_id"),
                     "child_frame_id": LaunchConfiguration("child_frame_id"),
+                    "odometry_timeout_sec": LaunchConfiguration("odometry_timeout_sec"),
                 },
             ],
         ),

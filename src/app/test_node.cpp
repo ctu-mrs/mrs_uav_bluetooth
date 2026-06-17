@@ -10,8 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
-#include <cstring>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -22,9 +22,109 @@ constexpr const char* kDefaultAdvertisementTopic = "/{hostname}/ble/adv_local_ex
 constexpr const char* kDefaultAdvertisementObserveTopic = "/{hostname}/ble/advertisements";
 constexpr const char* kDefaultPeerTopicPrefix = "/{hostname}/ble/peers";
 constexpr double kPi = 3.14159265358979323846;
-constexpr std::size_t kTimestampPayloadSize = sizeof(uint64_t);
-constexpr std::size_t kOdometryFloatCount = 13;
-constexpr std::size_t kOdometryPayloadSize = kTimestampPayloadSize + kOdometryFloatCount * sizeof(float);
+constexpr std::size_t kTimestampPayloadSize = 4;
+constexpr std::size_t kTimestampMiddleByteOffset = 2;
+constexpr uint64_t kTimestampResolutionNs = 1ULL << (8 * kTimestampMiddleByteOffset);
+constexpr uint64_t kTimestampHighPeriodNs = 1ULL << 48;
+constexpr double kTimestampHighPeriodHours =
+    static_cast<double>(kTimestampHighPeriodNs) / 1000000000.0 / 3600.0;
+constexpr std::size_t kFixedFieldCount = 12;
+constexpr std::size_t kFixedOdometryPayloadSize =
+    kTimestampPayloadSize + kFixedFieldCount * sizeof(int16_t);
+constexpr double kPositionScale = 100.0; // 100 = 1 cm precision, range +-327.67 m
+constexpr double kLinearVelocityScale = 100.0; // 100 = 1 cm/s precision, range +-327.67 m/s
+constexpr double kAngularVelocityScale = 1000.0; // 1000 = 1 mrad/s precision, range +-32.767 rad/s
+static_assert(kFixedOdometryPayloadSize == 28, "Fixed advertisement odometry payload must be 28 bytes");
+
+struct Quaternion {
+    double x{0.0};
+    double y{0.0};
+    double z{0.0};
+    double w{1.0};
+};
+
+struct RollPitchYaw {
+    double roll{0.0};
+    double pitch{0.0};
+    double yaw{0.0};
+};
+
+RollPitchYaw quaternion_to_rpy(double x, double y, double z, double w) {
+    const double norm = std::sqrt(x * x + y * y + z * z + w * w);
+    if (norm > 0.0) {
+        x /= norm;
+        y /= norm;
+        z /= norm;
+        w /= norm;
+    } else {
+        x = 0.0;
+        y = 0.0;
+        z = 0.0;
+        w = 1.0;
+    }
+
+    RollPitchYaw rpy;
+    const double sin_roll_cos_pitch = 2.0 * (w * x + y * z);
+    const double cos_roll_cos_pitch = 1.0 - 2.0 * (x * x + y * y);
+    rpy.roll = std::atan2(sin_roll_cos_pitch, cos_roll_cos_pitch);
+
+    const double sin_pitch = 2.0 * (w * y - z * x);
+    if (std::abs(sin_pitch) >= 1.0) {
+        rpy.pitch = std::copysign(kPi / 2.0, sin_pitch);
+    } else {
+        rpy.pitch = std::asin(sin_pitch);
+    }
+
+    const double sin_yaw_cos_pitch = 2.0 * (w * z + x * y);
+    const double cos_yaw_cos_pitch = 1.0 - 2.0 * (y * y + z * z);
+    rpy.yaw = std::atan2(sin_yaw_cos_pitch, cos_yaw_cos_pitch);
+    return rpy;
+}
+
+Quaternion rpy_to_quaternion(double roll, double pitch, double yaw) {
+    const double cr = std::cos(roll * 0.5);
+    const double sr = std::sin(roll * 0.5);
+    const double cp = std::cos(pitch * 0.5);
+    const double sp = std::sin(pitch * 0.5);
+    const double cy = std::cos(yaw * 0.5);
+    const double sy = std::sin(yaw * 0.5);
+
+    Quaternion q;
+    q.w = cr * cp * cy + sr * sp * sy;
+    q.x = sr * cp * cy - cr * sp * sy;
+    q.y = cr * sp * cy + sr * cp * sy;
+    q.z = cr * cp * sy - sr * sp * cy;
+    return q;
+}
+
+double normalize_angle(double angle) {
+    return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+int16_t encode_angle_int16(double angle) {
+    const double normalized = normalize_angle(angle);
+    const double scaled = std::round((normalized / kPi) * 32767.0);
+    return static_cast<int16_t>(std::clamp(scaled, -32767.0, 32767.0));
+}
+
+double decode_angle_int16(int16_t value) {
+    return (static_cast<double>(value) / 32767.0) * kPi;
+}
+
+int16_t encode_fixed_int16(double value, double scale) {
+    const double scaled = std::round(value * scale);
+    return static_cast<int16_t>(std::clamp(scaled, -32768.0, 32767.0));
+}
+
+double decode_fixed_int16(int16_t value, double scale) {
+    return static_cast<double>(value) / scale;
+}
+
+int16_t read_little_endian_int16(const std::vector<uint8_t>& data, std::size_t offset) {
+    return static_cast<int16_t>(
+        static_cast<uint16_t>(data[offset]) |
+        (static_cast<uint16_t>(data[offset + 1]) << 8));
+}
 
 }  // namespace
 
@@ -52,11 +152,13 @@ void TestNode::configure_parameters() {
     declare_parameter<std::string>("peer_topic_prefix", "");
     declare_parameter<std::string>("frame_id", frame_id_);
     declare_parameter<std::string>("child_frame_id", child_frame_id_);
+    declare_parameter<double>("odometry_timeout_sec", odometry_timeout_sec_);
 
     const auto requested_mode = normalize_mode(get_parameter("mode").as_string());
     rate_hz_ = get_parameter("rate_hz").as_double();
     frame_id_ = get_parameter("frame_id").as_string();
     child_frame_id_ = get_parameter("child_frame_id").as_string();
+    odometry_timeout_sec_ = get_parameter("odometry_timeout_sec").as_double();
 
     if (requested_mode == "odometry") {
         mode_ = Mode::kOdometry;
@@ -68,6 +170,9 @@ void TestNode::configure_parameters() {
 
     if (!std::isfinite(rate_hz_) || rate_hz_ <= 0.0) {
         throw std::runtime_error("rate_hz must be a finite value greater than 0");
+    }
+    if (!std::isfinite(odometry_timeout_sec_) || odometry_timeout_sec_ <= 0.0) {
+        throw std::runtime_error("odometry_timeout_sec must be a finite value greater than 0");
     }
 
     const auto raw_hostname = util::system_hostname();
@@ -112,8 +217,10 @@ void TestNode::configure_publishers() {
 
     advertisement_pub_ = create_publisher<std_msgs::msg::UInt8MultiArray>(advertisement_topic_, 10);
     RCLCPP_INFO(get_logger(),
-                "Publishing advertisement odometry payloads at %.3f Hz on %s; subscribing to local odometry on %s; peer odometry prefix %s",
-                rate_hz_, advertisement_topic_.c_str(), odometry_topic_.c_str(), peer_topic_prefix_.c_str());
+                "Publishing fixed advertisement odometry at %.3f Hz on %s; subscribing to local odometry on %s; payload=%zu bytes; timestamp resolution=%" PRIu64 " ns; high-byte overlap period=%.3f h; peer odometry prefix %s",
+                rate_hz_, advertisement_topic_.c_str(), odometry_topic_.c_str(),
+                kFixedOdometryPayloadSize, kTimestampResolutionNs, kTimestampHighPeriodHours,
+                peer_topic_prefix_.c_str());
 }
 
 void TestNode::configure_advertisement_watchers() {
@@ -191,53 +298,51 @@ void TestNode::publish_advertisement_payload() {
     }
 
     std_msgs::msg::UInt8MultiArray message;
-    std::optional<nav_msgs::msg::Odometry> odometry;
-    {
-        std::lock_guard<std::mutex> lock(local_odometry_mutex_);
-        odometry = latest_local_odometry_;
-    }
+    const auto odometry = fresh_local_odometry();
 
     if (odometry.has_value()) {
         const auto timestamp_ns = stamp_to_nanoseconds(odometry->header.stamp);
-        message.data.reserve(kOdometryPayloadSize);
-        append_little_endian_uint64(message.data, timestamp_ns);
-        append_little_endian_float32(message.data, static_cast<float>(odometry->pose.pose.position.x));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->pose.pose.position.y));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->pose.pose.position.z));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->pose.pose.orientation.x));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->pose.pose.orientation.y));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->pose.pose.orientation.z));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->pose.pose.orientation.w));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->twist.twist.linear.x));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->twist.twist.linear.y));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->twist.twist.linear.z));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->twist.twist.angular.x));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->twist.twist.angular.y));
-        append_little_endian_float32(message.data, static_cast<float>(odometry->twist.twist.angular.z));
+        const auto rpy = quaternion_to_rpy(odometry->pose.pose.orientation.x,
+                                           odometry->pose.pose.orientation.y,
+                                           odometry->pose.pose.orientation.z,
+                                           odometry->pose.pose.orientation.w);
+        message.data.reserve(kFixedOdometryPayloadSize);
+        append_middle_timestamp(message.data, timestamp_ns);
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->pose.pose.position.x, kPositionScale));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->pose.pose.position.y, kPositionScale));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->pose.pose.position.z, kPositionScale));
+        append_little_endian_int16(message.data, encode_angle_int16(rpy.roll));
+        append_little_endian_int16(message.data, encode_angle_int16(rpy.pitch));
+        append_little_endian_int16(message.data, encode_angle_int16(rpy.yaw));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.linear.x, kLinearVelocityScale));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.linear.y, kLinearVelocityScale));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.linear.z, kLinearVelocityScale));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.angular.x, kAngularVelocityScale));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.angular.y, kAngularVelocityScale));
+        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.angular.z, kAngularVelocityScale));
 
         RCLCPP_INFO(get_logger(),
-                    "Published advertisement odometry bytes=%zu stamp=%" PRIu64 " pos=(%.3f, %.3f, %.3f) q=(%.3f, %.3f, %.3f, %.3f) lin=(%.3f, %.3f, %.3f) ang=(%.3f, %.3f, %.3f)",
+                    "Published advertisement odometry bytes=%zu stamp=%" PRIu64 " pos=(%.3f, %.3f, %.3f)m rpy=(%.3f, %.3f, %.3f)° lin=(%.3f, %.3f, %.3f)m/s ang=(%.3f, %.3f, %.3f)°/s",
                     message.data.size(),
                     timestamp_ns,
                     odometry->pose.pose.position.x,
                     odometry->pose.pose.position.y,
                     odometry->pose.pose.position.z,
-                    odometry->pose.pose.orientation.x,
-                    odometry->pose.pose.orientation.y,
-                    odometry->pose.pose.orientation.z,
-                    odometry->pose.pose.orientation.w,
+                    rpy.roll * 180.0 / kPi,
+                    rpy.pitch * 180.0 / kPi,
+                    rpy.yaw * 180.0 / kPi,
                     odometry->twist.twist.linear.x,
                     odometry->twist.twist.linear.y,
                     odometry->twist.twist.linear.z,
-                    odometry->twist.twist.angular.x,
-                    odometry->twist.twist.angular.y,
-                    odometry->twist.twist.angular.z);
+                    odometry->twist.twist.angular.x * 180.0 / kPi,
+                    odometry->twist.twist.angular.y * 180.0 / kPi,
+                    odometry->twist.twist.angular.z * 180.0 / kPi);
     } else {
         const auto timestamp_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
                 .count());
-        append_little_endian_uint64(message.data, timestamp_ns);
+        append_middle_timestamp(message.data, timestamp_ns);
         RCLCPP_INFO(get_logger(),
                     "Published advertisement timestamp keepalive bytes=%zu stamp=%" PRIu64,
                     message.data.size(),
@@ -255,9 +360,10 @@ void TestNode::handle_local_odometry(const nav_msgs::msg::Odometry::SharedPtr me
     {
         std::lock_guard<std::mutex> lock(local_odometry_mutex_);
         latest_local_odometry_ = *message;
+        latest_local_odometry_received_ = std::chrono::steady_clock::now();
     }
 
-    const auto timestamp_ns = stamp_to_nanoseconds(message->header.stamp);
+    /*const auto timestamp_ns = stamp_to_nanoseconds(message->header.stamp);
     RCLCPP_INFO(get_logger(),
                 "Received local odometry for advertisement stamp=%" PRIu64 " pos=(%.3f, %.3f, %.3f) q=(%.3f, %.3f, %.3f, %.3f) lin=(%.3f, %.3f, %.3f) ang=(%.3f, %.3f, %.3f)",
                 timestamp_ns,
@@ -273,7 +379,29 @@ void TestNode::handle_local_odometry(const nav_msgs::msg::Odometry::SharedPtr me
                 message->twist.twist.linear.z,
                 message->twist.twist.angular.x,
                 message->twist.twist.angular.y,
-                message->twist.twist.angular.z);
+                message->twist.twist.angular.z);*/
+}
+
+std::optional<nav_msgs::msg::Odometry> TestNode::fresh_local_odometry() {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(local_odometry_mutex_);
+    if (!latest_local_odometry_ || !latest_local_odometry_received_) {
+        return std::nullopt;
+    }
+
+    const auto age_sec =
+        std::chrono::duration<double>(now - *latest_local_odometry_received_).count();
+    if (age_sec <= odometry_timeout_sec_) {
+        return latest_local_odometry_;
+    }
+
+    const auto stale_stamp_ns = stamp_to_nanoseconds(latest_local_odometry_->header.stamp);
+    RCLCPP_INFO(get_logger(),
+                "Local odometry stale for advertisement age=%.3f s timeout=%.3f s last_stamp=%" PRIu64 "; reverting to timestamp keepalive",
+                age_sec, odometry_timeout_sec_, stale_stamp_ns);
+    latest_local_odometry_.reset();
+    latest_local_odometry_received_.reset();
+    return std::nullopt;
 }
 
 void TestNode::handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message) {
@@ -314,10 +442,10 @@ void TestNode::handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDevice
 void TestNode::log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice& device,
                                          const std::vector<uint8_t>& data,
                                          uint64_t local_time_ns) {
-    const auto decoded = decode_little_endian_uint64(data);
+    const auto decoded = decode_middle_timestamp_ns(data, local_time_ns);
     uint64_t odometry_stamp_ns = 0;
     std::vector<float> odometry_values;
-    const bool has_odometry = decode_float32_odometry_payload(data, odometry_stamp_ns, odometry_values);
+    const bool has_odometry = decode_fixed_odometry_payload(data, local_time_ns, odometry_stamp_ns, odometry_values);
     std::ostringstream stream;
     stream << "Advertisement data"
            << " name='" << device.name << "'"
@@ -337,10 +465,10 @@ void TestNode::log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice
            << " remote-local-ms=" << std::fixed << std::setprecision(3)
            << static_cast<double>(remote_minus_local_ms);
     if (has_odometry) {
-        stream << " odom pos=(" << odometry_values[0] << ", " << odometry_values[1] << ", " << odometry_values[2] << ")"
-               << " q=(" << odometry_values[3] << ", " << odometry_values[4] << ", " << odometry_values[5] << ", " << odometry_values[6] << ")"
-               << " lin=(" << odometry_values[7] << ", " << odometry_values[8] << ", " << odometry_values[9] << ")"
-               << " ang=(" << odometry_values[10] << ", " << odometry_values[11] << ", " << odometry_values[12] << ")";
+        stream << " odom pos=(" << odometry_values[0] << ", " << odometry_values[1] << ", " << odometry_values[2] << ")m"
+               << " rpy=(" << (odometry_values[3] * 180.0 / kPi) << ", " << (odometry_values[4] * 180.0 / kPi) << ", " << (odometry_values[5] * 180.0 / kPi) << ")°"
+               << " lin=(" << odometry_values[6] << ", " << odometry_values[7] << ", " << odometry_values[8] << ")m/s"
+               << " ang=(" << (odometry_values[9] * 180.0 / kPi) << ", " << (odometry_values[10] * 180.0 / kPi) << ", " << (odometry_values[11] * 180.0 / kPi) << ")°/s";
     } else {
         stream << " keepalive";
     }
@@ -351,60 +479,94 @@ void TestNode::log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice
     }
 }
 
-std::optional<uint64_t> TestNode::decode_little_endian_uint64(const std::vector<uint8_t>& data) {
-    if (data.size() < sizeof(uint64_t)) {
+std::optional<uint64_t> TestNode::decode_middle_timestamp_ns(const std::vector<uint8_t>& data,
+                                                             uint64_t local_time_ns) {
+    if (data.size() < kTimestampPayloadSize) {
         return std::nullopt;
     }
 
-    uint64_t value = 0;
-    const auto bytes_to_decode = std::min<std::size_t>(sizeof(value), data.size());
-    for (std::size_t index = 0; index < bytes_to_decode; ++index) {
-        value |= static_cast<uint64_t>(data[index]) << (8 * index);
+    uint64_t middle = 0;
+    for (std::size_t index = 0; index < kTimestampPayloadSize; ++index) {
+        middle |= static_cast<uint64_t>(data[index]) << (8 * (index + kTimestampMiddleByteOffset));
     }
-    return value;
+
+    const uint64_t local_high = local_time_ns >> 48;
+    uint64_t best_timestamp = (local_high << 48) | middle;
+    uint64_t best_delta = best_timestamp > local_time_ns
+        ? best_timestamp - local_time_ns
+        : local_time_ns - best_timestamp;
+    for (const int delta_high : {-1, 1}) {
+        if ((delta_high < 0 && local_high == 0) ||
+            (delta_high > 0 && local_high == std::numeric_limits<uint16_t>::max())) {
+            continue;
+        }
+        const uint64_t candidate_high = delta_high < 0 ? local_high - 1 : local_high + 1;
+        const uint64_t candidate = (candidate_high << 48) | middle;
+        const uint64_t candidate_delta = candidate > local_time_ns
+            ? candidate - local_time_ns
+            : local_time_ns - candidate;
+        if (candidate_delta < best_delta) {
+            best_delta = candidate_delta;
+            best_timestamp = candidate;
+        }
+    }
+    return best_timestamp;
 }
 
-bool TestNode::decode_float32_odometry_payload(const std::vector<uint8_t>& data,
-                                               uint64_t& stamp_ns,
-                                               std::vector<float>& values) {
-    if (data.size() < kOdometryPayloadSize) {
+bool TestNode::decode_fixed_odometry_payload(const std::vector<uint8_t>& data,
+                                             uint64_t local_time_ns,
+                                             uint64_t& stamp_ns,
+                                             std::vector<float>& values) {
+    if (data.size() < kFixedOdometryPayloadSize) {
         return false;
     }
 
-    const auto decoded_stamp = decode_little_endian_uint64(data);
+    const auto decoded_stamp = decode_middle_timestamp_ns(data, local_time_ns);
     if (!decoded_stamp.has_value()) {
         return false;
     }
 
     stamp_ns = *decoded_stamp;
     values.clear();
-    values.reserve(kOdometryFloatCount);
+    values.reserve(kFixedFieldCount);
     std::size_t offset = kTimestampPayloadSize;
-    for (std::size_t index = 0; index < kOdometryFloatCount; ++index) {
-        uint32_t raw = 0;
-        for (std::size_t byte_index = 0; byte_index < sizeof(raw); ++byte_index) {
-            raw |= static_cast<uint32_t>(data[offset + byte_index]) << (8 * byte_index);
-        }
-        float value = 0.0F;
-        std::memcpy(&value, &raw, sizeof(value));
-        values.push_back(value);
-        offset += sizeof(value);
-    }
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kPositionScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kPositionScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kPositionScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_angle_int16(read_little_endian_int16(data, offset))));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_angle_int16(read_little_endian_int16(data, offset))));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_angle_int16(read_little_endian_int16(data, offset))));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kLinearVelocityScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kLinearVelocityScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kLinearVelocityScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kAngularVelocityScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kAngularVelocityScale)));
+    offset += sizeof(int16_t);
+    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kAngularVelocityScale)));
     return true;
 }
 
-void TestNode::append_little_endian_uint64(std::vector<uint8_t>& data, uint64_t value) {
-    for (std::size_t index = 0; index < sizeof(value); ++index) {
-        data.push_back(static_cast<uint8_t>((value >> (8 * index)) & 0xFFu));
+void TestNode::append_middle_timestamp(std::vector<uint8_t>& data, uint64_t timestamp_ns) {
+    for (std::size_t index = 0; index < kTimestampPayloadSize; ++index) {
+        data.push_back(static_cast<uint8_t>(
+            (timestamp_ns >> (8 * (index + kTimestampMiddleByteOffset))) & 0xFFu));
     }
 }
 
-void TestNode::append_little_endian_float32(std::vector<uint8_t>& data, float value) {
-    uint32_t raw = 0;
-    std::memcpy(&raw, &value, sizeof(raw));
-    for (std::size_t index = 0; index < sizeof(raw); ++index) {
-        data.push_back(static_cast<uint8_t>((raw >> (8 * index)) & 0xFFu));
-    }
+void TestNode::append_little_endian_int16(std::vector<uint8_t>& data, int16_t value) {
+    const auto raw = static_cast<uint16_t>(value);
+    data.push_back(static_cast<uint8_t>(raw & 0xFFu));
+    data.push_back(static_cast<uint8_t>((raw >> 8) & 0xFFu));
 }
 
 uint64_t TestNode::stamp_to_nanoseconds(const builtin_interfaces::msg::Time& stamp) {
@@ -436,7 +598,7 @@ std::string TestNode::format_system_time(uint64_t timestamp_ns) {
 void TestNode::publish_decoded_peer_odometry(const mrs_uav_bluetooth::msg::BleDevice& device,
                                              uint64_t stamp_ns,
                                              const std::vector<float>& values) {
-    if (values.size() < kOdometryFloatCount) {
+    if (values.size() < kFixedFieldCount) {
         return;
     }
 
@@ -449,25 +611,35 @@ void TestNode::publish_decoded_peer_odometry(const mrs_uav_bluetooth::msg::BleDe
     message.pose.pose.position.x = values[0];
     message.pose.pose.position.y = values[1];
     message.pose.pose.position.z = values[2];
-    message.pose.pose.orientation.x = values[3];
-    message.pose.pose.orientation.y = values[4];
-    message.pose.pose.orientation.z = values[5];
-    message.pose.pose.orientation.w = values[6];
-    message.twist.twist.linear.x = values[7];
-    message.twist.twist.linear.y = values[8];
-    message.twist.twist.linear.z = values[9];
-    message.twist.twist.angular.x = values[10];
-    message.twist.twist.angular.y = values[11];
-    message.twist.twist.angular.z = values[12];
+    const auto quaternion = rpy_to_quaternion(values[3], values[4], values[5]);
+    message.pose.pose.orientation.x = quaternion.x;
+    message.pose.pose.orientation.y = quaternion.y;
+    message.pose.pose.orientation.z = quaternion.z;
+    message.pose.pose.orientation.w = quaternion.w;
+    message.twist.twist.linear.x = values[6];
+    message.twist.twist.linear.y = values[7];
+    message.twist.twist.linear.z = values[8];
+    message.twist.twist.angular.x = values[9];
+    message.twist.twist.angular.y = values[10];
+    message.twist.twist.angular.z = values[11];
 
     publisher->publish(message);
     RCLCPP_INFO(get_logger(),
-                "Published decoded peer odometry for %s stamp=%" PRIu64 " pos=(%.3f, %.3f, %.3f)",
+                "Published decoded peer odometry for %s stamp=%" PRIu64 " pos=(%.3f, %.3f, %.3f)m rpy=(%.3f, %.3f, %.3f)° lin=(%.3f, %.3f, %.3f)m/s ang=(%.3f, %.3f, %.3f)°/s",
                 device_topic_token(device).c_str(),
                 stamp_ns,
                 message.pose.pose.position.x,
                 message.pose.pose.position.y,
-                message.pose.pose.position.z);
+                message.pose.pose.position.z,
+                values[3] * 180.0 / kPi,
+                values[4] * 180.0 / kPi,
+                values[5] * 180.0 / kPi,
+                message.twist.twist.linear.x,
+                message.twist.twist.linear.y,
+                message.twist.twist.linear.z,
+                message.twist.twist.angular.x * 180.0 / kPi,
+                message.twist.twist.angular.y * 180.0 / kPi,
+                message.twist.twist.angular.z * 180.0 / kPi);
 }
 
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr TestNode::peer_odometry_publisher(

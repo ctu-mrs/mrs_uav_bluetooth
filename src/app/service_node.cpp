@@ -31,7 +31,12 @@ namespace {
 
 constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr size_t kPrimaryAdvertisementMaxBytes = 31;
+constexpr size_t kExtendedAdvertisementMaxBytes = 251;
 constexpr size_t kAdvFlagsBytes = 3;
+
+bool contains_string(const std::vector<std::string>& values, const std::string& value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+}
 
 size_t advertising_structure_size(size_t payload_bytes) {
     return payload_bytes == 0 ? 0 : 2 + payload_bytes;
@@ -211,6 +216,84 @@ size_t estimate_primary_advertisement_bytes(
     }
 
     return total;
+}
+
+size_t estimate_user_data_competing_advertisement_bytes(
+    const mrs_uav_bluetooth::config::NodeConfig& cfg,
+    const std::map<uint8_t, std::vector<uint8_t>>& advertising_data) {
+    size_t total = 0;
+    total += advertising_uuid_list_size(cfg.advertise_solicit_uuids);
+    total += advertising_manufacturer_data_size(cfg.advertise_manufacturer_data);
+    total += advertising_service_data_size(cfg.advertise_service_data);
+    total += advertising_generic_data_size(advertising_data);
+
+    const bool include_tx_power = std::find(cfg.advertise_includes.begin(),
+                                            cfg.advertise_includes.end(),
+                                            "tx-power") != cfg.advertise_includes.end();
+    if (include_tx_power) {
+        total += advertising_structure_size(1);
+    }
+
+    const bool include_appearance = cfg.advertise_appearance.has_value() ||
+        std::find(cfg.advertise_includes.begin(),
+                  cfg.advertise_includes.end(),
+                  "appearance") != cfg.advertise_includes.end();
+    if (include_appearance) {
+        total += advertising_structure_size(sizeof(uint16_t));
+    }
+
+    return total;
+}
+
+std::string select_secondary_channel(
+    const std::optional<mrs_uav_bluetooth::bluez::AdapterInfo>& adapter_info) {
+    if (!adapter_info.has_value()) {
+        return {};
+    }
+
+    const auto& supported = adapter_info->supported_advertising_secondary_channels;
+    if (supported.empty() || adapter_info->max_advertisement_length <= kPrimaryAdvertisementMaxBytes) {
+        return {};
+    }
+
+    if (contains_string(supported, "1M")) {
+        return "1M";
+    }
+    return supported.empty() ? std::string{} : supported.front();
+}
+
+size_t resolve_advertisement_max_bytes(
+    const std::string& secondary_channel,
+    const std::optional<mrs_uav_bluetooth::bluez::AdapterInfo>& adapter_info) {
+    if (adapter_info.has_value() && adapter_info->max_advertisement_length > 0) {
+        return adapter_info->max_advertisement_length;
+    }
+    return secondary_channel.empty() ? kPrimaryAdvertisementMaxBytes : kExtendedAdvertisementMaxBytes;
+}
+
+std::optional<std::vector<uint8_t>> constrain_extra_advertisement_payload(
+    const std::vector<uint8_t>& payload,
+    const std::string& local_name,
+    const mrs_uav_bluetooth::config::NodeConfig& cfg,
+    size_t max_advertisement_bytes,
+    size_t& max_payload_bytes) {
+    auto static_advertise_data = cfg.advertise_data;
+    static_advertise_data.erase(mrs_uav_bluetooth::bluez::kDefaultAdvertisementExtraDataType);
+
+    static_cast<void>(local_name);
+    const size_t static_bytes = estimate_user_data_competing_advertisement_bytes(
+        cfg, static_advertise_data);
+    max_payload_bytes = static_bytes + 2 >= max_advertisement_bytes
+        ? 0
+        : (max_advertisement_bytes - static_bytes - 2);
+
+    if (max_payload_bytes == 0) {
+        return std::nullopt;
+    }
+    if (payload.size() <= max_payload_bytes) {
+        return payload;
+    }
+    return std::vector<uint8_t>(payload.begin(), payload.begin() + max_payload_bytes);
 }
 
 std::vector<std::string> select_advertised_service_uuids(
@@ -499,6 +582,10 @@ void ServiceNode::refresh_advertisement_registration() {
     }
     service_uuids = merge_service_uuids(service_uuids, active_config_.advertise_service_uuids);
 
+    const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
+    const auto secondary_channel = select_secondary_channel(adapter_info);
+    const size_t advertisement_max_bytes = resolve_advertisement_max_bytes(secondary_channel, adapter_info);
+
     advertisement_->set_local_name(local_name);
     advertisement_->set_discoverable(active_config_.advertise_discoverable.value_or(active_config_.enable_server));
     advertisement_->set_discoverable_timeout(
@@ -510,7 +597,28 @@ void ServiceNode::refresh_advertisement_registration() {
     advertisement_->set_service_data(active_config_.advertise_service_data);
     auto advertise_data = active_config_.advertise_data;
     if (advertisement_extra_payload_) {
-        advertise_data[bluez::kDefaultAdvertisementExtraDataType] = *advertisement_extra_payload_;
+        size_t max_payload_bytes = 0;
+        auto constrained_payload = constrain_extra_advertisement_payload(
+            *advertisement_extra_payload_,
+            local_name,
+            active_config_,
+            advertisement_max_bytes,
+            max_payload_bytes);
+        if (constrained_payload.has_value()) {
+            if (constrained_payload->size() != advertisement_extra_payload_->size()) {
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                     "Trimmed BLE advertisement user data from %zu to %zu bytes to fit adapter MaxAdvLen=%zu (payload budget=%zu)",
+                                     advertisement_extra_payload_->size(), constrained_payload->size(),
+                                     advertisement_max_bytes, max_payload_bytes);
+                advertisement_extra_payload_ = *constrained_payload;
+            }
+            advertise_data[bluez::kDefaultAdvertisementExtraDataType] = *advertisement_extra_payload_;
+        } else {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "Dropping BLE advertisement user data (%zu bytes): no payload bytes fit adapter MaxAdvLen=%zu",
+                                 advertisement_extra_payload_->size(), advertisement_max_bytes);
+            advertisement_extra_payload_.reset();
+        }
     }
     advertisement_->set_data(advertise_data);
     advertisement_->set_scan_response_service_uuids(active_config_.advertise_scan_response_service_uuids);
@@ -524,16 +632,16 @@ void ServiceNode::refresh_advertisement_registration() {
     advertisement_->set_appearance(active_config_.advertise_appearance);
     advertisement_->set_duration(active_config_.advertise_duration);
     advertisement_->set_timeout(active_config_.advertise_timeout);
-    advertisement_->set_secondary_channel(active_config_.advertise_secondary_channel);
+    advertisement_->set_secondary_channel(secondary_channel);
     advertisement_->set_min_interval(active_config_.advertise_min_interval);
     advertisement_->set_max_interval(active_config_.advertise_max_interval);
     advertisement_->set_tx_power(active_config_.advertise_tx_power);
 
     const auto estimated_primary_bytes = estimate_primary_advertisement_bytes(
         local_name, active_config_, advertise_data);
-    const size_t remaining_uuid_payload_bytes = estimated_primary_bytes + 2 >= kPrimaryAdvertisementMaxBytes
+    const size_t remaining_uuid_payload_bytes = estimated_primary_bytes + 2 >= advertisement_max_bytes
         ? 0
-        : (kPrimaryAdvertisementMaxBytes - estimated_primary_bytes - 2);
+        : (advertisement_max_bytes - estimated_primary_bytes - 2);
     const auto advertised_service_uuids = select_advertised_service_uuids(
         service_uuids, remaining_uuid_payload_bytes);
     if (advertised_service_uuids.size() != service_uuids.size()) {
@@ -559,9 +667,13 @@ void ServiceNode::refresh_advertisement_registration() {
     for (const auto& advertised_uuids : attempts) {
         advertisement_->set_service_uuids(advertised_uuids);
         try {
+            const auto log_secondary_channel = secondary_channel.empty()
+                ? std::string{"legacy"}
+                : secondary_channel;
             RCLCPP_INFO(get_logger(),
-                        "Registering BLE advertisement (name=%s, uuids=%zu)",
-                        local_name.c_str(), advertised_uuids.size());
+                        "Registering BLE advertisement (name=%s, uuids=%zu, secondary=%s, estimated_bytes=%zu, budget=%zu)",
+                        local_name.c_str(), advertised_uuids.size(), log_secondary_channel.c_str(),
+                        estimated_primary_bytes, advertisement_max_bytes);
             advertisement_->register_advertisement(adapter_path_);
             advertisement_registered = true;
             break;
@@ -651,21 +763,56 @@ void ServiceNode::handle_advertisement_payload(const std_msgs::msg::UInt8MultiAr
 
     std::vector<uint8_t> payload(message->data.begin(), message->data.end());
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    const auto local_name = active_config_.advertise_local_name.empty()
+        ? hostname_
+        : active_config_.advertise_local_name;
+    const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
+    const auto secondary_channel = select_secondary_channel(adapter_info);
+    const size_t max_advertisement_bytes =
+        resolve_advertisement_max_bytes(secondary_channel, adapter_info);
+    size_t max_payload_bytes = 0;
+    auto constrained_payload = constrain_extra_advertisement_payload(
+        payload,
+        local_name,
+        active_config_,
+        max_advertisement_bytes,
+        max_payload_bytes);
+    if (constrained_payload.has_value()) {
+        if (constrained_payload->size() != payload.size()) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                                 "Trimmed BLE advertisement user data from %zu to %zu bytes to fit adapter MaxAdvLen=%zu (payload budget=%zu)",
+                                 payload.size(), constrained_payload->size(),
+                                 max_advertisement_bytes, max_payload_bytes);
+        }
+        payload = std::move(*constrained_payload);
+    } else {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                             "Dropping BLE advertisement user data (%zu bytes): no payload bytes fit adapter MaxAdvLen=%zu",
+                             payload.size(), max_advertisement_bytes);
+        payload.clear();
+    }
+
     if (advertisement_extra_payload_ && *advertisement_extra_payload_ == payload) {
         return;
     }
 
+    const bool data_property_exported = advertisement_extra_payload_.has_value() ||
+        !active_config_.advertise_data.empty();
     const bool can_update_in_place = advertisement_ &&
         advertisement_->is_registered() &&
-        advertisement_extra_payload_.has_value() &&
-        advertisement_extra_payload_->size() == payload.size();
+        data_property_exported;
 
     advertisement_extra_payload_ = std::move(payload);
     if (can_update_in_place) {
         auto advertise_data = active_config_.advertise_data;
-        advertise_data[bluez::kDefaultAdvertisementExtraDataType] = *advertisement_extra_payload_;
+        if (!advertisement_extra_payload_->empty()) {
+            advertise_data[bluez::kDefaultAdvertisementExtraDataType] = *advertisement_extra_payload_;
+        }
         advertisement_->set_data(advertise_data);
         advertisement_->emit_property_changed("Data");
+        RCLCPP_INFO(get_logger(),
+                    "Updated BLE advertisement user data in place (%zu bytes)",
+                    advertisement_extra_payload_->size());
     } else if (advertisement_) {
         refresh_advertisement_registration();
     }

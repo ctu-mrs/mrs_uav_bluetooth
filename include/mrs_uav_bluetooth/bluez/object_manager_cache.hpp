@@ -110,6 +110,8 @@ private:
                             const std::map<std::string, sdbus::Variant>& props) const;
     void update_device_props(DeviceInfo& dev,
                              const std::map<std::string, sdbus::Variant>& props) const;
+    void update_advertising_manager_props(AdapterInfo& adapter,
+                                          const std::map<std::string, sdbus::Variant>& props) const;
     AdapterInfo parse_adapter(const std::string& path,
                               const std::map<std::string, sdbus::Variant>& props) const;
     GattServiceInfo parse_gatt_service(const std::string& path,

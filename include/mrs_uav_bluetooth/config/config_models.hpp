@@ -76,7 +76,6 @@ struct NodeConfig {
     std::optional<uint16_t> advertise_appearance;
     std::optional<uint16_t> advertise_duration;
     std::optional<uint16_t> advertise_timeout;
-    std::string advertise_secondary_channel;
     std::optional<uint32_t> advertise_min_interval;
     std::optional<uint32_t> advertise_max_interval;
     std::optional<int16_t> advertise_tx_power;

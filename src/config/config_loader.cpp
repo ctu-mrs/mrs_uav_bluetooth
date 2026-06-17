@@ -439,7 +439,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         doc, "advertise_duration", std::numeric_limits<uint16_t>::max());
     cfg.advertise_timeout = parse_optional_integer<uint16_t>(
         doc, "advertise_timeout", std::numeric_limits<uint16_t>::max());
-    cfg.advertise_secondary_channel = str("advertise_secondary_channel", cfg.advertise_secondary_channel);
     cfg.advertise_min_interval = parse_optional_integer<uint32_t>(
         doc, "advertise_min_interval", std::numeric_limits<uint32_t>::max());
     cfg.advertise_max_interval = parse_optional_integer<uint32_t>(

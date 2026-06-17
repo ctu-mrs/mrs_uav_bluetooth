@@ -446,6 +446,12 @@ void ObjectManagerCache::on_properties_changed(
                     a.alias = get_string(changed, "Alias");
                 notifications.emplace_back(CacheEvent::AdapterChanged, path);
             }
+        } else if (interface == std::string(kLeAdvManagerIface)) {
+            auto it = adapters_.find(path);
+            if (it != adapters_.end()) {
+                update_advertising_manager_props(it->second, changed);
+                notifications.emplace_back(CacheEvent::AdapterChanged, path);
+            }
         } else if (interface == std::string(kGattCharacteristicIface)) {
             auto it = gatt_characteristics_.find(path);
             if (it != gatt_characteristics_.end()) {
@@ -512,6 +518,20 @@ void ObjectManagerCache::process_object(const std::string& path,
     auto adapter_it = ifaces.find(std::string(kAdapterIface));
     if (adapter_it != ifaces.end()) {
         adapters_[path] = parse_adapter(path, adapter_it->second);
+        if (notifications) {
+            notifications->emplace_back(CacheEvent::AdapterChanged, path);
+        }
+    }
+
+    auto advertising_manager_it = ifaces.find(std::string(kLeAdvManagerIface));
+    if (advertising_manager_it != ifaces.end()) {
+        auto it = adapters_.find(path);
+        if (it == adapters_.end()) {
+            AdapterInfo adapter;
+            adapter.object_path = path;
+            it = adapters_.emplace(path, std::move(adapter)).first;
+        }
+        update_advertising_manager_props(it->second, advertising_manager_it->second);
         if (notifications) {
             notifications->emplace_back(CacheEvent::AdapterChanged, path);
         }
@@ -669,6 +689,14 @@ void ObjectManagerCache::remove_interfaces(const std::string& path,
             record_removal(CacheEvent::GattDescriptorRemoved, path);
         } else if (iface == std::string(kAdapterIface)) {
             adapters_.erase(path);
+        } else if (iface == std::string(kLeAdvManagerIface)) {
+            auto adapter_it = adapters_.find(path);
+            if (adapter_it != adapters_.end()) {
+                adapter_it->second.supported_advertising_secondary_channels.clear();
+                adapter_it->second.max_advertisement_length = 31;
+                adapter_it->second.max_scan_response_length = 31;
+                record_removal(CacheEvent::AdapterChanged, path);
+            }
         }
     }
 }
@@ -766,6 +794,31 @@ AdapterInfo ObjectManagerCache::parse_adapter(
     a.discovering = get_or<bool>(props, "Discovering", false);
     a.uuids = get_string_vector(props, "UUIDs");
     return a;
+}
+
+void ObjectManagerCache::update_advertising_manager_props(
+    AdapterInfo& adapter,
+    const std::map<std::string, sdbus::Variant>& props) const {
+    if (props.count("SupportedSecondaryChannels")) {
+        adapter.supported_advertising_secondary_channels =
+            get_string_vector(props, "SupportedSecondaryChannels");
+    }
+
+    if (props.count("SupportedCapabilities")) {
+        try {
+            const auto capabilities =
+                props.at("SupportedCapabilities").get<std::map<std::string, sdbus::Variant>>();
+            if (capabilities.count("MaxAdvLen")) {
+                adapter.max_advertisement_length =
+                    get_or<uint8_t>(capabilities, "MaxAdvLen", adapter.max_advertisement_length);
+            }
+            if (capabilities.count("MaxScnRspLen")) {
+                adapter.max_scan_response_length =
+                    get_or<uint8_t>(capabilities, "MaxScnRspLen", adapter.max_scan_response_length);
+            }
+        } catch (...) {
+        }
+    }
 }
 
 GattServiceInfo ObjectManagerCache::parse_gatt_service(

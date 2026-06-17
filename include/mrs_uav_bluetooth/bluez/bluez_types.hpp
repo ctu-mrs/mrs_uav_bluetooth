@@ -79,6 +79,9 @@ struct AdapterInfo {
     bool pairable{false};
     bool discovering{false};
     std::vector<std::string> uuids;
+    std::vector<std::string> supported_advertising_secondary_channels;
+    uint8_t max_advertisement_length{31};
+    uint8_t max_scan_response_length{31};
 };
 
 }  // namespace mrs_uav_bluetooth::bluez

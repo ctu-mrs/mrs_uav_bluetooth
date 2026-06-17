@@ -37,6 +37,7 @@ private:
     void publish_odometry();
     void publish_advertisement_payload();
     void handle_local_odometry(const nav_msgs::msg::Odometry::SharedPtr message);
+    std::optional<nav_msgs::msg::Odometry> fresh_local_odometry();
     void handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message);
     void log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice& device,
                                    const std::vector<uint8_t>& data,
@@ -49,12 +50,14 @@ private:
 
     static std::string normalize_mode(std::string value);
     static std::string expand_hostname(std::string value, const std::string& hostname);
-    static std::optional<uint64_t> decode_little_endian_uint64(const std::vector<uint8_t>& data);
-    static bool decode_float32_odometry_payload(const std::vector<uint8_t>& data,
-                                                uint64_t& stamp_ns,
-                                                std::vector<float>& values);
-    static void append_little_endian_uint64(std::vector<uint8_t>& data, uint64_t value);
-    static void append_little_endian_float32(std::vector<uint8_t>& data, float value);
+    static std::optional<uint64_t> decode_middle_timestamp_ns(const std::vector<uint8_t>& data,
+                                                              uint64_t local_time_ns);
+    static bool decode_fixed_odometry_payload(const std::vector<uint8_t>& data,
+                                              uint64_t local_time_ns,
+                                              uint64_t& stamp_ns,
+                                              std::vector<float>& values);
+    static void append_middle_timestamp(std::vector<uint8_t>& data, uint64_t timestamp_ns);
+    static void append_little_endian_int16(std::vector<uint8_t>& data, int16_t value);
     static uint64_t stamp_to_nanoseconds(const builtin_interfaces::msg::Time& stamp);
     static builtin_interfaces::msg::Time nanoseconds_to_stamp(uint64_t stamp_ns);
     static std::string format_system_time(uint64_t timestamp_ns);
@@ -71,11 +74,13 @@ private:
     std::string frame_id_{"map"};
     std::string child_frame_id_{"base_link"};
     double rate_hz_{1.0};
+    double odometry_timeout_sec_{2.5};
 
     std::mt19937 random_engine_;
     std::mutex observed_devices_mutex_;
     std::mutex local_odometry_mutex_;
     std::optional<nav_msgs::msg::Odometry> latest_local_odometry_;
+    std::optional<std::chrono::steady_clock::time_point> latest_local_odometry_received_;
     std::map<std::string, std::vector<uint8_t>> last_logged_advertisements_;
     std::map<std::string, rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr> peer_odometry_publishers_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odometry_pub_;
