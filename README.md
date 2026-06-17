@@ -4,8 +4,8 @@ This repository contains the MRS UAV Bluetooth package. It contains custom imple
 
 The package providese these standalone nodes:
 
-- `service_node`: a long-running background node that owns the BLE adapter, permorms periodic scans, hosts built-in GATT services, and exposes ROS 2 services and topics.
-- `user_node`: a node for experiment TMUX sessions that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
+- `service_node`: a node running at background that owns the BLE adapter, permorms periodic scans, hosts built-in GATT services, exposes ROS 2 services and topics, etc.
+- `user_node`: a helper node for user TMUX sessions that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
 - `tui_node`: a node with a keyboard-controllable text user interface, which you can use on your laptop for a quick access to nearby BLE-enabled UAVs and their Wi-Fi network settings.
 - `test_node`: a testing node for advertisement-based and connection-based communication modes.
 
@@ -43,29 +43,30 @@ All other uses of this package depend on both RMW and running service node. The 
 
 ### Advertisement-based communication
 
-The simplest use case is creating your own publisher of `std_msgs/UInt8MultiArray` at `/{hostname}/ble/adv_local_extra`. These bytes are used to update user data in the BLE advertisement of the local device. At the same time, the custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter, and data rate of this communication channel also depends on scan period of nearby devices discovery. 
+The simplest use case requires you to create your own publisher of `std_msgs/UInt8MultiArray` data (at `/{hostname}/ble/adv_local_extra`). These bytes are used to update user data in the BLE advertisement of the local device. Custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of bytes is quite limited by the adapter (31 B in BLE 4.0, 254 B in BLE 5.0+), and data rate of this communication channel also depends on device scan availability. 
 
-To test this functionality, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and immediately log decoded timestamps advertised by the other devices.
+To test this mode, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and immediately log decoded timestamps advertised by the other devices.
 
 ```bash
 ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=advertisement rate_hz:=1.0
 ```
+Additionally, the test node in this mode subscribes to a publisher of `nav_msgs/msg/Odometry` at path configured in the launch file. When the topic is available, the test node appends 13 floats with the odometry data to the user advertisement data. At the same time, all user data after timestamps is parsed and published in a new per-device odometry topic. The test node in this mode may be included in your TMUX session as well, to provide a simple multi-UAV positioning network.
 
 ### Connection-based communication
 
-This is the fully-featured use case of the BLE package. Whitelisted devices get connected automatically, while establishing a two-way handshake and producing custom ROS 2 topics. Typical experiment workflow is putting the following line into the tmux script (with your own custom yaml config):
+This is the fully-featured use case of the BLE package. Whitelisted devices get connected automatically, while establishing a two-way handshake and producing custom ROS 2 topics. Typical experiment workflow is putting the following line into the TMUX session (and creating your own custom yaml config):
 
 ```bash
 ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/example_sharing_odometry.yaml
 ```
 
-The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing a topic with a message type `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members. You can run a test node containing a random odometry publisher like this to test the example functionality (by echoing the topic on the other side):
+The file `config/example_sharing_odometry.yaml` shows an example configuration file for sharing a topic with a message type `nav_msgs/msg/Odometry`, using a fixed packet layout with timestamp, position, orientation, and twist members. You can run a test node in an odometry mode, containing a random odometry publisher in order to test the example config setup, and the data transfer can be validated by echoing the ROS topic on the connected devices:
 
 ```bash
 ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=odometry rate_hz:=10.0
 ```
 
-While `user_node` is running, it keeps renewing the overlay lease and prints either the bluetooth status stream (default) or log stream from `/{hostname}/ble/status` or `/{hostname}/ble/log`.
+While `user_node` is running, it keeps renewing the overlay lease and prints either the bluetooth status stream (default) or log stream from `/{hostname}/ble/status` or `/{hostname}/ble/log` (configurable).
 
 Note that when two BLE devices get connected, the advertisement-based communication stops working as the LE device discovery no longer provides the advertising information for them (data, RSSI etc.).
 
