@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <ctime>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -22,19 +21,28 @@ constexpr const char* kDefaultAdvertisementTopic = "/{hostname}/ble/adv_local_ex
 constexpr const char* kDefaultAdvertisementObserveTopic = "/{hostname}/ble/advertisements";
 constexpr const char* kDefaultPeerTopicPrefix = "/{hostname}/ble/peers";
 constexpr double kPi = 3.14159265358979323846;
-constexpr std::size_t kTimestampPayloadSize = 4;
-constexpr std::size_t kTimestampMiddleByteOffset = 2;
-constexpr uint64_t kTimestampResolutionNs = 1ULL << (8 * kTimestampMiddleByteOffset);
-constexpr uint64_t kTimestampHighPeriodNs = 1ULL << 48;
-constexpr double kTimestampHighPeriodHours =
-    static_cast<double>(kTimestampHighPeriodNs) / 1000000000.0 / 3600.0;
+constexpr std::size_t kTimestampPayloadSize = 7;
+constexpr uint64_t kTimestampResolutionNs = 1000;
+constexpr std::size_t kPackedOdometryDataSize = 21;
 constexpr std::size_t kFixedFieldCount = 12;
-constexpr std::size_t kFixedOdometryPayloadSize =
-    kTimestampPayloadSize + kFixedFieldCount * sizeof(int16_t);
-constexpr double kPositionScale = 100.0; // 100 = 1 cm precision, range +-327.67 m
-constexpr double kLinearVelocityScale = 100.0; // 100 = 1 cm/s precision, range +-327.67 m/s
-constexpr double kAngularVelocityScale = 1000.0; // 1000 = 1 mrad/s precision, range +-32.767 rad/s
-static_assert(kFixedOdometryPayloadSize == 28, "Fixed advertisement odometry payload must be 28 bytes");
+constexpr std::size_t kFixedOdometryPayloadSize = kTimestampPayloadSize + kPackedOdometryDataSize;
+constexpr uint8_t kPositionXyBits = 17;
+constexpr uint8_t kPositionZBits = 14;
+constexpr uint8_t kAngleBits = 15;
+constexpr uint8_t kLinearVelocityBits = 13;
+constexpr uint8_t kAngularVelocityBits = 12;
+constexpr double kPositionScale = 50.0; // 50 = 2 cm precision, range xy +-655 m, z +-164 m
+constexpr double kLinearVelocityScale = 50.0; // 50 = 2 cm/s precision, range +-82 m/s
+constexpr double kAngularVelocityScale = 200.0; // 200 = 0.005 rad/s precision, range +-10.24 rad/s
+constexpr std::size_t kPackedOdometryBits =
+    2 * kPositionXyBits + kPositionZBits +
+    3 * kAngleBits +
+    3 * kLinearVelocityBits +
+    3 * kAngularVelocityBits;
+static_assert(kPackedOdometryBits == kPackedOdometryDataSize * 8,
+              "Packed advertisement odometry data must be exactly 21 bytes");
+static_assert(kFixedOdometryPayloadSize == 28,
+              "Fixed advertisement odometry payload must be exactly 28 bytes");
 
 struct Quaternion {
     double x{0.0};
@@ -101,29 +109,82 @@ double normalize_angle(double angle) {
     return std::atan2(std::sin(angle), std::cos(angle));
 }
 
-int16_t encode_angle_int16(double angle) {
+int64_t signed_min(uint8_t bit_width) {
+    return -(int64_t{1} << (bit_width - 1));
+}
+
+int64_t signed_max(uint8_t bit_width) {
+    return (int64_t{1} << (bit_width - 1)) - 1;
+}
+
+int64_t encode_angle(double angle, uint8_t bit_width) {
     const double normalized = normalize_angle(angle);
-    const double scaled = std::round((normalized / kPi) * 32767.0);
-    return static_cast<int16_t>(std::clamp(scaled, -32767.0, 32767.0));
+    const auto max_value = signed_max(bit_width);
+    const double scaled = std::round((normalized / kPi) * static_cast<double>(max_value));
+    return static_cast<int64_t>(std::clamp(scaled,
+                                           -static_cast<double>(max_value),
+                                           static_cast<double>(max_value)));
 }
 
-double decode_angle_int16(int16_t value) {
-    return (static_cast<double>(value) / 32767.0) * kPi;
+double decode_angle(int64_t value, uint8_t bit_width) {
+    return (static_cast<double>(value) / static_cast<double>(signed_max(bit_width))) * kPi;
 }
 
-int16_t encode_fixed_int16(double value, double scale) {
+int64_t encode_fixed(double value, double scale, uint8_t bit_width) {
     const double scaled = std::round(value * scale);
-    return static_cast<int16_t>(std::clamp(scaled, -32768.0, 32767.0));
+    return static_cast<int64_t>(std::clamp(scaled,
+                                           static_cast<double>(signed_min(bit_width)),
+                                           static_cast<double>(signed_max(bit_width))));
 }
 
-double decode_fixed_int16(int16_t value, double scale) {
+double decode_fixed(int64_t value, double scale) {
     return static_cast<double>(value) / scale;
 }
 
-int16_t read_little_endian_int16(const std::vector<uint8_t>& data, std::size_t offset) {
-    return static_cast<int16_t>(
-        static_cast<uint16_t>(data[offset]) |
-        (static_cast<uint16_t>(data[offset + 1]) << 8));
+void append_signed_bits(std::vector<uint8_t>& data,
+                        int64_t value,
+                        uint8_t bit_width,
+                        std::size_t& bit_offset) {
+    const uint64_t mask = (uint64_t{1} << bit_width) - 1;
+    const uint64_t raw = static_cast<uint64_t>(value) & mask;
+    for (uint8_t bit = 0; bit < bit_width; ++bit) {
+        if (bit_offset % 8 == 0) {
+            data.push_back(0);
+        }
+        if (((raw >> bit) & 0x1u) != 0) {
+            data.back() |= static_cast<uint8_t>(1u << (bit_offset % 8));
+        }
+        ++bit_offset;
+    }
+}
+
+uint64_t read_unsigned_bits(const std::vector<uint8_t>& data,
+                            std::size_t byte_offset,
+                            std::size_t bit_offset,
+                            uint8_t bit_width) {
+    uint64_t raw = 0;
+    for (uint8_t bit = 0; bit < bit_width; ++bit) {
+        const std::size_t absolute_bit = byte_offset * 8 + bit_offset + bit;
+        const std::size_t byte_index = absolute_bit / 8;
+        const std::size_t bit_index = absolute_bit % 8;
+        if (((data[byte_index] >> bit_index) & 0x1u) != 0) {
+            raw |= uint64_t{1} << bit;
+        }
+    }
+    return raw;
+}
+
+int64_t read_signed_bits(const std::vector<uint8_t>& data,
+                         std::size_t byte_offset,
+                         std::size_t& bit_offset,
+                         uint8_t bit_width) {
+    const uint64_t raw = read_unsigned_bits(data, byte_offset, bit_offset, bit_width);
+    bit_offset += bit_width;
+    const uint64_t sign_bit = uint64_t{1} << (bit_width - 1);
+    if ((raw & sign_bit) == 0) {
+        return static_cast<int64_t>(raw);
+    }
+    return static_cast<int64_t>(raw) - static_cast<int64_t>(uint64_t{1} << bit_width);
 }
 
 }  // namespace
@@ -217,9 +278,9 @@ void TestNode::configure_publishers() {
 
     advertisement_pub_ = create_publisher<std_msgs::msg::UInt8MultiArray>(advertisement_topic_, 10);
     RCLCPP_INFO(get_logger(),
-                "Publishing fixed advertisement odometry at %.3f Hz on %s; subscribing to local odometry on %s; payload=%zu bytes; timestamp resolution=%" PRIu64 " ns; high-byte overlap period=%.3f h; peer odometry prefix %s",
+                "Publishing packed advertisement odometry at %.3f Hz on %s; subscribing to local odometry on %s; payload=%zu bytes; timestamp resolution=%" PRIu64 " ns; odometry bits=%zu; peer odometry prefix %s",
                 rate_hz_, advertisement_topic_.c_str(), odometry_topic_.c_str(),
-                kFixedOdometryPayloadSize, kTimestampResolutionNs, kTimestampHighPeriodHours,
+                kFixedOdometryPayloadSize, kTimestampResolutionNs, kPackedOdometryBits,
                 peer_topic_prefix_.c_str());
 }
 
@@ -307,19 +368,39 @@ void TestNode::publish_advertisement_payload() {
                                            odometry->pose.pose.orientation.z,
                                            odometry->pose.pose.orientation.w);
         message.data.reserve(kFixedOdometryPayloadSize);
-        append_middle_timestamp(message.data, timestamp_ns);
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->pose.pose.position.x, kPositionScale));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->pose.pose.position.y, kPositionScale));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->pose.pose.position.z, kPositionScale));
-        append_little_endian_int16(message.data, encode_angle_int16(rpy.roll));
-        append_little_endian_int16(message.data, encode_angle_int16(rpy.pitch));
-        append_little_endian_int16(message.data, encode_angle_int16(rpy.yaw));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.linear.x, kLinearVelocityScale));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.linear.y, kLinearVelocityScale));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.linear.z, kLinearVelocityScale));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.angular.x, kAngularVelocityScale));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.angular.y, kAngularVelocityScale));
-        append_little_endian_int16(message.data, encode_fixed_int16(odometry->twist.twist.angular.z, kAngularVelocityScale));
+        append_microsecond_timestamp(message.data, timestamp_ns);
+
+        std::size_t bit_offset = 0;
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->pose.pose.position.x, kPositionScale, kPositionXyBits),
+                           kPositionXyBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->pose.pose.position.y, kPositionScale, kPositionXyBits),
+                           kPositionXyBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->pose.pose.position.z, kPositionScale, kPositionZBits),
+                           kPositionZBits, bit_offset);
+        append_signed_bits(message.data, encode_angle(rpy.roll, kAngleBits), kAngleBits, bit_offset);
+        append_signed_bits(message.data, encode_angle(rpy.pitch, kAngleBits), kAngleBits, bit_offset);
+        append_signed_bits(message.data, encode_angle(rpy.yaw, kAngleBits), kAngleBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->twist.twist.linear.x, kLinearVelocityScale, kLinearVelocityBits),
+                           kLinearVelocityBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->twist.twist.linear.y, kLinearVelocityScale, kLinearVelocityBits),
+                           kLinearVelocityBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->twist.twist.linear.z, kLinearVelocityScale, kLinearVelocityBits),
+                           kLinearVelocityBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->twist.twist.angular.x, kAngularVelocityScale, kAngularVelocityBits),
+                           kAngularVelocityBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->twist.twist.angular.y, kAngularVelocityScale, kAngularVelocityBits),
+                           kAngularVelocityBits, bit_offset);
+        append_signed_bits(message.data,
+                           encode_fixed(odometry->twist.twist.angular.z, kAngularVelocityScale, kAngularVelocityBits),
+                           kAngularVelocityBits, bit_offset);
 
         RCLCPP_INFO(get_logger(),
                     "Published advertisement odometry bytes=%zu stamp=%" PRIu64 " pos=(%.3f, %.3f, %.3f)m rpy=(%.3f, %.3f, %.3f)° lin=(%.3f, %.3f, %.3f)m/s ang=(%.3f, %.3f, %.3f)°/s",
@@ -342,7 +423,7 @@ void TestNode::publish_advertisement_payload() {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::system_clock::now().time_since_epoch())
                 .count());
-        append_middle_timestamp(message.data, timestamp_ns);
+        append_microsecond_timestamp(message.data, timestamp_ns);
         RCLCPP_INFO(get_logger(),
                     "Published advertisement timestamp keepalive bytes=%zu stamp=%" PRIu64,
                     message.data.size(),
@@ -442,10 +523,17 @@ void TestNode::handle_advertisement_scan(const mrs_uav_bluetooth::msg::BleDevice
 void TestNode::log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice& device,
                                          const std::vector<uint8_t>& data,
                                          uint64_t local_time_ns) {
-    const auto decoded = decode_middle_timestamp_ns(data, local_time_ns);
+    if (data.size() != kTimestampPayloadSize && data.size() != kFixedOdometryPayloadSize) {
+        RCLCPP_INFO(get_logger(),
+                    "Advertisement data name='%s' mac=%s bytes=%zu unsupported packed payload size",
+                    device.name.c_str(), device.mac.c_str(), data.size());
+        return;
+    }
+
+    const auto decoded = decode_microsecond_timestamp_ns(data);
     uint64_t odometry_stamp_ns = 0;
     std::vector<float> odometry_values;
-    const bool has_odometry = decode_fixed_odometry_payload(data, local_time_ns, odometry_stamp_ns, odometry_values);
+    const bool has_odometry = decode_fixed_odometry_payload(data, odometry_stamp_ns, odometry_values);
     std::ostringstream stream;
     stream << "Advertisement data"
            << " name='" << device.name << "'"
@@ -479,49 +567,26 @@ void TestNode::log_decoded_advertisement(const mrs_uav_bluetooth::msg::BleDevice
     }
 }
 
-std::optional<uint64_t> TestNode::decode_middle_timestamp_ns(const std::vector<uint8_t>& data,
-                                                             uint64_t local_time_ns) {
+std::optional<uint64_t> TestNode::decode_microsecond_timestamp_ns(const std::vector<uint8_t>& data) {
     if (data.size() < kTimestampPayloadSize) {
         return std::nullopt;
     }
 
-    uint64_t middle = 0;
+    uint64_t timestamp_us = 0;
     for (std::size_t index = 0; index < kTimestampPayloadSize; ++index) {
-        middle |= static_cast<uint64_t>(data[index]) << (8 * (index + kTimestampMiddleByteOffset));
+        timestamp_us |= static_cast<uint64_t>(data[index]) << (8 * index);
     }
-
-    const uint64_t local_high = local_time_ns >> 48;
-    uint64_t best_timestamp = (local_high << 48) | middle;
-    uint64_t best_delta = best_timestamp > local_time_ns
-        ? best_timestamp - local_time_ns
-        : local_time_ns - best_timestamp;
-    for (const int delta_high : {-1, 1}) {
-        if ((delta_high < 0 && local_high == 0) ||
-            (delta_high > 0 && local_high == std::numeric_limits<uint16_t>::max())) {
-            continue;
-        }
-        const uint64_t candidate_high = delta_high < 0 ? local_high - 1 : local_high + 1;
-        const uint64_t candidate = (candidate_high << 48) | middle;
-        const uint64_t candidate_delta = candidate > local_time_ns
-            ? candidate - local_time_ns
-            : local_time_ns - candidate;
-        if (candidate_delta < best_delta) {
-            best_delta = candidate_delta;
-            best_timestamp = candidate;
-        }
-    }
-    return best_timestamp;
+    return timestamp_us * 1000ULL;
 }
 
 bool TestNode::decode_fixed_odometry_payload(const std::vector<uint8_t>& data,
-                                             uint64_t local_time_ns,
                                              uint64_t& stamp_ns,
                                              std::vector<float>& values) {
-    if (data.size() < kFixedOdometryPayloadSize) {
+    if (data.size() != kFixedOdometryPayloadSize) {
         return false;
     }
 
-    const auto decoded_stamp = decode_middle_timestamp_ns(data, local_time_ns);
+    const auto decoded_stamp = decode_microsecond_timestamp_ns(data);
     if (!decoded_stamp.has_value()) {
         return false;
     }
@@ -529,44 +594,45 @@ bool TestNode::decode_fixed_odometry_payload(const std::vector<uint8_t>& data,
     stamp_ns = *decoded_stamp;
     values.clear();
     values.reserve(kFixedFieldCount);
-    std::size_t offset = kTimestampPayloadSize;
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kPositionScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kPositionScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kPositionScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_angle_int16(read_little_endian_int16(data, offset))));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_angle_int16(read_little_endian_int16(data, offset))));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_angle_int16(read_little_endian_int16(data, offset))));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kLinearVelocityScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kLinearVelocityScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kLinearVelocityScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kAngularVelocityScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kAngularVelocityScale)));
-    offset += sizeof(int16_t);
-    values.push_back(static_cast<float>(decode_fixed_int16(read_little_endian_int16(data, offset), kAngularVelocityScale)));
+    std::size_t bit_offset = 0;
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kPositionXyBits), kPositionScale)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kPositionXyBits), kPositionScale)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kPositionZBits), kPositionScale)));
+    values.push_back(static_cast<float>(
+        decode_angle(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngleBits), kAngleBits)));
+    values.push_back(static_cast<float>(
+        decode_angle(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngleBits), kAngleBits)));
+    values.push_back(static_cast<float>(
+        decode_angle(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngleBits), kAngleBits)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityBits),
+                     kLinearVelocityScale)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityBits),
+                     kLinearVelocityScale)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityBits),
+                     kLinearVelocityScale)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngularVelocityBits),
+                     kAngularVelocityScale)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngularVelocityBits),
+                     kAngularVelocityScale)));
+    values.push_back(static_cast<float>(
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngularVelocityBits),
+                     kAngularVelocityScale)));
     return true;
 }
 
-void TestNode::append_middle_timestamp(std::vector<uint8_t>& data, uint64_t timestamp_ns) {
+void TestNode::append_microsecond_timestamp(std::vector<uint8_t>& data, uint64_t timestamp_ns) {
+    const uint64_t timestamp_us = timestamp_ns / 1000ULL;
     for (std::size_t index = 0; index < kTimestampPayloadSize; ++index) {
-        data.push_back(static_cast<uint8_t>(
-            (timestamp_ns >> (8 * (index + kTimestampMiddleByteOffset))) & 0xFFu));
+        data.push_back(static_cast<uint8_t>((timestamp_us >> (8 * index)) & 0xFFu));
     }
-}
-
-void TestNode::append_little_endian_int16(std::vector<uint8_t>& data, int16_t value) {
-    const auto raw = static_cast<uint16_t>(value);
-    data.push_back(static_cast<uint8_t>(raw & 0xFFu));
-    data.push_back(static_cast<uint8_t>((raw >> 8) & 0xFFu));
 }
 
 uint64_t TestNode::stamp_to_nanoseconds(const builtin_interfaces::msg::Time& stamp) {

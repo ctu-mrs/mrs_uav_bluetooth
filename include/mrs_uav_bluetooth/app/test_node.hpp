@@ -50,14 +50,11 @@ private:
 
     static std::string normalize_mode(std::string value);
     static std::string expand_hostname(std::string value, const std::string& hostname);
-    static std::optional<uint64_t> decode_middle_timestamp_ns(const std::vector<uint8_t>& data,
-                                                              uint64_t local_time_ns);
+    static std::optional<uint64_t> decode_microsecond_timestamp_ns(const std::vector<uint8_t>& data);
     static bool decode_fixed_odometry_payload(const std::vector<uint8_t>& data,
-                                              uint64_t local_time_ns,
                                               uint64_t& stamp_ns,
                                               std::vector<float>& values);
-    static void append_middle_timestamp(std::vector<uint8_t>& data, uint64_t timestamp_ns);
-    static void append_little_endian_int16(std::vector<uint8_t>& data, int16_t value);
+    static void append_microsecond_timestamp(std::vector<uint8_t>& data, uint64_t timestamp_ns);
     static uint64_t stamp_to_nanoseconds(const builtin_interfaces::msg::Time& stamp);
     static builtin_interfaces::msg::Time nanoseconds_to_stamp(uint64_t stamp_ns);
     static std::string format_system_time(uint64_t timestamp_ns);
