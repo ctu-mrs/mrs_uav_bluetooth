@@ -30,7 +30,7 @@
 namespace {
 
 constexpr double kLocalReconfigureGraceMin = 5.0;
-constexpr size_t kLegacyAdvMaxBytes = 31;
+constexpr size_t kPrimaryAdvertisementMaxBytes = 31;
 constexpr size_t kAdvFlagsBytes = 3;
 
 size_t advertising_structure_size(size_t payload_bytes) {
@@ -531,14 +531,14 @@ void ServiceNode::refresh_advertisement_registration() {
 
     const auto estimated_primary_bytes = estimate_primary_advertisement_bytes(
         local_name, active_config_, advertise_data);
-    const size_t remaining_uuid_payload_bytes = estimated_primary_bytes + 2 >= kLegacyAdvMaxBytes
+    const size_t remaining_uuid_payload_bytes = estimated_primary_bytes + 2 >= kPrimaryAdvertisementMaxBytes
         ? 0
-        : (kLegacyAdvMaxBytes - estimated_primary_bytes - 2);
+        : (kPrimaryAdvertisementMaxBytes - estimated_primary_bytes - 2);
     const auto advertised_service_uuids = select_advertised_service_uuids(
         service_uuids, remaining_uuid_payload_bytes);
     if (advertised_service_uuids.size() != service_uuids.size()) {
         RCLCPP_INFO(get_logger(),
-                    "Prepared legacy BLE advertisement fallback trimmed from %zu to %zu service UUIDs",
+                    "Prepared primary BLE advertisement trimmed from %zu to %zu service UUIDs",
                     service_uuids.size(), advertised_service_uuids.size());
     }
 

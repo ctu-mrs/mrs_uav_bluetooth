@@ -13,7 +13,7 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "rate_hz",
-            default_value="10.0",
+            default_value="1.0",
             description="Publish rate in Hz.",
         ),
         DeclareLaunchArgument(
@@ -29,17 +29,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "advertisement_observe_topic",
             default_value="",
-            description="Override for the advertisement-device monitor topic. Empty uses /{hostname}/ble/advertisement.",
+            description="Override for the advertisement-device monitor topic. Empty uses /{hostname}/ble/advertisements.",
         ),
         DeclareLaunchArgument(
-            "advertisement_observe_topic_compat",
+            "peer_topic_prefix",
             default_value="",
-            description="Compatibility advertisement-device monitor topic. Empty uses /{hostname}/ble/advertisements.",
-        ),
-        DeclareLaunchArgument(
-            "advertisement_log_period_sec",
-            default_value="2.0",
-            description="Compatibility parameter; advertisement updates are logged immediately when observed.",
+            description="Peer topic prefix for decoded advertisement odometry. Empty uses /{hostname}/ble/peers.",
         ),
         DeclareLaunchArgument(
             "frame_id",
@@ -63,8 +58,7 @@ def generate_launch_description():
                     "odometry_topic": LaunchConfiguration("odometry_topic"),
                     "advertisement_topic": LaunchConfiguration("advertisement_topic"),
                     "advertisement_observe_topic": LaunchConfiguration("advertisement_observe_topic"),
-                    "advertisement_observe_topic_compat": LaunchConfiguration("advertisement_observe_topic_compat"),
-                    "advertisement_log_period_sec": LaunchConfiguration("advertisement_log_period_sec"),
+                    "peer_topic_prefix": LaunchConfiguration("peer_topic_prefix"),
                     "frame_id": LaunchConfiguration("frame_id"),
                     "child_frame_id": LaunchConfiguration("child_frame_id"),
                 },
