@@ -43,14 +43,14 @@ All other uses of this package depend on both RMW and running service node. The 
 
 ### Advertisement-based communication
 
-The simplest use case requires you to create your own publisher of `std_msgs/UInt8MultiArray` data (at `/{hostname}/ble/adv_local_extra`). These bytes are used to update user data in the BLE advertisement of the local device. Custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of user bytes is quite limited by the adapter (28 B on Raspberry Pi 5, 248+ B on NUCs), and data rate of this communication channel also depends on device scan availability.
+The simplest use case requires you to create your own publisher of `std_msgs/UInt8MultiArray` data (at `/{hostname}/ble/adv_local_extra`). These bytes are used to update user data in the BLE advertisement of the local device. Custom user data of the other devices can be obtained by subscribing to `/{hostname}/ble/advertisements` topic. Note that the maximum number of user bytes is quite limited by the adapter (around 26 B on Raspberry Pi 5, 248+ B on NUCs), and data rate of this communication channel also depends on device scan availability.
 
 To test this mode, run the test node in advertisement mode. The node will regularly update the custom advertisement data with the UAV's system timestamps (as little-endian `uint64`), and immediately log decoded timestamps advertised by the other devices.
 
 ```bash
 ros2 launch mrs_uav_bluetooth test_node.launch.py mode:=advertisement rate_hz:=1.0
 ```
-Additionally, the test node in this mode subscribes to a publisher of `nav_msgs/msg/Odometry` at path configured in the launch file. When the topic is available, the test node appends 13 floats with the odometry data to the user advertisement data. At the same time, all user data after timestamps is parsed and published in a new per-device odometry topic. The test node in this mode may be included in your TMUX session as well, to provide a simple multi-UAV positioning network.
+Additionally, the test node in this mode subscribes to a publisher of `nav_msgs/msg/Odometry` at a path configured in the launch file. When the topic is available, the test node appends compressed odometry data to the user advertisement data. At the same time, all user data after timestamps is parsed from advertisements, and published in new per-device odometry topics. The test node in this mode may be included in your TMUX session as well, to provide a simple multi-UAV positioning network.
 
 ### Connection-based communication
 

@@ -220,8 +220,12 @@ size_t estimate_primary_advertisement_bytes(
 
 size_t estimate_user_data_competing_advertisement_bytes(
     const mrs_uav_bluetooth::config::NodeConfig& cfg,
-    const std::map<uint8_t, std::vector<uint8_t>>& advertising_data) {
+    const std::map<uint8_t, std::vector<uint8_t>>& advertising_data,
+    bool reserve_primary_flags) {
     size_t total = 0;
+    if (reserve_primary_flags) {
+        total += kAdvFlagsBytes;
+    }
     total += advertising_uuid_list_size(cfg.advertise_solicit_uuids);
     total += advertising_manufacturer_data_size(cfg.advertise_manufacturer_data);
     total += advertising_service_data_size(cfg.advertise_service_data);
@@ -291,8 +295,9 @@ std::optional<std::vector<uint8_t>> constrain_extra_advertisement_payload(
     static_advertise_data.erase(mrs_uav_bluetooth::bluez::kDefaultAdvertisementExtraDataType);
 
     static_cast<void>(local_name);
+    const bool reserve_primary_flags = max_advertisement_bytes <= kPrimaryAdvertisementMaxBytes;
     const size_t static_bytes = estimate_user_data_competing_advertisement_bytes(
-        cfg, static_advertise_data);
+        cfg, static_advertise_data, reserve_primary_flags);
     max_payload_bytes = static_bytes + 2 >= max_advertisement_bytes
         ? 0
         : (max_advertisement_bytes - static_bytes - 2);

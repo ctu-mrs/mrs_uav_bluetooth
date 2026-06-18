@@ -23,26 +23,27 @@ constexpr const char* kDefaultPeerTopicPrefix = "/{hostname}/ble/peers";
 constexpr double kPi = 3.14159265358979323846;
 constexpr std::size_t kTimestampPayloadSize = 7;
 constexpr uint64_t kTimestampResolutionNs = 1000;
-constexpr std::size_t kPackedOdometryDataSize = 21;
+constexpr std::size_t kPackedOdometryDataSize = 19;
 constexpr std::size_t kFixedFieldCount = 12;
 constexpr std::size_t kFixedOdometryPayloadSize = kTimestampPayloadSize + kPackedOdometryDataSize;
-constexpr uint8_t kPositionXyBits = 17;
-constexpr uint8_t kPositionZBits = 14;
-constexpr uint8_t kAngleBits = 15;
-constexpr uint8_t kLinearVelocityBits = 13;
-constexpr uint8_t kAngularVelocityBits = 12;
-constexpr double kPositionScale = 50.0; // 50 = 2 cm precision, range xy +-655 m, z +-164 m
-constexpr double kLinearVelocityScale = 50.0; // 50 = 2 cm/s precision, range +-82 m/s
-constexpr double kAngularVelocityScale = 200.0; // 200 = 0.005 rad/s precision, range +-10.24 rad/s
+constexpr uint8_t kPositionXyBits = 16;
+constexpr uint8_t kPositionZBits = 13;
+constexpr uint8_t kAngleBits = 14;
+constexpr uint8_t kLinearVelocityXyBits = 12;
+constexpr uint8_t kLinearVelocityZBits = 11;
+constexpr uint8_t kAngularVelocityBits = 10;
+constexpr double kPositionScale = 50.0; // 50 = 2 cm precision, range xy +-655 m, z +-82 m
+constexpr double kLinearVelocityScale = 50.0; // 50 = 2 cm/s precision, range xy +-41 m/s, z +-20 m/s
+constexpr double kAngularVelocityScale = 200.0; // 200 = 0.005 rad/s precision, range +-2.56 rad/s
 constexpr std::size_t kPackedOdometryBits =
     2 * kPositionXyBits + kPositionZBits +
     3 * kAngleBits +
-    3 * kLinearVelocityBits +
+    2 * kLinearVelocityXyBits + kLinearVelocityZBits +
     3 * kAngularVelocityBits;
 static_assert(kPackedOdometryBits == kPackedOdometryDataSize * 8,
-              "Packed advertisement odometry data must be exactly 21 bytes");
-static_assert(kFixedOdometryPayloadSize == 28,
-              "Fixed advertisement odometry payload must be exactly 28 bytes");
+              "Packed advertisement odometry data must be exactly 19 bytes");
+static_assert(kFixedOdometryPayloadSize == 26,
+              "Fixed advertisement odometry payload must be exactly 26 bytes");
 
 struct Quaternion {
     double x{0.0};
@@ -384,14 +385,14 @@ void TestNode::publish_advertisement_payload() {
         append_signed_bits(message.data, encode_angle(rpy.pitch, kAngleBits), kAngleBits, bit_offset);
         append_signed_bits(message.data, encode_angle(rpy.yaw, kAngleBits), kAngleBits, bit_offset);
         append_signed_bits(message.data,
-                           encode_fixed(odometry->twist.twist.linear.x, kLinearVelocityScale, kLinearVelocityBits),
-                           kLinearVelocityBits, bit_offset);
+                           encode_fixed(odometry->twist.twist.linear.x, kLinearVelocityScale, kLinearVelocityXyBits),
+                           kLinearVelocityXyBits, bit_offset);
         append_signed_bits(message.data,
-                           encode_fixed(odometry->twist.twist.linear.y, kLinearVelocityScale, kLinearVelocityBits),
-                           kLinearVelocityBits, bit_offset);
+                           encode_fixed(odometry->twist.twist.linear.y, kLinearVelocityScale, kLinearVelocityXyBits),
+                           kLinearVelocityXyBits, bit_offset);
         append_signed_bits(message.data,
-                           encode_fixed(odometry->twist.twist.linear.z, kLinearVelocityScale, kLinearVelocityBits),
-                           kLinearVelocityBits, bit_offset);
+                           encode_fixed(odometry->twist.twist.linear.z, kLinearVelocityScale, kLinearVelocityZBits),
+                           kLinearVelocityZBits, bit_offset);
         append_signed_bits(message.data,
                            encode_fixed(odometry->twist.twist.angular.x, kAngularVelocityScale, kAngularVelocityBits),
                            kAngularVelocityBits, bit_offset);
@@ -608,13 +609,13 @@ bool TestNode::decode_fixed_odometry_payload(const std::vector<uint8_t>& data,
     values.push_back(static_cast<float>(
         decode_angle(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngleBits), kAngleBits)));
     values.push_back(static_cast<float>(
-        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityBits),
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityXyBits),
                      kLinearVelocityScale)));
     values.push_back(static_cast<float>(
-        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityBits),
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityXyBits),
                      kLinearVelocityScale)));
     values.push_back(static_cast<float>(
-        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityBits),
+        decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kLinearVelocityZBits),
                      kLinearVelocityScale)));
     values.push_back(static_cast<float>(
         decode_fixed(read_signed_bits(data, kTimestampPayloadSize, bit_offset, kAngularVelocityBits),
