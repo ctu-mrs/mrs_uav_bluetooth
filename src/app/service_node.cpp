@@ -246,9 +246,14 @@ size_t estimate_user_data_competing_advertisement_bytes(
 }
 
 std::string select_secondary_channel(
+    const mrs_uav_bluetooth::config::NodeConfig& cfg,
     const std::optional<mrs_uav_bluetooth::bluez::AdapterInfo>& adapter_info) {
-    if (!adapter_info.has_value()) {
+    if (cfg.advertise_size != "extended") {
         return {};
+    }
+
+    if (!adapter_info.has_value()) {
+        return "1M";
     }
 
     const auto& supported = adapter_info->supported_advertising_secondary_channels;
@@ -263,12 +268,17 @@ std::string select_secondary_channel(
 }
 
 size_t resolve_advertisement_max_bytes(
+    const mrs_uav_bluetooth::config::NodeConfig& cfg,
     const std::string& secondary_channel,
     const std::optional<mrs_uav_bluetooth::bluez::AdapterInfo>& adapter_info) {
+    if (cfg.advertise_size != "extended" || secondary_channel.empty()) {
+        return kPrimaryAdvertisementMaxBytes;
+    }
+
     if (adapter_info.has_value() && adapter_info->max_advertisement_length > 0) {
         return adapter_info->max_advertisement_length;
     }
-    return secondary_channel.empty() ? kPrimaryAdvertisementMaxBytes : kExtendedAdvertisementMaxBytes;
+    return kExtendedAdvertisementMaxBytes;
 }
 
 std::optional<std::vector<uint8_t>> constrain_extra_advertisement_payload(
@@ -583,8 +593,13 @@ void ServiceNode::refresh_advertisement_registration() {
     service_uuids = merge_service_uuids(service_uuids, active_config_.advertise_service_uuids);
 
     const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
-    const auto secondary_channel = select_secondary_channel(adapter_info);
-    const size_t advertisement_max_bytes = resolve_advertisement_max_bytes(secondary_channel, adapter_info);
+    const auto secondary_channel = select_secondary_channel(active_config_, adapter_info);
+    const size_t advertisement_max_bytes = resolve_advertisement_max_bytes(
+        active_config_, secondary_channel, adapter_info);
+    if (active_config_.advertise_size == "extended" && secondary_channel.empty()) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                             "advertise_size=extended requested, but adapter does not report usable extended advertising; falling back to legacy 31-byte advertisement");
+    }
 
     advertisement_->set_local_name(local_name);
     advertisement_->set_discoverable(active_config_.advertise_discoverable.value_or(active_config_.enable_server));
@@ -671,9 +686,9 @@ void ServiceNode::refresh_advertisement_registration() {
                 ? std::string{"legacy"}
                 : secondary_channel;
             RCLCPP_INFO(get_logger(),
-                        "Registering BLE advertisement (name=%s, uuids=%zu, secondary=%s, estimated_bytes=%zu, budget=%zu)",
-                        local_name.c_str(), advertised_uuids.size(), log_secondary_channel.c_str(),
-                        estimated_primary_bytes, advertisement_max_bytes);
+                        "Registering BLE advertisement (name=%s, uuids=%zu, size=%s, secondary=%s, estimated_bytes=%zu, budget=%zu)",
+                        local_name.c_str(), advertised_uuids.size(), active_config_.advertise_size.c_str(),
+                        log_secondary_channel.c_str(), estimated_primary_bytes, advertisement_max_bytes);
             advertisement_->register_advertisement(adapter_path_);
             advertisement_registered = true;
             break;
@@ -767,9 +782,9 @@ void ServiceNode::handle_advertisement_payload(const std_msgs::msg::UInt8MultiAr
         ? hostname_
         : active_config_.advertise_local_name;
     const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
-    const auto secondary_channel = select_secondary_channel(adapter_info);
+    const auto secondary_channel = select_secondary_channel(active_config_, adapter_info);
     const size_t max_advertisement_bytes =
-        resolve_advertisement_max_bytes(secondary_channel, adapter_info);
+        resolve_advertisement_max_bytes(active_config_, secondary_channel, adapter_info);
     size_t max_payload_bytes = 0;
     auto constrained_payload = constrain_extra_advertisement_payload(
         payload,

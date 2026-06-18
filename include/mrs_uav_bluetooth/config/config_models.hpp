@@ -60,6 +60,7 @@ struct NodeConfig {
 
     // Static / rarely changing.
     std::string advertise_mode = "peripheral";
+    std::string advertise_size = "legacy";
     std::string advertise_local_name;
     std::optional<bool> advertise_discoverable;
     std::vector<std::string> advertise_includes;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/config/config_loader.hpp"
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
 #include "mrs_uav_bluetooth/util/topic_utils.hpp"
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
@@ -386,6 +387,10 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.overlay_keepalive_topic_suffix = str("overlay_keepalive_topic_suffix", cfg.overlay_keepalive_topic_suffix);
     cfg.verbose_log_file = str("verbose_log_file", cfg.verbose_log_file);
     cfg.advertise_mode = str("advertise_mode", cfg.advertise_mode);
+    cfg.advertise_size = util::lower_trim_copy(str("advertise_size", cfg.advertise_size));
+    if (cfg.advertise_size != "legacy" && cfg.advertise_size != "extended") {
+        throw std::runtime_error("advertise_size must be 'legacy' or 'extended'");
+    }
     cfg.advertise_local_name = expand_hostname(str("advertise_local_name", cfg.advertise_local_name), hostname);
     cfg.advertise_discoverable = parse_optional_bool(doc, "advertise_discoverable");
     cfg.advertise_includes = str_list("advertise_includes");

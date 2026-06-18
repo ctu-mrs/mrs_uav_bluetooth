@@ -86,6 +86,11 @@ verbose_log_file: ""
 # Static runtime settings for the system service.
 advertise_mode: peripheral
 
+# Advertisement size/PHY mode:
+# - legacy: 31-byte advertisements visible to older BLE controllers (e.g. Raspberry Pi boards).
+# - extended: use adapter MaxAdvLen and secondary-channel advertising when supported (e.g. Intel NUC boards).
+advertise_size: legacy
+
 # Optional subscribed ROS topic carrying an extra raw advertisement payload.
 advertise_extra_data_topic: "/{hostname}/ble/adv_local_extra"
 
