@@ -15,8 +15,8 @@ ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
 ###################################
 
 # selection of BlueZ and ELL versions
-BLUEZ_VERSION=5.86 ;
-ELL_VERSION=0.82 ;
+BLUEZ_VERSION=5.87 ;
+ELL_VERSION=0.83 ;
 
 # custom package name; it replaces distro BlueZ when explicitly installed,
 # but it is not the same package so normal system updates do not require it.
