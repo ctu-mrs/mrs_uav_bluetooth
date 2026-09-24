@@ -86,6 +86,103 @@ void ensure_private_directory(const std::string& path) {
     }
     (void)::chmod(path.c_str(), S_IRWXU);
 }
+bool has_readable_system_ssh_host_key() {
+    constexpr const char* paths[] = {
+        "/etc/ssh/ssh_host_ed25519_key",
+        "/etc/ssh/ssh_host_ecdsa_key",
+        "/etc/ssh/ssh_host_rsa_key",
+    };
+    for (const auto* path : paths) {
+        if (::access(path, R_OK) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string user_ssh_host_key_path() {
+    if (const char* state_home = std::getenv("XDG_STATE_HOME");
+        state_home != nullptr && state_home[0] != '\0' &&
+        std::filesystem::path{state_home}.is_absolute()) {
+        return (std::filesystem::path{state_home} /
+                "mrs-uav-bluetooth" / "ssh_host_ed25519_key").string();
+    }
+    if (const char* home = std::getenv("HOME");
+        home != nullptr && home[0] != '\0' &&
+        std::filesystem::path{home}.is_absolute()) {
+        return (std::filesystem::path{home} / ".local" / "state" /
+                "mrs-uav-bluetooth" / "ssh_host_ed25519_key").string();
+    }
+    return default_fallback_directory() + "/ssh_host_ed25519_key";
+}
+
+bool ensure_user_ssh_host_key(const std::string& key_path) {
+    struct stat key_stat {};
+    if (::lstat(key_path.c_str(), &key_stat) == 0) {
+        if (!S_ISREG(key_stat.st_mode)) {
+            throw std::runtime_error("SSH host key is not a regular file: " + key_path);
+        }
+        if (::access(key_path.c_str(), R_OK) != 0) {
+            throw std::runtime_error("SSH host key is not readable: " + key_path +
+                                     ": " + std::strerror(errno));
+        }
+        (void)::chmod(key_path.c_str(), S_IRUSR | S_IWUSR);
+        return false;
+    }
+    if (errno != ENOENT) {
+        throw std::runtime_error("cannot inspect SSH host key " + key_path +
+                                 ": " + std::strerror(errno));
+    }
+
+    const auto parent = std::filesystem::path{key_path}.parent_path();
+    if (parent.empty()) {
+        throw std::runtime_error("SSH host key path has no parent directory: " + key_path);
+    }
+    ensure_private_directory(parent.string());
+
+    const auto temporary_path = key_path + ".tmp." + std::to_string(::getpid());
+    const auto temporary_public_path = temporary_path + ".pub";
+    (void)::unlink(temporary_path.c_str());
+    (void)::unlink(temporary_public_path.c_str());
+
+    const auto pid = ::fork();
+    if (pid < 0) {
+        throw std::runtime_error("fork for ssh-keygen failed: " +
+                                 std::string{std::strerror(errno)});
+    }
+    if (pid == 0) {
+        ::execl("/usr/bin/ssh-keygen", "/usr/bin/ssh-keygen",
+                "-q", "-t", "ed25519", "-N", "", "-f",
+                temporary_path.c_str(), nullptr);
+        _exit(127);
+    }
+
+    int status = 0;
+    pid_t wait_result = -1;
+    do {
+        wait_result = ::waitpid(pid, &status, 0);
+    } while (wait_result < 0 && errno == EINTR);
+    if (wait_result < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        (void)::unlink(temporary_path.c_str());
+        (void)::unlink(temporary_public_path.c_str());
+        throw std::runtime_error("ssh-keygen failed while creating " + key_path);
+    }
+
+    (void)::chmod(temporary_path.c_str(), S_IRUSR | S_IWUSR);
+    std::error_code error;
+    std::filesystem::rename(temporary_path, key_path, error);
+    if (error) {
+        (void)::unlink(temporary_path.c_str());
+        (void)::unlink(temporary_public_path.c_str());
+        throw std::runtime_error("cannot install SSH host key " + key_path +
+                                 ": " + error.message());
+    }
+    std::filesystem::rename(temporary_public_path, key_path + ".pub", error);
+    if (error) {
+        (void)::unlink(temporary_public_path.c_str());
+    }
+    return true;
+}
 
 }  // namespace
 
@@ -436,7 +533,11 @@ struct SerialSshServer::Session {
 };
 
 SerialSshServer::SerialSshServer(rclcpp::Logger logger, std::string sshd_path)
-    : logger_(logger), sshd_path_(std::move(sshd_path)) {}
+    : logger_(logger), sshd_path_(std::move(sshd_path)) {
+    if (!has_readable_system_ssh_host_key()) {
+        host_key_path_ = user_ssh_host_key_path();
+    }
+}
 
 SerialSshServer::~SerialSshServer() {
     stop_all();
@@ -450,6 +551,12 @@ void SerialSshServer::start_session(const std::string& device_path, int socket_f
     if (::access(sshd_path_.c_str(), X_OK) != 0) {
         const auto error = std::string{std::strerror(errno)};
         throw std::runtime_error("sshd is not executable at " + sshd_path_ + ": " + error);
+    }
+    if (!host_key_path_.empty()) {
+        const bool generated = ensure_user_ssh_host_key(host_key_path_);
+        RCLCPP_INFO(logger_, "%s SSH host key %s for unprivileged serial sshd",
+                    generated ? "Generated" : "Using",
+                    host_key_path_.c_str());
     }
 
     stop_session(device_path);
@@ -468,8 +575,19 @@ void SerialSshServer::start_session(const std::string& device_path, int socket_f
         if (socket_fd > STDERR_FILENO) {
             ::close(socket_fd);
         }
-        ::execl(sshd_path_.c_str(), sshd_path_.c_str(), "-i", "-e",
-                "-o", "LoginGraceTime=0", nullptr);
+        if (host_key_path_.empty()) {
+            ::execl(sshd_path_.c_str(), sshd_path_.c_str(), "-i", "-e",
+                    "-o", "LoginGraceTime=0", nullptr);
+        } else {
+            ::execl(sshd_path_.c_str(), sshd_path_.c_str(), "-i", "-e",
+                    "-f", "/dev/null",
+                    "-h", host_key_path_.c_str(),
+                    "-o", "LoginGraceTime=0",
+                    "-o", "UsePAM=yes",
+                    "-o", "PasswordAuthentication=yes",
+                    "-o", "PermitRootLogin=no",
+                    "-o", "PermitEmptyPasswords=no", nullptr);
+        }
         _exit(127);
     }
 

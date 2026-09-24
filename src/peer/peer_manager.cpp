@@ -183,6 +183,7 @@ void PeerManager::set_session_phase(PeerConnectionSession& session,
 
 void PeerManager::note_local_connect_attempt(PeerConnectionSession& session,
                                              double now_mono) const {
+    session.peer_initiated = false;
     session.last_connect_attempt_monotonic = now_mono;
     session.connect_started_monotonic = now_mono;
 }
@@ -377,10 +378,13 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     const bool local_connect_in_flight = session.connect_started_monotonic > 0.0 &&
         (now - session.connect_started_monotonic) < connect_grace_s;
 
+    if (first_connection_observed && !local_connect_in_flight) {
+        session.peer_initiated = true;
+        clear_device_reset(session);
+    }
+
     session.connected_since_monotonic = session.connected_since_monotonic > 0.0
         ? session.connected_since_monotonic : now;
-    (void)first_connection_observed;
-    (void)local_connect_in_flight;
 
     if (device_has_required_pairing(device, config)) {
         session.pairing_in_progress = false;

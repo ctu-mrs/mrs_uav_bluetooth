@@ -731,6 +731,28 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
         }
 
+        // An authenticated inbound serial session owns the Bluetooth link until
+        // sshd exits. In particular, do not let GATT/time-bridge recovery tear
+        // down a TUI connection whose peer does not host the UAV GATT services.
+        if (device && serial_ssh_server_ &&
+            serial_ssh_server_->active(device->object_path)) {
+            peers_->clear_device_reset(session);
+            session.pairing_in_progress = false;
+            session.phase = "serial_active";
+            session.detail = "peer-initiated serial SSH session active";
+            continue;
+        }
+
+        if (session.peer_initiated) {
+            peers_->clear_device_reset(session);
+            session.pairing_in_progress = false;
+            session.phase = is_connected ? "passive" : "idle";
+            session.detail = is_connected
+                ? "peer-initiated connection"
+                : "waiting for peer-initiated connection";
+            continue;
+        }
+
         // Automatic connection selection is not an inbound connection ACL. Leave
         // peer-initiated and manually managed connections alone, but let an explicit
         // stale-bond repair finish before returning to passive management.

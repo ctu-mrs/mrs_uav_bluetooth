@@ -91,6 +91,7 @@ private:
 
     rclcpp::Logger logger_;
     std::string sshd_path_;
+    std::string host_key_path_;
     mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<Session>> sessions_;
 };

@@ -11,6 +11,7 @@ struct PeerConnectionSession {
     bool desired{false};
     bool explicit_target{false};
     bool peer_candidate{false};
+    bool peer_initiated{false};
     std::string peer_name;
     std::string phase{"idle"};
     std::string detail;

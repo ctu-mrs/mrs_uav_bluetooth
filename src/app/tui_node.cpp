@@ -166,6 +166,19 @@ bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
     return has_remote_gatt();
 }
 
+bool connect_serial_profile_with_retry(bluez::BluezClient& client,
+                                       const std::string& mac,
+                                       std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        if (client.connect_profile(mac, std::string{bluez::kSerialPortProfileUuid})) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
 }  // namespace
 
 TuiNode::TuiNode()
@@ -818,7 +831,10 @@ void TuiNode::trigger_connect_toggle() {
                         ? "connected; remote GATT cache still populating"
                         : "connected; GATT services unresolved";
                 } else {
-                    return std::string{"connection dropped before services resolved for "} + mac;
+                    // Pairing/profile negotiation can briefly replace the LE
+                    // bearer with BR/EDR. SPP ConnectProfile is authoritative
+                    // for this action and can restore its own transport.
+                    result = "LE bearer transitioned during security setup";
                 }
 
                 if (!serial_profile_ || !serial_links_) {
@@ -831,8 +847,8 @@ void TuiNode::trigger_connect_toggle() {
                     (void)client.pair(mac, 30.0, &pairing_error);
                 }
 
-                if (!client.connect_profile(
-                        mac, std::string{bluez::kSerialPortProfileUuid})) {
+                if (!connect_serial_profile_with_retry(
+                        client, mac, std::chrono::seconds(8))) {
                     return result + "; serial profile connection failed" +
                         (pairing_error.empty() ? std::string{} :
                          std::string{" (pairing: "} + pairing_error + ")") +
@@ -876,8 +892,8 @@ void TuiNode::trigger_serial_connect() {
                 return ok ? std::string{"serial link closed for "} + mac
                           : std::string{"serial disconnect failed for "} + mac;
             }
-            if (!client.connect_profile(
-                    mac, std::string{bluez::kSerialPortProfileUuid})) {
+            if (!connect_serial_profile_with_retry(
+                    client, mac, std::chrono::seconds(8))) {
                 return std::string{"serial connection failed for "} + mac;
             }
             serial::SerialLinkInfo link;
