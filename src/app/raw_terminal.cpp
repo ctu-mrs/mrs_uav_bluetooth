@@ -100,6 +100,40 @@ bool RawTerminal::active() const {
     return active_;
 }
 
+void RawTerminal::suspend() {
+    if (!active_ || tty_fd_ < 0) {
+        return;
+    }
+    if (flags_saved_) {
+        (void)::fcntl(tty_fd_, F_SETFL, original_flags_);
+    }
+    if (termios_saved_ && original_termios_ != nullptr) {
+        (void)::tcsetattr(tty_fd_, TCSAFLUSH, original_termios_);
+    }
+    write_all(tty_fd_, "\x1b[?25h\x1b[0m\x1b[?1049l");
+    active_ = false;
+}
+
+void RawTerminal::resume() {
+    if (active_ || tty_fd_ < 0 || !termios_saved_ || original_termios_ == nullptr) {
+        return;
+    }
+
+    termios raw = *original_termios_;
+    raw.c_lflag &= static_cast<unsigned long>(~(ICANON | ECHO));
+    raw.c_iflag &= static_cast<unsigned long>(~(IXON | ICRNL));
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+    if (::tcsetattr(tty_fd_, TCSAFLUSH, &raw) != 0) {
+        return;
+    }
+    if (flags_saved_) {
+        (void)::fcntl(tty_fd_, F_SETFL, original_flags_ | O_NONBLOCK);
+    }
+    write_all(tty_fd_, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+    active_ = true;
+}
+
 std::optional<TerminalKeyEvent> RawTerminal::read_key() {
     if (!active_) {
         return std::nullopt;

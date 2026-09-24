@@ -67,6 +67,10 @@ void CentralClientRuntime::refresh_scan(const std::string& transport) {
     client_->start_scan(transport.empty() ? options_.scan_mode : transport);
 }
 
+bluez::DbusConnection& CentralClientRuntime::dbus() {
+    return *dbus_;
+}
+
 bluez::ObjectManagerCache& CentralClientRuntime::cache() {
     return *cache_;
 }

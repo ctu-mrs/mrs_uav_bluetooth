@@ -33,6 +33,17 @@ auto_trust: true
 enable_time_service: true
 enable_wifi_service: true
 
+# Publish the standard Bluetooth Serial Port Profile and serve OpenSSH over
+# each authenticated RFCOMM connection. Disable this on hosts that must not
+# offer shell access.
+enable_serial_port_profile: true
+serial_port_channel: 22
+serial_sshd_path: /usr/sbin/sshd
+
+# Optional org.bluez.GattProfile1 UUIDs. BlueZ automatically reconnects to
+# devices exposing any of these remote GATT services.
+gatt_profile_uuids: []
+
 # Global gate for automatic peer discovery/connection logic.
 # When false, the node never auto-connects or auto-pairs peers.
 auto_connect_enable: false

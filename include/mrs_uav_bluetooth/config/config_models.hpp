@@ -46,6 +46,10 @@ struct NodeConfig {
     bool auto_trust{true};
     bool enable_time_service{true};
     bool enable_wifi_service{true};
+    bool enable_serial_port_profile{true};
+    uint16_t serial_port_channel{22};
+    std::string serial_sshd_path = "/usr/sbin/sshd";
+    std::vector<std::string> gatt_profile_uuids;
     bool auto_connect_enable{false};
     std::vector<std::string> auto_connect_whitelist;
     std::string auto_connect_pattern = "^uav[0-9]{1,2}$";

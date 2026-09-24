@@ -12,8 +12,13 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <filesystem>
+#include <fcntl.h>
+#include <stdexcept>
 #include <sstream>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
 
 namespace mrs_uav_bluetooth::app {
 
@@ -181,6 +186,68 @@ TuiNode::TuiNode()
         });
     status_message_ = "ready";
 
+    if (enable_serial_port_profile_) {
+        try {
+            serial_links_ = std::make_unique<serial::SerialLinkManager>(
+                get_logger(), serial_device_directory_, serial_fallback_directory_);
+
+            bluez::SerialPortProfileOptions profile_options;
+            profile_options.role = bluez::ProfileRole::Client;
+            profile_options.channel = serial_port_channel_;
+            profile_options.require_authentication = true;
+            profile_options.require_authorization = false;
+            profile_options.auto_connect = true;
+            profile_options.name = "MRS UAV Serial Client";
+
+            serial_profile_ = std::make_unique<bluez::SerialPortProfile>(
+                runtime_->dbus(),
+                "/cz/cvut/mrs/uav/bluetooth/serial_client",
+                get_logger(),
+                profile_options);
+            serial_profile_->set_connection_handler(
+                [this](const std::string& device_path,
+                       int socket_fd,
+                       const std::map<std::string, sdbus::Variant>&) {
+                    bool handed_off = false;
+                    try {
+                        if (!serial_links_) {
+                            throw std::runtime_error("serial link manager is unavailable");
+                        }
+                        const auto device = runtime_->cache().device(device_path);
+                        if (!device) {
+                            throw std::runtime_error("BlueZ device disappeared before serial setup");
+                        }
+                        const auto peer_name =
+                            util::device_hostname_guess(*device, uav_name_pattern_);
+                        handed_off = true;
+                        (void)serial_links_->attach(
+                            device_path, peer_name, device->mac, socket_fd);
+                    } catch (...) {
+                        if (!handed_off) {
+                            ::close(socket_fd);
+                        }
+                        throw;
+                    }
+                });
+            serial_profile_->set_disconnection_handler(
+                [this](const std::string& device_path) {
+                    if (serial_links_) {
+                        serial_links_->detach(device_path);
+                    }
+                });
+            serial_profile_->set_release_handler([this]() {
+                if (serial_links_) {
+                    serial_links_->detach_all();
+                }
+            });
+            serial_profile_->register_profile();
+        } catch (const std::exception& error) {
+            serial_profile_.reset();
+            serial_links_.reset();
+            status_message_ = std::string{"serial profile unavailable: "} + error.what();
+        }
+    }
+
     ui_timer_ = create_wall_timer(
         std::chrono::duration<double>(render_period_sec_),
         [this]() { ui_tick(); });
@@ -208,15 +275,22 @@ TuiNode::~TuiNode() {
     if (action_future_.valid()) {
         action_future_.wait();
     }
+    serial_profile_.reset();
+    serial_links_.reset();
 }
 
 void TuiNode::configure_parameters() {
     declare_parameter<std::string>("adapter_alias", "");
-    declare_parameter<std::string>("scan_mode", "le");
+    declare_parameter<std::string>("scan_mode", "auto");
     declare_parameter<std::string>("uav_name_pattern", "^uav[0-9]{1,2}$");
     declare_parameter<double>("refresh_period_sec", 1.0);
     declare_parameter<double>("render_period_sec", 0.1);
     declare_parameter<double>("topic_count_refresh_sec", 5.0);
+    declare_parameter<bool>("enable_serial_port_profile", true);
+    declare_parameter<int>("serial_port_channel", 22);
+    declare_parameter<std::string>("serial_device_directory", "/dev");
+    declare_parameter<std::string>("serial_fallback_directory", "");
+    declare_parameter<std::string>("ssh_user", "");
     declare_parameter<bool>("hide_non_uav", false);
 
     adapter_alias_ = get_parameter("adapter_alias").as_string();
@@ -225,6 +299,16 @@ void TuiNode::configure_parameters() {
     refresh_period_sec_ = std::max(0.2, get_parameter("refresh_period_sec").as_double());
     render_period_sec_ = std::max(0.05, get_parameter("render_period_sec").as_double());
     topic_count_refresh_sec_ = std::max(1.0, get_parameter("topic_count_refresh_sec").as_double());
+    enable_serial_port_profile_ =
+        get_parameter("enable_serial_port_profile").as_bool();
+    const auto serial_channel = get_parameter("serial_port_channel").as_int();
+    if (serial_channel < 1 || serial_channel > 30) {
+        throw std::invalid_argument("serial_port_channel must be in the range 1..30");
+    }
+    serial_port_channel_ = static_cast<uint16_t>(serial_channel);
+    serial_device_directory_ = get_parameter("serial_device_directory").as_string();
+    serial_fallback_directory_ = get_parameter("serial_fallback_directory").as_string();
+    ssh_user_ = get_parameter("ssh_user").as_string();
     hide_non_uav_ = get_parameter("hide_non_uav").as_bool();
 }
 
@@ -305,6 +389,12 @@ void TuiNode::handle_key_event(const TerminalKeyEvent& event) {
             break;
         case 'c':
             trigger_connect_toggle();
+            break;
+        case 'l':
+            trigger_serial_connect();
+            break;
+        case 'h':
+            trigger_ssh();
             break;
         case 't':
             if (const auto* device = selected_device()) {
@@ -400,6 +490,9 @@ void TuiNode::refresh_device_cache(bool force) {
         current_macs.push_back(device.mac);
         if (!device.connected) {
             resolved_service_latch_.erase(device.mac);
+            if (serial_links_) {
+                serial_links_->detach(device.object_path);
+            }
             continue;
         }
         if (device.services_resolved) {
@@ -686,47 +779,178 @@ void TuiNode::trigger_connect_toggle() {
     }
 
     const auto mac = device->mac;
+    const auto device_path = device->object_path;
     const bool connected = device->connected;
     action_label_ = connected ? "disconnect" : "connect";
     status_message_ = action_label_ + " requested for " + mac;
-    action_future_ = std::async(std::launch::async, [this, mac, connected]() {
-        try {
-            auto& client = runtime_->client();
-            if (connected) {
-                const bool ok = client.disconnect(mac, 10.0);
-                return ok ? std::string{"disconnected "} + mac
-                          : std::string{"disconnect failed for "} + mac;
-            }
-
-            const bool scan_was_active = runtime_->is_scanning();
-            if (scan_was_active) {
-                (void)client.stop_scan();
-            }
-
-            (void)client.set_preferred_bearer(mac, "le");
-            const bool connected_ok = client.connect(mac, 15.0, true);
-            if (!connected_ok) {
-                return std::string{"connect failed for "} + mac;
-            }
-
-            const bool services_ok = client.wait_services_resolved(mac, 15.0);
-            if (services_ok) {
-                if (wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
-                    return std::string{"connected over LE "} + mac;
+    action_future_ = std::async(
+        std::launch::async,
+        [this, mac, device_path, connected]() {
+            try {
+                auto& client = runtime_->client();
+                if (connected) {
+                    if (serial_profile_) {
+                        (void)client.disconnect_profile(
+                            mac, std::string{bluez::kSerialPortProfileUuid});
+                    }
+                    const bool ok = client.disconnect(mac, 10.0);
+                    return ok ? std::string{"disconnected "} + mac
+                              : std::string{"disconnect failed for "} + mac;
                 }
 
-                return std::string{"connected, remote GATT cache still populating for "} + mac;
-            }
+                if (runtime_->is_scanning()) {
+                    (void)client.stop_scan();
+                }
 
-            const auto current = client.get_device(mac);
-            if (current && current->connected) {
-                return std::string{"connected but services unresolved for "} + mac;
+                (void)client.set_preferred_bearer(mac, "le");
+                if (!client.connect(mac, 15.0, true)) {
+                    return std::string{"connect failed for "} + mac;
+                }
+
+                std::string result;
+                const bool services_ok = client.wait_services_resolved(mac, 15.0);
+                if (services_ok &&
+                    wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
+                    result = "connected over LE";
+                } else if (const auto current = client.get_device(mac);
+                           current && current->connected) {
+                    result = services_ok
+                        ? "connected; remote GATT cache still populating"
+                        : "connected; GATT services unresolved";
+                } else {
+                    return std::string{"connection dropped before services resolved for "} + mac;
+                }
+
+                if (!serial_profile_ || !serial_links_) {
+                    return result + " (serial profile unavailable) " + mac;
+                }
+
+                const auto current = client.get_device(mac);
+                std::string pairing_error;
+                if (current && !current->paired && !current->bonded) {
+                    (void)client.pair(mac, 30.0, &pairing_error);
+                }
+
+                if (!client.connect_profile(
+                        mac, std::string{bluez::kSerialPortProfileUuid})) {
+                    return result + "; serial profile connection failed" +
+                        (pairing_error.empty() ? std::string{} :
+                         std::string{" (pairing: "} + pairing_error + ")") +
+                        " " + mac;
+                }
+
+                serial::SerialLinkInfo link;
+                if (!serial_links_->wait_for_link(
+                        device_path, std::chrono::seconds(12), &link)) {
+                    return result + "; serial profile connected but no PTY arrived " + mac;
+                }
+                return result + "; serial=" + link.tty_path + " " + mac;
+            } catch (const std::exception& e) {
+                return std::string{"connect action failed: "} + e.what();
             }
-            return std::string{"connection dropped before services resolved for "} + mac;
-        } catch (const std::exception& e) {
-            return std::string{"connect action failed: "} + e.what();
+        }).share();
+}
+
+void TuiNode::trigger_serial_connect() {
+    const auto* device = selected_device();
+    if (device == nullptr || action_future_.valid()) {
+        return;
+    }
+    if (!device->connected || !serial_profile_ || !serial_links_) {
+        status_message_ = "connect the UAV first; serial profile is unavailable";
+        return;
+    }
+
+    const auto mac = device->mac;
+    const auto device_path = device->object_path;
+    const bool already_open = serial_links_->link_for_device(device_path).has_value();
+    action_label_ = already_open ? "close serial" : "open serial";
+    status_message_ = action_label_ + " requested for " + mac;
+    action_future_ = std::async(
+        std::launch::async,
+        [this, mac, device_path, already_open]() {
+            auto& client = runtime_->client();
+            if (already_open) {
+                const bool ok = client.disconnect_profile(
+                    mac, std::string{bluez::kSerialPortProfileUuid});
+                return ok ? std::string{"serial link closed for "} + mac
+                          : std::string{"serial disconnect failed for "} + mac;
+            }
+            if (!client.connect_profile(
+                    mac, std::string{bluez::kSerialPortProfileUuid})) {
+                return std::string{"serial connection failed for "} + mac;
+            }
+            serial::SerialLinkInfo link;
+            if (!serial_links_->wait_for_link(
+                    device_path, std::chrono::seconds(12), &link)) {
+                return std::string{"serial connected but PTY was not created for "} + mac;
+            }
+            return std::string{"serial link "} + link.tty_path + " ready for " + mac;
+        }).share();
+}
+
+std::string TuiNode::ssh_wrapper_path() const {
+    std::vector<char> executable(4096, '\0');
+    const auto size = ::readlink("/proc/self/exe", executable.data(), executable.size() - 1);
+    if (size < 0) {
+        return "mrs-uav-bluetooth-ssh";
+    }
+    executable[static_cast<size_t>(size)] = '\0';
+    return (std::filesystem::path(executable.data()).parent_path() /
+            "mrs-uav-bluetooth-ssh").string();
+}
+
+void TuiNode::trigger_ssh() {
+    const auto* device = selected_device();
+    if (device == nullptr || !serial_links_) {
+        status_message_ = "no UAV serial link is available";
+        return;
+    }
+    const auto link = serial_links_->link_for_device(device->object_path);
+    const auto hostname = util::device_hostname_guess(*device, uav_name_pattern_);
+    if (!link || hostname.empty()) {
+        status_message_ = "open the selected UAV serial link before SSH";
+        return;
+    }
+
+    const auto wrapper = ssh_wrapper_path();
+    const auto tty_path = link->tty_path;
+    const auto user = ssh_user_;
+    terminal_.suspend();
+
+    const auto pid = ::fork();
+    const int fork_error = pid < 0 ? errno : 0;
+    if (pid == 0) {
+        const int tty_fd = ::open("/dev/tty", O_RDWR | O_NOCTTY);
+        if (tty_fd >= 0) {
+            (void)::dup2(tty_fd, STDIN_FILENO);
+            (void)::dup2(tty_fd, STDOUT_FILENO);
+            (void)::dup2(tty_fd, STDERR_FILENO);
+            if (tty_fd > STDERR_FILENO) {
+                ::close(tty_fd);
+            }
         }
-    }).share();
+        if (user.empty()) {
+            ::execl(wrapper.c_str(), wrapper.c_str(),
+                    "--device", tty_path.c_str(), hostname.c_str(), nullptr);
+        } else {
+            ::execl(wrapper.c_str(), wrapper.c_str(),
+                    "--device", tty_path.c_str(),
+                    "--user", user.c_str(), hostname.c_str(), nullptr);
+        }
+        _exit(127);
+    }
+
+    int wait_status = 0;
+    if (pid > 0) {
+        while (::waitpid(pid, &wait_status, 0) < 0 && errno == EINTR) {
+        }
+    }
+    terminal_.resume();
+    last_frame_.clear();
+    status_message_ = pid < 0
+        ? std::string{"failed to start SSH: "} + std::strerror(fork_error)
+        : std::string{"SSH session ended for "} + hostname;
 }
 
 void TuiNode::trigger_scan_toggle() {
@@ -1069,6 +1293,17 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
                                   " services=" + yes_no(services_resolved));
             right_lines.push_back("trust:  paired=" + yes_no(device->paired || device->bonded) +
                                   " trusted=" + yes_no(device->trusted));
+            if (serial_links_) {
+                if (const auto serial_link =
+                        serial_links_->link_for_device(device->object_path)) {
+                    right_lines.push_back("serial: " + serial_link->tty_path);
+                    right_lines.push_back("ssh:    press h");
+                } else {
+                    right_lines.push_back("serial: - (press l)");
+                }
+            } else {
+                right_lines.push_back("serial: unavailable");
+            }
 
             std::string export_count = "-";
             if (const auto it = topic_counts_.find(device->mac); it != topic_counts_.end()) {
@@ -1161,6 +1396,8 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
         right_lines.push_back("Controls");
         right_lines.push_back("j/k or arrows: move");
         right_lines.push_back("c connect/disconnect");
+        right_lines.push_back("l open/close serial");
+        right_lines.push_back("h SSH over serial");
         right_lines.push_back("s toggle scan");
         right_lines.push_back("t refresh time");
         right_lines.push_back("w refresh Wi-Fi");
@@ -1179,6 +1416,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
              << "\x1b[2madapter=" << runtime_->adapter_path()
              << "  local_mac=" << adapter_local_mac()
              << "  scan=" << yes_no(runtime_->is_scanning())
+             << "  serial=" << yes_no(serial_profile_ != nullptr)
              << "  filter=" << (hide_non_uav_ ? "uav-only" : "all")
              << "\x1b[0m";
         out << frame_line(line.str(), frame_width);

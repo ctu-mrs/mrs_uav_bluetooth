@@ -26,6 +26,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <unistd.h>
 
 namespace {
 
@@ -346,22 +347,22 @@ std::vector<std::string> merge_service_uuids(const std::vector<std::string>& run
 
 std::string gatt_layout_signature_for_config(const mrs_uav_bluetooth::config::NodeConfig& cfg) {
     std::vector<std::string> tokens;
-    tokens.reserve(cfg.shared_topics.size() + 3);
+    tokens.reserve(cfg.shared_topics.size() + cfg.gatt_profile_uuids.size() + 3);
 
-    if (!cfg.enable_server) {
-        return "server:off";
-    }
-
-    tokens.push_back("server:on");
-    if (cfg.enable_wifi_service) {
+    tokens.push_back(cfg.enable_server ? "server:on" : "server:off");
+    if (cfg.enable_server && cfg.enable_wifi_service) {
         tokens.push_back("svc:wifi");
     }
-    if (cfg.enable_time_service) {
+    if (cfg.enable_server && cfg.enable_time_service) {
         tokens.push_back("svc:time");
+    }
+    for (const auto& uuid : cfg.gatt_profile_uuids) {
+        tokens.push_back("profile:" + uuid);
     }
 
     for (const auto& shared_topic : cfg.shared_topics) {
-        if (shared_topic.mode != "export" && shared_topic.mode != "both") {
+        if (!cfg.enable_server ||
+            (shared_topic.mode != "export" && shared_topic.mode != "both")) {
             continue;
         }
         tokens.push_back("bridge:" + shared_topic.bridge_name);
@@ -419,6 +420,8 @@ ServiceNode::~ServiceNode() {
         cache_observer_token_ = 0;
     }
     wait_for_peer_tasks();
+    serial_profile_.reset();
+    serial_ssh_server_.reset();
     if (advertisement_ && !adapter_path_.empty()) {
         try {
             advertisement_->unregister_advertisement(adapter_path_);
@@ -557,7 +560,8 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
     }
 
     const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
-    const bool should_be_discoverable = cfg.advertise_discoverable.value_or(cfg.enable_server);
+    const bool should_be_discoverable = cfg.advertise_discoverable.value_or(
+        cfg.enable_server || cfg.enable_serial_port_profile);
     const bool should_be_pairable = cfg.auto_pair;
 
     if (!adapter_info || !adapter_info->powered) {
@@ -578,6 +582,79 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
         adapter_info->discoverable != should_be_discoverable ||
         (should_be_discoverable && adapter_info->discoverable_timeout != cfg.discoverable_timeout)) {
         adapter_->set_discoverable(should_be_discoverable, cfg.discoverable_timeout);
+    }
+}
+
+void ServiceNode::configure_serial_profile(const config::NodeConfig& cfg) {
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+
+    if (!cfg.enable_serial_port_profile) {
+        serial_profile_.reset();
+        serial_ssh_server_.reset();
+        serial_sshd_path_.clear();
+        return;
+    }
+
+    if (serial_profile_ && serial_profile_->registered() &&
+        serial_profile_->options().channel == cfg.serial_port_channel &&
+        serial_sshd_path_ == cfg.serial_sshd_path) {
+        return;
+    }
+
+    serial_profile_.reset();
+    serial_ssh_server_.reset();
+
+    auto ssh_server = std::make_unique<serial::SerialSshServer>(
+        get_logger(), cfg.serial_sshd_path);
+    bluez::SerialPortProfileOptions options;
+    options.role = bluez::ProfileRole::Server;
+    options.channel = cfg.serial_port_channel;
+    options.require_authentication = true;
+    options.require_authorization = false;
+    options.auto_connect = false;
+    options.name = "MRS UAV SSH Serial Port";
+
+    auto profile = std::make_unique<bluez::SerialPortProfile>(
+        *server_dbus_,
+        "/cz/cvut/mrs/uav/bluetooth/serial_server",
+        get_logger(),
+        options);
+    profile->set_connection_handler(
+        [this](const std::string& device_path,
+               int socket_fd,
+               const std::map<std::string, sdbus::Variant>&) {
+            std::lock_guard<std::recursive_mutex> callback_lock(state_mutex_);
+            if (!can_run_callbacks() || !serial_ssh_server_) {
+                ::close(socket_fd);
+                throw std::runtime_error("serial SSH service is shutting down");
+            }
+            serial_ssh_server_->start_session(device_path, socket_fd);
+        });
+    profile->set_disconnection_handler([this](const std::string& device_path) {
+        std::lock_guard<std::recursive_mutex> callback_lock(state_mutex_);
+        if (serial_ssh_server_) {
+            serial_ssh_server_->stop_session(device_path);
+        }
+    });
+    profile->set_release_handler([this]() {
+        std::lock_guard<std::recursive_mutex> callback_lock(state_mutex_);
+        if (serial_ssh_server_) {
+            serial_ssh_server_->stop_all();
+        }
+    });
+    serial_sshd_path_ = cfg.serial_sshd_path;
+    serial_ssh_server_ = std::move(ssh_server);
+    try {
+        profile->register_profile();
+        serial_profile_ = std::move(profile);
+    } catch (const std::exception& error) {
+        serial_ssh_server_.reset();
+        serial_sshd_path_.clear();
+        RCLCPP_ERROR(get_logger(), "Serial Port Profile is unavailable: %s", error.what());
+    } catch (...) {
+        serial_ssh_server_.reset();
+        serial_sshd_path_.clear();
+        RCLCPP_ERROR(get_logger(), "Serial Port Profile is unavailable: unknown error");
     }
 }
 
@@ -607,7 +684,8 @@ void ServiceNode::refresh_advertisement_registration() {
     }
 
     advertisement_->set_local_name(local_name);
-    advertisement_->set_discoverable(active_config_.advertise_discoverable.value_or(active_config_.enable_server));
+    advertisement_->set_discoverable(active_config_.advertise_discoverable.value_or(
+        active_config_.enable_server || active_config_.enable_serial_port_profile));
     advertisement_->set_discoverable_timeout(
         static_cast<uint16_t>(std::min<uint32_t>(active_config_.discoverable_timeout,
                                                  std::numeric_limits<uint16_t>::max())));
@@ -883,6 +961,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         bluez::kDefaultAdvertisementExtraDataType);
     publish_scan_snapshot();
     apply_adapter_state(cfg);
+    configure_serial_profile(cfg);
 
     if (status_timer_) {
         status_timer_->cancel();
@@ -1071,13 +1150,25 @@ void ServiceNode::rebuild_server_objects() {
     if (!active_config_.enable_server) {
         wifi_service_.reset();
         time_service_.reset();
-        return;
+        if (active_config_.gatt_profile_uuids.empty()) {
+            return;
+        }
     }
 
     gatt_app_ = std::make_unique<gatt::GattApplication>(*server_dbus_, "/org/bluez/app", get_logger());
+    if (!active_config_.gatt_profile_uuids.empty()) {
+        auto profile = std::make_shared<gatt::GattProfile>(
+            *server_dbus_,
+            "/org/bluez/app/profile0",
+            active_config_.gatt_profile_uuids);
+        profile->set_release_callback([this]() {
+            RCLCPP_INFO(get_logger(), "BlueZ released the local GATT client profile");
+        });
+        gatt_app_->add_profile(std::move(profile));
+    }
 
     int service_index = 0;
-    if (active_config_.enable_wifi_service) {
+    if (active_config_.enable_server && active_config_.enable_wifi_service) {
         wifi_service_ = std::make_unique<gatt::services::WifiService>(
             *server_dbus_, "/org/bluez/app", service_index++,
             [this]() {
@@ -1110,7 +1201,7 @@ void ServiceNode::rebuild_server_objects() {
         wifi_service_.reset();
     }
 
-    if (active_config_.enable_time_service) {
+    if (active_config_.enable_server && active_config_.enable_time_service) {
         time_service_ = std::make_unique<gatt::services::TimeService>(
             *server_dbus_, "/org/bluez/app", service_index++,
             [this](const std::vector<uint8_t>& payload,
@@ -1132,13 +1223,17 @@ void ServiceNode::rebuild_server_objects() {
         time_service_.reset();
     }
 
-    export_bridges_->rebuild_gatt_services(*gatt_app_, *server_dbus_, "/org/bluez/app");
+    if (active_config_.enable_server) {
+        export_bridges_->rebuild_gatt_services(*gatt_app_, *server_dbus_, "/org/bluez/app");
+    }
     gatt_app_->register_application(adapter_path_);
 
-    RCLCPP_INFO(get_logger(), "[node] GATT server registered, setting up advertisement");
-    advertisement_ = std::make_unique<gatt::Advertisement>(
-        *server_dbus_, "/org/bluez/advertisement0", active_config_.advertise_mode);
-    refresh_advertisement_registration();
+    if (active_config_.enable_server) {
+        RCLCPP_INFO(get_logger(), "[node] GATT server registered, setting up advertisement");
+        advertisement_ = std::make_unique<gatt::Advertisement>(
+            *server_dbus_, "/org/bluez/advertisement0", active_config_.advertise_mode);
+        refresh_advertisement_registration();
+    }
 }
 
 void ServiceNode::handle_configure_notification_bridge(const std::shared_ptr<mrs_uav_bluetooth::srv::ConfigureNotificationBridge::Request> request,

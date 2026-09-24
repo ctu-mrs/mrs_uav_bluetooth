@@ -3,7 +3,9 @@
 
 #include "mrs_uav_bluetooth/app/central_client_runtime.hpp"
 #include "mrs_uav_bluetooth/app/raw_terminal.hpp"
+#include "mrs_uav_bluetooth/bluez/serial_port_profile.hpp"
 #include "mrs_uav_bluetooth/gatt/remote_gatt_inspector.hpp"
+#include "mrs_uav_bluetooth/serial/serial_link.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -93,8 +95,11 @@ private:
     void request_time_sample(const bluez::DeviceInfo& device, bool force = false);
     void request_wifi_refresh(const bluez::DeviceInfo& device, bool force = false);
     void trigger_connect_toggle();
+    void trigger_serial_connect();
+    void trigger_ssh();
     void trigger_scan_toggle();
     void trigger_wifi_write(PromptMode mode, std::string value);
+    std::string ssh_wrapper_path() const;
     void ensure_builtin_subscriptions();
     void ensure_builtin_subscription(const bluez::DeviceInfo& device);
     void on_notification(const std::vector<uint8_t>& data,
@@ -110,6 +115,8 @@ private:
 
     std::unique_ptr<CentralClientRuntime> runtime_;
     std::unique_ptr<gatt::RemoteGattInspector> inspector_;
+    std::unique_ptr<serial::SerialLinkManager> serial_links_;
+    std::unique_ptr<bluez::SerialPortProfile> serial_profile_;
     RawTerminal terminal_;
     rclcpp::TimerBase::SharedPtr ui_timer_;
     std::vector<bluez::DeviceInfo> current_devices_;
@@ -121,6 +128,9 @@ private:
     std::string adapter_alias_;
     std::string scan_mode_;
     std::string uav_name_pattern_;
+    std::string serial_device_directory_;
+    std::string serial_fallback_directory_;
+    std::string ssh_user_;
     std::string selected_mac_;
     std::string status_message_;
     std::string last_frame_;
@@ -132,6 +142,8 @@ private:
     double refresh_period_sec_{1.0};
     double render_period_sec_{0.1};
     double topic_count_refresh_sec_{5.0};
+    uint16_t serial_port_channel_{22};
+    bool enable_serial_port_profile_{true};
     bool hide_non_uav_{false};
     PromptMode prompt_mode_{PromptMode::None};
     std::string prompt_buffer_;

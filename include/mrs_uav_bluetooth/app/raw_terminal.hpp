@@ -39,6 +39,8 @@ public:
     RawTerminal& operator=(const RawTerminal&) = delete;
 
     bool active() const;
+    void suspend();
+    void resume();
     std::optional<TerminalKeyEvent> read_key();
     TerminalSize size() const;
     void write_text(const std::string& text) const;

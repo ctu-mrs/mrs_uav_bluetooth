@@ -22,6 +22,8 @@ find_package(rcl_interfaces REQUIRED)
 
 # ---- External dependencies ----
 find_package(yaml-cpp REQUIRED)
+find_package(Threads REQUIRED)
+find_library(UTIL_LIBRARY util)
 
 # Debian/Bloom package builds need the packaged sdbus-c++ from /usr. Both
 # CMake and pkg-config usually search /usr/local first, which can make the
@@ -189,6 +191,7 @@ add_library(${PROJECT_NAME}_bluez STATIC
   src/bluez/bluez_client.cpp
   src/bluez/bluez_client_gatt.cpp
   src/bluez/bluez_pairing_agent.cpp
+  src/bluez/serial_port_profile.cpp
 )
 target_include_directories(${PROJECT_NAME}_bluez PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -199,6 +202,27 @@ target_link_libraries(${PROJECT_NAME}_bluez
   SDBusCpp::sdbus-c++
 )
 ament_target_dependencies(${PROJECT_NAME}_bluez
+  rclcpp
+)
+
+# =====================================================================
+# Serial transport / SSH library
+# =====================================================================
+
+add_library(${PROJECT_NAME}_serial STATIC
+  src/serial/serial_link.cpp
+)
+target_include_directories(${PROJECT_NAME}_serial PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(${PROJECT_NAME}_serial
+  Threads::Threads
+)
+if(UTIL_LIBRARY)
+  target_link_libraries(${PROJECT_NAME}_serial ${UTIL_LIBRARY})
+endif()
+ament_target_dependencies(${PROJECT_NAME}_serial
   rclcpp
 )
 
@@ -329,6 +353,7 @@ target_link_libraries(${PROJECT_NAME}_util ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_config ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_bridge ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_bluez ${cpp_typesupport_target})
+target_link_libraries(${PROJECT_NAME}_serial ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_gatt ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_network ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_ros ${cpp_typesupport_target})
@@ -357,6 +382,7 @@ target_link_libraries(service_node
   ${PROJECT_NAME}_bridge
   ${PROJECT_NAME}_bridge_mgr
   ${PROJECT_NAME}_bluez
+  ${PROJECT_NAME}_serial
   ${PROJECT_NAME}_gatt
   ${PROJECT_NAME}_network
   ${PROJECT_NAME}_ros
@@ -395,11 +421,26 @@ target_include_directories(tui_node PRIVATE
 target_link_libraries(tui_node
   ${PROJECT_NAME}_util
   ${PROJECT_NAME}_bluez
+  ${PROJECT_NAME}_serial
   ${PROJECT_NAME}_gatt
   ${cpp_typesupport_target}
 )
 ament_target_dependencies(tui_node
   rclcpp
+)
+
+add_executable(mrs_uav_bluetooth_serial_proxy
+  src/app/main_serial_proxy.cpp
+)
+set_target_properties(mrs_uav_bluetooth_serial_proxy PROPERTIES
+  OUTPUT_NAME "mrs-uav-bluetooth-serial-proxy"
+)
+
+add_executable(mrs_uav_bluetooth_ssh
+  src/app/main_bluetooth_ssh.cpp
+)
+set_target_properties(mrs_uav_bluetooth_ssh PROPERTIES
+  OUTPUT_NAME "mrs-uav-bluetooth-ssh"
 )
 
 add_executable(test_node
@@ -420,7 +461,13 @@ ament_target_dependencies(test_node
 # Install targets
 # =====================================================================
 
-install(TARGETS service_node user_node tui_node test_node
+install(TARGETS
+  service_node
+  user_node
+  tui_node
+  test_node
+  mrs_uav_bluetooth_serial_proxy
+  mrs_uav_bluetooth_ssh
   DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/

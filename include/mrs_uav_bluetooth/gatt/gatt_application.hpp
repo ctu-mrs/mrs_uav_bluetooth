@@ -26,6 +26,38 @@ class GattCharacteristic;
 class GattDescriptor;
 
 // ---------------------------------------------------------------------------
+// GattProfile
+// ---------------------------------------------------------------------------
+
+/// Local org.bluez.GattProfile1 client profile. Registering it as part of a
+/// GATT application asks BlueZ to reconnect devices exposing any listed UUID.
+class GattProfile {
+public:
+    using ReleaseCallback = std::function<void()>;
+
+    GattProfile(bluez::DbusConnection& dbus,
+                std::string object_path,
+                std::vector<std::string> uuids);
+    ~GattProfile();
+
+    void export_object();
+    void unexport();
+
+    const std::string& path() const { return path_; }
+    const std::vector<std::string>& uuids() const { return uuids_; }
+    void set_release_callback(ReleaseCallback callback) {
+        release_callback_ = std::move(callback);
+    }
+
+private:
+    bluez::DbusConnection& dbus_;
+    std::string path_;
+    std::vector<std::string> uuids_;
+    ReleaseCallback release_callback_;
+    std::unique_ptr<sdbus::IObject> exported_;
+};
+
+// ---------------------------------------------------------------------------
 // GattDescriptor
 // ---------------------------------------------------------------------------
 
@@ -194,6 +226,7 @@ public:
     ~GattApplication();
 
     void add_service(std::shared_ptr<GattService> svc);
+    void add_profile(std::shared_ptr<GattProfile> profile);
 
     /// Export the ObjectManager interface and register with BlueZ GattManager1.
     void register_application(const std::string& adapter_path);
@@ -203,6 +236,7 @@ public:
 
     const std::string& path() const { return path_; }
     const std::vector<std::shared_ptr<GattService>>& services() const { return services_; }
+    const std::vector<std::shared_ptr<GattProfile>>& profiles() const { return profiles_; }
     ManagedObjects get_managed_objects() const;
 
 private:
@@ -213,6 +247,7 @@ private:
     std::unique_ptr<sdbus::IObject> exported_;
     std::optional<sdbus::Slot> object_manager_slot_;
     std::vector<std::shared_ptr<GattService>> services_;
+    std::vector<std::shared_ptr<GattProfile>> profiles_;
     bool registered_{false};
 };
 

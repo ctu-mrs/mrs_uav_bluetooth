@@ -17,6 +17,7 @@ inline constexpr std::string_view kAdapterIface            = "org.bluez.Adapter1
 inline constexpr std::string_view kDeviceIface             = "org.bluez.Device1";
 inline constexpr std::string_view kBatteryIface            = "org.bluez.Battery1";
 inline constexpr std::string_view kGattManagerIface        = "org.bluez.GattManager1";
+inline constexpr std::string_view kGattProfileIface        = "org.bluez.GattProfile1";
 inline constexpr std::string_view kGattServiceIface        = "org.bluez.GattService1";
 inline constexpr std::string_view kGattCharacteristicIface = "org.bluez.GattCharacteristic1";
 inline constexpr std::string_view kGattDescriptorIface     = "org.bluez.GattDescriptor1";
@@ -24,6 +25,12 @@ inline constexpr std::string_view kLeAdvManagerIface       = "org.bluez.LEAdvert
 inline constexpr std::string_view kLeAdvertisementIface    = "org.bluez.LEAdvertisement1";
 inline constexpr std::string_view kAgentIface              = "org.bluez.Agent1";
 inline constexpr std::string_view kAgentManagerIface       = "org.bluez.AgentManager1";
+inline constexpr std::string_view kProfileIface            = "org.bluez.Profile1";
+inline constexpr std::string_view kProfileManagerIface     = "org.bluez.ProfileManager1";
+
+// ---- Bluetooth SIG profile UUIDs ----
+inline constexpr std::string_view kSerialPortProfileUuid =
+    "00001101-0000-1000-8000-00805f9b34fb";
 
 // ---- Standard D-Bus interface names ----
 inline constexpr std::string_view kDbusObjectManagerIface  = "org.freedesktop.DBus.ObjectManager";

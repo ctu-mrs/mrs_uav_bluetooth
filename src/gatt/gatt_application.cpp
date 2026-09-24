@@ -24,6 +24,35 @@ void log_properties_changed_failure(const char* object_kind,
 }  // namespace
 
 // ===========================================================================
+// GattProfile
+// ===========================================================================
+
+GattProfile::GattProfile(DbusConnection& dbus,
+                         std::string object_path,
+                         std::vector<std::string> uuids)
+    : dbus_(dbus), path_(std::move(object_path)), uuids_(std::move(uuids)) {}
+
+GattProfile::~GattProfile() { unexport(); }
+
+void GattProfile::export_object() {
+    exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
+    exported_->addVTable(
+        sdbus::registerProperty("UUIDs")
+            .withGetter([this]() -> std::vector<std::string> { return uuids_; }),
+        sdbus::registerMethod("Release")
+            .implementedAs([this]() {
+                if (release_callback_) {
+                    release_callback_();
+                }
+            })
+    ).forInterface(std::string(kGattProfileIface));
+}
+
+void GattProfile::unexport() {
+    exported_.reset();
+}
+
+// ===========================================================================
 // GattDescriptor
 // ===========================================================================
 
@@ -403,6 +432,10 @@ void GattApplication::add_service(std::shared_ptr<GattService> svc) {
     services_.push_back(std::move(svc));
 }
 
+void GattApplication::add_profile(std::shared_ptr<GattProfile> profile) {
+    profiles_.push_back(std::move(profile));
+}
+
 void GattApplication::register_application(const std::string& adapter_path) {
     // Create the application-level D-Bus object.
     RCLCPP_INFO(logger_, "Creating GATT application object at %s", path_.c_str());
@@ -435,6 +468,11 @@ void GattApplication::register_application(const std::string& adapter_path) {
                             desc->path().c_str(), desc->uuid().c_str());
             }
         }
+    }
+    for (auto& profile : profiles_) {
+        RCLCPP_INFO(logger_, "Exporting GATT client profile at %s (%zu UUIDs)",
+                    profile->path().c_str(), profile->uuids().size());
+        profile->export_object();
     }
 
     // Now enable the automatic ObjectManager on the application object.
@@ -488,6 +526,9 @@ void GattApplication::unregister_application(const std::string& adapter_path) {
     }
     for (auto& svc : services_) {
         svc->unexport();
+    }
+    for (auto& profile : profiles_) {
+        profile->unexport();
     }
     object_manager_slot_.reset();
     exported_.reset();

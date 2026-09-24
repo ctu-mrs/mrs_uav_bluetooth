@@ -375,6 +375,22 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.auto_trust = b("auto_trust", cfg.auto_trust);
     cfg.enable_time_service = b("enable_time_service", cfg.enable_time_service);
     cfg.enable_wifi_service = b("enable_wifi_service", cfg.enable_wifi_service);
+    cfg.enable_serial_port_profile =
+        b("enable_serial_port_profile", cfg.enable_serial_port_profile);
+    const auto serial_port_channel = u32("serial_port_channel", cfg.serial_port_channel);
+    if (serial_port_channel == 0 || serial_port_channel > 30) {
+        throw std::runtime_error("serial_port_channel must be in the range 1..30");
+    }
+    cfg.serial_port_channel = static_cast<uint16_t>(serial_port_channel);
+    cfg.serial_sshd_path = str("serial_sshd_path", cfg.serial_sshd_path);
+    cfg.gatt_profile_uuids = str_list("gatt_profile_uuids");
+    for (auto& uuid : cfg.gatt_profile_uuids) {
+        uuid = util::lower_trim_copy(uuid);
+        if (!util::is_uuid(uuid)) {
+            throw std::runtime_error(
+                "gatt_profile_uuids must contain only 128-bit UUIDs: " + uuid);
+        }
+    }
     cfg.auto_connect_enable = b("auto_connect_enable", cfg.auto_connect_enable);
     cfg.auto_connect_whitelist = str_list("auto_connect_whitelist");
     cfg.auto_connect_pattern = str("auto_connect_pattern", cfg.auto_connect_pattern);

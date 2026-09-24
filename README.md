@@ -6,7 +6,7 @@ The package providese these standalone nodes:
 
 - `service_node`: a node running at background that owns the BLE adapter, performs periodic scans, hosts built-in GATT services, exposes ROS 2 services and topics, etc.
 - `user_node`: a helper node for user TMUX sessions that temporarily applies an overlay YAML configuration on top of the service default config while it stays alive.
-- `tui_node`: a node with a keyboard-controllable text user interface, which you can use on your laptop for a quick access to nearby BLE-enabled UAVs and their Wi-Fi network settings.
+- `tui_node`: a node with a keyboard-controllable text user interface, which you can use on your laptop for a quick access to nearby BLE-enabled UAVs and their Wi-Fi network settings, and to establish SSH-over-Bluetooth connection.
 - `test_node`: a testing node for advertisement-based and connection-based communication modes.
 
 Main capabilities:
@@ -16,6 +16,7 @@ Main capabilities:
 - Automatic peer discovery and connection management for UAV hostnames matching a configurable pattern.
 - Declarative export and import of compact ROS 2 topic payloads over BLE characteristics or descriptors.
 - Periodic status reporting plus raw notification and device inventory topics.
+- Bluetooth Serial Port Profile links with PTY devices and OpenSSH over RFCOMM.
 
 ## Installation
 
@@ -40,6 +41,17 @@ ros2 launch mrs_uav_bluetooth tui_node.launch.py
 and does not require ROS Middleware (RMW) or Bluetooth service node running.
 
 All other uses of this package depend on both RMW and running service node. The `service_node` is launched automatically in the systemd service when `mrs-uav-bluetooth-service` package is installed (on UAVs), otherwise it can be launched manually by user.
+
+### Bluetooth serial and SSH
+
+When enabled in config, the service node registers the Bluetooth Serial Port Profile (SPP). Each authenticated serial connection is handed to OpenSSH `sshd`. The serial link can be opened/closed in the TUI node on user laptops, while creating access symlinks such as `/dev/ttyBLE_uavXX` (based on peer hostname) or `/dev/ttyBLE_AA-BB-CC-DD-EE-FF` (based on peer MAC). The symlink exists only while the connection is alive.
+
+SSH can be opened with `h` in the TUI or with the installed SSH wrapper, for example:
+
+```bash
+ros2 run mrs_uav_bluetooth mrs-uav-bluetooth-ssh uav01
+ros2 run mrs_uav_bluetooth mrs-uav-bluetooth-ssh --mac AA:BB:CC:DD:EE:FF --user mrs uav01
+```
 
 ### Advertisement-based communication
 
@@ -138,6 +150,8 @@ Important configuration keys in `config/default.yaml`:
 - `node_topics_prefix`: root of all node-created topics, usually `/{hostname}/ble`.
 - `enable_scan`, `scan_mode`, `scan_publish_period`: BLE discovery behavior.
 - `enable_server`, `enable_time_service`, `enable_wifi_service`: built-in BLE server features.
+- `enable_serial_port_profile`, `serial_port_channel`, `serial_sshd_path`: authenticated SPP and direct SSH-over-RFCOMM service settings.
+- `gatt_profile_uuids`: remote service UUIDs exported through `org.bluez.GattProfile1` for BlueZ-managed reconnection.
 - `advertise_mode`, `advertise_extra_data_topic`: common advertisement settings kept in the base config. Additional BlueZ advertisement fields are also accepted in overlay YAMLs when needed.
 - `auto_connect_enable`, `auto_connect_whitelist`, `auto_connect_pattern`, `peer_connection_timeout`: automatic peer management.
 - `wifi_netplan_config_path`: netplan file updated by the BLE Wi-Fi service.

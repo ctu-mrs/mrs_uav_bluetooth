@@ -6,6 +6,7 @@
 #include "mrs_uav_bluetooth/bluez/bluez_pairing_agent.hpp"
 #include "mrs_uav_bluetooth/bluez/dbus_connection.hpp"
 #include "mrs_uav_bluetooth/bluez/object_manager_cache.hpp"
+#include "mrs_uav_bluetooth/bluez/serial_port_profile.hpp"
 #include "mrs_uav_bluetooth/bridge/bridge_registry.hpp"
 #include "mrs_uav_bluetooth/msg/ble_peer_time_status.hpp"
 #include "mrs_uav_bluetooth/bridge/export_bridge_manager.hpp"
@@ -18,6 +19,7 @@
 #include "mrs_uav_bluetooth/network/netplan_manager.hpp"
 #include "mrs_uav_bluetooth/peer/peer_manager.hpp"
 #include "mrs_uav_bluetooth/ros/ros_interface_manager.hpp"
+#include "mrs_uav_bluetooth/serial/serial_link.hpp"
 #include "mrs_uav_bluetooth/srv/configure_notification_bridge.hpp"
 #include "mrs_uav_bluetooth/srv/connect_device.hpp"
 #include "mrs_uav_bluetooth/srv/disconnect_device.hpp"
@@ -69,6 +71,7 @@ private:
     void create_services();
     void apply_config(const config::NodeConfig& cfg);
     void apply_adapter_state(const config::NodeConfig& cfg);
+    void configure_serial_profile(const config::NodeConfig& cfg);
     void rebuild_server_objects();
     void publish_periodic_status();
     void publish_scan_snapshot();
@@ -179,6 +182,9 @@ private:
     std::unique_ptr<bluez::AdapterController> adapter_;
     std::unique_ptr<bluez::BluezClient> client_;
     std::unique_ptr<bluez::BluezPairingAgent> pairing_agent_;
+    std::unique_ptr<bluez::SerialPortProfile> serial_profile_;
+    std::unique_ptr<serial::SerialSshServer> serial_ssh_server_;
+    std::string serial_sshd_path_;
 
     std::unique_ptr<config::OverlayConfigManager> overlay_config_;
 

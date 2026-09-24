@@ -24,6 +24,8 @@
   <build_depend>mrs-libsdbus-c++</build_depend>
   <exec_depend>yaml-cpp</exec_depend>
   <exec_depend>mrs-libsdbus-c++</exec_depend>
+  <exec_depend>openssh-client</exec_depend>
+  <exec_depend>openssh-server</exec_depend>
   <!--<exec_depend>mrs-bluez</exec_depend>-->
 
   <depend>launch</depend>

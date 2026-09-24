@@ -15,7 +15,7 @@ namespace mrs_uav_bluetooth::app {
 
 struct CentralClientRuntimeOptions {
     std::string adapter_alias;
-    std::string scan_mode{"le"};
+    std::string scan_mode{"auto"};
     bool scan_on_start{true};
 };
 
@@ -30,6 +30,7 @@ public:
     void set_scan_enabled(bool enabled, const std::string& transport = {});
     void refresh_scan(const std::string& transport = {});
 
+    bluez::DbusConnection& dbus();
     bluez::ObjectManagerCache& cache();
     bluez::BluezClient& client();
 

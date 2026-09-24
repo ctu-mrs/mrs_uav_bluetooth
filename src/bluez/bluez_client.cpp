@@ -389,6 +389,54 @@ bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
     });
 }
 
+bool BluezClient::connect_profile(const std::string& mac, const std::string& uuid) {
+    const auto path = device_path_for_mac(mac);
+    if (path.empty() || uuid.empty()) {
+        return false;
+    }
+
+    try {
+        auto connection = create_blocking_system_bus();
+        auto proxy = create_bluez_proxy(*connection, path);
+        proxy->callMethod("ConnectProfile")
+            .onInterface(std::string(kDeviceIface))
+            .withArguments(uuid);
+        return true;
+    } catch (const sdbus::Error& error) {
+        const auto message = error.getMessage();
+        if (message_contains(message, {"AlreadyConnected", "Already connected"})) {
+            return true;
+        }
+        RCLCPP_WARN(logger_, "connect_profile(%s, %s) failed: %s",
+                    mac.c_str(), uuid.c_str(), message.c_str());
+        return false;
+    }
+}
+
+bool BluezClient::disconnect_profile(const std::string& mac, const std::string& uuid) {
+    const auto path = device_path_for_mac(mac);
+    if (path.empty() || uuid.empty()) {
+        return true;
+    }
+
+    try {
+        auto connection = create_blocking_system_bus();
+        auto proxy = create_bluez_proxy(*connection, path);
+        proxy->callMethod("DisconnectProfile")
+            .onInterface(std::string(kDeviceIface))
+            .withArguments(uuid);
+        return true;
+    } catch (const sdbus::Error& error) {
+        const auto message = error.getMessage();
+        if (message_contains(message, {"NotConnected", "NoSuchObject", "UnknownObject"})) {
+            return true;
+        }
+        RCLCPP_WARN(logger_, "disconnect_profile(%s, %s) failed: %s",
+                    mac.c_str(), uuid.c_str(), message.c_str());
+        return false;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pairing/trust
 // ---------------------------------------------------------------------------
