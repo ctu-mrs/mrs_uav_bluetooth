@@ -44,12 +44,14 @@ serial_sshd_path: /usr/sbin/sshd
 # devices exposing any of these remote GATT services.
 gatt_profile_uuids: []
 
-# Global gate for automatic peer discovery/connection logic.
-# When false, the node never auto-connects or auto-pairs peers.
-auto_connect_enable: false
+# Global gate for outbound automatic peer discovery/connection logic.
+# When false, the node never initiates automatic connections or pairing. Incoming
+# pairing and connections remain allowed when auto_pair and BlueZ permit them.
+auto_connect_enable: true
 
 # Optional whitelist of peer hostnames or BLE MAC addresses.
-# If non-empty, only these peers are kept automatically connected.
+# If non-empty, only these peers are selected for outbound automatic connection.
+# It does not reject, disconnect, or remove peer-initiated connections.
 auto_connect_whitelist: []
 
 # Hostname pattern used to identify UAV peers.

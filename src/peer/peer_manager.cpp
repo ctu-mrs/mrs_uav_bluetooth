@@ -269,10 +269,11 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
                                                  session.peer_name);
     session.peer_candidate = matches_auto_connect_policy(device, config, session.peer_name);
 
-    // When whitelist is enabled, only explicit targets are desired among peer candidates.
-    // When whitelist is empty, any matching peer candidate is desired (if auto_connect is on).
-    session.desired = session.explicit_target ||
-                      (config.auto_connect_enable && session.peer_candidate && !whitelist_enabled);
+    // The global flag gates all outbound automation. When enabled, a non-empty
+    // whitelist selects explicit targets; otherwise the hostname policy does.
+    session.desired = config.auto_connect_enable &&
+                      (session.explicit_target ||
+                       (session.peer_candidate && !whitelist_enabled));
     if (session.desired) {
         if (!was_desired || session.desired_since_monotonic <= 0.0) {
             session.desired_since_monotonic = now;
@@ -280,7 +281,7 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
         session.forget_pending = false;
     } else {
         session.desired_since_monotonic = 0.0;
-        session.forget_pending = session.peer_candidate && device_has_local_security(device);
+        session.forget_pending = false;
     }
     session.services_wait_grace_s = std::max(kServicesWaitGraceMin, config.peer_connection_timeout);
 
@@ -319,18 +320,20 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
             session.forget_pending = false;
             clear_device_reset(session);
         }
-        if (session.peer_candidate) {
+        if (device.connected) {
             set_session_phase(session,
-                              "policy_blocked",
-                              whitelist_enabled && !session.explicit_target
-                                  ? "peer not present in whitelist"
-                                  : "peer not allowed by current config");
+                              "passive",
+                              "peer-initiated or manually managed connection");
+        } else if (session.peer_candidate) {
+            set_session_phase(session,
+                              "idle",
+                              config.auto_connect_enable
+                                  ? "not selected for automatic connection"
+                                  : "automatic connection disabled");
         } else if (!session.peer_candidate) {
             set_session_phase(session, "idle",
                               session.peer_name.empty() ? "device does not match peer policy"
                                                         : "not a peer candidate");
-        } else {
-            set_session_phase(session, "idle", "auto-connect disabled");
         }
         return;
     }

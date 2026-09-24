@@ -153,7 +153,7 @@ Important configuration keys in `config/default.yaml`:
 - `enable_serial_port_profile`, `serial_port_channel`, `serial_sshd_path`: authenticated SPP and direct SSH-over-RFCOMM service settings.
 - `gatt_profile_uuids`: remote service UUIDs exported through `org.bluez.GattProfile1` for BlueZ-managed reconnection.
 - `advertise_mode`, `advertise_extra_data_topic`: common advertisement settings kept in the base config. Additional BlueZ advertisement fields are also accepted in overlay YAMLs when needed.
-- `auto_connect_enable`, `auto_connect_whitelist`, `auto_connect_pattern`, `peer_connection_timeout`: automatic peer management.
+- `auto_connect_enable`, `auto_connect_whitelist`, `auto_connect_pattern`, `peer_connection_timeout`: outbound automatic peer management. The enable flag and whitelist do not reject, disconnect, or remove peer-initiated connections; incoming pairing is controlled by `auto_pair` and BlueZ security state.
 - `wifi_netplan_config_path`: netplan file updated by the BLE Wi-Fi service.
 - `allowed_wifi_networks`: Wi-Fi SSIDs that may be selected over BLE.
 - `status_report_period`, `log_topic_enable`, `verbose_log_file`: observability and logging.

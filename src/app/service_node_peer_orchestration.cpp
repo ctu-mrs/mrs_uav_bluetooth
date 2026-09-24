@@ -167,18 +167,6 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         }
     }
 
-    const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
-
-    if (!session.desired) {
-        const bool allow_passive_non_peer = !whitelist_enabled && !session.peer_candidate;
-        if (!allow_passive_non_peer) {
-            log_warn_coalesced("pairing-rejected-policy:" + device->mac + ":" + event_type,
-                               "[node] rejecting pairing request for " + device->mac +
-                                   " due to current config");
-            return false;
-        }
-    }
-
     const bool active_repair = session.repair_in_progress ||
         (session.repair_requested &&
          (!session.repair_remove_issued || session.repair_awaiting_cache_removal));
@@ -701,7 +689,6 @@ void ServiceNode::reconcile_peers() {
 
     const auto now = peers_->now_monotonic();
     const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
-    const bool whitelist_enabled = !active_config_.auto_connect_whitelist.empty();
     bool should_suspend_scan = false;
     std::set<std::string> current_macs;
     for (const auto& device : client_->get_devices()) {
@@ -744,51 +731,22 @@ void ServiceNode::reconcile_peers() {
             state_lock.lock();
         }
 
-        if (!session.desired) {
-            const bool allow_passive_non_peer = !whitelist_enabled && !session.peer_candidate;
-            if (allow_passive_non_peer) {
-                session.forget_pending = false;
-                session.phase = "idle";
+        // Automatic connection selection is not an inbound connection ACL. Leave
+        // peer-initiated and manually managed connections alone, but let an explicit
+        // stale-bond repair finish before returning to passive management.
+        if (!session.desired && !session.repair_requested && !session.repair_in_progress) {
+            session.forget_pending = false;
+            session.phase = device && device->connected ? "passive" : "idle";
+            if (device && device->connected) {
+                session.detail = "peer-initiated or manually managed connection";
+            } else if (session.peer_candidate) {
+                session.detail = active_config_.auto_connect_enable
+                    ? "not selected for automatic connection"
+                    : "automatic connection disabled";
+            } else {
                 session.detail = session.peer_name.empty() ? "device does not match peer policy"
                                                            : "not a peer candidate";
-                continue;
             }
-            const bool should_forget_blocked_peer =
-                session.forget_pending &&
-                session.peer_candidate &&
-                device &&
-                (device->connected || device->services_resolved || device_has_local_security(*device));
-            if (should_forget_blocked_peer) {
-                if (run_peer_task_once(mac, "forget blocked peer", [this, mac, retry_period_s]() {
-                        (void)client_->disconnect(mac, retry_period_s);
-                        (void)client_->remove(mac);
-                    })) {
-                    expected_disconnect_reasons_[mac] = whitelist_enabled
-                        ? "removing saved peer not present in whitelist"
-                        : "removing saved peer not allowed by current config";
-                    session.phase = "policy_blocked";
-                    session.detail = whitelist_enabled
-                        ? "removing saved peer not present in whitelist"
-                        : "removing saved peer not allowed by current config";
-                }
-                continue;
-            }
-            if (device && device->connected) {
-                if (run_peer_task_once(mac, "disconnect undesired peer", [this, mac, retry_period_s]() {
-                        (void)client_->disconnect(mac, retry_period_s);
-                    })) {
-                    expected_disconnect_reasons_[mac] = whitelist_enabled
-                        ? "disconnecting peer not present in whitelist"
-                        : "disconnecting peer not allowed by current config";
-                    session.phase = "policy_blocked";
-                    session.detail = whitelist_enabled ? "disconnecting peer not present in whitelist"
-                                                      : "disconnecting peer not allowed by current config";
-                }
-                continue;
-            }
-            session.phase = "policy_blocked";
-            session.detail = whitelist_enabled ? "peer not present in whitelist"
-                                              : "peer not allowed by current config";
             continue;
         }
 
