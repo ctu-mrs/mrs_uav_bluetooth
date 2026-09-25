@@ -55,6 +55,7 @@ public:
     bool connect(const std::string& mac,
                  double timeout_s = 15.0,
                  bool prefer_le = false);
+    bool connect_le_bearer(const std::string& mac, double timeout_s = 15.0);
     bool disconnect(const std::string& mac, double timeout_s = 10.0);
     bool connect_profile(const std::string& mac, const std::string& uuid);
     bool disconnect_profile(const std::string& mac, const std::string& uuid);

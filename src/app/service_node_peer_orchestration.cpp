@@ -47,8 +47,7 @@ bool is_interactive_pairing_request_event(const std::string& event_type) {
 }
 
 bool is_stale_bond_sensitive_pairing_event(const std::string& event_type) {
-    return is_interactive_pairing_request_event(event_type) ||
-           event_type == "request_authorization";
+    return is_interactive_pairing_request_event(event_type);
 }
 
 bool is_manual_security_authorization_event(const std::string& event_type) {
@@ -442,7 +441,11 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         if (handshake_complete) {
             bridge.status = "ready";
             bridge.detail = "peer time bridge active";
+            const double services_resolved_since_monotonic =
+                session.services_resolved_since_monotonic;
             peers_->clear_device_reset(session);
+            session.services_resolved_since_monotonic =
+                services_resolved_since_monotonic;
             session.time_bridge_healthy_this_connection = true;
             session.bridge_wait_started_monotonic = 0.0;
             session.bridge_wait_reason.clear();
@@ -690,6 +693,24 @@ void ServiceNode::reconcile_peers() {
     const auto now = peers_->now_monotonic();
     const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
     bool should_suspend_scan = false;
+    const auto reconnect_incomplete_time_bridge =
+        [this, retry_period_s](const std::string& mac,
+                               const std::string& device_label,
+                               peer::PeerConnectionSession& session,
+                               const std::string& reason) {
+            if (!run_peer_task_once(mac, "recover incomplete time bridge", [this, mac, retry_period_s]() {
+                    (void)client_->disconnect(mac, retry_period_s);
+                })) {
+                return false;
+            }
+            expected_disconnect_reasons_[mac] = reason;
+            RCLCPP_WARN(get_logger(),
+                        "[reconcile] %s: %s; reconnecting without removing the bond",
+                        device_label.c_str(), reason.c_str());
+            session.phase = "recovering";
+            session.detail = reason;
+            return true;
+        };
     std::set<std::string> current_macs;
     for (const auto& device : client_->get_devices()) {
         current_macs.insert(device.mac);
@@ -729,6 +750,18 @@ void ServiceNode::reconcile_peers() {
             state_lock.unlock();
             refresh_import_bridges_for_device(device_copy);
             state_lock.lock();
+        }
+
+        // An inbound UAV service is still a fully functional bridge peer. Keep
+        // laptops/TUI clients passive, but promote a peer once its built-in time
+        // characteristic proves that the remote service node is running.
+        const bool peer_service_available = device && device->connected &&
+            device->services_resolved &&
+            !client_->find_characteristic(
+                mac, gatt::time_characteristic_uuid()).empty();
+        if (session.peer_initiated && peer_service_available) {
+            session.peer_initiated = false;
+            session.detail = "peer-initiated UAV service connection";
         }
 
         // An authenticated inbound serial session owns the Bluetooth link until
@@ -889,6 +922,18 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device_has_required_pairing(*device, active_config_)) {
+            const auto local_adapter = cache_->adapter(adapter_path_);
+            const bool local_owns_pairing = local_adapter && !local_adapter->address.empty()
+                ? local_adapter->address < device->mac
+                : (!session.peer_name.empty() && hostname_ < session.peer_name);
+            if (!local_owns_pairing) {
+                session.pairing_in_progress = false;
+                session.phase = "securing";
+                session.detail = "waiting for peer-initiated pairing";
+                schedule_peer_reconcile(kPeerWaitReconcileDelay);
+                continue;
+            }
+
             if (session.pairing_in_progress &&
                 session.last_security_attempt_monotonic > 0.0 &&
                 (now - session.last_security_attempt_monotonic) >= kPeerPairTimeout) {
@@ -985,11 +1030,13 @@ void ServiceNode::reconcile_peers() {
                     bridge_it != peers_->time_bridges().end() &&
                     bridge_it->second.time_notification_received &&
                     !bridge_it->second.time_writeback_received;
-                peers_->request_device_reset(session,
-                                             missing_writeback
-                                                 ? "peer time writeback missing, resetting peer device state"
-                                                 : "peer time notifications missing, resetting peer device state",
-                                             false);
+                (void)reconnect_incomplete_time_bridge(
+                    mac,
+                    device_label,
+                    session,
+                    missing_writeback
+                        ? "peer time writeback missing after GATT rediscovery"
+                        : "peer time notifications missing after GATT rediscovery");
                 continue;
             }
 
@@ -1059,11 +1106,13 @@ void ServiceNode::reconcile_peers() {
                     bridge_it != peers_->time_bridges().end() &&
                     bridge_it->second.time_notification_received &&
                     !bridge_it->second.time_writeback_received;
-                peers_->request_device_reset(session,
-                                             missing_writeback
-                                                 ? "peer time writeback missing, resetting peer device state"
-                                                 : "peer time notifications missing, resetting peer device state",
-                                             false);
+                (void)reconnect_incomplete_time_bridge(
+                    mac,
+                    device_label,
+                    session,
+                    missing_writeback
+                        ? "peer time writeback missing after GATT rediscovery"
+                        : "peer time notifications missing after GATT rediscovery");
                 continue;
             }
 

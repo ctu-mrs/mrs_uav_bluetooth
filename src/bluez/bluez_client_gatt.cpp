@@ -217,6 +217,7 @@ bool BluezClient::stop_notify(const std::string& chrc_path) {
             emit_gatt("client_notify_disabled", chrc_path, message);
             return true;
         }
+        remove_notify_match(chrc_path);
         emit_gatt("client_notify_failed", chrc_path, message);
         return false;
     }

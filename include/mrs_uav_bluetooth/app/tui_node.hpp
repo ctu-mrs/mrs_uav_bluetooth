@@ -45,6 +45,7 @@ private:
         std::string password;
         std::string status;
         std::string error;
+        std::chrono::steady_clock::time_point last_attempt{};
         std::shared_future<std::tuple<std::string, std::string, std::string, std::string>> future;
     };
 

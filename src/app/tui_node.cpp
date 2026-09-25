@@ -553,14 +553,12 @@ void TuiNode::refresh_device_cache(bool force) {
         auto time_it = time_samples_.find(it->mac);
         if (time_it != time_samples_.end()) {
             time_it->second.available = false;
-            time_it->second.pending = false;
             time_it->second.metrics_available = false;
             time_it->second.error = !it->connected ? "device not connected" : "services not resolved";
         }
         auto wifi_it = wifi_state_.find(it->mac);
         if (wifi_it != wifi_state_.end()) {
             wifi_it->second.available = false;
-            wifi_it->second.pending = false;
             wifi_it->second.config_known = false;
             wifi_it->second.error = !it->connected ? "device not connected" : "services not resolved";
         }
@@ -736,53 +734,53 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
     auto& entry = wifi_state_[device.mac];
     if (!device.connected || !effective_services_resolved(device)) {
         entry.available = false;
-        entry.pending = false;
         entry.config_known = false;
-        entry.future = {};
         entry.error = "device not connected";
         return;
     }
-    if (entry.pending || (entry.config_known && !force)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (entry.pending ||
+        (!force && entry.config_known) ||
+        (!force && entry.last_attempt != std::chrono::steady_clock::time_point{} &&
+         (now - entry.last_attempt) < std::chrono::seconds(2))) {
         return;
     }
 
     const auto mac = device.mac;
-    entry.pending = false;
+    entry.pending = true;
+    entry.last_attempt = now;
     entry.error.clear();
-    entry.future = {};
-    try {
-        (void)runtime_->client().refresh_gatt_snapshot(mac);
+    entry.future = std::async(std::launch::async, [this, mac]() {
+        try {
+            (void)runtime_->client().refresh_gatt_snapshot(mac);
 
-        const auto paths = inspector_->resolve_builtin_paths(mac);
-        if (!paths.has_wifi()) {
-            entry.available = false;
-            entry.config_known = true;
-            entry.error = "wifi service not found";
-            return;
-        }
-
-        const auto read_ascii = [this](const std::string& path) {
-            const auto payload = runtime_->client().read_characteristic(path);
-            if (!payload.empty()) {
-                return util::trim_ascii_copy(std::string(payload.begin(), payload.end()));
+            const auto paths = inspector_->resolve_builtin_paths(mac);
+            if (!paths.has_wifi()) {
+                return std::make_tuple(std::string{}, std::string{}, std::string{},
+                                       std::string{"wifi service not found"});
             }
-            return cached_ascii_value(runtime_->cache().characteristic(path));
-        };
 
-        entry.ssid = read_ascii(paths.wifi_ssid_characteristic_path);
-        entry.password = read_ascii(paths.wifi_password_characteristic_path);
-        entry.status = read_ascii(paths.wifi_status_characteristic_path);
-        entry.available = true;
-        entry.config_known = true;
-        if (entry.ssid.empty() && entry.status.empty() && entry.password.empty()) {
-            entry.available = false;
-            entry.error = "wifi ReadValue returned no data";
+            const auto read_ascii = [this](const std::string& path) {
+                const auto payload = runtime_->client().read_characteristic(path);
+                if (!payload.empty()) {
+                    return util::trim_ascii_copy(std::string(payload.begin(), payload.end()));
+                }
+                return cached_ascii_value(runtime_->cache().characteristic(path));
+            };
+
+            auto ssid = read_ascii(paths.wifi_ssid_characteristic_path);
+            auto password = read_ascii(paths.wifi_password_characteristic_path);
+            auto status = read_ascii(paths.wifi_status_characteristic_path);
+            const auto error = ssid.empty() && status.empty() && password.empty()
+                ? std::string{"wifi ReadValue returned no data"}
+                : std::string{};
+            return std::make_tuple(std::move(ssid), std::move(password),
+                                   std::move(status), error);
+        } catch (const std::exception& e) {
+            return std::make_tuple(std::string{}, std::string{}, std::string{},
+                                   std::string{e.what()});
         }
-    } catch (const std::exception& e) {
-        entry.available = false;
-        entry.config_known = true;
-        entry.error = e.what();
-    }
+    }).share();
 }
 
 void TuiNode::trigger_connect_toggle() {
@@ -860,6 +858,12 @@ void TuiNode::trigger_connect_toggle() {
                         device_path, std::chrono::seconds(12), &link)) {
                     return result + "; serial profile connected but no PTY arrived " + mac;
                 }
+                if (!client.connect_le_bearer(mac, 15.0) ||
+                    !client.wait_services_resolved(mac, 15.0)) {
+                    return result + "; serial=" + link.tty_path +
+                        "; failed to restore LE GATT bearer " + mac;
+                }
+                (void)client.refresh_gatt_snapshot(mac);
                 return result + "; serial=" + link.tty_path + " " + mac;
             } catch (const std::exception& e) {
                 return std::string{"connect action failed: "} + e.what();
@@ -901,6 +905,12 @@ void TuiNode::trigger_serial_connect() {
                     device_path, std::chrono::seconds(12), &link)) {
                 return std::string{"serial connected but PTY was not created for "} + mac;
             }
+            if (!client.connect_le_bearer(mac, 15.0) ||
+                !client.wait_services_resolved(mac, 15.0)) {
+                return std::string{"serial link ready at "} + link.tty_path +
+                    ", but the LE GATT bearer could not be restored for " + mac;
+            }
+            (void)client.refresh_gatt_snapshot(mac);
             return std::string{"serial link "} + link.tty_path + " ready for " + mac;
         }).share();
 }

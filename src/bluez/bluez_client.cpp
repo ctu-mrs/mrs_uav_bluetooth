@@ -89,6 +89,19 @@ std::optional<std::map<std::string, sdbus::Variant>> read_device_properties(
     return properties;
 }
 
+std::optional<std::map<std::string, sdbus::Variant>> read_interface_properties(
+    sdbus::IConnection& connection,
+    const std::string& object_path,
+    const std::string& interface) {
+    auto proxy = create_bluez_proxy(connection, object_path);
+    std::map<std::string, sdbus::Variant> properties;
+    proxy->callMethod("GetAll")
+        .onInterface(std::string(kDbusPropertiesIface))
+        .withArguments(interface)
+        .storeResultsTo(properties);
+    return properties;
+}
+
 bool device_has_resolved_characteristics(sdbus::IConnection& connection,
                                          const std::string& device_path) {
     auto proxy = create_bluez_proxy(connection, "/");
@@ -355,6 +368,81 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
             throw;
         }
     });
+}
+
+bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
+    auto dev = cache_.device_by_mac(mac);
+    if (!dev || dev->object_path.empty()) {
+        return false;
+    }
+
+    const auto path = dev->object_path;
+    auto connection = create_blocking_system_bus();
+    const auto le_connected = [&]() -> std::optional<bool> {
+        try {
+            const auto properties = read_interface_properties(
+                *connection, path, std::string{kLeBearerIface});
+            return properties && get_variant_or<bool>(*properties, "Connected", false);
+        } catch (const sdbus::Error& error) {
+            if (message_contains(error.getMessage(),
+                                 {"UnknownInterface", "UnknownProperty", "doesn't exist"})) {
+                return std::nullopt;
+            }
+            throw;
+        }
+    };
+
+    try {
+        const auto connected = le_connected();
+        if (connected && *connected) {
+            return true;
+        }
+        if (connected.has_value()) {
+            RCLCPP_INFO(logger_, "[client] connect_le_bearer(%s) path=%s timeout=%.1fs",
+                        mac.c_str(), path.c_str(), timeout_s);
+            try {
+                auto proxy = create_bluez_proxy(*connection, path);
+                proxy->callMethod("Connect")
+                    .onInterface(std::string(kLeBearerIface));
+            } catch (const sdbus::Error& error) {
+                if (!message_contains(error.getMessage(),
+                                      {"AlreadyConnected", "Already connected", "InProgress",
+                                       "In Progress", "Operation already in progress"})) {
+                    RCLCPP_WARN(logger_, "connect_le_bearer(%s) failed: %s",
+                                mac.c_str(), error.getMessage().c_str());
+                    return false;
+                }
+            }
+            return poll_until(timeout_s, kConnectPollInterval, [&]() {
+                const auto state = le_connected();
+                return state && *state;
+            });
+        }
+    } catch (const sdbus::Error& error) {
+        RCLCPP_WARN(logger_, "connect_le_bearer(%s) state check failed: %s",
+                    mac.c_str(), error.getMessage().c_str());
+        return false;
+    }
+
+    // Older BlueZ versions do not expose Bearer.LE1. Device1.Connect selects
+    // the disconnected bearer when BR/EDR is already up; PreferredBearer keeps
+    // the initial connection on LE when no bearer is active.
+    (void)set_preferred_bearer(mac, "le");
+    try {
+        auto proxy = create_bluez_proxy(*connection, path);
+        proxy->callMethod("Connect")
+            .onInterface(std::string(kDeviceIface));
+        return true;
+    } catch (const sdbus::Error& error) {
+        if (message_contains(error.getMessage(),
+                             {"AlreadyConnected", "Already connected", "InProgress",
+                              "In Progress", "Operation already in progress"})) {
+            return true;
+        }
+        RCLCPP_WARN(logger_, "connect_le_bearer(%s) Device1 fallback failed: %s",
+                    mac.c_str(), error.getMessage().c_str());
+        return false;
+    }
 }
 
 bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
@@ -727,6 +815,28 @@ void BluezClient::on_cache_event(CacheEvent event, const std::string& object_pat
             scan_running_ = adapter->discovering;
             RCLCPP_DEBUG(logger_, "[client] adapter changed: discovering=%s",
                          adapter->discovering ? "true" : "false");
+        }
+    }
+    if (event == CacheEvent::GattCharacteristicRemoved) {
+        remove_notify_match(object_path);
+    } else if (event == CacheEvent::GattCharacteristicChanged) {
+        const auto characteristic = cache_.characteristic(object_path);
+        if (!characteristic || !characteristic->notifying) {
+            remove_notify_match(object_path);
+        }
+    } else if (event == CacheEvent::DeviceRemoved ||
+               event == CacheEvent::DevicePropertyChanged) {
+        const auto device = cache_.device(object_path);
+        if (event == CacheEvent::DeviceRemoved || (device && !device->connected)) {
+            const auto prefix = object_path + "/";
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = notify_paths_.begin(); it != notify_paths_.end();) {
+                if (it->find(prefix) == 0) {
+                    it = notify_paths_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
     }
     if (event == CacheEvent::GattCharacteristicValueChanged) {

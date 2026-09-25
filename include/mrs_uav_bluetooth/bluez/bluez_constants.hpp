@@ -15,6 +15,7 @@ inline constexpr std::string_view kLocalServerServiceName = "cz.cvut.mrs.uav.ble
 // ---- BlueZ interface names ----
 inline constexpr std::string_view kAdapterIface            = "org.bluez.Adapter1";
 inline constexpr std::string_view kDeviceIface             = "org.bluez.Device1";
+inline constexpr std::string_view kLeBearerIface           = "org.bluez.Bearer.LE1";
 inline constexpr std::string_view kBatteryIface            = "org.bluez.Battery1";
 inline constexpr std::string_view kGattManagerIface        = "org.bluez.GattManager1";
 inline constexpr std::string_view kGattProfileIface        = "org.bluez.GattProfile1";
