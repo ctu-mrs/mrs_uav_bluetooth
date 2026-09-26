@@ -1,3 +1,6 @@
+![ROS Package Build](https://github.com/ctu-mrs/mrs_uav_bluetooth/actions/workflows/ros_package_build.yml/badge.svg)
+![Generic Package Build](https://github.com/ctu-mrs/mrs_uav_bluetooth/actions/workflows/generic_package_build.yml/badge.svg)
+
 # MRS UAV Bluetooth
 
 This package lets UAVs share ROS 2 topics over Bluetooth. It can also find nearby UAVs, help configure their Wi-Fi, and provide an SSH connection when Wi-Fi is unavailable.
