@@ -1,2 +1,9 @@
 log/
 build/
+install/
+/examples/
+/test/
+/tests/
+
+__pycache__/
+*.py[cod]

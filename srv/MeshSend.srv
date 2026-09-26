@@ -1,0 +1,16 @@
+# mode: send, dev_key_send, publish, add_net_key, add_app_key
+string mode
+uint8 element_index
+uint16 destination
+uint16 key_index
+uint16 network_index
+bool remote
+bool update
+bool force_segmented
+uint16 model_id
+bool vendor_model
+uint16 vendor_id
+uint8[] data
+---
+bool success
+string message

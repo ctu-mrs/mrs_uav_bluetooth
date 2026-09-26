@@ -13,6 +13,9 @@ namespace {
 using ManagedObjectMap = std::map<sdbus::ObjectPath,
                                   std::map<std::string, std::map<std::string, sdbus::Variant>>>;
 
+// Discovery is best-effort during radio handoff. Bound each D-Bus call so a
+// powered-down/raw-HCI controller cannot stall overlay activation for 25 seconds.
+constexpr auto kDiscoveryTimeout = std::chrono::seconds(2);
 constexpr auto kConnectPollInterval = std::chrono::milliseconds(300);
 constexpr auto kPairPollInterval = std::chrono::milliseconds(500);
 constexpr auto kGattRefreshRetryBackoff = std::chrono::milliseconds(3000);
@@ -147,6 +150,17 @@ BluezClient::BluezClient(DbusConnection& dbus,
       cache_(cache),
       adapter_path_(adapter_path),
       logger_(logger) {
+    // A cached Paired=true does not prove the other endpoint still has its
+    // key. Forward BlueZ's explicit authentication reason, without guessing
+    // from connection duration or treating ordinary timeouts as stale bonds.
+    disconnect_match_ = dbus_.connection().addMatch(
+        "type='signal',sender='org.bluez',interface='org.bluez.Device1',"
+        "member='Disconnected',path_namespace='" + adapter_path_ + "'",
+        [this](sdbus::Message message) {
+            std::string reason, description;
+            message >> reason >> description;
+            emit_gatt("device_disconnected", message.getPath(), reason);
+        }, sdbus::return_slot);
     cache_observer_token_ = cache_.add_observer(
         [this](CacheEvent event, const std::string& object_path) {
             on_cache_event(event, object_path);
@@ -154,6 +168,7 @@ BluezClient::BluezClient(DbusConnection& dbus,
 }
 
 BluezClient::~BluezClient() {
+    disconnect_match_.reset();
     if (cache_observer_token_ != 0) {
         cache_.remove_observer(cache_observer_token_);
         cache_observer_token_ = 0;
@@ -172,6 +187,10 @@ BluezClient::~BluezClient() {
 
 bool BluezClient::start_scan(const std::string& transport,
                              bool make_discoverable_while_scanning) {
+    std::lock_guard<std::recursive_mutex> operation_lock(discovery_operation_mutex_);
+    if (!discovery_connection_) discovery_connection_ = create_blocking_system_bus();
+    last_scan_transport_ = transport;
+    last_scan_discoverable_ = make_discoverable_while_scanning;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (scan_running_) {
@@ -183,7 +202,7 @@ bool BluezClient::start_scan(const std::string& transport,
     RCLCPP_INFO(logger_, "[client] start_scan transport=%s discoverable=%s",
                 transport.c_str(), make_discoverable_while_scanning ? "true" : "false");
     try {
-        auto proxy = sdbus::createProxy(dbus_.connection(),
+        auto proxy = sdbus::createProxy(*discovery_connection_,
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
                                         sdbus::ObjectPath{adapter_path_});
         // Set discovery filter.
@@ -192,9 +211,11 @@ bool BluezClient::start_scan(const std::string& transport,
         filter["Discoverable"] = sdbus::Variant{make_discoverable_while_scanning};
         proxy->callMethod("SetDiscoveryFilter")
             .onInterface(std::string(kAdapterIface))
+            .withTimeout(kDiscoveryTimeout)
             .withArguments(filter);
         proxy->callMethod("StartDiscovery")
-            .onInterface(std::string(kAdapterIface));
+            .onInterface(std::string(kAdapterIface))
+            .withTimeout(kDiscoveryTimeout);
         return true;
     } catch (const sdbus::Error& e) {
         std::string msg = e.getMessage();
@@ -211,12 +232,16 @@ bool BluezClient::start_scan(const std::string& transport,
 }
 
 bool BluezClient::stop_scan() {
+    std::lock_guard<std::recursive_mutex> operation_lock(discovery_operation_mutex_);
+    // A new client has no discovery session of its own to stop.
+    if (!discovery_connection_) return true;
     try {
-        auto proxy = sdbus::createProxy(dbus_.connection(),
+        auto proxy = sdbus::createProxy(*discovery_connection_,
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
                                         sdbus::ObjectPath{adapter_path_});
         proxy->callMethod("StopDiscovery")
-            .onInterface(std::string(kAdapterIface));
+            .onInterface(std::string(kAdapterIface))
+            .withTimeout(kDiscoveryTimeout);
         std::lock_guard<std::mutex> lock(mutex_);
         scan_running_ = false;
         return true;
@@ -231,6 +256,22 @@ bool BluezClient::stop_scan() {
         RCLCPP_WARN(logger_, "stop_scan failed: %s", msg.c_str());
         return false;
     }
+}
+
+void BluezClient::with_discovery_paused(const std::function<void()>& operation) {
+    std::lock_guard<std::recursive_mutex> lock(discovery_operation_mutex_);
+    const bool resume = is_scanning();
+    const auto transport = last_scan_transport_;
+    const bool discoverable = last_scan_discoverable_;
+    if (resume && !stop_scan())
+        throw std::runtime_error("Could not pause discovery for advertisement registration");
+    try {
+        operation();
+    } catch (...) {
+        if (resume) start_scan(transport, discoverable);
+        throw;
+    }
+    if (resume) start_scan(transport, discoverable);
 }
 
 bool BluezClient::is_scanning() const {
@@ -259,6 +300,7 @@ std::vector<DeviceInfo> BluezClient::get_connected_devices() const {
 // ---------------------------------------------------------------------------
 
 bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_le) {
+    if (!connections_allowed_.load()) return false;
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return false;
     if (dev->connected) return true;
@@ -329,6 +371,7 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
         }
     }
 
+    if (!connections_allowed_.load()) return false;
     if (use_device_connect_fallback) {
         if (device_connected_now()) {
             return true;
@@ -371,6 +414,7 @@ bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_
 }
 
 bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
+    if (!connections_allowed_.load()) return false;
     auto dev = cache_.device_by_mac(mac);
     if (!dev || dev->object_path.empty()) {
         return false;
@@ -424,6 +468,7 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
         return false;
     }
 
+    if (!connections_allowed_.load()) return false;
     // Older BlueZ versions do not expose Bearer.LE1. Device1.Connect selects
     // the disconnected bearer when BR/EDR is already up; PreferredBearer keeps
     // the initial connection on LE when no bearer is active.
@@ -445,27 +490,64 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
     }
 }
 
-bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
+bool BluezClient::disconnect(const std::string& mac, double timeout_s,
+                             bool suppress_reconnect) {
     auto path = device_path_for_mac(mac);
     if (path.empty()) return true;
     auto dev = cache_.device_by_mac(mac);
-    if (!dev || !dev->connected) return true;
+    // Disconnect also cancels an outstanding Connect/Pair before Connected
+    // becomes true. A cached false must not skip this cancellation on handoff.
+    if (!dev) return true;
     RCLCPP_INFO(logger_, "[client] disconnect(%s) path=%s timeout=%.1fs",
                 mac.c_str(), path.c_str(), timeout_s);
 
     auto connection = create_blocking_system_bus();
+    auto proxy = create_bluez_proxy(*connection, path);
+    bool restore_trusted = false;
+    bool disconnected = true;
+    const auto set_trusted = [&](bool trusted) {
+        proxy->callMethod("Set").onInterface(std::string(kDbusPropertiesIface))
+            .withTimeout(std::chrono::seconds(2))
+            .withArguments(std::string(kDeviceIface), std::string{"Trusted"},
+                           sdbus::Variant{trusted});
+    };
     try {
-        auto proxy = create_bluez_proxy(*connection, path);
+        if (suppress_reconnect) {
+            const auto properties = read_device_properties(*connection, path);
+            if (!properties) return true;
+            if (get_variant_or<bool>(*properties, "Trusted", false)) {
+                // BlueZ Device1.Disconnect disables passive auto-connect only
+                // for untrusted devices. Clearing trust is restrictive, and
+                // restoring it does not restart scanning; explicit Connect
+                // does. Read the live value, never a potentially stale cache.
+                // Mark restoration BEFORE Set: even a timed-out reply may have
+                // successfully changed the daemon's property.
+                restore_trusted = true;
+                set_trusted(false);
+            }
+        }
         proxy->callMethod("Disconnect")
-            .onInterface(std::string(kDeviceIface));
+            .onInterface(std::string(kDeviceIface))
+            .withTimeout(std::chrono::seconds(5));
     } catch (const sdbus::Error& error) {
         const auto message = error.getMessage();
-        if (!message_contains(message, {"NotConnected", "NoSuchObject", "UnknownObject"})) {
+        // Private advertising addresses can expire from BlueZ between the
+        // snapshot and cancellation. A vanished object has nothing to release.
+        disconnected = message_contains(message, {"NotConnected"}) ||
+            is_missing_object_error(message);
+        if (!disconnected)
             RCLCPP_WARN(logger_, "disconnect(%s) failed: %s", mac.c_str(), message.c_str());
+    }
+    if (restore_trusted) {
+        try {
+            set_trusted(true);
+        } catch (const sdbus::Error& error) {
+            RCLCPP_ERROR(logger_, "Could not restore original trust for %s: %s",
+                         mac.c_str(), error.what());
             return false;
         }
-        return true;
     }
+    if (!disconnected) return false;
 
     return poll_until(timeout_s, kConnectPollInterval, [&]() {
         try {
@@ -478,6 +560,7 @@ bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
 }
 
 bool BluezClient::connect_profile(const std::string& mac, const std::string& uuid) {
+    if (!connections_allowed_.load()) return false;
     const auto path = device_path_for_mac(mac);
     if (path.empty() || uuid.empty()) {
         return false;
@@ -530,6 +613,7 @@ bool BluezClient::disconnect_profile(const std::string& mac, const std::string& 
 // ---------------------------------------------------------------------------
 
 bool BluezClient::pair(const std::string& mac, double timeout_s, std::string* error_detail) {
+    if (!connections_allowed_.load()) return false;
     if (error_detail != nullptr) {
         error_detail->clear();
     }

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Refresh systemd after dpkg removes the bluetooth-mesh.service drop-in.
+set -e
+systemctl daemon-reload 2>/dev/null || true

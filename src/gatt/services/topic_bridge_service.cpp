@@ -110,8 +110,9 @@ std::string TopicBridgeService::transport_path() const {
 }
 
 void TopicBridgeService::publish(const std::vector<uint8_t>& payload) {
-    payload_ = payload;
-    characteristic_->publish(payload_);
+    // The characteristic owns a mutex-protected value; an extra shared
+    // scratch vector here races concurrent immediate/rate-limited publishers.
+    characteristic_->publish(payload);
 }
 
 }  // namespace mrs_uav_bluetooth::gatt::services

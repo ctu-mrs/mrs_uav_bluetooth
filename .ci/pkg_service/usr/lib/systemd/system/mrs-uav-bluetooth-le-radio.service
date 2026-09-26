@@ -1,0 +1,9 @@
+# Node: service_node; one-shot cleanup before enabling ordinary LE roles.
+[Unit]
+Description=Release stale Bluetooth Mesh receive state for MRS LE roles
+After=bluetooth.service bluetooth-mesh.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/mrs-uav-bluetooth/mesh-daemon --release
+TimeoutStartSec=5s

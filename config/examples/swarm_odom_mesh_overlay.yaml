@@ -1,0 +1,82 @@
+# Node: user_node (overlay applied to the background service_node)
+# Purpose: join one persistent relayed Mesh and dynamically share timestamped
+# odometry only with UAVs in the same logical swarm.
+# Usage: deploy this same overlay to every listed UAV, then run:
+#   ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=<absolute-path-to-this-file>
+# Run random_odometry_publisher.launch.py when no estimator is available.
+
+node_topics_prefix: "/{hostname}/bluetooth"
+enable_mesh: true
+mesh_swarm_auto_provisioning: true
+# The service chooses the initial provisioner, starts or joins the network,
+# stores the private keys, and enables relay on every joined UAV.
+
+# Deploy the same ordered admission list to each UAV. A later entry can start a
+# network after waiting for earlier entries. UAV numbers 1..32767 become
+# stable Mesh addresses. Private PB-ADV enrollment needs this list to target
+# each peer's Device UUID. To change the fleet, update the same list on all UAVs.
+peer_whitelist:
+  - uav42
+  - uav99
+
+# "ordered" follows the written list. A listed hostname can be put first
+# explicitly if that is more convenient. Each UAV falls back to the first
+# currently reachable candidate when the preferred one disappears.
+mesh_provisioner_preference: ordered
+
+# The service turns off ordinary LE roles while this overlay owns the radio.
+# The default logical swarm is 1, and its group address is 0xc000. You can
+# override those settings in this overlay if the application needs them.
+
+# The same generalized codec used by GATT and advertisements frames this data
+# under Mesh channel 1001. Received messages appear below:
+# /{hostname}/bluetooth/mesh/peers/<peer>/mavros/local_position/odom
+shared_topics:
+  - name: swarm_odometry_mesh
+    transport: mesh
+    channel_id: 1001
+    mode: both
+    payload_format: struct
+    export_topic: /{hostname}/mavros/local_position/odom
+    import_topic_suffix: mavros/local_position/odom
+    message_type: nav_msgs/msg/Odometry
+    # This 14-member codec uses several segments with network retransmissions.
+    # It carries stamp, pose and twist, not frame IDs or covariance matrices.
+    # A conservative 0.2 Hz leaves airtime for both directions and relay traffic
+    # on half-duplex UAV radios. Increase only after measuring your topology.
+    rate_hz: 0.2
+    destination: 0xc000
+    app_key_index: 0
+    element_index: 0
+    force_segmented: true
+    vendor_opcode: 0xc1
+    company_id: 0x05f1
+    members:
+      - path: header.stamp
+        type: time_ns
+      - path: pose.pose.position.x
+        type: float32
+      - path: pose.pose.position.y
+        type: float32
+      - path: pose.pose.position.z
+        type: float32
+      - path: pose.pose.orientation.x
+        type: float32
+      - path: pose.pose.orientation.y
+        type: float32
+      - path: pose.pose.orientation.z
+        type: float32
+      - path: pose.pose.orientation.w
+        type: float32
+      - path: twist.twist.linear.x
+        type: float32
+      - path: twist.twist.linear.y
+        type: float32
+      - path: twist.twist.linear.z
+        type: float32
+      - path: twist.twist.angular.x
+        type: float32
+      - path: twist.twist.angular.y
+        type: float32
+      - path: twist.twist.angular.z
+        type: float32

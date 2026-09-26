@@ -23,8 +23,8 @@ echo "[service_exec.sh] ROS_LOG_DIR: $ROS_LOG_DIR"
 echo "[service_exec.sh] Sourcing ROS 2 setup..."
 source /opt/ros/jazzy/setup.bash
 
-echo "[service_exec.sh] Sourcing mrs_uav_bluetooth config..."
-source /etc/ctu-mrs/mrs-uav-bluetooth/config
+echo "[service_exec.sh] Sourcing mrs_uav_bluetooth startup_config..."
+source /etc/ctu-mrs/mrs-uav-bluetooth/startup_config
 
 echo "[service_exec.sh] Launching mrs_uav_bluetooth service..."
 exec ros2 launch mrs_uav_bluetooth service_node.launch.py

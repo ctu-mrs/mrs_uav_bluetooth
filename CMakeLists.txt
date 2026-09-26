@@ -83,6 +83,9 @@ set(msg_files
   "msg/BleGattDescriptor.msg"
   "msg/BleNotification.msg"
   "msg/BlePeerTimeStatus.msg"
+  "msg/MeshMessage.msg"
+  "msg/MeshStatus.msg"
+  "msg/MeshEvent.msg"
 )
 
 set(srv_files
@@ -103,6 +106,10 @@ set(srv_files
   "srv/FindGattPath.srv"
   "srv/ConfigureNotificationBridge.srv"
   "srv/SetActiveConfig.srv"
+  "srv/MeshNetwork.srv"
+  "srv/MeshSend.srv"
+  "srv/MeshManagement.srv"
+  "srv/MeshSwarm.srv"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -204,6 +211,26 @@ target_link_libraries(${PROJECT_NAME}_bluez
 ament_target_dependencies(${PROJECT_NAME}_bluez
   rclcpp
 )
+
+# =====================================================================
+# BlueZ Mesh D-Bus application/client library
+# =====================================================================
+
+add_library(${PROJECT_NAME}_mesh STATIC
+  src/mesh/mesh_application.cpp
+  src/mesh/swarm_coordinator.cpp
+)
+target_include_directories(${PROJECT_NAME}_mesh PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(${PROJECT_NAME}_mesh
+  ${PROJECT_NAME}_util
+  ${PROJECT_NAME}_config
+  ${PROJECT_NAME}_bluez
+  SDBusCpp::sdbus-c++
+)
+ament_target_dependencies(${PROJECT_NAME}_mesh rclcpp)
 
 # =====================================================================
 # Serial transport / SSH library
@@ -328,6 +355,7 @@ ament_target_dependencies(${PROJECT_NAME}_peer
 add_library(${PROJECT_NAME}_bridge_mgr STATIC
   src/bridge/export_bridge_manager.cpp
   src/bridge/import_bridge_manager.cpp
+  src/bridge/transport_bridge_manager.cpp
 )
 target_include_directories(${PROJECT_NAME}_bridge_mgr PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -355,13 +383,14 @@ target_link_libraries(${PROJECT_NAME}_bridge ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_bluez ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_serial ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_gatt ${cpp_typesupport_target})
+target_link_libraries(${PROJECT_NAME}_mesh ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_network ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_ros ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_peer ${cpp_typesupport_target})
 target_link_libraries(${PROJECT_NAME}_bridge_mgr ${cpp_typesupport_target})
 
 # =====================================================================
-# Executables (stubs during early migration)
+# ROS 2 executables
 # =====================================================================
 
 add_executable(service_node
@@ -372,6 +401,7 @@ add_executable(service_node
   src/app/service_node_peer_orchestration.cpp
   src/app/service_node_status.cpp
   src/app/service_node_services.cpp
+  src/app/service_node_mesh.cpp
 )
 target_include_directories(service_node PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -383,6 +413,7 @@ target_link_libraries(service_node
   ${PROJECT_NAME}_bridge_mgr
   ${PROJECT_NAME}_bluez
   ${PROJECT_NAME}_serial
+  ${PROJECT_NAME}_mesh
   ${PROJECT_NAME}_gatt
   ${PROJECT_NAME}_network
   ${PROJECT_NAME}_ros
@@ -443,18 +474,18 @@ set_target_properties(mrs_uav_bluetooth_ssh PROPERTIES
   OUTPUT_NAME "mrs-uav-bluetooth-ssh"
 )
 
-add_executable(test_node
-  src/app/main_test_node.cpp
-  src/app/test_node.cpp
+add_executable(random_odometry_publisher
+  src/app/main_random_odometry_publisher.cpp
+  src/app/random_odometry_publisher_node.cpp
 )
-target_include_directories(test_node PRIVATE
+target_include_directories(random_odometry_publisher PRIVATE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(test_node
+target_link_libraries(random_odometry_publisher
   ${PROJECT_NAME}_util
 )
-ament_target_dependencies(test_node
-  rclcpp std_msgs nav_msgs
+ament_target_dependencies(random_odometry_publisher
+  rclcpp nav_msgs
 )
 
 # =====================================================================
@@ -465,7 +496,7 @@ install(TARGETS
   service_node
   user_node
   tui_node
-  test_node
+  random_odometry_publisher
   mrs_uav_bluetooth_serial_proxy
   mrs_uav_bluetooth_ssh
   DESTINATION lib/${PROJECT_NAME}
@@ -473,8 +504,11 @@ install(TARGETS
 install(DIRECTORY include/
   DESTINATION include
 )
+# Python bytecode is a local validation artifact, not package data. Excluding
+# cache directories also prevents stale launch files from surviving renames.
 install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE
 )
 
 ament_export_dependencies(rosidl_default_runtime)

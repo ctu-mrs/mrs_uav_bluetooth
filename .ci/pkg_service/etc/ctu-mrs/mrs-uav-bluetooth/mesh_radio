@@ -1,0 +1,6 @@
+# Node: bluetooth-meshd (system service wrapper, not a ROS parameter file).
+# generic: exclusive raw HCI; tested on uav42 and uav99.
+# auto: BlueZ chooses MGMT/raw HCI; use only after validating your radio stack.
+MRS_UAV_BLUETOOTH_MESH_IO=generic
+# Empty chooses the sole controller; multiple-controller hosts must choose one.
+MRS_UAV_BLUETOOTH_MESH_ADAPTER=

@@ -33,7 +33,7 @@ std::string bridge_service_name_for_host(const std::string& host,
 std::string peer_topic_token(const std::string& peer_name, const std::string& mac) {
     auto token = mrs_uav_bluetooth::util::sanitize_topic_suffix(peer_name);
     if (token.empty() || token == "ble_device") {
-        token = "peer_" + mrs_uav_bluetooth::util::sanitize_topic_suffix(mac);
+        token = "mac_" + mrs_uav_bluetooth::util::sanitize_topic_suffix(mac);
     }
     if (!token.empty() && std::isdigit(static_cast<unsigned char>(token.front())) != 0) {
         token = "peer_" + token;
@@ -248,7 +248,9 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
 
     const auto session_it = peers_->sessions().find(device.mac);
     const bool desired_peer = session_it != peers_->sessions().end() && session_it->second.desired;
-    const auto peer_name = util::device_hostname_guess(device);
+    const auto peer_name = util::device_hostname_guess(
+        device, active_config_.auto_connect_pattern,
+        active_config_.peer_whitelist);
     const bool local_peer = !peer_name.empty() &&
         util::lower_trim_copy(peer_name) == util::lower_trim_copy(hostname_);
     const bool functional_peer = desired_peer && !local_peer && device_can_host_peer_import_bridges(device);
@@ -259,6 +261,7 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
     std::set<std::string> desired_keys;
     if (functional_peer) {
         for (const auto& shared_topic : active_config_.shared_topics) {
+            if (shared_topic.transport != "gatt") continue;
             if (shared_topic.mode != "import" && shared_topic.mode != "both") {
                 continue;
             }
@@ -376,14 +379,14 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
 }
 
 std::string ServiceNode::peer_status_topic(const std::string& mac, const std::string& peer_name) const {
-    return util::normalize_ros_topic(active_config_.node_topics_prefix + "/peers/" +
+    return util::normalize_ros_topic(active_config_.node_topics_prefix + "/le/peers/" +
                                      peer_topic_token(peer_name, mac) + "/time_status");
 }
 
 std::string ServiceNode::peer_bridge_topic(const std::string& mac,
                                            const std::string& peer_name,
                                            const std::string& requested_topic_suffix) const {
-    std::string topic = active_config_.node_topics_prefix + "/peers/" + peer_topic_token(peer_name, mac);
+    std::string topic = active_config_.node_topics_prefix + "/le/peers/" + peer_topic_token(peer_name, mac);
     const auto suffix = trim_topic_segment(requested_topic_suffix);
     if (!suffix.empty()) {
         topic += "/" + suffix;
@@ -482,7 +485,9 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
         bridge.status = "subscribing";
         bridge.detail = "time notification received, awaiting writeback";
         if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
-            session_it->second.bridge_wait_started_monotonic = bridge.last_activity_monotonic;
+            // Repeated partial traffic must not postpone handshake recovery.
+            // Only full bidirectional completion clears this deadline.
+            session_it->second.begin_bridge_wait(bridge.last_activity_monotonic);
             session_it->second.bridge_wait_reason = "writeback";
             session_it->second.phase = "connected_unready";
             session_it->second.detail = bridge.detail;
@@ -556,7 +561,9 @@ void ServiceNode::handle_time_writeback(const std::vector<uint8_t>& payload,
         bridge.status = "subscribing";
         bridge.detail = "peer time writeback received, awaiting notifications";
         if (auto session_it = peers_->sessions().find(mac); session_it != peers_->sessions().end()) {
-            session_it->second.bridge_wait_started_monotonic = bridge.last_activity_monotonic;
+            // Repeated partial traffic must not postpone handshake recovery.
+            // Only full bidirectional completion clears this deadline.
+            session_it->second.begin_bridge_wait(bridge.last_activity_monotonic);
             session_it->second.bridge_wait_reason = "notify";
             session_it->second.phase = "connected_unready";
             session_it->second.detail = bridge.detail;

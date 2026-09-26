@@ -1,0 +1,46 @@
+# Node: user_node (overlay applied to the background service_node)
+# Purpose: share timestamped odometry through connectionless BLE advertisements.
+# Usage: ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=<absolute-path-to-this-file>
+# Run the optional random_odometry_publisher launch if no estimator is available.
+
+node_topics_prefix: "/{hostname}/bluetooth"
+
+# Advertisement topic sharing is a connectionless mode. Broadcast advertising
+# and disabled GATT/pairing settings prevent a connection from stopping the
+# controller's advertisement data stream.
+advertise_mode: broadcast
+advertise_discoverable: false
+enable_server: true
+enable_scan: true
+enable_time_service: false
+enable_wifi_service: false
+enable_serial_port_profile: false
+auto_connect_enable: false
+auto_pair: false
+auto_trust: false
+# Global admission list for this example. Empty would accept every nearby peer.
+peer_whitelist:
+  - uav42
+  - uav99
+
+# Legacy advertisements have a very small payload budget. The generalized
+# compact codec below selects an 8-byte timestamp and 4-byte X position.
+# The 5-byte bridge envelope brings the total to 17 bytes, which fits the
+# smallest user-data budget observed on the test UAVs. Add more fields only
+# when every radio supports the larger advertisement. Received samples appear below:
+# /{hostname}/bluetooth/le/peers/<peer>/mavros/local_position/odom
+shared_topics:
+  - name: swarm_odometry_advertisement
+    transport: advertisement
+    channel_id: 1001
+    mode: both
+    payload_format: struct
+    export_topic: /{hostname}/mavros/local_position/odom
+    import_topic_suffix: mavros/local_position/odom
+    message_type: nav_msgs/msg/Odometry
+    rate_hz: 1.0
+    members:
+      - path: header.stamp
+        type: time_ns
+      - path: pose.pose.position.x
+        type: float32

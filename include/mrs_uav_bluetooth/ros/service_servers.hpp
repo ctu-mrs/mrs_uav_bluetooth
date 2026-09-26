@@ -73,8 +73,18 @@ public:
 
     explicit ServiceServers(rclcpp::Node& node);
 
+    /// Register the LE and runtime-configuration services below one root.
+    ///
+    /// Device lifecycle, GATT, scan, and notification-bridge operations are
+    /// grouped below `<root>/le`; overlay/reload operations are grouped below
+    /// `<root>/config`. Mesh services are registered by `ServiceNode` because
+    /// their handlers belong to the optional Mesh subsystem.
+    /// @param owner Node that owns the resulting service servers.
+    /// @param handlers Complete callback set for the registered interfaces.
+    /// @param service_root Absolute `/{hostname}/bluetooth` root.
     std::vector<rclcpp::ServiceBase::SharedPtr> register_all(rclcpp::Node& owner,
                                                              const Handlers& handlers,
+                                                             const std::string& service_root,
                                                              const rclcpp::CallbackGroup::SharedPtr& callback_group = nullptr);
 
     template<typename ServiceT, typename CallbackT>

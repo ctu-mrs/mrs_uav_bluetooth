@@ -1,0 +1,15 @@
+diff --git a/mesh/manager.c b/mesh/manager.c
+index 4e456f1..80d8782 100644
+--- a/mesh/manager.c
++++ b/mesh/manager.c
+@@ -470,7 +470,7 @@ static struct l_dbus_message *add_node_call(struct l_dbus *dbus,
+ 							"Invalid options");
+ 
+-	/* If no server specified, use local */
+-	if (!server)
+-		server = node_get_primary(node);
++	/* No Server option means direct local PB-ADV. Routing through this
++	 * node's Remote Provisioning Server needlessly loops Mesh messages
++	 * through the local model and can stall the provisioning bearer. */
+ 
+ 	/* AddNode cancels all outstanding Scanning from node */

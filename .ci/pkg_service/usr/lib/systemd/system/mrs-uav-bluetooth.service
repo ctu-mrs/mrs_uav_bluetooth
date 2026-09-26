@@ -1,0 +1,13 @@
+[Unit]
+Description=ROS 2 MRS UAV BLE service node
+Wants=bluetooth.service
+After=network.target bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=always
+ExecStart=/etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
+
+[Install]
+WantedBy=multi-user.target

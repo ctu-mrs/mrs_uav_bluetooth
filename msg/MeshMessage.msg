@@ -1,0 +1,9 @@
+std_msgs/Header header
+uint8 element_index
+uint16 source
+uint16 destination
+uint16 key_index
+uint16 net_index
+bool device_key
+bool remote
+uint8[] data

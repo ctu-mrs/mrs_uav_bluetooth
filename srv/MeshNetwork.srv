@@ -1,0 +1,18 @@
+# action: join, cancel, attach, leave, create, import
+string action
+uint8[] uuid
+uint64 token
+uint8[] device_key
+uint8[] network_key
+uint16 network_index
+bool iv_update
+bool key_refresh
+uint32 iv_index
+uint16 unicast
+---
+bool success
+string message
+string state
+uint64 token
+string node_path
+uint16[] addresses

@@ -1,0 +1,11 @@
+// Allow only the UAV service account to hand the Mesh controller back to LE.
+// This grants no rights over other units, unit-file editing, reboot or shells.
+polkit.addRule(function(action, subject) {
+    if (subject.user === "mrs" &&
+        action.id === "org.freedesktop.systemd1.manage-units" &&
+        (action.lookup("unit") === "bluetooth-mesh.service" ||
+         action.lookup("unit") === "mrs-uav-bluetooth-le-radio.service") &&
+        (action.lookup("verb") === "start" || action.lookup("verb") === "stop")) {
+        return polkit.Result.YES;
+    }
+});

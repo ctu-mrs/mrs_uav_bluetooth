@@ -33,6 +33,9 @@ void ExportBridgeManager::configure_export_bridge(const std::string& bridge_key,
                 }
                 auto& state = it->second;
                 auto payload = runtime->encode_payload(*message, state.member_specs, state.payload_format);
+                // publish_export_payload takes its own snapshot. Do not keep
+                // this outer recursive lock across a D-Bus signal emission.
+                if (state_lock.owns_lock()) state_lock.unlock();
                 publish_export_payload(bridge_key, payload);
             } catch (const std::exception& e) {
                 RCLCPP_WARN(logger_, "Failed to encode export bridge %s: %s",
@@ -100,7 +103,11 @@ void ExportBridgeManager::publish_export_payload(const std::string& bridge_key,
         it->second.pending_payload = payload;
         return;
     }
-    it->second.service->publish(payload);
+    auto service = it->second.service;
+    // The server's D-Bus callback may need the same state mutex. Retain the
+    // service lifetime, but release state BEFORE acquiring the bus lock.
+    if (state_lock.owns_lock()) state_lock.unlock();
+    service->publish(payload);
 }
 
 void ExportBridgeManager::destroy_export_bridge(TopicExportBridgeState& state) {
@@ -137,7 +144,10 @@ void ExportBridgeManager::configure_export_rate_timer(const std::string& bridge_
             }
             auto payload = it->second.pending_payload;
             it->second.pending_payload.clear();
-            it->second.service->publish(payload);
+            auto service = it->second.service;
+            // Snapshot under lock; emit outside it (see immediate path above).
+            if (state_lock.owns_lock()) state_lock.unlock();
+            service->publish(payload);
         });
 }
 

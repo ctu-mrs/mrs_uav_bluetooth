@@ -1,4 +1,6 @@
 string config_path
+# Minimum initial grace before sentinel-absence lease expiry; 0 uses normal expiry.
+# Must be finite and nonnegative. A live sentinel publisher keeps the overlay.
 float32 hold_seconds
 ---
 bool success

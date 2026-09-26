@@ -295,7 +295,7 @@ TuiNode::~TuiNode() {
 void TuiNode::configure_parameters() {
     declare_parameter<std::string>("adapter_alias", "");
     declare_parameter<std::string>("scan_mode", "auto");
-    declare_parameter<std::string>("uav_name_pattern", "^uav[0-9]{1,2}$");
+    declare_parameter<std::string>("uav_name_pattern", "^uav[0-9]{1,5}$");
     declare_parameter<double>("refresh_period_sec", 1.0);
     declare_parameter<double>("render_period_sec", 0.1);
     declare_parameter<double>("topic_count_refresh_sec", 5.0);

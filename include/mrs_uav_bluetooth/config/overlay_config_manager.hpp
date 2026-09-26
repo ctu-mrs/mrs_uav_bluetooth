@@ -33,7 +33,8 @@ public:
     void load_initial();
 
     /// Activate an overlay file.  Returns success + message.
-    std::pair<bool, std::string> activate_overlay(const std::string& overlay_path);
+    std::pair<bool, std::string> activate_overlay(
+        const std::string& overlay_path, double hold_seconds = 0.0);
 
     /// Revert to default config.  Returns success + message.
     std::pair<bool, std::string> revert_to_default();
@@ -88,6 +89,8 @@ private:
     std::string active_source_;
     std::string keepalive_topic_;
     int keepalive_miss_count_{0};
+    /// Minimum initial hold requested through SetActiveConfig; zero disables it.
+    std::chrono::steady_clock::time_point lease_hold_until_{};
     static constexpr int kRequiredMisses = 3;
 
     std::set<std::string> overlay_connected_baseline_;

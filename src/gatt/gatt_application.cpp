@@ -66,13 +66,14 @@ GattDescriptor::GattDescriptor(DbusConnection& dbus,
 GattDescriptor::~GattDescriptor() { unexport(); }
 
 void GattDescriptor::export_object() {
-    exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
+    auto object = std::shared_ptr<sdbus::IObject>(
+        sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_}));
 
     // Register BlueZ-expected properties + methods on the GattDescriptor1 interface.
     // sdbus-c++ automatically provides org.freedesktop.DBus.Properties (GetAll,
     // Get, Set, PropertiesChanged) for registered properties — do NOT register
     // that interface manually, or BlueZ will reject the vtable.
-    exported_->addVTable(
+    object->addVTable(
         sdbus::registerProperty("UUID")
             .withGetter([this]() -> std::string { return uuid_; }),
         sdbus::registerProperty("Characteristic")
@@ -103,14 +104,13 @@ void GattDescriptor::export_object() {
             })
     ).forInterface(std::string(kGattDescriptorIface));
 
-    //exported_->emitInterfacesAddedSignal();
+    std::atomic_store(&exported_, std::move(object));
 }
 
 void GattDescriptor::unexport() {
-    /*if (exported_) {
-        exported_->emitInterfacesRemovedSignal();
-    }*/
-    exported_.reset();
+    // Drop the registration outside any value/service-state lock. In-flight
+    // publishers retain a safe snapshot until their emission completes.
+    std::atomic_store(&exported_, std::shared_ptr<sdbus::IObject>{});
 }
 
 void GattDescriptor::set_value(const std::vector<uint8_t>& val, bool emit) {
@@ -118,9 +118,10 @@ void GattDescriptor::set_value(const std::vector<uint8_t>& val, bool emit) {
         std::lock_guard<std::mutex> lock(mutex_);
         value_ = val;
     }
-    if (emit && exported_) {
+    const auto object = std::atomic_load(&exported_);
+    if (emit && object) {
         try {
-            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattDescriptorIface)},
+            object->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattDescriptorIface)},
                                                   std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
         } catch (const sdbus::Error& error) {
             log_properties_changed_failure("descriptor", path_, "Value", error);
@@ -158,11 +159,12 @@ GattCharacteristic::GattCharacteristic(DbusConnection& dbus,
 GattCharacteristic::~GattCharacteristic() { unexport(); }
 
 void GattCharacteristic::export_object() {
-    exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
+    auto object = std::shared_ptr<sdbus::IObject>(
+        sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_}));
 
     // Register BlueZ-expected properties + methods on the GattCharacteristic1
     // interface.  sdbus-c++ automatically provides org.freedesktop.DBus.Properties.
-    exported_->addVTable(
+    object->addVTable(
         sdbus::registerProperty("UUID")
             .withGetter([this]() -> std::string { return uuid_; }),
         sdbus::registerProperty("Service")
@@ -209,17 +211,16 @@ void GattCharacteristic::export_object() {
         desc->export_object();
     }
 
-    //exported_->emitInterfacesAddedSignal();
+    std::atomic_store(&exported_, std::move(object));
 }
 
 void GattCharacteristic::unexport() {
     for (auto& desc : descriptors_) {
         desc->unexport();
     }
-    /*if (exported_) {
-        exported_->emitInterfacesRemovedSignal();
-    }*/
-    exported_.reset();
+    // Drop the registration outside any value/service-state lock. In-flight
+    // publishers retain a safe snapshot until their emission completes.
+    std::atomic_store(&exported_, std::shared_ptr<sdbus::IObject>{});
 }
 
 void GattCharacteristic::add_descriptor(std::shared_ptr<GattDescriptor> desc) {
@@ -231,13 +232,14 @@ void GattCharacteristic::set_value(const std::vector<uint8_t>& val, bool emit) {
         std::lock_guard<std::mutex> lock(mutex_);
         value_ = val;
     }
-    if (emit && exported_) {
+    const auto object = std::atomic_load(&exported_);
+    if (emit && object) {
         static rclcpp::Clock throttle_clock{RCL_STEADY_TIME};
         RCLCPP_DEBUG_THROTTLE(rclcpp::get_logger("mrs_uav_bluetooth"), throttle_clock, 5000,
                               "[server] value changed path=%s bytes=%zu",
                               path_.c_str(), val.size());
         try {
-            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+            object->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                                   std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Value"}});
         } catch (const sdbus::Error& error) {
             log_properties_changed_failure("characteristic", path_, "Value", error);
@@ -278,9 +280,9 @@ void GattCharacteristic::on_start_notify() {
     notifying_ = true;
     RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
                 "[server] notify enabled path=%s", path_.c_str());
-    if (exported_) {
+    if (const auto object = std::atomic_load(&exported_)) {
         try {
-            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+            object->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                                   std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
         } catch (const sdbus::Error& error) {
             log_properties_changed_failure("characteristic", path_, "Notifying", error);
@@ -294,9 +296,9 @@ void GattCharacteristic::on_stop_notify() {
     notifying_ = false;
     RCLCPP_INFO(rclcpp::get_logger("mrs_uav_bluetooth"),
                 "[server] notify disabled path=%s", path_.c_str());
-    if (exported_) {
+    if (const auto object = std::atomic_load(&exported_)) {
         try {
-            exported_->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
+            object->emitPropertiesChangedSignal(sdbus::InterfaceName{std::string(kGattCharacteristicIface)},
                                                   std::vector<sdbus::PropertyName>{sdbus::PropertyName{"Notifying"}});
         } catch (const sdbus::Error& error) {
             log_properties_changed_failure("characteristic", path_, "Notifying", error);

@@ -7,8 +7,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
+#include <filesystem>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -307,7 +310,13 @@ YAML::Node load_yaml_file(const std::string& path) {
     if (!ifs.is_open()) {
         throw std::runtime_error("Cannot open config file: " + path);
     }
-    YAML::Node doc = YAML::Load(ifs);
+    YAML::Node doc;
+    try {
+        doc = YAML::Load(ifs);
+    } catch (const YAML::Exception&) {
+        // YAML diagnostics can include a line of private Mesh credentials.
+        throw std::runtime_error("Cannot parse YAML config file: " + path);
+    }
     if (!doc.IsMap() && !doc.IsNull()) {
         throw std::runtime_error("Config " + path + " must contain a YAML mapping at the top level");
     }
@@ -338,18 +347,67 @@ NodeConfig parse_node_config(const YAML::Node& doc,
                              const std::string& auto_connect_pattern) {
     NodeConfig cfg;
     if (!doc.IsDefined() || doc.IsNull()) return cfg;
+    if (!doc.IsMap()) throw std::runtime_error("Node configuration must be a YAML map");
+    const std::set<std::string> mesh_options{
+        "mesh_agent_capabilities",
+        "mesh_agent_numeric_oob",
+        "mesh_agent_oob_info",
+        "mesh_agent_private_key",
+        "mesh_agent_public_key",
+        "mesh_agent_static_oob",
+        "mesh_agent_uri",
+        "mesh_auto_attach",
+        "mesh_auto_configure_relay",
+        "mesh_auto_create_network",
+        "mesh_auto_join",
+        "mesh_company_id",
+        "mesh_crpl",
+        "mesh_default_ttl",
+        "mesh_device_uuid",
+        "mesh_fleet",
+        "mesh_fleet_config_path",
+        "mesh_network_owner_path",
+        "mesh_next_unicast",
+        "mesh_product_id",
+        "mesh_provisioner",
+        "mesh_provisioner_preference",
+        "mesh_relay_retransmit_count",
+        "mesh_relay_retransmit_interval_steps",
+        "mesh_swarm_address_block_size",
+        "mesh_swarm_allow_partition_creation",
+        "mesh_swarm_app_key_index",
+        "mesh_swarm_auto_provisioning",
+        "mesh_swarm_auto_reconcile_networks",
+        "mesh_swarm_group_address",
+        "mesh_swarm_heartbeat_period",
+        "mesh_swarm_id",
+        "mesh_swarm_network_index",
+        "mesh_swarm_participating",
+        "mesh_swarm_provisioner_timeout",
+        "mesh_swarm_startup_grace",
+        "mesh_swarm_state_path",
+        "mesh_token",
+        "mesh_token_path",
+        "mesh_unicast_cursor_path",
+        "mesh_vendor_model_id",
+        "mesh_version_id"};
+    for (const auto& field : doc) {
+        const auto key = field.first.as<std::string>();
+        if (key.starts_with("mesh_") && !mesh_options.contains(key))
+            throw std::runtime_error("Unknown Mesh configuration option: " + key);
+    }
 
     auto str = [&](const std::string& key, const std::string& def) -> std::string {
-        return doc[key] ? doc[key].as<std::string>(def) : def;
+        return doc[key] ? doc[key].as<std::string>() : def;
     };
     auto dbl = [&](const std::string& key, double def) -> double {
-        return doc[key] ? doc[key].as<double>(def) : def;
+        return doc[key] ? doc[key].as<double>() : def;
     };
     auto b = [&](const std::string& key, bool def) -> bool {
-        return doc[key] ? doc[key].as<bool>(def) : def;
+        return doc[key] ? doc[key].as<bool>() : def;
     };
     auto u32 = [&](const std::string& key, uint32_t def) -> uint32_t {
-        return doc[key] ? doc[key].as<uint32_t>(def) : def;
+        return doc[key] ? doc[key].as<uint32_t>() : def;
     };
     auto str_list = [&](const std::string& key) -> std::vector<std::string> {
         std::vector<std::string> result;
@@ -383,6 +441,340 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     }
     cfg.serial_port_channel = static_cast<uint16_t>(serial_port_channel);
     cfg.serial_sshd_path = str("serial_sshd_path", cfg.serial_sshd_path);
+    cfg.enable_mesh = b("enable_mesh", cfg.enable_mesh);
+    cfg.mesh_auto_attach = b("mesh_auto_attach", cfg.mesh_auto_attach);
+    cfg.mesh_auto_join = b("mesh_auto_join", cfg.mesh_auto_join);
+    cfg.mesh_auto_create_network =
+        b("mesh_auto_create_network", cfg.mesh_auto_create_network);
+    if (cfg.mesh_auto_join && cfg.mesh_auto_create_network) {
+        throw std::runtime_error(
+            "mesh_auto_join and mesh_auto_create_network are mutually exclusive");
+    }
+    cfg.mesh_provisioner = b("mesh_provisioner", cfg.mesh_provisioner);
+    cfg.mesh_auto_configure_relay =
+        b("mesh_auto_configure_relay", cfg.mesh_auto_configure_relay);
+    cfg.mesh_default_ttl = static_cast<uint8_t>(parse_integer_value(
+        doc["mesh_default_ttl"] ? doc["mesh_default_ttl"] : YAML::Node(cfg.mesh_default_ttl),
+        127, "mesh_default_ttl"));
+    if (cfg.mesh_default_ttl == 1) {
+        throw std::runtime_error("mesh_default_ttl must be 0 or in the range 2..127");
+    }
+    cfg.mesh_relay_retransmit_count = static_cast<uint8_t>(parse_integer_value(
+        doc["mesh_relay_retransmit_count"]
+            ? doc["mesh_relay_retransmit_count"]
+            : YAML::Node(cfg.mesh_relay_retransmit_count),
+        7, "mesh_relay_retransmit_count"));
+    cfg.mesh_relay_retransmit_interval_steps = static_cast<uint8_t>(parse_integer_value(
+        doc["mesh_relay_retransmit_interval_steps"]
+            ? doc["mesh_relay_retransmit_interval_steps"]
+            : YAML::Node(cfg.mesh_relay_retransmit_interval_steps),
+        31, "mesh_relay_retransmit_interval_steps"));
+    cfg.peer_whitelist = str_list("peer_whitelist");
+    {
+        std::set<std::string> unique_peers;
+        for (auto& peer : cfg.peer_whitelist) {
+            peer = util::lower_trim_copy(peer);
+            if (peer.empty() || !unique_peers.insert(peer).second) {
+                throw std::runtime_error(
+                    "peer_whitelist must contain unique, non-empty hostnames");
+            }
+        }
+    }
+    cfg.mesh_swarm_auto_provisioning = b(
+        "mesh_swarm_auto_provisioning", cfg.mesh_swarm_auto_provisioning);
+    for (const auto* obsolete : {"mesh_swarm_allow_partition_creation",
+            "mesh_swarm_auto_reconcile_networks", "mesh_swarm_address_block_size",
+            "mesh_network_owner_path"}) {
+        if (doc[obsolete])
+            throw std::runtime_error(std::string(obsolete) +
+                " was removed; use mesh_fleet_config_path for automatic fleet enrollment");
+    }
+    cfg.mesh_swarm_id = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_swarm_id"] ? doc["mesh_swarm_id"]
+                              : YAML::Node(cfg.mesh_swarm_id),
+        0xffff, "mesh_swarm_id"));
+    if (cfg.mesh_swarm_id == 0) {
+        throw std::runtime_error("mesh_swarm_id must be in 1..65535");
+    }
+    cfg.mesh_swarm_participating = b(
+        "mesh_swarm_participating", cfg.mesh_swarm_participating);
+    cfg.mesh_swarm_state_path = expand_hostname(
+        str("mesh_swarm_state_path", cfg.mesh_swarm_state_path), hostname);
+    cfg.mesh_provisioner_preference = util::lower_trim_copy(str(
+        "mesh_provisioner_preference", cfg.mesh_provisioner_preference));
+    cfg.mesh_swarm_startup_grace =
+        dbl("mesh_swarm_startup_grace", cfg.mesh_swarm_startup_grace);
+    cfg.mesh_swarm_heartbeat_period =
+        dbl("mesh_swarm_heartbeat_period", cfg.mesh_swarm_heartbeat_period);
+    cfg.mesh_swarm_provisioner_timeout = dbl(
+        "mesh_swarm_provisioner_timeout", cfg.mesh_swarm_provisioner_timeout);
+    cfg.mesh_swarm_group_address = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_swarm_group_address"] ? doc["mesh_swarm_group_address"]
+                                         : YAML::Node(cfg.mesh_swarm_group_address),
+        std::numeric_limits<uint16_t>::max(), "mesh_swarm_group_address"));
+    cfg.mesh_swarm_network_index = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_swarm_network_index"] ? doc["mesh_swarm_network_index"]
+                                         : YAML::Node(cfg.mesh_swarm_network_index),
+        0x0fff, "mesh_swarm_network_index"));
+    cfg.mesh_swarm_app_key_index = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_swarm_app_key_index"] ? doc["mesh_swarm_app_key_index"]
+                                         : YAML::Node(cfg.mesh_swarm_app_key_index),
+        0x0fff, "mesh_swarm_app_key_index"));
+    cfg.mesh_unicast_cursor_path = expand_hostname(
+        str("mesh_unicast_cursor_path", cfg.mesh_unicast_cursor_path), hostname);
+    cfg.mesh_device_uuid = str("mesh_device_uuid", cfg.mesh_device_uuid);
+    if (!cfg.mesh_device_uuid.empty()) {
+        std::string normalized_uuid;
+        for (const char ch : cfg.mesh_device_uuid) {
+            if (ch != '-') normalized_uuid.push_back(ch);
+        }
+        if (normalized_uuid.size() != 32 ||
+            !std::all_of(normalized_uuid.begin(), normalized_uuid.end(),
+                         [](unsigned char ch) { return std::isxdigit(ch) != 0; })) {
+            throw std::runtime_error(
+                "mesh_device_uuid must contain exactly 16 hexadecimal bytes");
+        }
+        cfg.mesh_device_uuid = normalized_uuid;
+    }
+    if (cfg.mesh_swarm_auto_provisioning) {
+        if (!cfg.enable_mesh) {
+            throw std::runtime_error(
+                "mesh_swarm_auto_provisioning requires enable_mesh");
+        }
+        // Every automatic member can relay, provision a newcomer, and take
+        // over from an unavailable preferred peer. These are service roles,
+        // not choices each UAV operator must maintain separately.
+        cfg.mesh_provisioner = true;
+        cfg.mesh_auto_attach = true;
+        cfg.mesh_auto_join = false;
+        cfg.mesh_auto_create_network = false;
+        cfg.mesh_auto_configure_relay = true;
+        if (!cfg.mesh_device_uuid.empty()) {
+            throw std::runtime_error(
+                "mesh_swarm_auto_provisioning requires hostname-derived Mesh UUIDs; "
+                "leave mesh_device_uuid empty");
+        }
+        if (cfg.mesh_provisioner_preference.empty()) {
+            throw std::runtime_error(
+                "mesh_provisioner_preference must be 'ordered' or a UAV hostname");
+        }
+
+        std::set<uint64_t> unique_numbers;
+        const auto number_for = [](const std::string& member,
+                                   const std::string& context) -> uint64_t {
+            const auto non_digit = member.find_last_not_of("0123456789");
+            const auto digits = non_digit == std::string::npos
+                ? member : member.substr(non_digit + 1);
+            if (digits.empty()) {
+                throw std::runtime_error(context +
+                    " must end in a UAV number: " + member);
+            }
+            const auto number = parse_integer_value(
+                YAML::Node(digits), 0xffff, context + " UAV number");
+            if (number == 0) {
+                throw std::runtime_error(context + " UAV number must be nonzero");
+            }
+            return number;
+        };
+        for (const auto& peer : cfg.peer_whitelist) {
+            const auto number = number_for(peer, "peer_whitelist entry");
+            if (!unique_numbers.insert(number).second) {
+                throw std::runtime_error(
+                    "peer_whitelist must contain unique UAV numbers");
+            }
+        }
+        const auto local_name = util::lower_trim_copy(hostname);
+        const auto local_number = number_for(local_name, "local hostname");
+        if (!cfg.peer_whitelist.empty() &&
+            std::find(cfg.peer_whitelist.begin(), cfg.peer_whitelist.end(),
+                      local_name) == cfg.peer_whitelist.end()) {
+            throw std::runtime_error(
+                "local hostname is missing from peer_whitelist: " + local_name);
+        }
+        if (cfg.mesh_provisioner_preference != "ordered") {
+            (void)number_for(cfg.mesh_provisioner_preference,
+                             "mesh_provisioner_preference");
+            if (!cfg.peer_whitelist.empty() &&
+                std::find(cfg.peer_whitelist.begin(), cfg.peer_whitelist.end(),
+                          cfg.mesh_provisioner_preference) ==
+                    cfg.peer_whitelist.end()) {
+                throw std::runtime_error(
+                    "explicit mesh_provisioner_preference must appear in peer_whitelist");
+            }
+        }
+        const auto positive_finite = [](double value) {
+            return std::isfinite(value) && value > 0.0;
+        };
+        if (!positive_finite(cfg.mesh_swarm_startup_grace) ||
+            !positive_finite(cfg.mesh_swarm_heartbeat_period) ||
+            !positive_finite(cfg.mesh_swarm_provisioner_timeout)) {
+            throw std::runtime_error(
+                "automatic Mesh provisioning periods must be finite and greater than zero");
+        }
+        if (cfg.mesh_swarm_provisioner_timeout <=
+            cfg.mesh_swarm_heartbeat_period * 2.0) {
+            throw std::runtime_error(
+                "mesh_swarm_provisioner_timeout must exceed two heartbeat periods");
+        }
+        if (cfg.mesh_swarm_provisioner_timeout > 63.0) {
+            throw std::runtime_error(
+                "mesh_swarm_provisioner_timeout must not exceed 63 seconds");
+        }
+        if (cfg.mesh_swarm_startup_grace < cfg.mesh_swarm_provisioner_timeout) {
+            throw std::runtime_error(
+                "mesh_swarm_startup_grace must be at least mesh_swarm_provisioner_timeout");
+        }
+        if (cfg.mesh_swarm_group_address < 0xc000 ||
+            cfg.mesh_swarm_group_address > 0xfeff) {
+            throw std::runtime_error(
+                "mesh_swarm_group_address must be a Mesh group address (0xc000..0xfeff)");
+        }
+        (void)local_number;
+    }
+    cfg.mesh_token = static_cast<uint64_t>(parse_integer_value(
+        doc["mesh_token"] ? doc["mesh_token"] : YAML::Node(0),
+        std::numeric_limits<uint64_t>::max(), "mesh_token"));
+    cfg.mesh_token_path = expand_hostname(
+        str("mesh_token_path", cfg.mesh_token_path), hostname);
+    cfg.mesh_fleet_config_path = str("mesh_fleet_config_path", "");
+    const auto inline_fleet = doc["mesh_fleet"];
+    if (inline_fleet && !inline_fleet.IsNull() && !cfg.mesh_fleet_config_path.empty()) {
+        throw std::runtime_error(
+            "Use either mesh_fleet in a private overlay or mesh_fleet_config_path");
+    }
+    YAML::Node fleet;
+    if (!cfg.mesh_fleet_config_path.empty()) {
+        // Keep the existing private-file route valid for deployed fleets.
+        namespace fs = std::filesystem;
+        const auto permissions = fs::status(cfg.mesh_fleet_config_path).permissions();
+        const auto exposed = fs::perms::group_all | fs::perms::others_all;
+        if ((permissions & exposed) != fs::perms::none) {
+            throw std::runtime_error("Mesh fleet credentials must have mode 0600");
+        }
+        try {
+            fleet = YAML::LoadFile(cfg.mesh_fleet_config_path);
+        } catch (const YAML::Exception&) {
+            // YAML parser diagnostics can contain the offending secret value.
+            throw std::runtime_error("Cannot parse private Mesh fleet credential file");
+        }
+    } else if (inline_fleet && !inline_fleet.IsNull()) {
+        fleet = inline_fleet;
+    }
+    if (fleet && !fleet.IsNull()) {
+        // Fleet credentials are explicit trust material, never derived from
+        // public UAV names or the admission list. Validate before radio changes.
+        if (!cfg.enable_mesh || !cfg.mesh_swarm_auto_provisioning ||
+            !cfg.mesh_auto_attach || cfg.mesh_token != 0 ||
+            cfg.mesh_token_path.empty()) {
+            throw std::runtime_error(
+                "Mesh fleet credentials require automatic Mesh, auto_attach, "
+                "a persistent token path, and mesh_token: 0");
+        }
+        const std::set<std::string> fields{
+            "version", "fleet_id", "network_key", "application_key", "iv_index"};
+        if (!fleet.IsMap()) throw std::runtime_error("Mesh fleet file must be a map");
+        for (const auto& entry : fleet) {
+            if (!entry.first.IsScalar() ||
+                !fields.contains(entry.first.as<std::string>())) {
+                throw std::runtime_error("Unknown Mesh fleet credential field");
+            }
+        }
+        const auto hex_bytes = [&](const char* field) {
+            if (!fleet[field] || !fleet[field].IsScalar()) {
+                throw std::runtime_error(std::string("Missing Mesh fleet field: ") + field);
+            }
+            const auto hex = fleet[field].Scalar();
+            if (hex.size() != 32 || !std::all_of(hex.begin(), hex.end(),
+                    [](unsigned char c) { return std::isxdigit(c); })) {
+                throw std::runtime_error(std::string("Mesh fleet field needs 32 hex digits: ") + field);
+            }
+            std::vector<uint8_t> bytes;
+            for (size_t i = 0; i < hex.size(); i += 2)
+                bytes.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+            if (std::all_of(bytes.begin(), bytes.end(), [](auto b) { return b == 0; }))
+                throw std::runtime_error("Mesh fleet identifiers and keys must not be all zero");
+            return bytes;
+        };
+        if (!fleet["version"] || fleet["version"].Scalar() != "1")
+            throw std::runtime_error("Unsupported Mesh fleet credential version");
+        hex_bytes("fleet_id");
+        cfg.mesh_fleet_id = util::lower_trim_copy(fleet["fleet_id"].Scalar());
+        cfg.mesh_fleet_network_key = hex_bytes("network_key");
+        cfg.mesh_fleet_application_key = hex_bytes("application_key");
+        if (cfg.mesh_fleet_network_key == cfg.mesh_fleet_application_key)
+            throw std::runtime_error("Mesh network and application keys must differ");
+        cfg.mesh_fleet_iv_index = static_cast<uint32_t>(parse_integer_value(
+            fleet["iv_index"], 0xffffffffU, "fleet iv_index"));
+        const auto digits = hostname.substr(hostname.find_last_not_of("0123456789") + 1);
+        cfg.mesh_fleet_unicast = static_cast<uint16_t>(std::stoul(digits));
+        if (std::stoul(digits) > 0x7fffU)
+            throw std::runtime_error("Fleet-import UAV number must be in 1..32767");
+        // Separate persistent identities for different fleets; changing order
+        // or availability never changes a UAV's address, keys or replay state.
+        cfg.mesh_token_path += "." + cfg.mesh_fleet_id;
+    }
+    cfg.mesh_company_id = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_company_id"] ? doc["mesh_company_id"] : YAML::Node(cfg.mesh_company_id),
+        std::numeric_limits<uint16_t>::max(), "mesh_company_id"));
+    cfg.mesh_product_id = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_product_id"] ? doc["mesh_product_id"] : YAML::Node(cfg.mesh_product_id),
+        std::numeric_limits<uint16_t>::max(), "mesh_product_id"));
+    cfg.mesh_version_id = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_version_id"] ? doc["mesh_version_id"] : YAML::Node(cfg.mesh_version_id),
+        std::numeric_limits<uint16_t>::max(), "mesh_version_id"));
+    cfg.mesh_crpl = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_crpl"] ? doc["mesh_crpl"] : YAML::Node(cfg.mesh_crpl),
+        std::numeric_limits<uint16_t>::max(), "mesh_crpl"));
+    if (cfg.mesh_crpl == 0) {
+        throw std::runtime_error("mesh_crpl must be greater than zero");
+    }
+    cfg.mesh_vendor_model_id = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_vendor_model_id"] ? doc["mesh_vendor_model_id"]
+                                    : YAML::Node(cfg.mesh_vendor_model_id),
+        std::numeric_limits<uint16_t>::max(), "mesh_vendor_model_id"));
+    cfg.mesh_next_unicast = static_cast<uint16_t>(parse_integer_value(
+        doc["mesh_next_unicast"] ? doc["mesh_next_unicast"]
+                                 : YAML::Node(cfg.mesh_next_unicast),
+        0x7fff, "mesh_next_unicast"));
+    if (cfg.mesh_next_unicast == 0) {
+        throw std::runtime_error("mesh_next_unicast must be in the range 0x0001..0x7fff");
+    }
+    if (cfg.mesh_swarm_auto_provisioning && cfg.mesh_fleet_id.empty()) {
+        if (cfg.peer_whitelist.empty())
+            throw std::runtime_error(
+                "Hands-free private Mesh needs an ordered peer_whitelist so "
+                "PB-ADV can target each nearby UAV's Device UUID");
+        // A new private network can be created and joined by PB-ADV. Keep its
+        // identity separate from older manually controlled Mesh nodes.
+        cfg.mesh_token_path += ".auto";
+        const auto digits = hostname.substr(hostname.find_last_not_of("0123456789") + 1);
+        cfg.mesh_fleet_unicast = static_cast<uint16_t>(std::stoul(digits));
+        if (cfg.mesh_fleet_unicast > 0x7fffU)
+            throw std::runtime_error("Automatic Mesh UAV number must be in 1..32767");
+    }
+    cfg.mesh_agent_capabilities = str_list("mesh_agent_capabilities");
+    cfg.mesh_agent_oob_info = str_list("mesh_agent_oob_info");
+    cfg.mesh_agent_static_oob = parse_byte_sequence(
+        doc["mesh_agent_static_oob"], "mesh_agent_static_oob");
+    cfg.mesh_agent_private_key = parse_byte_sequence(
+        doc["mesh_agent_private_key"], "mesh_agent_private_key");
+    cfg.mesh_agent_public_key = parse_byte_sequence(
+        doc["mesh_agent_public_key"], "mesh_agent_public_key");
+    if (!cfg.mesh_agent_static_oob.empty() && cfg.mesh_agent_static_oob.size() != 16) {
+        throw std::runtime_error("mesh_agent_static_oob must contain exactly 16 bytes");
+    }
+    if (!cfg.mesh_agent_private_key.empty() && cfg.mesh_agent_private_key.size() != 32) {
+        throw std::runtime_error("mesh_agent_private_key must contain exactly 32 bytes");
+    }
+    if (!cfg.mesh_agent_public_key.empty() && cfg.mesh_agent_public_key.size() != 64) {
+        throw std::runtime_error("mesh_agent_public_key must contain exactly 64 bytes");
+    }
+    cfg.mesh_agent_numeric_oob = u32(
+        "mesh_agent_numeric_oob", cfg.mesh_agent_numeric_oob);
+    if (cfg.mesh_agent_numeric_oob > 99999999U) {
+        throw std::runtime_error("mesh_agent_numeric_oob must be at most 99999999");
+    }
+    cfg.mesh_agent_uri = str("mesh_agent_uri", cfg.mesh_agent_uri);
     cfg.gatt_profile_uuids = str_list("gatt_profile_uuids");
     for (auto& uuid : cfg.gatt_profile_uuids) {
         uuid = util::lower_trim_copy(uuid);
@@ -392,7 +784,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         }
     }
     cfg.auto_connect_enable = b("auto_connect_enable", cfg.auto_connect_enable);
-    cfg.auto_connect_whitelist = str_list("auto_connect_whitelist");
     cfg.auto_connect_pattern = str("auto_connect_pattern", cfg.auto_connect_pattern);
     cfg.peer_connection_timeout = dbl("peer_connection_timeout", cfg.peer_connection_timeout);
     cfg.wifi_netplan_config_path = str("wifi_netplan_config_path", cfg.wifi_netplan_config_path);
@@ -402,7 +793,13 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.expire_connections_with_overlay = b("expire_connections_with_overlay", cfg.expire_connections_with_overlay);
     cfg.overlay_keepalive_topic_suffix = str("overlay_keepalive_topic_suffix", cfg.overlay_keepalive_topic_suffix);
     cfg.verbose_log_file = str("verbose_log_file", cfg.verbose_log_file);
-    cfg.advertise_mode = str("advertise_mode", cfg.advertise_mode);
+    cfg.advertise_mode = util::lower_trim_copy(
+        str("advertise_mode", cfg.advertise_mode));
+    if (cfg.advertise_mode != "peripheral" &&
+        cfg.advertise_mode != "broadcast") {
+        throw std::runtime_error(
+            "advertise_mode must be 'peripheral' or 'broadcast'");
+    }
     cfg.advertise_size = util::lower_trim_copy(str("advertise_size", cfg.advertise_size));
     if (cfg.advertise_size != "legacy" && cfg.advertise_size != "extended") {
         throw std::runtime_error("advertise_size must be 'legacy' or 'extended'");
@@ -476,6 +873,20 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.enable_server = b("enable_server", cfg.enable_server);
     cfg.enable_scan = b("enable_scan", cfg.enable_scan);
     cfg.scan_mode = str("scan_mode", cfg.scan_mode);
+    if (cfg.mesh_swarm_auto_provisioning) {
+        // bluetooth-meshd owns advertising and scanning for this overlay.
+        // Derive the mutually exclusive LE switches instead of requiring a
+        // long, fragile list of `false` values in every user's Mesh YAML.
+        cfg.enable_server = false;
+        cfg.enable_scan = false;
+        cfg.enable_time_service = false;
+        cfg.enable_wifi_service = false;
+        cfg.enable_serial_port_profile = false;
+        cfg.auto_connect_enable = false;
+        cfg.auto_pair = false;
+        cfg.auto_trust = false;
+        cfg.gatt_profile_uuids.clear();
+    }
 
     // Use the config's auto_connect_pattern for canonical topic derivation.
     std::string pattern = cfg.auto_connect_pattern.empty()
@@ -485,12 +896,25 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     if (doc["shared_topics"] && doc["shared_topics"].IsSequence()) {
         int index = 0;
         std::map<std::string, bool> seen_keys;
+        std::set<std::string> seen_channels;
         for (const auto& raw : doc["shared_topics"]) {
             if (!raw.IsMap()) {
                 throw std::runtime_error("shared_topics[" + std::to_string(index) + "] must be a mapping");
             }
 
             SharedTopicConfig stc;
+            stc.transport = util::lower_trim_copy(
+                raw["transport"] ? raw["transport"].as<std::string>("gatt") : "gatt");
+            if (stc.transport == "advertising" || stc.transport == "advertisement_data") {
+                stc.transport = "advertisement";
+            }
+            if (stc.transport.empty()) stc.transport = "gatt";
+            if (stc.transport != "gatt" && stc.transport != "advertisement" &&
+                stc.transport != "mesh") {
+                throw std::runtime_error(
+                    "shared_topics[" + std::to_string(index) +
+                    "].transport must be gatt, advertisement, or mesh");
+            }
             std::string mode = raw["mode"] ? raw["mode"].as<std::string>("both") : "both";
             std::transform(mode.begin(), mode.end(), mode.begin(),
                            [](unsigned char c) { return std::tolower(c); });
@@ -532,16 +956,32 @@ NodeConfig parse_node_config(const YAML::Node& doc,
                 throw std::runtime_error("shared_topics[" + std::to_string(index) + "] requires message_type");
             }
 
-            // Parse members.
+            stc.payload_format = util::lower_trim_copy(
+                raw["payload_format"]
+                    ? raw["payload_format"].as<std::string>("struct")
+                    : "struct");
+            if (stc.payload_format == "compact") stc.payload_format = "struct";
+            if (stc.payload_format != "struct" && stc.payload_format != "raw" &&
+                stc.payload_format != "ros2") {
+                throw std::runtime_error(
+                    "shared_topics[" + std::to_string(index) +
+                    "].payload_format must be struct, raw, or ros2");
+            }
+
+            // `raw` is shorthand for the byte vector carried by
+            // std_msgs/msg/UInt8MultiArray. Explicit mappings work with any
+            // introspectable numeric ROS message fields.
             if (raw["members"] && raw["members"].IsSequence()) {
                 for (const auto& m : raw["members"]) {
                     stc.member_specs.push_back(parse_member_spec(m));
                 }
             }
-            if (stc.member_specs.empty()) {
+            if (stc.payload_format == "raw" && stc.member_specs.empty()) {
+                stc.member_specs.push_back({"data[:]", "uint8"});
+            }
+            if (stc.payload_format != "ros2" && stc.member_specs.empty()) {
                 throw std::runtime_error("shared_topics[" + std::to_string(index) + "] requires at least one compact member definition");
             }
-            stc.payload_format = "struct";
 
             std::string import_suffix = raw["import_topic_suffix"]
                 ? raw["import_topic_suffix"].as<std::string>(canonical) : canonical;
@@ -557,13 +997,140 @@ NodeConfig parse_node_config(const YAML::Node& doc,
                 ? raw["name"].as<std::string>(canonical) : canonical;
             if (stc.name.empty()) stc.name = canonical;
 
-            if (seen_keys.count(stc.bridge_key)) {
+            if (stc.transport != "gatt") {
+                if (!raw["channel_id"]) {
+                    throw std::runtime_error(
+                        "shared_topics[" + std::to_string(index) +
+                        "].channel_id is required for advertisement and mesh transports");
+                }
+                stc.channel_id = static_cast<uint16_t>(parse_integer_value(
+                    raw["channel_id"], std::numeric_limits<uint16_t>::max(),
+                    "shared_topics[" + std::to_string(index) + "].channel_id"));
+                if (stc.channel_id == 0) {
+                    throw std::runtime_error(
+                        "shared_topics[" + std::to_string(index) +
+                        "].channel_id must be in the range 1..65535");
+                }
+                const auto channel_key = stc.transport + ":" +
+                    std::to_string(stc.channel_id);
+                if (!seen_channels.insert(channel_key).second) {
+                    throw std::runtime_error(
+                        "shared_topics[" + std::to_string(index) +
+                        "] duplicates channel_id for transport " + stc.transport);
+                }
+            }
+
+            if (stc.transport == "mesh") {
+                stc.mesh_destination = static_cast<uint16_t>(parse_integer_value(
+                    raw["destination"] ? raw["destination"] : YAML::Node(cfg.mesh_swarm_group_address),
+                    std::numeric_limits<uint16_t>::max(), "shared_topics.mesh.destination"));
+                stc.mesh_app_key_index = static_cast<uint16_t>(parse_integer_value(
+                    raw["app_key_index"] ? raw["app_key_index"] : YAML::Node(cfg.mesh_swarm_app_key_index),
+                    0x0fff, "shared_topics.mesh.app_key_index"));
+                stc.mesh_element_index = static_cast<uint8_t>(parse_integer_value(
+                    raw["element_index"] ? raw["element_index"] : YAML::Node(0),
+                    std::numeric_limits<uint8_t>::max(), "shared_topics.mesh.element_index"));
+                stc.mesh_force_segmented = raw["force_segmented"]
+                    ? raw["force_segmented"].as<bool>(true) : true;
+                stc.mesh_vendor_opcode = static_cast<uint8_t>(parse_integer_value(
+                    raw["vendor_opcode"] ? raw["vendor_opcode"] : YAML::Node(0xc1),
+                    std::numeric_limits<uint8_t>::max(), "shared_topics.mesh.vendor_opcode"));
+                stc.mesh_company_id = static_cast<uint16_t>(parse_integer_value(
+                    raw["company_id"] ? raw["company_id"] : YAML::Node(cfg.mesh_company_id),
+                    std::numeric_limits<uint16_t>::max(), "shared_topics.mesh.company_id"));
+                if (stc.mesh_vendor_opcode < 0xc0) {
+                    throw std::runtime_error(
+                        "shared_topics.mesh.vendor_opcode must be in 0xc0..0xff");
+                }
+            }
+
+            const auto unique_key = stc.transport + ":" + stc.bridge_key;
+            if (seen_keys.count(unique_key)) {
                 throw std::runtime_error("shared_topics[" + std::to_string(index) +
                                          "] duplicates bridge key for " + canonical);
             }
-            seen_keys[stc.bridge_key] = true;
+            seen_keys[unique_key] = true;
             cfg.shared_topics.push_back(std::move(stc));
             ++index;
+        }
+    }
+
+    // A bridge overlay selects one radio data plane. GATT connections,
+    // connectionless advertisement data, and Bluetooth Mesh compete for
+    // controller advertising state and are intentionally not mixed.
+    std::set<std::string> bridge_transports;
+    bool advertisement_exports = false;
+    bool advertisement_imports = false;
+    for (const auto& bridge : cfg.shared_topics) {
+        bridge_transports.insert(bridge.transport);
+        if (bridge.transport == "advertisement") {
+            advertisement_exports = advertisement_exports ||
+                bridge.mode == "export" || bridge.mode == "both";
+            advertisement_imports = advertisement_imports ||
+                bridge.mode == "import" || bridge.mode == "both";
+        }
+    }
+    if (bridge_transports.size() > 1) {
+        throw std::runtime_error(
+            "shared_topics must use exactly one transport mode per overlay; "
+            "gatt, advertisement, and mesh cannot be mixed");
+    }
+
+    const bool advertisement_mode =
+        bridge_transports.contains("advertisement");
+    const bool mesh_bridge_mode = bridge_transports.contains("mesh");
+    const bool gatt_bridge_mode = bridge_transports.contains("gatt");
+    if (mesh_bridge_mode && !cfg.enable_mesh) {
+        throw std::runtime_error(
+            "mesh shared_topics require enable_mesh: true");
+    }
+    if ((gatt_bridge_mode || advertisement_mode) && cfg.enable_mesh) {
+        throw std::runtime_error(
+            "enable_mesh cannot be combined with gatt or advertisement "
+            "shared_topics");
+    }
+    if (advertisement_exports && !cfg.enable_server) {
+        throw std::runtime_error(
+            "advertisement export bridges require enable_server: true");
+    }
+    if (advertisement_imports && !cfg.enable_scan) {
+        throw std::runtime_error(
+            "advertisement import bridges require enable_scan: true");
+    }
+
+    const bool broadcast_mode = cfg.advertise_mode == "broadcast";
+    if (broadcast_mode &&
+        (cfg.auto_connect_enable || cfg.auto_pair || cfg.auto_trust ||
+         cfg.enable_time_service || cfg.enable_wifi_service ||
+         cfg.enable_serial_port_profile || !cfg.gatt_profile_uuids.empty())) {
+        throw std::runtime_error(
+            "broadcast advertisement overlays must disable auto-connect, "
+            "pairing/trust, Wi-Fi/time GATT services, SPP, and GATT profiles");
+    }
+    if (broadcast_mode && gatt_bridge_mode) {
+        throw std::runtime_error(
+            "GATT shared_topics cannot use advertise_mode: broadcast");
+    }
+    if (cfg.enable_mesh &&
+        (cfg.enable_server || cfg.enable_scan ||
+         cfg.enable_time_service || cfg.enable_wifi_service ||
+         cfg.enable_serial_port_profile || cfg.auto_connect_enable ||
+         cfg.auto_pair || cfg.auto_trust || !cfg.gatt_profile_uuids.empty())) {
+        throw std::runtime_error(
+            "Mesh mode requires exclusive controller ownership: disable the "
+            "ordinary LE server/scanner, pairing/trust, GATT services/profiles, "
+            "SPP, and automatic GATT connections");
+    }
+
+    if (cfg.mesh_swarm_auto_provisioning) {
+        for (const auto& bridge : cfg.shared_topics) {
+            if (bridge.transport == "mesh" &&
+                bridge.mesh_company_id == cfg.mesh_company_id &&
+                bridge.mesh_vendor_opcode == 0xc0) {
+                throw std::runtime_error(
+                    "Mesh vendor opcode 0xc0 at mesh_company_id is reserved for "
+                    "automatic provisioning heartbeats");
+            }
         }
     }
 
@@ -573,9 +1140,22 @@ NodeConfig parse_node_config(const YAML::Node& doc,
 NodeConfig load_effective_config(const std::string& default_path,
                                  const std::string& overlay_path,
                                  const std::string& hostname) {
+    const auto require_private_fleet_source = [](const YAML::Node& document,
+                                                 const std::string& path) {
+        if (!document["mesh_fleet"] || document["mesh_fleet"].IsNull()) return;
+        const auto permissions = std::filesystem::status(path).permissions();
+        const auto exposed = std::filesystem::perms::group_all |
+                             std::filesystem::perms::others_all;
+        if ((permissions & exposed) != std::filesystem::perms::none) {
+            throw std::runtime_error(
+                "Mesh credentials require a private config file (mode 0600): " + path);
+        }
+    };
     YAML::Node base = load_yaml_file(default_path);
+    require_private_fleet_source(base, default_path);
     if (!overlay_path.empty()) {
         YAML::Node overlay = load_yaml_file(overlay_path);
+        require_private_fleet_source(overlay, overlay_path);
         base = deep_merge(base, overlay);
     }
     return parse_node_config(base, hostname);

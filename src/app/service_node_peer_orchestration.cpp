@@ -54,6 +54,24 @@ bool is_manual_security_authorization_event(const std::string& event_type) {
     return event_type == "authorize_service";
 }
 
+bool peer_allowed_by_whitelist(
+    const mrs_uav_bluetooth::config::NodeConfig& config,
+    const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    if (config.peer_whitelist.empty()) return true;
+    const auto peer_name = mrs_uav_bluetooth::util::lower_trim_copy(
+        mrs_uav_bluetooth::util::device_hostname_guess(
+            device, config.auto_connect_pattern,
+            config.peer_whitelist));
+    const auto mac = mrs_uav_bluetooth::util::lower_trim_copy(device.mac);
+    return std::any_of(config.peer_whitelist.begin(),
+                       config.peer_whitelist.end(),
+                       [&peer_name, &mac](const auto& entry) {
+                           const auto normalized =
+                               mrs_uav_bluetooth::util::lower_trim_copy(entry);
+                           return normalized == peer_name || normalized == mac;
+                       });
+}
+
 template<typename DurationT, typename CallbackT>
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
@@ -140,7 +158,9 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         return false;
     }
 
-    const auto peer_name = util::device_hostname_guess(*device);
+    const auto peer_name = util::device_hostname_guess(
+        *device, active_config_.auto_connect_pattern,
+        active_config_.peer_whitelist);
     auto& session = peers_->get_or_create_session(device->mac, peer_name);
     const bool preserve_ready_runtime =
         has_ready_peer_time_bridge(device->mac) ||
@@ -156,6 +176,14 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
     const bool stale_bond_sensitive_event = is_stale_bond_sensitive_pairing_event(event_type);
     const bool manual_security_authorization_event =
         is_manual_security_authorization_event(event_type);
+
+    if (!peer_allowed_by_whitelist(active_config_, *device)) {
+        log_warn_coalesced(
+            "pairing-rejected-whitelist:" + device->mac + ":" + event_type,
+            "[node] rejecting pairing request from " + device->mac +
+                " because it is outside peer_whitelist");
+        return false;
+    }
 
     if (!active_config_.auto_pair) {
         if (is_interactive_pairing_request_event(event_type)) {
@@ -308,7 +336,11 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     const auto now_mono = peers_->now_monotonic();
     const auto& time_characteristic_uuid = gatt::time_characteristic_uuid();
     const auto& writeback_descriptor_uuid = gatt::time_writeback_descriptor_uuid();
-    const auto peer_name = session.peer_name.empty() ? util::device_hostname_guess(device) : session.peer_name;
+    const auto peer_name = session.peer_name.empty()
+        ? util::device_hostname_guess(
+            device, active_config_.auto_connect_pattern,
+            active_config_.peer_whitelist)
+        : session.peer_name;
     auto bridge_it = peers_->time_bridges().find(mac);
     std::string stop_notify_path;
 
@@ -692,6 +724,35 @@ void ServiceNode::reconcile_peers() {
 
     const auto now = peers_->now_monotonic();
     const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
+
+    // Do not observe half-applied role changes, and never run GATT bond
+    // recovery while the Mesh daemon owns this controller.
+    if (config_apply_in_progress_.load() || active_config_.enable_mesh) return;
+
+    // Broadcast overlays are deliberately connectionless. Do not run normal
+    // pairing/bond recovery here: that machinery may repair or remove a bond,
+    // while this mode only needs to close a transient link and keep scanning.
+    if (active_config_.advertise_mode == "broadcast") {
+        std::vector<std::string> connected_macs;
+        for (const auto& device : client_->get_connected_devices()) {
+            connected_macs.push_back(device.mac);
+        }
+        state_lock.unlock();
+        for (const auto& mac : connected_macs) {
+            (void)run_peer_task_once(
+                mac, "disconnect connectionless-mode peer",
+                [this, mac, retry_period_s]() {
+                    (void)client_->disconnect(mac, retry_period_s);
+                });
+        }
+        if (active_config_.enable_scan && !client_->is_scanning()) {
+            client_->start_scan(active_config_.scan_mode, false);
+        } else if (!active_config_.enable_scan && client_->is_scanning()) {
+            client_->stop_scan();
+        }
+        return;
+    }
+
     bool should_suspend_scan = false;
     const auto reconnect_incomplete_time_bridge =
         [this, retry_period_s](const std::string& mac,
@@ -720,7 +781,7 @@ void ServiceNode::reconcile_peers() {
                           "[reconcile] sessions=%zu devices=%zu auto_connect=%s whitelist=%zu",
                           peers_->sessions().size(), current_macs.size(),
                           active_config_.auto_connect_enable ? "on" : "off",
-                          active_config_.auto_connect_whitelist.size());
+                          active_config_.peer_whitelist.size());
 
     peers_->prune_sessions(current_macs, now, std::max(5.0, active_config_.peer_connection_timeout));
 
@@ -734,6 +795,24 @@ void ServiceNode::reconcile_peers() {
             state_lock.unlock();
             clear_peer_runtime(mac);
             state_lock.lock();
+        }
+
+        if (device && device->connected &&
+            !peer_allowed_by_whitelist(active_config_, *device)) {
+            state_lock.unlock();
+            const bool started = run_peer_task_once(
+                mac, "disconnect peer outside whitelist",
+                [this, mac, retry_period_s]() {
+                    (void)client_->disconnect(mac, retry_period_s);
+                });
+            state_lock.lock();
+            if (started) {
+                expected_disconnect_reasons_[mac] =
+                    "peer is outside active peer_whitelist";
+                session.phase = "disconnecting";
+                session.detail = "peer is outside active peer_whitelist";
+            }
+            continue;
         }
 
         const bool recent_connect_flow = session.last_connect_attempt_monotonic > 0.0 &&
@@ -826,7 +905,10 @@ void ServiceNode::reconcile_peers() {
                 !run_peer_task_once(mac, "reset peer device", [this, mac, retry_period_s, connected = is_connected]() {
                     const auto should_continue_repair = [this, &mac]() {
                         std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
-                        if (shutting_down_.load() || !peers_) {
+                        if (shutting_down_.load() || !peers_ ||
+                            config_apply_in_progress_.load() ||
+                            active_config_.enable_mesh ||
+                            active_config_.advertise_mode == "broadcast") {
                             return false;
                         }
                         const auto session_it = peers_->sessions().find(mac);
@@ -922,11 +1004,16 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (is_connected && device && !device_has_required_pairing(*device, active_config_)) {
+            if (session.pairing_wait_started_monotonic <= 0.0)
+                session.pairing_wait_started_monotonic = now;
             const auto local_adapter = cache_->adapter(adapter_path_);
             const bool local_owns_pairing = local_adapter && !local_adapter->address.empty()
                 ? local_adapter->address < device->mac
                 : (!session.peer_name.empty() && hostname_ < session.peer_name);
-            if (!local_owns_pairing) {
+            // The other UAV may retain its bond while this side has lost it.
+            // After a bounded grace, initiate ordinary pairing here too; do
+            // not require coordinated bond deletion or wait indefinitely.
+            if (!local_owns_pairing && !session.pairing_fallback_due(now)) {
                 session.pairing_in_progress = false;
                 session.phase = "securing";
                 session.detail = "waiting for peer-initiated pairing";
@@ -1178,7 +1265,13 @@ void ServiceNode::reconcile_peers() {
     state_lock.unlock();
     if (should_scan) {
         if (!client_->is_scanning()) {
-            client_->start_scan(active_config_.scan_mode, active_config_.enable_server);
+            const bool discoverable_while_scanning =
+                active_config_.advertise_mode != "broadcast" &&
+                active_config_.advertise_discoverable.value_or(
+                    active_config_.enable_server ||
+                    active_config_.enable_serial_port_profile);
+            client_->start_scan(active_config_.scan_mode,
+                                discoverable_while_scanning);
         }
     } else {
         if (client_->is_scanning()) {

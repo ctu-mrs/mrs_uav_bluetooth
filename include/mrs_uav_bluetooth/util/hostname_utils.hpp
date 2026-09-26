@@ -9,8 +9,8 @@ namespace mrs_uav_bluetooth::util {
 /// Return the system hostname (gethostname).
 std::string system_hostname();
 
-/// True when the hostname matches the given regex pattern (default: ^uav[0-9]{1,2}$).
+/// True when the hostname matches the given regex pattern (default: ^uav[0-9]{1,5}$).
 bool is_uav_hostname(std::string_view value,
-                     std::string_view pattern = "^uav[0-9]{1,2}$");
+                     std::string_view pattern = "^uav[0-9]{1,5}$");
 
 }  // namespace mrs_uav_bluetooth::util

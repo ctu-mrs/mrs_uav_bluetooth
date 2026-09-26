@@ -7,6 +7,7 @@
 #include <sdbus-c++/sdbus-c++.h>
 #include <rclcpp/rclcpp.hpp>
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
@@ -100,7 +101,8 @@ protected:
 
     mutable std::mutex mutex_;
     std::vector<uint8_t> value_;
-    std::unique_ptr<sdbus::IObject> exported_;
+    // Atomic shared snapshots keep an in-flight emission alive across unexport.
+    std::shared_ptr<sdbus::IObject> exported_;
 };
 
 // ---------------------------------------------------------------------------
@@ -161,14 +163,15 @@ protected:
     std::string uuid_;
     std::vector<std::string> flags_;
     GattService& parent_;
-    bool notifying_{false};
-    bool force_emit_value_{false};
+    std::atomic_bool notifying_{false};
+    std::atomic_bool force_emit_value_{false};
     uint16_t handle_{0};
     std::optional<uint16_t> mtu_;
 
     mutable std::mutex mutex_;
     std::vector<uint8_t> value_;
-    std::unique_ptr<sdbus::IObject> exported_;
+    // Atomic shared snapshots keep an in-flight emission alive across unexport.
+    std::shared_ptr<sdbus::IObject> exported_;
 
     std::vector<std::shared_ptr<GattDescriptor>> descriptors_;
 

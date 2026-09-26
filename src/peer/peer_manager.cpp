@@ -264,8 +264,8 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
 
     session.missing_since_monotonic = 0.0;
 
-    const bool whitelist_enabled = !config.auto_connect_whitelist.empty();
-    session.explicit_target = whitelist_contains(config.auto_connect_whitelist,
+    const bool whitelist_enabled = !config.peer_whitelist.empty();
+    session.explicit_target = whitelist_contains(config.peer_whitelist,
                                                  device.mac,
                                                  session.peer_name);
     session.peer_candidate = matches_auto_connect_policy(device, config, session.peer_name);
@@ -345,6 +345,14 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
     }
 
     if (!device.connected) {
+        // ``peer_initiated`` describes who owned the connection that just ended;
+        // it must not permanently make an automatically selected UAV passive.
+        // This is especially important after BlueZ removes and rediscovers a
+        // device record: the PeerConnectionSession intentionally survives for a
+        // short time, but the next connection has not been initiated by either
+        // side yet. Non-selected/manual devices return above and therefore keep
+        // their passive behaviour.
+        session.peer_initiated = false;
         session.pairing_in_progress = false;
         session.time_bridge_healthy_this_connection = false;
         session.local_time_notify_active_this_connection = false;
@@ -388,6 +396,7 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
 
     if (device_has_required_pairing(device, config)) {
         session.pairing_in_progress = false;
+        session.pairing_wait_started_monotonic = 0.0;
     } else {
         session.last_service_retry_monotonic = 0.0;
         session.bridge_wait_started_monotonic = 0.0;
@@ -657,7 +666,8 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
     const double services_wait_started = session.services_wait_started_monotonic > 0.0
         ? session.services_wait_started_monotonic
         : session.connected_since_monotonic;
-    if (services_wait_started <= 0.0 || (now_mono - services_wait_started) < pair_grace_s) {
+    if (!session.pairing_fallback_due(now_mono) &&
+        (services_wait_started <= 0.0 || (now_mono - services_wait_started) < pair_grace_s)) {
         return false;
     }
 
@@ -665,6 +675,16 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
                                      retry_period_s * std::max(1, session.pairing_failures + 1));
     return session.last_security_attempt_monotonic <= 0.0 ||
            now_mono - session.last_security_attempt_monotonic >= cooldown;
+}
+
+bool PeerManager::should_repair_authentication_disconnect(
+    const PeerConnectionSession& session, const bluez::DeviceInfo& device,
+    const config::NodeConfig& config, const std::string& reason) const {
+    return reason == "org.bluez.Reason.Authentication" &&
+        config.auto_pair && config.auto_connect_enable && !config.enable_mesh &&
+        config.advertise_mode != "broadcast" && session.desired &&
+        !device.blocked && (device.paired || device.bonded) &&
+        !session.repair_requested && !session.repair_in_progress;
 }
 
 void PeerManager::prune_sessions(const std::set<std::string>& current_macs,

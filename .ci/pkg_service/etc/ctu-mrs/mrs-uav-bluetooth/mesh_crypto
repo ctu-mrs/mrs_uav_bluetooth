@@ -1,0 +1,6 @@
+# Component: bluetooth-mesh.service AEAD prerequisite helper
+#
+# Keep disabled unless the UAV image maintainer has verified that loading
+# algif_aead is appropriate for the running kernel (see CopyFail CVE-2026-31431 vulnerability). 
+# Setting this to 1 permits the helper to bypass an `install algif_aead ...` modprobe policy rule.
+MRS_UAV_BLUETOOTH_ALLOW_AEAD_POLICY_OVERRIDE=0

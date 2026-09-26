@@ -14,20 +14,29 @@ fi
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 
-#setup new systemctl service
+# The unit is shipped in the package payload, not generated on the target.
 chmod +x /etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
-touch /etc/systemd/system/mrs-uav-bluetooth.service
-> /etc/systemd/system/mrs-uav-bluetooth.service
-echo "[Unit]
-Description=ROS 2 MRS UAV BLE service node
-After=network.target
-StartLimitIntervalSec=0
-[Service]
-Type=simple
-Restart=always
-ExecStart=/etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
-[Install]
-WantedBy=multi-user.target" >> /etc/systemd/system/mrs-uav-bluetooth.service
+# The Mesh daemon drop-in calls the same helper before every daemon start. Run
+# it once during installation as well so a policy-permitted host is immediately
+# ready for a Mesh overlay. Mesh remains optional: a blocked module emits a
+# warning but does not prevent installation of the GATT service.
+chmod +x /usr/lib/mrs-uav-bluetooth/prepare-mesh-crypto
+chmod +x /usr/lib/mrs-uav-bluetooth/mesh-daemon
+chmod +x /usr/lib/mrs-uav-bluetooth/clear-mesh-receiver
+# Tokens and collision-free unicast cursors must survive service restarts. The
+# account exists on UAV images; root remains able to use the directory too.
+if getent passwd mrs >/dev/null; then
+  install -d -m 0750 -o mrs -g mrs /var/lib/mrs_uav_bluetooth
+else
+  install -d -m 0750 /var/lib/mrs_uav_bluetooth
+fi
+if ! /usr/lib/mrs-uav-bluetooth/prepare-mesh-crypto; then
+  echo "WARNING: Bluetooth Mesh crypto prerequisite is unavailable; see the message above." >&2
+fi
+
 systemctl daemon-reload
+# The package ships only BlueZ's D-Bus alias, not the bluetooth.target Wants
+# link. This permits on-demand activation when a Mesh overlay is selected
+# without making bluetooth-meshd contend with normal LE/GATT roles at boot.
 systemctl enable mrs-uav-bluetooth
 systemctl start mrs-uav-bluetooth

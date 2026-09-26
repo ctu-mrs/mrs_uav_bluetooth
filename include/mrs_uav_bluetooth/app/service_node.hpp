@@ -11,12 +11,15 @@
 #include "mrs_uav_bluetooth/msg/ble_peer_time_status.hpp"
 #include "mrs_uav_bluetooth/bridge/export_bridge_manager.hpp"
 #include "mrs_uav_bluetooth/bridge/import_bridge_manager.hpp"
+#include "mrs_uav_bluetooth/bridge/transport_bridge_manager.hpp"
 #include "mrs_uav_bluetooth/config/overlay_config_manager.hpp"
 #include "mrs_uav_bluetooth/gatt/advertisement.hpp"
 #include "mrs_uav_bluetooth/gatt/gatt_application.hpp"
 #include "mrs_uav_bluetooth/gatt/services/time_service.hpp"
 #include "mrs_uav_bluetooth/gatt/services/wifi_service.hpp"
 #include "mrs_uav_bluetooth/network/netplan_manager.hpp"
+#include "mrs_uav_bluetooth/mesh/mesh_application.hpp"
+#include "mrs_uav_bluetooth/mesh/swarm_coordinator.hpp"
 #include "mrs_uav_bluetooth/peer/peer_manager.hpp"
 #include "mrs_uav_bluetooth/ros/ros_interface_manager.hpp"
 #include "mrs_uav_bluetooth/serial/serial_link.hpp"
@@ -37,6 +40,13 @@
 #include "mrs_uav_bluetooth/srv/set_notify.hpp"
 #include "mrs_uav_bluetooth/srv/set_scan_enabled.hpp"
 #include "mrs_uav_bluetooth/srv/write_gatt_value.hpp"
+#include "mrs_uav_bluetooth/srv/mesh_network.hpp"
+#include "mrs_uav_bluetooth/srv/mesh_send.hpp"
+#include "mrs_uav_bluetooth/srv/mesh_management.hpp"
+#include "mrs_uav_bluetooth/srv/mesh_swarm.hpp"
+#include "mrs_uav_bluetooth/msg/mesh_message.hpp"
+#include "mrs_uav_bluetooth/msg/mesh_status.hpp"
+#include "mrs_uav_bluetooth/msg/mesh_event.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/u_int8_multi_array.hpp>
@@ -71,7 +81,13 @@ private:
     void create_services();
     void apply_config(const config::NodeConfig& cfg);
     void apply_adapter_state(const config::NodeConfig& cfg);
+    void reconcile_adapter_state_if_requested();
     void configure_serial_profile(const config::NodeConfig& cfg);
+    void configure_mesh(const config::NodeConfig& cfg);
+    void maintain_mesh();
+    void publish_mesh_status();
+    void publish_mesh_message(const mesh::ReceivedMessage& message);
+    void publish_mesh_event(const mesh::Event& event);
     void rebuild_server_objects();
     void publish_periodic_status();
     void publish_scan_snapshot();
@@ -89,6 +105,14 @@ private:
     void refresh_advertisement_registration();
     void refresh_advertisement_topic_subscription();
     void handle_advertisement_payload(const std_msgs::msg::UInt8MultiArray::SharedPtr message);
+    /// Apply an advertisement payload from either the raw ROS topic or a
+    /// declarative bridge. Configured bridge frames are rejected rather than
+    /// truncated because truncation would silently corrupt their codec.
+    void set_advertisement_payload(std::vector<uint8_t> payload,
+                                   bool allow_truncate);
+    /// Forward one already-framed access message through the attached Mesh.
+    void send_mesh_bridge_payload(const config::SharedTopicConfig& bridge,
+                                  const std::vector<uint8_t>& payload);
     void note_local_time_notify_state(bool enabled);
     void on_pairing_event(const std::string& event_type, const std::string& device_path);
     void note_pair_attempt_result(const std::string& mac,
@@ -171,6 +195,15 @@ private:
                               std::shared_ptr<std_srvs::srv::Trigger::Response> response);
     void handle_set_active_config(const std::shared_ptr<mrs_uav_bluetooth::srv::SetActiveConfig::Request> request,
                                   std::shared_ptr<mrs_uav_bluetooth::srv::SetActiveConfig::Response> response);
+    void handle_mesh_network(const std::shared_ptr<mrs_uav_bluetooth::srv::MeshNetwork::Request> request,
+                             std::shared_ptr<mrs_uav_bluetooth::srv::MeshNetwork::Response> response);
+    void handle_mesh_send(const std::shared_ptr<mrs_uav_bluetooth::srv::MeshSend::Request> request,
+                          std::shared_ptr<mrs_uav_bluetooth::srv::MeshSend::Response> response);
+    void handle_mesh_management(const std::shared_ptr<mrs_uav_bluetooth::srv::MeshManagement::Request> request,
+                                std::shared_ptr<mrs_uav_bluetooth::srv::MeshManagement::Response> response);
+    /// Runtime logical-swarm control never changes Mesh provisioning credentials.
+    void handle_mesh_swarm(const std::shared_ptr<mrs_uav_bluetooth::srv::MeshSwarm::Request> request,
+                           std::shared_ptr<mrs_uav_bluetooth::srv::MeshSwarm::Response> response);
 
     std::string hostname_;
     std::string adapter_path_;
@@ -185,8 +218,18 @@ private:
     std::unique_ptr<bluez::SerialPortProfile> serial_profile_;
     std::unique_ptr<serial::SerialSshServer> serial_ssh_server_;
     std::string serial_sshd_path_;
+    // A dedicated connection lets BlueZ observe detach when an overlay ends.
+    std::unique_ptr<bluez::DbusConnection> mesh_dbus_;
+    std::unique_ptr<mesh::MeshApplication> mesh_app_;
+    /// Steady-clock observation, independent of BlueZ's platform-specific clock.
+    std::atomic<int64_t> mesh_last_peer_heard_ns_{0};
+    std::unique_ptr<mesh::MeshSwarmCoordinator> mesh_swarm_coordinator_;
+    std::atomic_bool mesh_bootstrap_attempted_{false};
+    std::atomic_bool mesh_local_relay_configured_{false};
+    std::string mesh_topic_prefix_;
 
     std::unique_ptr<config::OverlayConfigManager> overlay_config_;
+    std::string mesh_config_signature_;
 
     std::unique_ptr<network::NetplanManager> netplan_;
 
@@ -198,6 +241,7 @@ private:
     bridge::BridgeRegistry bridge_registry_;
     std::unique_ptr<bridge::ExportBridgeManager> export_bridges_;
     std::unique_ptr<bridge::ImportBridgeManager> import_bridges_;
+    std::unique_ptr<bridge::TransportBridgeManager> transport_bridges_;
     std::unique_ptr<peer::PeerManager> peers_;
     std::unique_ptr<ros::RosInterfaceManager> ros_;
 
@@ -212,9 +256,28 @@ private:
     rclcpp::TimerBase::SharedPtr peer_timer_;
     rclcpp::TimerBase::SharedPtr time_service_timer_;
     rclcpp::TimerBase::SharedPtr wifi_service_timer_;
+    rclcpp::TimerBase::SharedPtr mesh_timer_;
+    rclcpp::Publisher<mrs_uav_bluetooth::msg::MeshStatus>::SharedPtr mesh_status_pub_;
+    rclcpp::Publisher<mrs_uav_bluetooth::msg::MeshMessage>::SharedPtr mesh_message_pub_;
+    rclcpp::Publisher<mrs_uav_bluetooth::msg::MeshEvent>::SharedPtr mesh_event_pub_;
     rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr advertisement_payload_sub_;
     std::chrono::steady_clock::time_point peer_reconcile_deadline_{};
     std::atomic_bool shutting_down_{false};
+    // BlueZ emits Adapter1 PropertiesChanged while the service is applying a
+    // group of adapter properties. Guard the group and defer reconciliation to
+    // the lease timer so asynchronous property events can never recursively
+    // write back to BlueZ from its D-Bus callback thread.
+    std::atomic_bool adapter_state_apply_in_progress_{false};
+    std::atomic_bool adapter_state_reconcile_requested_{false};
+    // Some controllers reject policy writes while Mesh owns an advertising
+    // operation. Keep the correction request pending, but do not retry it on
+    // every one-second lease tick and flood BlueZ/the journal.
+    std::chrono::steady_clock::time_point next_adapter_state_reconcile_{};
+    // Overlay activation runs in a reentrant service callback while timers and
+    // D-Bus events remain live. Serialize full config transitions and expose a
+    // cheap flag that those callbacks can use to defer corrective work.
+    std::mutex config_apply_mutex_;
+    std::atomic_bool config_apply_in_progress_{false};
     mutable std::recursive_mutex state_mutex_;
     mutable std::mutex peer_task_mutex_;
     std::shared_future<void> peer_task_;

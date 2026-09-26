@@ -22,6 +22,20 @@ struct PeerConnectionSession {
     double connect_started_monotonic{0.0};
     double connected_since_monotonic{0.0};
     double last_security_attempt_monotonic{0.0};
+    // Survives short reconnects while unpaired: an asymmetric bond must not
+    // restart the non-initiator's grace period on every failed encryption.
+    double pairing_wait_started_monotonic{0.0};
+
+    /// Prefer one pairing initiator initially, but never wait for it forever.
+    bool pairing_fallback_due(double now) const {
+        return pairing_wait_started_monotonic > 0.0 &&
+            now - pairing_wait_started_monotonic >= 10.0;
+    }
+
+    /// Partial handshake traffic starts, but never postpones, the deadline.
+    void begin_bridge_wait(double now) {
+        if (bridge_wait_started_monotonic <= 0.0) bridge_wait_started_monotonic = now;
+    }
     double last_policy_action_monotonic{0.0};
     double last_repair_monotonic{0.0};
     double repair_requested_monotonic{0.0};

@@ -1,0 +1,56 @@
+#!/bin/bash
+# Prepare the AF_ALG AEAD userspace interface required by bluetooth-meshd.
+#
+# This helper deliberately contains no kernel-release allow-list. Distribution
+# and administrator module policy wins by default. A deployment that has
+# independently established that its kernel is suitable may opt in to
+# --ignore-install through the root-owned package configuration file.
+set -euo pipefail
+
+readonly module=algif_aead
+readonly settings=/etc/ctu-mrs/mrs-uav-bluetooth/mesh_crypto
+readonly modprobe_bin="$(command -v modprobe)"
+
+log() {
+  printf "[mrs-uav-bluetooth mesh crypto] %s\n" "$*"
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+  log "must run as root"
+  exit 1
+fi
+
+if [ -d "/sys/module/${module}" ]; then
+  exit 0
+fi
+
+# Honor normal distribution and local administrator policy first.
+if "$modprobe_bin" "$module" 2>/dev/null && [ -d "/sys/module/${module}" ]; then
+  log "loaded ${module} through normal module policy"
+  exit 0
+fi
+
+MRS_UAV_BLUETOOTH_ALLOW_AEAD_POLICY_OVERRIDE=0
+if [ -r "$settings" ]; then
+  # This file is installed below /etc and is a dpkg conffile. It is sourced as
+  # root, so administrators must keep it root-owned and non-writable by others.
+  # shellcheck disable=SC1090
+  . "$settings"
+fi
+
+case "${MRS_UAV_BLUETOOTH_ALLOW_AEAD_POLICY_OVERRIDE:-0}" in
+  1|true|TRUE|yes|YES) ;;
+  *)
+    log "normal loading was blocked; set MRS_UAV_BLUETOOTH_ALLOW_AEAD_POLICY_OVERRIDE=1 in ${settings} only after validating the running kernel"
+    exit 1
+    ;;
+esac
+
+# The explicit setting is the security boundary. Do not infer safety from a
+# kernel name or version here: that policy belongs to the maintained UAV image.
+"$modprobe_bin" --ignore-install "$module"
+if [ ! -d "/sys/module/${module}" ]; then
+  log "modprobe returned without loading ${module}"
+  exit 1
+fi
+log "loaded ${module} using the administrator-approved module-policy override"

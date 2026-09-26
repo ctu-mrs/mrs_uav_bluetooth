@@ -1,0 +1,12 @@
+std_msgs/Header header
+string event
+string uuid
+string reason
+int16 rssi
+uint8[] data
+uint16 server
+uint16 original
+uint16 unicast
+uint8 nppi
+uint8 count
+string detail

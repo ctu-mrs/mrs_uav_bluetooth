@@ -1,0 +1,11 @@
+# Read or change this UAV's logical swarm without leaving the provisioned Mesh.
+# action: status, join, leave. join requires swarm_id in 1..65535.
+# Changes are persisted locally and advertised over the Mesh control group.
+string action
+uint16 swarm_id
+---
+bool success
+string message
+uint16 swarm_id
+bool participating
+string[] members

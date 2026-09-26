@@ -211,7 +211,9 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                                "[node] on_cache_event: DeviceAdded path=" + object_path + " but device not in cache");
             return;
         }
-        const auto peer_name = util::device_hostname_guess(*device);
+        const auto peer_name = util::device_hostname_guess(
+            *device, active_config_.auto_connect_pattern,
+            active_config_.peer_whitelist);
         log_info_coalesced("cache:DeviceAdded:" + device->mac,
                            "[node] on_cache_event: DeviceAdded mac=" + device->mac +
                                " name='" + device->name + "' peer_name='" + peer_name +
@@ -272,7 +274,9 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    util::device_hostname_guess(*device),
+                                    util::device_hostname_guess(
+                                        *device, active_config_.auto_connect_pattern,
+                                        active_config_.peer_whitelist),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -297,7 +301,9 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    util::device_hostname_guess(*device),
+                                    util::device_hostname_guess(
+                                        *device, active_config_.auto_connect_pattern,
+                                        active_config_.peer_whitelist),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -323,7 +329,9 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    util::device_hostname_guess(*device),
+                                    util::device_hostname_guess(
+                                        *device, active_config_.auto_connect_pattern,
+                                        active_config_.peer_whitelist),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -332,20 +340,34 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
     } else {
         RCLCPP_DEBUG(get_logger(), "[node] on_cache_event: %s path=%s", event_name, object_path.c_str());
         if (event == bluez::CacheEvent::AdapterChanged && object_path == adapter_path_) {
-            if (const auto adapter = cache_->adapter(object_path)) {
-                const bool should_be_discoverable = active_config_.enable_server;
+            const bool mesh_exclusive = active_config_.enable_mesh &&
+                !active_config_.enable_server && !active_config_.enable_scan &&
+                !active_config_.enable_serial_port_profile &&
+                !active_config_.auto_connect_enable;
+            if (!mesh_exclusive) {
+              if (const auto adapter = cache_->adapter(object_path)) {
+                const bool broadcast_mode =
+                    active_config_.advertise_mode == "broadcast";
+                const bool should_be_discoverable = !broadcast_mode &&
+                    active_config_.advertise_discoverable.value_or(
+                        active_config_.enable_server ||
+                        active_config_.enable_serial_port_profile);
+                const bool should_be_connectable = !broadcast_mode;
                 const bool should_be_pairable = active_config_.auto_pair;
                 const bool drifted = !adapter->powered ||
-                    !adapter->connectable ||
+                    adapter->connectable != should_be_connectable ||
                     adapter->pairable != should_be_pairable ||
                     adapter->alias != hostname_ ||
                     adapter->discoverable != should_be_discoverable ||
                     (should_be_discoverable && adapter->discoverable_timeout != active_config_.discoverable_timeout);
                 if (drifted) {
-                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                                         "[node] adapter state drift detected, reapplying powered/pairable/discoverable/alias settings");
-                    apply_adapter_state(active_config_);
+                    // D-Bus property setters themselves generate this event.
+                    // Record the need for a later, coalesced check instead of
+                    // writing from BlueZ's callback thread and feeding back on
+                    // every intermediate property snapshot.
+                    adapter_state_reconcile_requested_.store(true);
                 }
+              }
             }
         }
         if (const auto device_path = device_path_for_cache_event(*cache_, event, object_path)) {
@@ -358,7 +380,9 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                 maybe_capture_disconnect_transition(*device);
                 peers_->sync_device(*device,
                                     active_config_,
-                                    util::device_hostname_guess(*device),
+                                    util::device_hostname_guess(
+                                        *device, active_config_.auto_connect_pattern,
+                                        active_config_.peer_whitelist),
                                     preserve_ready_runtime,
                                     preserve_active_bridge_runtime);
                 refresh_device = *device;
@@ -366,7 +390,8 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         }
     }
 
-    if (refresh_device && !active_config_.auto_pair) {
+    if (refresh_device && active_config_.advertise_mode != "broadcast" &&
+        !active_config_.auto_pair) {
         const auto session_it = peers_->sessions().find(refresh_device->mac);
         if (session_it != peers_->sessions().end() &&
             session_it->second.desired &&
@@ -425,6 +450,26 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
     }
 
     if (!cache_ || !client_) {
+        return;
+    }
+
+    if (event_type == "device_disconnected") {
+        // BlueZ reports authentication failure even while Paired/Bonded
+        // remain true locally. Recover that one stale GATT bond through the
+        // existing admission-controlled reset path. Never infer this from an
+        // RF timeout, and ignore late events during a radio-mode transaction.
+        if (!peers_ || config_apply_in_progress_.load()) return;
+        if (const auto device = cache_->device(object_path)) {
+            const auto it = peers_->sessions().find(device->mac);
+            if (it != peers_->sessions().end() &&
+                peers_->should_repair_authentication_disconnect(
+                    it->second, *device, active_config_, detail)) {
+                it->second.peer_initiated = false;
+                peers_->request_device_reset(it->second,
+                    "stored GATT bond failed authentication, re-pairing admitted peer", true);
+                schedule_peer_reconcile(std::chrono::milliseconds(1));
+            }
+        }
         return;
     }
 
@@ -498,7 +543,9 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                 should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(*device);
             peers_->sync_device(*device,
                                 active_config_,
-                                util::device_hostname_guess(*device),
+                                util::device_hostname_guess(
+                                    *device, active_config_.auto_connect_pattern,
+                                    active_config_.peer_whitelist),
                                 preserve_ready_runtime,
                                 preserve_active_bridge_runtime);
             if (!clear_runtime_mac) {

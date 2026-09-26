@@ -1,0 +1,125 @@
+diff --git a/mesh/appkey.c b/mesh/appkey.c
+index b03ddae..1b96d09 100644
+--- a/mesh/appkey.c
++++ b/mesh/appkey.c
+@@ -25,6 +25,7 @@
+ #include "mesh/util.h"
+ #include "mesh/model.h"
+ #include "mesh/mesh-config.h"
++#include "mesh/keyring.h"
+ #include "mesh/appkey.h"
+ 
+ struct mesh_app_key {
+@@ -289,6 +290,7 @@ int appkey_key_add(struct mesh_net *net, uint16_t net_idx, uint16_t app_idx,
+ 							const uint8_t *new_key)
+ {
+ 	struct mesh_app_key *key;
++	struct keyring_app_key stored_key;
+ 	struct l_queue *app_keys;
+ 	struct mesh_node *node;
+ 
+@@ -330,6 +332,17 @@ int appkey_key_add(struct mesh_net *net, uint16_t net_idx, uint16_t app_idx,
+ 	key->net_idx = net_idx;
+ 	key->app_idx = app_idx;
+ 	l_queue_push_tail(app_keys, key);
++	/* A provisioned node can become a provisioner without a manual key copy.
++	 * Keep its management keyring in step with Config Server AppKey Add. */
++	if (!keyring_get_app_key(node, app_idx, &stored_key)) {
++		memset(&stored_key, 0, sizeof(stored_key));
++		stored_key.app_idx = app_idx;
++		stored_key.net_idx = net_idx;
++		memcpy(stored_key.old_key, new_key, 16);
++		memcpy(stored_key.new_key, new_key, 16);
++		if (!keyring_put_app_key(node, app_idx, net_idx, &stored_key))
++			return MESH_STATUS_STORAGE_FAIL;
++	}
+ 
+ 	return MESH_STATUS_SUCCESS;
+ }
+diff --git a/mesh/node.c b/mesh/node.c
+index 7f20e97..a426add 100644
+--- a/mesh/node.c
++++ b/mesh/node.c
+@@ -373,6 +373,22 @@ static bool add_elements_from_storage(struct mesh_node *node,
+ 	return true;
+ }
+ 
++static bool seed_net_keyring(struct mesh_node *node, uint16_t index,
++		const uint8_t old_key[16], const uint8_t new_key[16], uint8_t phase)
++{
++	struct keyring_net_key entry;
++
++	if (keyring_get_net_key(node, index, &entry))
++		return true;
++
++	memset(&entry, 0, sizeof(entry));
++	entry.net_idx = index;
++	entry.phase = phase;
++	memcpy(entry.old_key, old_key, 16);
++	memcpy(entry.new_key, new_key, 16);
++	return keyring_put_net_key(node, index, &entry);
++}
++
+ static void set_net_key(void *a, void *b)
+ {
+ 	struct mesh_config_netkey *netkey = a;
+@@ -380,15 +396,31 @@ static void set_net_key(void *a, void *b)
+ 
+ 	mesh_net_set_key(node->net, netkey->idx, netkey->key, netkey->new_key,
+ 								netkey->phase);
++	/* A newly joined node may later act as a provisioner. Rebuild only a
++	 * missing management keyring entry from its own persistent node state. */
++	if (!seed_net_keyring(node, netkey->idx, netkey->key,
++					netkey->new_key, netkey->phase))
++		l_error("Failed to seed local Mesh network keyring");
+ }
+ 
+ static void set_appkey(void *a, void *b)
+ {
+ 	struct mesh_config_appkey *appkey = a;
+ 	struct mesh_node *node = b;
++	struct keyring_app_key entry;
+ 
+ 	appkey_key_init(node->net, appkey->net_idx, appkey->app_idx,
+ 						appkey->key, appkey->new_key);
++	if (keyring_get_app_key(node, appkey->app_idx, &entry))
++		return;
++	memset(&entry, 0, sizeof(entry));
++	entry.app_idx = appkey->app_idx;
++	entry.net_idx = appkey->net_idx;
++	memcpy(entry.old_key, appkey->key, 16);
++	memcpy(entry.new_key, appkey->new_key, 16);
++	if (!keyring_put_app_key(node, appkey->app_idx,
++					appkey->net_idx, &entry))
++		l_error("Failed to seed local Mesh application keyring");
+ }
+ 
+ static bool init_storage_dir(struct mesh_node *node)
+@@ -499,6 +531,14 @@ static bool init_from_storage(struct mesh_config_node *db_node,
+ 	l_queue_foreach(db_node->netkeys, set_net_key, node);
+ 
+ 	l_queue_foreach(db_node->appkeys, set_appkey, node);
++	if (IS_UNICAST(node->primary) && node->num_ele) {
++		uint8_t stored_key[16];
++
++		if (!keyring_get_remote_dev_key(node, node->primary, stored_key) &&
++			!keyring_put_remote_dev_key(node, node->primary,
++						node->num_ele, node->dev_key))
++			goto fail;
++	}
+ 
+ 	while (l_queue_length(db_node->pages)) {
+ 		struct mesh_config_comp_page *page;
+@@ -1454,6 +1494,12 @@ static bool add_local_node(struct mesh_node *node, uint16_t unicast, bool kr,
+ 				KEY_REFRESH_PHASE_TWO) != MESH_STATUS_SUCCESS)
+ 			return false;
+ 	}
++	if (!kr && !seed_net_keyring(node, net_key_idx, net_key,
++					net_key, KEY_REFRESH_PHASE_NONE))
++		return false;
++	if (!keyring_put_remote_dev_key(node, unicast,
++						node->num_ele, dev_key))
++		return false;
+ 
+ 	l_queue_foreach(node->pages, save_pages, node);
+ 

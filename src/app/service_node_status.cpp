@@ -227,6 +227,17 @@ void ServiceNode::publish_scan_snapshot() {
     std::map<std::string, bluez::DeviceInfo> devices_map;
     for (const auto& device : client_->get_devices()) {
         devices_map[device.mac] = device;
+        if (transport_bridges_) {
+            const auto payload = advertisement_user_payload(
+                device, bluez::kDefaultAdvertisementExtraDataType);
+            if (!payload.empty()) {
+                transport_bridges_->handle_advertisement(
+                    util::device_hostname_guess(
+                        device, active_config_.auto_connect_pattern,
+                        active_config_.peer_whitelist),
+                    device.mac, payload);
+            }
+        }
     }
     ros_->status_publisher().publish_devices(devices_map);
 }
@@ -510,8 +521,10 @@ std::string ServiceNode::build_detailed_status_report(
         if (!device.connected) {
             continue;
         }
-        const auto guessed_name = util::device_hostname_guess(device);
-        if (!guessed_name.empty() && util::is_uav_hostname(guessed_name, active_config_.auto_connect_pattern)) {
+        const auto guessed_name = util::device_hostname_guess(
+            device, active_config_.auto_connect_pattern,
+            active_config_.peer_whitelist);
+        if (!guessed_name.empty()) {
             connected_peers.push_back(&device);
         } else {
             other_connected.push_back(&device);
@@ -686,7 +699,9 @@ mrs_uav_bluetooth::msg::BleDevice ServiceNode::to_device_msg(const bluez::Device
     msg.address_type = device.address_type;
     msg.name = device.name;
     msg.alias = device.alias;
-    msg.hostname = util::device_hostname_guess(device);
+    msg.hostname = util::device_hostname_guess(
+        device, active_config_.auto_connect_pattern,
+        active_config_.peer_whitelist);
     msg.icon = device.icon;
     msg.appearance = device.appearance;
     msg.rssi = device.rssi;

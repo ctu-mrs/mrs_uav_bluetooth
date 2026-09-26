@@ -1,0 +1,34 @@
+diff --git a/mesh/mesh-io-generic.c b/mesh/mesh-io-generic.c
+index df1450e..34b55d7 100644
+--- a/mesh/mesh-io-generic.c
++++ b/mesh/mesh-io-generic.c
+@@ -695,6 +695,7 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+ {
+ 	struct mesh_io_private *pvt = io->pvt;
+ 	struct tx_pkt *tx;
++	bool idle;
+ 
+ 	if (!info || !data || !len || len > sizeof(tx->pkt))
+ 		return false;
+@@ -705,6 +706,12 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+ 	memcpy(&tx->pkt, data, len);
+ 	tx->len = len;
+ 
++	/* A queued packet already owns the worker, even before its idle callback
++	 * runs or after the current HCI command completes. Scheduling another
++	 * worker here replaces pvt->tx during segmented/group bursts.
++	 */
++	idle = !pvt->tx && !pvt->tx_timeout && l_queue_isempty(pvt->tx_pkts);
++
+ 	if (info->type == MESH_IO_TIMING_TYPE_POLL_RSP)
+ 		l_queue_push_head(pvt->tx_pkts, tx);
+ 	else {
+@@ -722,7 +729,7 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+ 	}
+ 
+ 	/* If not already sending, schedule the tx worker */
+-	if (!pvt->tx) {
++	if (idle) {
+ 		l_timeout_remove(pvt->tx_timeout);
+ 		pvt->tx_timeout = NULL;
+ 		l_idle_oneshot(tx_worker, pvt, NULL);

@@ -17,17 +17,22 @@ ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
 # selection of BlueZ and ELL versions
 BLUEZ_VERSION=5.87 ;
 ELL_VERSION=0.83 ;
+# Keep the existing BlueZ package version. The Mesh fix is part of this build,
+# not a separate package revision that callers need to select explicitly.
+PACKAGE_VERSION="${BLUEZ_VERSION}" ;
+PATCH_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/patches" ;
+OUTPUT_DIR="$(pwd)" ;
 
 # custom package name; it replaces distro BlueZ when explicitly installed,
 # but it is not the same package so normal system updates do not require it.
 PACKAGE_NAME="mrs-bluez" ; # better than bluez-mrs
 
 # the final package name
-PACKAGE_FILENAME=$PACKAGE_NAME"_"$BLUEZ_VERSION"_"$ARCH".deb" ;
+PACKAGE_FILENAME=$PACKAGE_NAME"_"$PACKAGE_VERSION"_"$ARCH".deb" ;
 
 # package metadata
 PACKAGE_MAINTAINER="Vojtech Vrba <vrba.vojtech@fel.cvut.cz>" ;
-PACKAGE_DEPENDS="libc6, libdbus-1-3, libglib2.0-0, libreadline8, libudev1, kmod, udev, dbus" ;
+PACKAGE_DEPENDS="libc6, libdbus-1-3, libglib2.0-0, libjson-c5, libreadline8, libudev1, kmod, udev, dbus" ;
 PACKAGE_PROVIDES="bluez (= $BLUEZ_VERSION), bluez-obexd (= $BLUEZ_VERSION), bluez-hcidump (= $BLUEZ_VERSION), bluez-meshd (= $BLUEZ_VERSION)" ;
 PACKAGE_CONFLICTS="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-tools" ;
 PACKAGE_REPLACES="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-tools" ;
@@ -36,13 +41,14 @@ PACKAGE_REPLACES="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-too
 ###  CONFIGURATION SECTION END  ###
 ###################################
 
-# clean before running the script
-rm -rf bluez* ell* ;
+# Isolate each build; never glob-delete checkouts in the caller directory.
+BUILD_DIR="$(mktemp -d /tmp/mrs-bluez-package.XXXXXX)" ;
+cd "$BUILD_DIR" ;
 
 # install pre-requisites (with sources)
 # sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ; # this enables deb-src for apt
 apt-get -y update ;
-apt-get -y install git libasound2-dev ;
+apt-get -y install git libasound2-dev libjson-c-dev python3-docutils ;
 # apt-get -y build-dep bluez ; # this installs packages obtained by: apt-cache showsrc bluez | grep ^Build-Depends
 apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, libebook1.2-dev (>= 3.12)" ;
 
@@ -50,8 +56,15 @@ apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison,
 git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
 git clone https://git.kernel.org/pub/scm/libs/ell/ell.git --branch $ELL_VERSION --depth 1 ;
 
-# enter the bluez directory
+# enter the bluez directory and apply the verified source-level queue fix.
+# A changed upstream context fails the build, rather than silently omitting it.
 cd bluez ;
+git apply --check "$PATCH_ROOT/bluez-mesh-single-tx-worker.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-single-tx-worker.patch" ;
+git apply --check "$PATCH_ROOT/bluez-mesh-local-pb-adv.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-local-pb-adv.patch" ;
+git apply --check "$PATCH_ROOT/bluez-mesh-joined-provisioner-keyring.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-joined-provisioner-keyring.patch" ;
 
 # recover files (configure.ac etc.) 
 ./bootstrap ;
@@ -95,7 +108,7 @@ fi
 # create package control file
 cat > "$PACKAGE_ROOT/DEBIAN/control" <<EOT
 Package: $PACKAGE_NAME
-Version: $BLUEZ_VERSION
+Version: $PACKAGE_VERSION
 Section: admin
 Priority: optional
 Architecture: $ARCH
@@ -185,9 +198,8 @@ case "$1" in
 	    invoke-rc.d bluetooth stop || true
 	fi
 
-	if [ -d /var/lib/bluetooth ] ; then
-	    rm -rf /var/lib/bluetooth
-	fi
+        # Package removal must never erase bonds, Mesh keys or replay state.
+        # Administrators may archive/remove specific identities explicitly.
     ;;
 esac
 
@@ -200,18 +212,19 @@ dpkg-deb --build "$PACKAGE_ROOT" "$PACKAGE_FILENAME" ;
 
 # move the deb package to the parent directory
 #chmod 644 ./$PACKAGE_FILENAME ;
-mv ./$PACKAGE_FILENAME ../$PACKAGE_FILENAME ;
+mv "./$PACKAGE_FILENAME" "$OUTPUT_DIR/$PACKAGE_FILENAME" ;
 
 # create a world-readable copy outside private home directories for apt validation
 if [ -d /var/tmp ] ; then
-    cp ../$PACKAGE_FILENAME /var/tmp/$PACKAGE_FILENAME ;
+    cp "$OUTPUT_DIR/$PACKAGE_FILENAME" "/var/tmp/$PACKAGE_FILENAME" ;
     chmod 644 /var/tmp/$PACKAGE_FILENAME ;
 fi
 
 echo "" ;
 echo "###### FINISHED PACKAGE INFO START ######" ;
-stat ../$PACKAGE_FILENAME ;
-dpkg-deb --info ../$PACKAGE_FILENAME ;
+stat "$OUTPUT_DIR/$PACKAGE_FILENAME" ;
+dpkg-deb --info "$OUTPUT_DIR/$PACKAGE_FILENAME" ;
+echo "Build sources retained for inspection: $BUILD_DIR" ;
 if [ -f /var/tmp/$PACKAGE_FILENAME ] ; then
     echo "APT validation copy: /var/tmp/$PACKAGE_FILENAME" ;
 fi
@@ -220,4 +233,3 @@ echo "" ;
 
 # terminate successfully
 exit 0
-

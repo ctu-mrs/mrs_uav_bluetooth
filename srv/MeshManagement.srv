@@ -1,0 +1,23 @@
+# action: scan, scan_cancel, add_node, reprovision, create_subnet,
+# import_subnet, update_subnet, delete_subnet, set_key_phase,
+# create_app_key, import_app_key, update_app_key, delete_app_key,
+# import_remote_node, delete_remote_node, export_keys
+string action
+uint8[] uuid
+uint8[] filter
+uint8[] extended
+uint8[] key
+uint16 seconds
+uint16 server
+uint16 subnet
+uint16 unicast
+uint16 network_index
+uint16 application_index
+uint8 nppi
+uint8 phase
+uint8 count
+bool update
+---
+bool success
+string message
+string result_yaml

@@ -36,7 +36,7 @@ public:
 private:
     std::shared_ptr<GattService> service_;
     std::shared_ptr<GattCharacteristic> characteristic_;
-    std::vector<uint8_t> payload_;
+
 };
 
 }  // namespace mrs_uav_bluetooth::gatt::services

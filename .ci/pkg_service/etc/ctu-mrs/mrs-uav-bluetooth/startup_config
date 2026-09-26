@@ -1,2 +1,4 @@
+# Node: service_node, sourced by the system service launcher as startup_config.
+# Shell environment settings, not a ROS/YAML parameter file.
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_zenoh_cpp}"
 export ZENOH_ROUTER_CONFIG_URI="${ZENOH_ROUTER_CONFIG_URI:-/opt/ros/jazzy/share/mrs_uav_deployment/config/zenoh/uav_router.json5}"

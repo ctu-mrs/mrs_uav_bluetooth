@@ -8,11 +8,13 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sdbus-c++/sdbus-c++.h>
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -46,17 +48,30 @@ public:
     bool stop_scan();
     bool is_scanning() const;
 
+    /// Run a radio reconfiguration with discovery paused, restoring its prior
+    /// settings even on failure. Serializes against all start/stop requests;
+    /// legacy controllers reject random-address changes while scanning.
+    void with_discovery_paused(const std::function<void()>& operation);
+
     // ---- Device queries (from cache) ----
     std::vector<DeviceInfo> get_devices() const;
     std::optional<DeviceInfo> get_device(const std::string& mac) const;
     std::vector<DeviceInfo> get_connected_devices() const;
 
     // ---- Connection management ----
+    /// Gate queued connection/pairing work before a connectionless overlay
+    /// cancels pending Device1 operations. Read again before fallback retries.
+    void set_connections_allowed(bool allowed) { connections_allowed_.store(allowed); }
+
     bool connect(const std::string& mac,
                  double timeout_s = 15.0,
                  bool prefer_le = false);
     bool connect_le_bearer(const std::string& mac, double timeout_s = 15.0);
-    bool disconnect(const std::string& mac, double timeout_s = 10.0);
+    /// Disconnect/cancel pending work. Exclusive radio handoff also suppresses
+    /// BlueZ's trusted-peer auto-reconnect, restoring the original trust flag.
+    /// A subsequent explicit Connect re-enables reconnect; bonds are untouched.
+    bool disconnect(const std::string& mac, double timeout_s = 10.0,
+                    bool suppress_reconnect = false);
     bool connect_profile(const std::string& mac, const std::string& uuid);
     bool disconnect_profile(const std::string& mac, const std::string& uuid);
 
@@ -128,7 +143,16 @@ private:
 
     mutable std::mutex mutex_;
     int cache_observer_token_{0};
+    // Device1.Disconnected distinguishes stale security from normal RF loss.
+    std::optional<sdbus::Slot> disconnect_match_;
     bool scan_running_{false};
+    std::atomic_bool connections_allowed_{true};
+    std::recursive_mutex discovery_operation_mutex_;
+    // Discovery is owned by this persistent blocking connection. Never use the
+    // cache/event connection while a caller may hold the service state lock.
+    std::unique_ptr<sdbus::IConnection> discovery_connection_;
+    std::string last_scan_transport_{"le"};
+    bool last_scan_discoverable_{false};
     mutable std::map<std::string, std::chrono::steady_clock::time_point> gatt_refresh_backoff_until_;
 
     int next_ntf_token_{1};

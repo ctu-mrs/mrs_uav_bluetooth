@@ -70,7 +70,7 @@ bool has_advertisement_user_data(const bluez::DeviceInfo& device,
 StatusPublisher::StatusPublisher(rclcpp::Node& node)
     : node_(node),
       advertisement_user_data_type_(bluez::kDefaultAdvertisementExtraDataType) {
-    configure_topics("/ble");
+    configure_topics("/bluetooth");
 }
 
 void StatusPublisher::set_advertisement_user_data_type(uint8_t data_type) {
@@ -79,11 +79,11 @@ void StatusPublisher::set_advertisement_user_data_type(uint8_t data_type) {
 
 void StatusPublisher::configure_topics(const std::string& node_topics_prefix) {
     node_topics_prefix_ = util::normalize_ros_topic(node_topics_prefix);
-    auto status_topic = util::normalize_ros_topic(node_topics_prefix_ + "/status");
-    auto log_topic = util::normalize_ros_topic(node_topics_prefix_ + "/log");
-    auto devices_topic = util::normalize_ros_topic(node_topics_prefix_ + "/devices");
-    auto advertisements_topic = util::normalize_ros_topic(node_topics_prefix_ + "/advertisements");
-    auto notifications_topic = util::normalize_ros_topic(node_topics_prefix_ + "/notifications");
+    auto status_topic = util::normalize_ros_topic(node_topics_prefix_ + "/system/status");
+    auto log_topic = util::normalize_ros_topic(node_topics_prefix_ + "/system/log");
+    auto devices_topic = util::normalize_ros_topic(node_topics_prefix_ + "/le/devices");
+    auto advertisements_topic = util::normalize_ros_topic(node_topics_prefix_ + "/le/advertisements");
+    auto notifications_topic = util::normalize_ros_topic(node_topics_prefix_ + "/le/notifications");
     status_pub_ = node_.create_publisher<std_msgs::msg::String>(status_topic, 50);
     log_pub_ = node_.create_publisher<std_msgs::msg::String>(log_topic, 10);
     devices_pub_ = node_.create_publisher<mrs_uav_bluetooth::msg::BleDeviceArray>(devices_topic, 10);

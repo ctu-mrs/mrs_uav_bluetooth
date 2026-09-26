@@ -17,13 +17,8 @@ echo "$0: building the package sdbus-cpp"
 sudo ./.ci/build_sdbus_package.sh
 
 echo "$0: building the package mrs-uav-bluetooth-service"
+dpkg-deb --build --root-owner-group .ci/pkg_service .
 
-if [ "$ARCH" = "amd64" ]; then
-  dpkg-deb --build --root-owner-group .ci/pkg_service .
-else
-  echo "$0: skipping mrs-uav-bluetooth-service build on architecture $ARCH"
-fi
-
-
+echo "$0: moving final deb artifacts"
 mv ./*.deb "$ARTIFACTS_FOLDER"
 

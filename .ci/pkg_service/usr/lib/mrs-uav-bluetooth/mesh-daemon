@@ -1,0 +1,64 @@
+#!/bin/sh
+# Node: bluetooth-meshd, started on demand by service_node's Mesh overlay.
+# Raw HCI avoids the MGMT receive/transmit failure reproduced on the test UAVs.
+# No kernel-version assumptions: administrators may explicitly select auto.
+set -eu
+radio_config=/etc/ctu-mrs/mrs-uav-bluetooth/mesh_radio
+if [ -r "$radio_config" ]; then . "$radio_config"; fi
+mesh_io=${MRS_UAV_BLUETOOTH_MESH_IO:-generic}
+# Release also runs after an auto/MGMT daemon, where stale scan state originates.
+if [ "$mesh_io" = generic ] || [ "${1:-}" = --release ]; then
+    mesh_adapter=${MRS_UAV_BLUETOOTH_MESH_ADAPTER:-}
+    if [ -z "$mesh_adapter" ]; then
+        for controller in /sys/class/bluetooth/hci*; do
+            [ -e "$controller" ] || continue
+            # sysfs also exposes live links as hci0:123. They are not adapters.
+            controller_name=${controller##*/}
+            case "${controller_name#hci}" in
+                ''|*[!0-9]*) continue ;;
+            esac
+            if [ -n "$mesh_adapter" ]; then
+                echo "Multiple controllers: set MRS_UAV_BLUETOOTH_MESH_ADAPTER in $radio_config" >&2
+                exit 1
+            fi
+            mesh_adapter=${controller##*/}
+        done
+    fi
+    case "$mesh_adapter" in
+        hci[0-9]*) ;;
+        *) echo "No valid Mesh controller selected" >&2; exit 1 ;;
+    esac
+    case "${mesh_adapter#hci}" in
+        *[!0-9]*) echo "Invalid controller index" >&2; exit 1 ;;
+    esac
+    [ -d "/sys/class/bluetooth/$mesh_adapter" ] || exit 1
+    if [ "${1:-}" = --release ]; then
+        # Refuse to interfere with a Mesh process not stopped by our caller.
+        if busctl --system call org.freedesktop.DBus /org/freedesktop/DBus \
+            org.freedesktop.DBus NameHasOwner s org.bluez.mesh | grep -q 'true'; then
+            echo "Mesh still owns the radio; stop it before starting LE" >&2
+            exit 1
+        fi
+        # The management transaction requires an up controller on some
+        # kernels. Raw HCI releases it powered off; wait briefly for Adapter1
+        # and power it on before disabling the persistent Mesh receive bit.
+        # This does not reset or replace any stored security identity.
+        power_attempt=0
+        until busctl set-property org.bluez "/org/bluez/$mesh_adapter" \
+            org.bluez.Adapter1 Powered b true; do
+            power_attempt=$((power_attempt + 1))
+            [ "$power_attempt" -lt 20 ] || exit 1
+            sleep 0.1
+        done
+        exec /usr/lib/mrs-uav-bluetooth/clear-mesh-receiver "$mesh_adapter"
+    fi
+    # USER-channel acquisition requires Powered=false. bluetoothd may remain
+    # running, but Adapter1 disappears until this daemon releases the radio.
+    busctl set-property org.bluez "/org/bluez/$mesh_adapter" org.bluez.Adapter1 Powered b false
+    mesh_io="generic:$mesh_adapter"
+elif [ "$mesh_io" != auto ]; then
+    echo "MRS_UAV_BLUETOOTH_MESH_IO must be generic or auto" >&2
+    exit 1
+fi
+# Pin the persistent identity store independently of the daemon build prefix.
+exec /usr/libexec/bluetooth/bluetooth-meshd --io "$mesh_io" --storage /var/lib/bluetooth/mesh

@@ -1,0 +1,5 @@
+/etc/ctu-mrs/mrs-uav-bluetooth/startup_config
+/etc/ctu-mrs/mrs-uav-bluetooth/mesh_crypto
+/etc/ctu-mrs/mrs-uav-bluetooth/mesh_radio
+/etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
+/etc/dbus-1/system.d/mrs_uav_bluetooth.conf

@@ -2,6 +2,7 @@
 #include "mrs_uav_bluetooth/config/overlay_config_manager.hpp"
 
 #include <filesystem>
+#include <cmath>
 
 namespace mrs_uav_bluetooth::config {
 
@@ -23,7 +24,11 @@ void OverlayConfigManager::load_initial() {
     apply_config("", "initial load");
 }
 
-std::pair<bool, std::string> OverlayConfigManager::activate_overlay(const std::string& overlay_path) {
+std::pair<bool, std::string> OverlayConfigManager::activate_overlay(
+    const std::string& overlay_path, double hold_seconds) {
+    if (!std::isfinite(hold_seconds) || hold_seconds < 0.0)
+        return {false, "hold_seconds must be finite and nonnegative"};
+    const auto previous_overlay = this->overlay_path();
     if (overlay_path.empty()) {
         return revert_to_default();
     }
@@ -37,26 +42,30 @@ std::pair<bool, std::string> OverlayConfigManager::activate_overlay(const std::s
         }
         overlay_path_ = overlay_path;
         keepalive_miss_count_ = 0;
+        lease_hold_until_ = std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(hold_seconds));
     }
     try {
         apply_config(overlay_path, "overlay activated");
         return {true, "Activated overlay: " + overlay_path};
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(mutex_);
-        overlay_path_.clear();
+        overlay_path_ = previous_overlay;
         return {false, std::string("Failed to activate overlay: ") + e.what()};
     }
 }
 
 std::pair<bool, std::string> OverlayConfigManager::revert_to_default() {
-    {
+    try {
+        // Commit lease metadata only after the radio transition succeeds.
+        // apply_config restores the previous runtime on failure, so retaining
+        // the overlay path allows a later lease check to retry the handoff.
+        apply_config("", "reverted to default");
         std::lock_guard<std::mutex> lock(mutex_);
         overlay_path_.clear();
         keepalive_miss_count_ = 0;
         overlay_connected_baseline_.clear();
-    }
-    try {
-        apply_config("", "reverted to default");
         return {true, "Reverted to default config"};
     } catch (const std::exception& e) {
         return {false, std::string("Failed to revert: ") + e.what()};
@@ -81,7 +90,8 @@ void OverlayConfigManager::check_lease() {
     std::string keepalive_topic;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (overlay_path_.empty()) {
+        if (overlay_path_.empty() ||
+            std::chrono::steady_clock::now() < lease_hold_until_) {
             return;
         }
         keepalive_topic = keepalive_topic_;
@@ -117,15 +127,14 @@ void OverlayConfigManager::check_lease() {
 
     RCLCPP_INFO(logger_, "Overlay keepalive missing (%d misses), reverting from %s",
                 keepalive_miss_count_, overlay_path_.c_str());
-    overlay_path_.clear();
     keepalive_miss_count_ = 0;
 
-    // Unlock before apply_config to avoid holding the lock during callbacks.
+    // Radio callbacks must not execute under the metadata mutex. A failed
+    // transition retains the lease so the next expiry check can retry it.
     lock.unlock();
-    try {
-        apply_config("", "keepalive expired");
-    } catch (const std::exception& e) {
-        RCLCPP_ERROR(logger_, "Failed to revert after keepalive expiry: %s", e.what());
+    const auto [success, message] = revert_to_default();
+    if (!success) {
+        RCLCPP_ERROR(logger_, "Failed to revert after keepalive expiry: %s", message.c_str());
     }
 }
 
@@ -196,19 +205,41 @@ void OverlayConfigManager::apply_config(const std::string& overlay,
     if (keepalive_topic.back() != '/') {
         keepalive_topic += '/';
     }
+    keepalive_topic += "config/";
     keepalive_topic += suffix;
     keepalive_topic = util::normalize_ros_topic(keepalive_topic);
 
+    NodeConfig previous;
+    std::string previous_source;
+    std::string previous_topic;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        previous = config_;
+        previous_source = active_source_;
+        previous_topic = keepalive_topic_;
         config_ = std::move(cfg);
         active_source_ = overlay.empty() ? default_config_path_ : overlay;
         keepalive_topic_ = std::move(keepalive_topic);
     }
-
+    try {
+        notify();
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            config_ = std::move(previous);
+            active_source_ = previous_source;
+            keepalive_topic_ = previous_topic;
+        }
+        if (!previous_source.empty()) {
+            try { notify(); }
+            catch (const std::exception& error) {
+                RCLCPP_ERROR(logger_, "Overlay rollback also failed: %s", error.what());
+            }
+        }
+        throw;  // Never claim that a failed radio transition was applied.
+    }
     RCLCPP_INFO(logger_, "Config applied (%s): source=%s",
                 source_label.c_str(), active_source_.c_str());
-    notify();
 }
 
 void OverlayConfigManager::notify() {
@@ -222,13 +253,7 @@ void OverlayConfigManager::notify() {
         std::lock_guard<std::mutex> lock(mutex_);
         cfg = config_;
     }
-    for (auto& cb : cbs) {
-        try {
-            cb(cfg);
-        } catch (const std::exception& e) {
-            RCLCPP_WARN(logger_, "Config-change callback threw: %s", e.what());
-        }
-    }
+    for (auto& cb : cbs) cb(cfg);
 }
 
 }  // namespace mrs_uav_bluetooth::config

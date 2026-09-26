@@ -49,6 +49,12 @@ public:
                              const config::NodeConfig& config,
                              double now_mono,
                              double retry_period_s) const;
+    /// Recover only an admitted, automatically paired GATT peer whose stored
+    /// bond failed authentication; RF loss and exclusive modes never qualify.
+    bool should_repair_authentication_disconnect(const PeerConnectionSession& session,
+                                                 const bluez::DeviceInfo& device,
+                                                 const config::NodeConfig& config,
+                                                 const std::string& reason) const;
     void note_local_connect_attempt(PeerConnectionSession& session,
                                     double now_mono) const;
     void prune_sessions(const std::set<std::string>& current_macs, double now_mono, double ttl_s);

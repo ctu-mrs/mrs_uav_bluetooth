@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>mrs_uav_bluetooth</name>
-  <version>0.2.0</version>
-  <description>ROS 2 Bluetooth for MRS UAV System (server and client).</description>
+  <version>0.3.0</version>
+  <description>ROS 2 Bluetooth support for MRS UAV System.</description>
   <maintainer email="vojtech.vrba@fel.cvut.cz">Vojtech Vrba</maintainer>
   <license>MIT</license>
 
@@ -10,6 +10,8 @@
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
   <depend>rclcpp</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <depend>ament_index_cpp</depend>
   <depend>rcpputils</depend>
   <depend>rosidl_runtime_cpp</depend>
@@ -31,6 +33,7 @@
   <depend>launch</depend>
   <depend>launch_ros</depend>
 
+  <test_depend>dbus</test_depend>
   <exec_depend>rosidl_default_runtime</exec_depend>
   <member_of_group>rosidl_interface_packages</member_of_group>
 
