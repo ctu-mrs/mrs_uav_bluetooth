@@ -23,6 +23,8 @@ peer_whitelist:
 # explicitly if that is more convenient. Each UAV falls back to the first
 # currently reachable candidate when the preferred one disappears.
 mesh_provisioner_preference: ordered
+# Keep a peer present through brief RF losses during segmented odometry traffic.
+mesh_swarm_provisioner_timeout: 20.0
 
 # The service turns off ordinary LE roles while this overlay owns the radio.
 # The default logical swarm is 1, and its group address is 0xc000. You can
@@ -40,10 +42,10 @@ shared_topics:
     export_topic: /{hostname}/mavros/local_position/odom
     import_topic_suffix: mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
-    # This 14-member codec uses several segments with network retransmissions.
-    # It carries stamp, pose and twist, not frame IDs or covariance matrices.
-    # A conservative 0.2 Hz leaves airtime for both directions and relay traffic
-    # on half-duplex UAV radios. Increase only after measuring your topology.
+    # The same 21-byte timestamp and pose codec as the advertisement example
+    # needs far fewer Mesh segments than an uncompressed odometry message.
+    # It omits twist, frame IDs, and covariance. Keep the rate conservative to
+    # leave airtime for both directions and multi-hop relay traffic.
     rate_hz: 0.2
     destination: 0xc000
     app_key_index: 0
@@ -51,32 +53,71 @@ shared_topics:
     force_segmented: true
     vendor_opcode: 0xc1
     company_id: 0x05f1
-    members:
-      - path: header.stamp
-        type: time_ns
-      - path: pose.pose.position.x
-        type: float32
-      - path: pose.pose.position.y
-        type: float32
-      - path: pose.pose.position.z
-        type: float32
-      - path: pose.pose.orientation.x
-        type: float32
-      - path: pose.pose.orientation.y
-        type: float32
-      - path: pose.pose.orientation.z
-        type: float32
-      - path: pose.pose.orientation.w
-        type: float32
-      - path: twist.twist.linear.x
-        type: float32
-      - path: twist.twist.linear.y
-        type: float32
-      - path: twist.twist.linear.z
-        type: float32
-      - path: twist.twist.angular.x
-        type: float32
-      - path: twist.twist.angular.y
-        type: float32
-      - path: twist.twist.angular.z
-        type: float32
+    members_encode:
+      - target: timestamp_us
+        type: uint64
+        expression: header.stamp.sec * 1000000.0 + floor(header.stamp.nanosec / 1000.0)
+      - target: timestamp_subus
+        type: uint8
+        expression: >-
+          round((header.stamp.nanosec - floor(header.stamp.nanosec / 1000.0) * 1000.0)
+          * 255.0 / 999.0)
+      # Quaternion-derived Euler angles retain signed 16-bit precision.
+      - target: roll
+        type: int16
+        expression: >-
+          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.x +
+          pose.pose.orientation.y * pose.pose.orientation.z),
+          1.0 - 2.0 * (pose.pose.orientation.x * pose.pose.orientation.x +
+          pose.pose.orientation.y * pose.pose.orientation.y))
+      - target: pitch
+        type: int16
+        expression: >-
+          (32767.0 / pi) * asin(clamp(2.0 * (pose.pose.orientation.w * pose.pose.orientation.y -
+          pose.pose.orientation.z * pose.pose.orientation.x), -1.0, 1.0))
+      - target: yaw
+        type: int16
+        expression: >-
+          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.z +
+          pose.pose.orientation.x * pose.pose.orientation.y),
+          1.0 - 2.0 * (pose.pose.orientation.y * pose.pose.orientation.y +
+          pose.pose.orientation.z * pose.pose.orientation.z))
+      # Signed centimetres cover approximately +/-327 m on each axis.
+      - target: x_cm
+        type: int16
+        expression: pose.pose.position.x * 100.0
+      - target: y_cm
+        type: int16
+        expression: pose.pose.position.y * 100.0
+      - target: z_cm
+        type: int16
+        expression: pose.pose.position.z * 100.0
+    members_decode:
+      - target: header.stamp.sec
+        expression: floor(timestamp_us / 1000000.0)
+      - target: header.stamp.nanosec
+        expression: >-
+          (timestamp_us - floor(timestamp_us / 1000000.0) * 1000000.0) * 1000.0
+          + round(timestamp_subus * 999.0 / 255.0)
+      - target: pose.pose.orientation.w
+        expression: >-
+          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
+          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.x
+        expression: >-
+          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) -
+          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.y
+        expression: >-
+          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
+          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.z
+        expression: >-
+          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0) -
+          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0)
+      - target: pose.pose.position.x
+        expression: x_cm / 100.0
+      - target: pose.pose.position.y
+        expression: y_cm / 100.0
+      - target: pose.pose.position.z
+        expression: z_cm / 100.0

@@ -17,7 +17,8 @@ peer_whitelist:
 
 # Share one compact odometry packet in both directions.
 # Packet layout:
-#   uint64  timestamp_ns
+#   uint32  timestamp_seconds
+#   uint32  timestamp_nanoseconds
 #   float32 position.x
 #   float32 position.y
 #   float32 position.z
@@ -38,32 +39,43 @@ shared_topics:
     export_topic: /{hostname}/mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
     rate_hz: 10.0
-    members:
-      - path: header.stamp
-        type: time_ns
-      - path: pose.pose.position.x
+    members_encode:
+      - target: seconds
+        type: uint32
+        expression: header.stamp.sec
+      - target: nanoseconds
+        type: uint32
+        expression: header.stamp.nanosec
+      - target: pose.pose.position.x
         type: float32
-      - path: pose.pose.position.y
+      - target: pose.pose.position.y
         type: float32
-      - path: pose.pose.position.z
+      - target: pose.pose.position.z
         type: float32
-      - path: pose.pose.orientation.x
+      - target: pose.pose.orientation.x
         type: float32
-      - path: pose.pose.orientation.y
+      - target: pose.pose.orientation.y
         type: float32
-      - path: pose.pose.orientation.z
+      - target: pose.pose.orientation.z
         type: float32
-      - path: pose.pose.orientation.w
+      - target: pose.pose.orientation.w
         type: float32
-      - path: twist.twist.linear.x
+      - target: twist.twist.linear.x
         type: float32
-      - path: twist.twist.linear.y
+      - target: twist.twist.linear.y
         type: float32
-      - path: twist.twist.linear.z
+      - target: twist.twist.linear.z
         type: float32
-      - path: twist.twist.angular.x
+      - target: twist.twist.angular.x
         type: float32
-      - path: twist.twist.angular.y
+      - target: twist.twist.angular.y
         type: float32
-      - path: twist.twist.angular.z
+      - target: twist.twist.angular.z
         type: float32
+    # Direct path members are restored automatically. Computed wire members
+    # need explicit assignments to the corresponding ROS message fields.
+    members_decode:
+      - target: header.stamp.sec
+        expression: seconds
+      - target: header.stamp.nanosec
+        expression: nanoseconds

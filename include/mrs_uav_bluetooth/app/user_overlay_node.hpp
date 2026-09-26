@@ -15,9 +15,11 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 
 namespace mrs_uav_bluetooth::app {
 
@@ -39,7 +41,7 @@ private:
     void publish_keepalive();
     mrs_uav_bluetooth::srv::SetActiveConfig::Response::SharedPtr call_config_service(const std::string& config_path);
     void handle_print(const std_msgs::msg::String::SharedPtr message);
-    /// Cache the latest nearby advertisement snapshot for the next report.
+    /// Keep recently seen advertisement peers across empty scan snapshots.
     void handle_advertisements(
         const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message);
     /// Cache current Mesh lifecycle and topology state.
@@ -80,6 +82,9 @@ private:
     // user's terminal.
     std::mutex transport_status_mutex_;
     std::optional<mrs_uav_bluetooth::msg::BleDeviceArray> latest_advertisements_;
+    std::map<std::string, std::pair<
+        mrs_uav_bluetooth::msg::BleDevice,
+        std::chrono::steady_clock::time_point>> recent_advertisements_;
     std::optional<mrs_uav_bluetooth::msg::MeshStatus> latest_mesh_status_;
     std::optional<mrs_uav_bluetooth::msg::MeshEvent> latest_mesh_event_;
     std::optional<mrs_uav_bluetooth::msg::MeshMessage> latest_mesh_message_;

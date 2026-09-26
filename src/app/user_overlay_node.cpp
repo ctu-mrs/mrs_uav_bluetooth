@@ -62,8 +62,9 @@ std::optional<uint16_t> advertisement_channel(
         payload[1] != 'B' || payload[2] != 1) {
         return std::nullopt;
     }
-    return static_cast<uint16_t>(payload[3]) |
-        (static_cast<uint16_t>(payload[4]) << 8U);
+    const auto channel = static_cast<uint16_t>(
+        payload[3] | (static_cast<uint16_t>(payload[4]) << 8U));
+    return channel == 0 ? std::nullopt : std::optional<uint16_t>{channel};
 }
 
 double age_seconds(std::chrono::steady_clock::time_point received_at,
@@ -338,7 +339,23 @@ void UserOverlayNode::handle_advertisements(
     const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message) {
     std::lock_guard<std::mutex> lock(transport_status_mutex_);
     latest_advertisements_ = *message;
-    advertisements_received_at_ = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    advertisements_received_at_ = now;
+    // BlueZ may briefly remove a device while an advertisement is replaced.
+    // Preserve its last sample so the periodic report does not alternate
+    // between a real peer and an empty list on every scan cycle.
+    for (const auto& device : message->devices) {
+        const auto key = !device.hostname.empty() ? device.hostname : device.mac;
+        recent_advertisements_[key] = {device, now};
+    }
+    for (auto it = recent_advertisements_.begin();
+         it != recent_advertisements_.end();) {
+        if (now - it->second.second > 10s) {
+            it = recent_advertisements_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void UserOverlayNode::handle_mesh_status(
@@ -366,6 +383,9 @@ void UserOverlayNode::handle_mesh_message(
 
 void UserOverlayNode::print_transport_status() {
     std::optional<mrs_uav_bluetooth::msg::BleDeviceArray> advertisements;
+    std::map<std::string, std::pair<
+        mrs_uav_bluetooth::msg::BleDevice,
+        std::chrono::steady_clock::time_point>> recent_advertisements;
     std::optional<mrs_uav_bluetooth::msg::MeshStatus> mesh_status;
     std::optional<mrs_uav_bluetooth::msg::MeshEvent> mesh_event;
     std::optional<mrs_uav_bluetooth::msg::MeshMessage> mesh_message;
@@ -380,6 +400,7 @@ void UserOverlayNode::print_transport_status() {
         // prevents terminal I/O from delaying status/RX callbacks.
         std::lock_guard<std::mutex> lock(transport_status_mutex_);
         advertisements = latest_advertisements_;
+        recent_advertisements = recent_advertisements_;
         mesh_status = latest_mesh_status_;
         mesh_event = latest_mesh_event_;
         mesh_message = latest_mesh_message_;
@@ -427,10 +448,12 @@ void UserOverlayNode::print_transport_status() {
                 ? bridge.name
                 : bridge.bridge_name;
             report << "    " << display_name
-                   << ": channel=" << bridge.channel_id
+                   << ": " << (bridge.advertisement_bare ? "framing=bare" :
+                              "channel=" + std::to_string(bridge.channel_id))
                    << " mode=" << bridge.mode
                    << " format=" << bridge.payload_format
-                   << " members=" << bridge.member_specs.size();
+                   << " members_encode=" << bridge.member_specs.size()
+                   << " members_decode=" << bridge.decode_assignments.size();
             if (bridge.rate_hz > 0.0) {
                 report << " rate=" << bridge.rate_hz << "Hz";
             }
@@ -458,17 +481,25 @@ void UserOverlayNode::print_transport_status() {
         if (!advertisements) {
             report << "  advertisement scan: waiting for first snapshot\n";
         } else {
-            report << "  advertisement scan: peers="
-                   << advertisements->devices.size()
+            report << "  advertisement scan: peers_seen_10s="
+                   << recent_advertisements.size()
                    << " snapshot_age=" << std::fixed << std::setprecision(1)
                    << age_seconds(advertisements_received_at, steady_now)
                    << "s\n";
-            for (const auto& device : advertisements->devices) {
+            for (const auto& [key, cached] : recent_advertisements) {
+                static_cast<void>(key);
+                const auto& device = cached.first;
+                const auto channel = advertisement_channel(device.advertising_data);
                 const auto normalized_peer = util::lower_trim_copy(device.hostname);
+                const auto normalized_mac = util::lower_trim_copy(device.mac);
                 const bool allowed = effective_config_.peer_whitelist.empty() ||
                     std::find(effective_config_.peer_whitelist.begin(),
                               effective_config_.peer_whitelist.end(),
                               normalized_peer) !=
+                        effective_config_.peer_whitelist.end() ||
+                    std::find(effective_config_.peer_whitelist.begin(),
+                              effective_config_.peer_whitelist.end(),
+                              normalized_mac) !=
                         effective_config_.peer_whitelist.end();
                 std::string display_name = device.hostname;
                 if (display_name.empty()) display_name = device.alias;
@@ -477,9 +508,20 @@ void UserOverlayNode::print_transport_status() {
                 report << "    " << display_name << " (" << device.mac << ")"
                        << " RSSI=" << device.rssi << "dBm"
                        << " admitted=" << yes_no(allowed)
-                       << " frame_bytes=" << device.advertising_data.size();
-                if (const auto channel =
-                        advertisement_channel(device.advertising_data)) {
+                       << " frame_bytes=" << device.advertising_data.size()
+                       << " seen=" << std::fixed << std::setprecision(1)
+                       << age_seconds(cached.second, steady_now) << "s ago";
+                const bool bare = std::any_of(
+                    effective_config_.shared_topics.begin(),
+                    effective_config_.shared_topics.end(),
+                    [](const auto& bridge) {
+                        return bridge.transport == "advertisement" &&
+                            bridge.advertisement_bare;
+                    });
+                if (bare) {
+                    report << " framing=bare payload_bytes="
+                           << device.advertising_data.size();
+                } else if (channel) {
                     report << " channel=" << *channel
                            << " payload_bytes="
                            << (device.advertising_data.size() -
@@ -490,8 +532,8 @@ void UserOverlayNode::print_transport_status() {
                 report << " data=[" << byte_preview(device.advertising_data)
                        << "]\n";
             }
-            if (advertisements->devices.empty()) {
-                report << "    (no nearby bridge advertisements)\n";
+            if (recent_advertisements.empty()) {
+                report << "    (no bridge advertisements seen recently)\n";
             }
         }
     }

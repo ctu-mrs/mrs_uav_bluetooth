@@ -45,7 +45,9 @@ bool ImportBridgeManager::publish_payload(TopicImportBridgeState& state,
 
     try {
         auto runtime = runtime_for(state);
-        auto serialized = runtime->decode_payload(payload, state.member_specs, state.payload_format);
+        auto serialized = runtime->decode_payload(
+            payload, state.member_specs, state.payload_format,
+            state.decode_assignments);
         publisher->publish(serialized);
         state.last_payload = payload;
         state.pending_payload.clear();

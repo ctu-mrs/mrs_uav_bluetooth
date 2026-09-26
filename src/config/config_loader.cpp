@@ -72,7 +72,6 @@ const std::map<std::string, size_t>& struct_format_sizes() {
         {"int32", 4}, {"uint32", 4},
         {"int64", 8}, {"uint64", 8},
         {"float32", 4}, {"float64", 8},
-        {"time_ns", 8},
     };
     return sizes;
 }
@@ -101,20 +100,25 @@ std::string normalize_value_type(const std::string& vt) {
 
 BridgeMemberSpec parse_member_spec(const YAML::Node& item) {
     BridgeMemberSpec spec;
-    if (item.IsScalar()) {
-        spec.path = item.as<std::string>();
-        spec.value_type = "float64";
-    } else if (item.IsMap()) {
-        spec.path = item["path"].as<std::string>("");
+    if (item.IsMap()) {
+        spec.target = item["target"].as<std::string>("");
         std::string raw_type = item["type"].as<std::string>("");
         std::transform(raw_type.begin(), raw_type.end(), raw_type.begin(),
                        [](unsigned char c) { return std::tolower(c); });
         spec.value_type = normalize_value_type(raw_type);
+        spec.expression = item["expression"]
+            ? item["expression"].as<std::string>("") : "";
+        for (const auto& field : item) {
+            const auto key = field.first.as<std::string>();
+            if (key != "target" && key != "type" && key != "expression") {
+                throw std::runtime_error("Unsupported members_encode field: " + key);
+            }
+        }
     } else {
-        throw std::runtime_error("Unsupported member specification format");
+        throw std::runtime_error("members_encode item must be a mapping");
     }
-    if (spec.path.empty()) {
-        throw std::runtime_error("Member path must not be empty");
+    if (spec.target.empty()) {
+        throw std::runtime_error("members_encode item needs a target");
     }
     return spec;
 }
@@ -364,20 +368,14 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         "mesh_crpl",
         "mesh_default_ttl",
         "mesh_device_uuid",
-        "mesh_fleet",
-        "mesh_fleet_config_path",
-        "mesh_network_owner_path",
         "mesh_next_unicast",
         "mesh_product_id",
         "mesh_provisioner",
         "mesh_provisioner_preference",
         "mesh_relay_retransmit_count",
         "mesh_relay_retransmit_interval_steps",
-        "mesh_swarm_address_block_size",
-        "mesh_swarm_allow_partition_creation",
         "mesh_swarm_app_key_index",
         "mesh_swarm_auto_provisioning",
-        "mesh_swarm_auto_reconcile_networks",
         "mesh_swarm_group_address",
         "mesh_swarm_heartbeat_period",
         "mesh_swarm_id",
@@ -482,13 +480,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     }
     cfg.mesh_swarm_auto_provisioning = b(
         "mesh_swarm_auto_provisioning", cfg.mesh_swarm_auto_provisioning);
-    for (const auto* obsolete : {"mesh_swarm_allow_partition_creation",
-            "mesh_swarm_auto_reconcile_networks", "mesh_swarm_address_block_size",
-            "mesh_network_owner_path"}) {
-        if (doc[obsolete])
-            throw std::runtime_error(std::string(obsolete) +
-                " was removed; use mesh_fleet_config_path for automatic fleet enrollment");
-    }
     cfg.mesh_swarm_id = static_cast<uint16_t>(parse_integer_value(
         doc["mesh_swarm_id"] ? doc["mesh_swarm_id"]
                               : YAML::Node(cfg.mesh_swarm_id),
@@ -620,10 +611,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
             throw std::runtime_error(
                 "mesh_swarm_provisioner_timeout must not exceed 63 seconds");
         }
-        if (cfg.mesh_swarm_startup_grace < cfg.mesh_swarm_provisioner_timeout) {
-            throw std::runtime_error(
-                "mesh_swarm_startup_grace must be at least mesh_swarm_provisioner_timeout");
-        }
         if (cfg.mesh_swarm_group_address < 0xc000 ||
             cfg.mesh_swarm_group_address > 0xfeff) {
             throw std::runtime_error(
@@ -636,83 +623,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         std::numeric_limits<uint64_t>::max(), "mesh_token"));
     cfg.mesh_token_path = expand_hostname(
         str("mesh_token_path", cfg.mesh_token_path), hostname);
-    cfg.mesh_fleet_config_path = str("mesh_fleet_config_path", "");
-    const auto inline_fleet = doc["mesh_fleet"];
-    if (inline_fleet && !inline_fleet.IsNull() && !cfg.mesh_fleet_config_path.empty()) {
-        throw std::runtime_error(
-            "Use either mesh_fleet in a private overlay or mesh_fleet_config_path");
-    }
-    YAML::Node fleet;
-    if (!cfg.mesh_fleet_config_path.empty()) {
-        // Keep the existing private-file route valid for deployed fleets.
-        namespace fs = std::filesystem;
-        const auto permissions = fs::status(cfg.mesh_fleet_config_path).permissions();
-        const auto exposed = fs::perms::group_all | fs::perms::others_all;
-        if ((permissions & exposed) != fs::perms::none) {
-            throw std::runtime_error("Mesh fleet credentials must have mode 0600");
-        }
-        try {
-            fleet = YAML::LoadFile(cfg.mesh_fleet_config_path);
-        } catch (const YAML::Exception&) {
-            // YAML parser diagnostics can contain the offending secret value.
-            throw std::runtime_error("Cannot parse private Mesh fleet credential file");
-        }
-    } else if (inline_fleet && !inline_fleet.IsNull()) {
-        fleet = inline_fleet;
-    }
-    if (fleet && !fleet.IsNull()) {
-        // Fleet credentials are explicit trust material, never derived from
-        // public UAV names or the admission list. Validate before radio changes.
-        if (!cfg.enable_mesh || !cfg.mesh_swarm_auto_provisioning ||
-            !cfg.mesh_auto_attach || cfg.mesh_token != 0 ||
-            cfg.mesh_token_path.empty()) {
-            throw std::runtime_error(
-                "Mesh fleet credentials require automatic Mesh, auto_attach, "
-                "a persistent token path, and mesh_token: 0");
-        }
-        const std::set<std::string> fields{
-            "version", "fleet_id", "network_key", "application_key", "iv_index"};
-        if (!fleet.IsMap()) throw std::runtime_error("Mesh fleet file must be a map");
-        for (const auto& entry : fleet) {
-            if (!entry.first.IsScalar() ||
-                !fields.contains(entry.first.as<std::string>())) {
-                throw std::runtime_error("Unknown Mesh fleet credential field");
-            }
-        }
-        const auto hex_bytes = [&](const char* field) {
-            if (!fleet[field] || !fleet[field].IsScalar()) {
-                throw std::runtime_error(std::string("Missing Mesh fleet field: ") + field);
-            }
-            const auto hex = fleet[field].Scalar();
-            if (hex.size() != 32 || !std::all_of(hex.begin(), hex.end(),
-                    [](unsigned char c) { return std::isxdigit(c); })) {
-                throw std::runtime_error(std::string("Mesh fleet field needs 32 hex digits: ") + field);
-            }
-            std::vector<uint8_t> bytes;
-            for (size_t i = 0; i < hex.size(); i += 2)
-                bytes.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
-            if (std::all_of(bytes.begin(), bytes.end(), [](auto b) { return b == 0; }))
-                throw std::runtime_error("Mesh fleet identifiers and keys must not be all zero");
-            return bytes;
-        };
-        if (!fleet["version"] || fleet["version"].Scalar() != "1")
-            throw std::runtime_error("Unsupported Mesh fleet credential version");
-        hex_bytes("fleet_id");
-        cfg.mesh_fleet_id = util::lower_trim_copy(fleet["fleet_id"].Scalar());
-        cfg.mesh_fleet_network_key = hex_bytes("network_key");
-        cfg.mesh_fleet_application_key = hex_bytes("application_key");
-        if (cfg.mesh_fleet_network_key == cfg.mesh_fleet_application_key)
-            throw std::runtime_error("Mesh network and application keys must differ");
-        cfg.mesh_fleet_iv_index = static_cast<uint32_t>(parse_integer_value(
-            fleet["iv_index"], 0xffffffffU, "fleet iv_index"));
-        const auto digits = hostname.substr(hostname.find_last_not_of("0123456789") + 1);
-        cfg.mesh_fleet_unicast = static_cast<uint16_t>(std::stoul(digits));
-        if (std::stoul(digits) > 0x7fffU)
-            throw std::runtime_error("Fleet-import UAV number must be in 1..32767");
-        // Separate persistent identities for different fleets; changing order
-        // or availability never changes a UAV's address, keys or replay state.
-        cfg.mesh_token_path += "." + cfg.mesh_fleet_id;
-    }
     cfg.mesh_company_id = static_cast<uint16_t>(parse_integer_value(
         doc["mesh_company_id"] ? doc["mesh_company_id"] : YAML::Node(cfg.mesh_company_id),
         std::numeric_limits<uint16_t>::max(), "mesh_company_id"));
@@ -739,17 +649,16 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     if (cfg.mesh_next_unicast == 0) {
         throw std::runtime_error("mesh_next_unicast must be in the range 0x0001..0x7fff");
     }
-    if (cfg.mesh_swarm_auto_provisioning && cfg.mesh_fleet_id.empty()) {
+    if (cfg.mesh_swarm_auto_provisioning) {
         if (cfg.peer_whitelist.empty())
             throw std::runtime_error(
                 "Hands-free private Mesh needs an ordered peer_whitelist so "
                 "PB-ADV can target each nearby UAV's Device UUID");
         // A new private network can be created and joined by PB-ADV. Keep its
-        // identity separate from older manually controlled Mesh nodes.
+        // identity separate from other Mesh applications on this machine.
         cfg.mesh_token_path += ".auto";
         const auto digits = hostname.substr(hostname.find_last_not_of("0123456789") + 1);
-        cfg.mesh_fleet_unicast = static_cast<uint16_t>(std::stoul(digits));
-        if (cfg.mesh_fleet_unicast > 0x7fffU)
+        if (std::stoul(digits) > 0x7fffU)
             throw std::runtime_error("Automatic Mesh UAV number must be in 1..32767");
     }
     cfg.mesh_agent_capabilities = str_list("mesh_agent_capabilities");
@@ -960,7 +869,6 @@ NodeConfig parse_node_config(const YAML::Node& doc,
                 raw["payload_format"]
                     ? raw["payload_format"].as<std::string>("struct")
                     : "struct");
-            if (stc.payload_format == "compact") stc.payload_format = "struct";
             if (stc.payload_format != "struct" && stc.payload_format != "raw" &&
                 stc.payload_format != "ros2") {
                 throw std::runtime_error(
@@ -971,16 +879,49 @@ NodeConfig parse_node_config(const YAML::Node& doc,
             // `raw` is shorthand for the byte vector carried by
             // std_msgs/msg/UInt8MultiArray. Explicit mappings work with any
             // introspectable numeric ROS message fields.
-            if (raw["members"] && raw["members"].IsSequence()) {
-                for (const auto& m : raw["members"]) {
+            const auto encode_members = raw["members_encode"];
+            if (encode_members && !encode_members.IsSequence()) {
+                throw std::runtime_error("members_encode must be a list");
+            }
+            if (encode_members) {
+                for (const auto& m : encode_members) {
                     stc.member_specs.push_back(parse_member_spec(m));
+                }
+            }
+            if (raw["members_decode"]) {
+                if (!raw["members_decode"].IsSequence()) {
+                    throw std::runtime_error("members_decode must be a list");
+                }
+                for (const auto& item : raw["members_decode"]) {
+                    if (!item.IsMap()) {
+                        throw std::runtime_error("members_decode item must be a mapping");
+                    }
+                    BridgeAssignmentSpec assignment{
+                        item["target"].as<std::string>(""),
+                        item["expression"].as<std::string>("")};
+                    if (assignment.target.empty() || assignment.expression.empty()) {
+                        throw std::runtime_error("members_decode item needs target and expression");
+                    }
+                    for (const auto& field : item) {
+                        const auto key = field.first.as<std::string>();
+                        if (key != "target" && key != "expression") {
+                            throw std::runtime_error("Unsupported members_decode field: " + key);
+                        }
+                    }
+                    stc.decode_assignments.push_back(std::move(assignment));
                 }
             }
             if (stc.payload_format == "raw" && stc.member_specs.empty()) {
                 stc.member_specs.push_back({"data[:]", "uint8"});
             }
             if (stc.payload_format != "ros2" && stc.member_specs.empty()) {
-                throw std::runtime_error("shared_topics[" + std::to_string(index) + "] requires at least one compact member definition");
+                throw std::runtime_error("shared_topics[" + std::to_string(index) + "] requires at least one members_encode definition");
+            }
+            std::set<std::string> member_targets;
+            for (const auto& member : stc.member_specs) {
+                if (!member_targets.insert(member.target).second) {
+                    throw std::runtime_error("Duplicate members_encode target: " + member.target);
+                }
             }
 
             std::string import_suffix = raw["import_topic_suffix"]
@@ -997,7 +938,16 @@ NodeConfig parse_node_config(const YAML::Node& doc,
                 ? raw["name"].as<std::string>(canonical) : canonical;
             if (stc.name.empty()) stc.name = canonical;
 
-            if (stc.transport != "gatt") {
+            const auto framing = util::lower_trim_copy(raw["framing"]
+                ? raw["framing"].as<std::string>() : "channel");
+            if (framing != "channel" && framing != "bare") {
+                throw std::runtime_error("shared_topics.framing must be channel or bare");
+            }
+            stc.advertisement_bare = framing == "bare";
+            if (stc.advertisement_bare && stc.transport != "advertisement") {
+                throw std::runtime_error("bare framing is supported only for advertisements");
+            }
+            if (stc.transport != "gatt" && !stc.advertisement_bare) {
                 if (!raw["channel_id"]) {
                     throw std::runtime_error(
                         "shared_topics[" + std::to_string(index) +
@@ -1018,6 +968,8 @@ NodeConfig parse_node_config(const YAML::Node& doc,
                         "shared_topics[" + std::to_string(index) +
                         "] duplicates channel_id for transport " + stc.transport);
                 }
+            } else if (stc.advertisement_bare && raw["channel_id"]) {
+                throw std::runtime_error("A bare advertisement bridge must not set channel_id");
             }
 
             if (stc.transport == "mesh") {
@@ -1074,6 +1026,12 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         throw std::runtime_error(
             "shared_topics must use exactly one transport mode per overlay; "
             "gatt, advertisement, and mesh cannot be mixed");
+    }
+    if (std::any_of(cfg.shared_topics.begin(), cfg.shared_topics.end(),
+                    [](const auto& bridge) { return bridge.advertisement_bare; }) &&
+        std::count_if(cfg.shared_topics.begin(), cfg.shared_topics.end(),
+                      [](const auto& bridge) { return bridge.transport == "advertisement"; }) != 1) {
+        throw std::runtime_error("Bare advertisement framing requires exactly one advertisement bridge");
     }
 
     const bool advertisement_mode =
@@ -1140,22 +1098,9 @@ NodeConfig parse_node_config(const YAML::Node& doc,
 NodeConfig load_effective_config(const std::string& default_path,
                                  const std::string& overlay_path,
                                  const std::string& hostname) {
-    const auto require_private_fleet_source = [](const YAML::Node& document,
-                                                 const std::string& path) {
-        if (!document["mesh_fleet"] || document["mesh_fleet"].IsNull()) return;
-        const auto permissions = std::filesystem::status(path).permissions();
-        const auto exposed = std::filesystem::perms::group_all |
-                             std::filesystem::perms::others_all;
-        if ((permissions & exposed) != std::filesystem::perms::none) {
-            throw std::runtime_error(
-                "Mesh credentials require a private config file (mode 0600): " + path);
-        }
-    };
     YAML::Node base = load_yaml_file(default_path);
-    require_private_fleet_source(base, default_path);
     if (!overlay_path.empty()) {
         YAML::Node overlay = load_yaml_file(overlay_path);
-        require_private_fleet_source(overlay, overlay_path);
         base = deep_merge(base, overlay);
     }
     return parse_node_config(base, hostname);

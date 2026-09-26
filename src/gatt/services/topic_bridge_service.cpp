@@ -30,8 +30,9 @@ std::vector<uint8_t> serialize_member_specs(const std::vector<config::BridgeMemb
     out << YAML::Flow << YAML::BeginSeq;
     for (const auto& spec : member_specs) {
         out << YAML::Flow << YAML::BeginMap;
-        out << YAML::Key << "path" << YAML::Value << spec.path;
+        out << YAML::Key << "target" << YAML::Value << spec.target;
         out << YAML::Key << "type" << YAML::Value << spec.value_type;
+        if (!spec.expression.empty()) out << YAML::Key << "expression" << YAML::Value << spec.expression;
         out << YAML::EndMap;
     }
     out << YAML::EndSeq;

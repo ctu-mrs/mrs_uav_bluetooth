@@ -69,7 +69,7 @@ bool looks_like_rate_hz(const std::string& value) {
 bool looks_like_member_type(const std::string& value) {
     static const std::set<std::string> kKnownTypes{
         "bool", "int8", "uint8", "int16", "uint16", "int32", "uint32",
-        "int64", "uint64", "float32", "float64", "time_ns",
+        "int64", "uint64", "float32", "float64",
     };
     return kKnownTypes.find(value) != kKnownTypes.end();
 }
@@ -91,12 +91,12 @@ bool looks_like_member_layout(const std::string& value) {
     }
 
     for (const auto& entry : root) {
-        if (!entry.IsMap() || !entry["path"] || !entry["type"]) {
+        if (!entry.IsMap() || !entry["type"]) {
             return false;
         }
-        const auto path = entry["path"].as<std::string>("");
+        const auto target = entry["target"] ? entry["target"].as<std::string>("") : "";
         const auto type = entry["type"].as<std::string>("");
-        if (path.empty() || !looks_like_member_type(type)) {
+        if (target.empty() || !looks_like_member_type(type)) {
             return false;
         }
     }

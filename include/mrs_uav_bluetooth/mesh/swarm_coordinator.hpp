@@ -106,7 +106,6 @@ private:
     uint8_t local_model_stage_{0};
     Clock::time_point next_local_model_action_{};
     std::atomic_bool application_ready_{false};
-    bool automatic_private_{false};
     std::deque<Event> pending_events_;
     std::string pending_provision_uuid_;
     uint16_t pending_provision_address_{0};

@@ -16,11 +16,6 @@ systemctl reset-failed 2>/dev/null || true
 
 # The unit is shipped in the package payload, not generated on the target.
 chmod +x /etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
-# The Mesh daemon drop-in calls the same helper before every daemon start. Run
-# it once during installation as well so a policy-permitted host is immediately
-# ready for a Mesh overlay. Mesh remains optional: a blocked module emits a
-# warning but does not prevent installation of the GATT service.
-chmod +x /usr/lib/mrs-uav-bluetooth/prepare-mesh-crypto
 chmod +x /usr/lib/mrs-uav-bluetooth/mesh-daemon
 chmod +x /usr/lib/mrs-uav-bluetooth/clear-mesh-receiver
 # Tokens and collision-free unicast cursors must survive service restarts. The
@@ -30,10 +25,6 @@ if getent passwd mrs >/dev/null; then
 else
   install -d -m 0750 /var/lib/mrs_uav_bluetooth
 fi
-if ! /usr/lib/mrs-uav-bluetooth/prepare-mesh-crypto; then
-  echo "WARNING: Bluetooth Mesh crypto prerequisite is unavailable; see the message above." >&2
-fi
-
 systemctl daemon-reload
 # The package ships only BlueZ's D-Bus alias, not the bluetooth.target Wants
 # link. This permits on-demand activation when a Mesh overlay is selected

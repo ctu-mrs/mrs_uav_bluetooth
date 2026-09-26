@@ -39,7 +39,8 @@ public:
     rclcpp::SerializedMessage decode_payload(
         const std::vector<uint8_t>& payload,
         const std::vector<config::BridgeMemberSpec>& member_specs,
-        const std::string& payload_format) const;
+        const std::string& payload_format,
+        const std::vector<config::BridgeAssignmentSpec>& decode_assignments = {}) const;
 
 private:
     struct Impl;

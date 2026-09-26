@@ -41,6 +41,7 @@ struct TopicImportBridgeState {
     std::string bridge_key;
     std::string bridge_uuid;
     std::vector<config::BridgeMemberSpec> member_specs;
+    std::vector<config::BridgeAssignmentSpec> decode_assignments;
     double rate_hz{0.0};
     std::string payload_format{"struct"};
     std::string path;

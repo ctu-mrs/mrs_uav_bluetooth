@@ -9,13 +9,26 @@
 
 namespace mrs_uav_bluetooth::config {
 
-/// Represents a single member in a compact bridge payload.
+/// Assign a decoded wire expression to a ROS field named by `target`.
+struct BridgeAssignmentSpec {
+    std::string target;
+    std::string expression;
+
+    bool operator==(const BridgeAssignmentSpec& o) const {
+        return target == o.target && expression == o.expression;
+    }
+};
+
+/// One wire value. `target` names the encoded value and `value_type` its wire type.
+/// With no expression, target is also the ROS field path for direct copying.
 struct BridgeMemberSpec {
-    std::string path;
-    std::string value_type;  // bool, int8 .. uint64, float32, float64, time_ns
+    std::string target;
+    std::string value_type;  // final scalar wire type
+    std::string expression;
 
     bool operator==(const BridgeMemberSpec& o) const {
-        return path == o.path && value_type == o.value_type;
+        return target == o.target && value_type == o.value_type &&
+               expression == o.expression;
     }
 };
 
@@ -32,11 +45,14 @@ struct SharedTopicConfig {
     double rate_hz{0.0};
     std::string payload_format;      // "struct", "raw", or "ros2"
     std::vector<BridgeMemberSpec> member_specs;
+    std::vector<BridgeAssignmentSpec> decode_assignments;
 
     // GATT discovers bridges through descriptors. Advertisement and Mesh use
     // channel_id as a small, deployment-defined wire routing key.
     std::string transport{"gatt"};  // "gatt", "advertisement", or "mesh"
     uint16_t channel_id{0};
+    /// Omit the five-byte channel envelope for a single advertisement bridge.
+    bool advertisement_bare{false};
 
     // Mesh access-message metadata. These values are ignored by GATT and
     // advertisement bridges and intentionally mirror the MeshSend service.
@@ -73,14 +89,6 @@ struct NodeConfig {
     uint8_t mesh_relay_retransmit_count{1};
     uint8_t mesh_relay_retransmit_interval_steps{2};
     bool mesh_swarm_auto_provisioning{false};
-    /// Private common fleet credential file; empty selects explicit PB-ADV.
-    std::string mesh_fleet_config_path;
-    /// Validated credentials, loaded before changing any live radio state.
-    std::string mesh_fleet_id;
-    std::vector<uint8_t> mesh_fleet_network_key;
-    std::vector<uint8_t> mesh_fleet_application_key;
-    uint32_t mesh_fleet_iv_index{0};
-    uint16_t mesh_fleet_unicast{0};
     /// Logical application swarm; zero is reserved for "not participating".
     uint16_t mesh_swarm_id{1};
     bool mesh_swarm_participating{true};
@@ -94,7 +102,7 @@ struct NodeConfig {
     /// Period of BLE and in-Mesh availability/selection heartbeats.
     double mesh_swarm_heartbeat_period{1.0};
     /// A provisioner peer is unavailable after this heartbeat silence.
-    double mesh_swarm_provisioner_timeout{4.0};
+    double mesh_swarm_provisioner_timeout{20.0};
     uint16_t mesh_swarm_group_address{0xc000};
     uint16_t mesh_swarm_network_index{0};
     uint16_t mesh_swarm_app_key_index{0};
@@ -134,7 +142,8 @@ struct NodeConfig {
     // Static / rarely changing.
     std::string advertise_mode = "peripheral";
     std::string advertise_size = "legacy";
-    std::string advertise_local_name;
+    // Empty explicitly omits LocalName. The default is the local hostname.
+    std::string advertise_local_name{"{hostname}"};
     std::optional<bool> advertise_discoverable;
     std::vector<std::string> advertise_includes;
     std::vector<std::string> advertise_service_uuids;

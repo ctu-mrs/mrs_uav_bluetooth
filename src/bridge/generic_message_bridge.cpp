@@ -2,6 +2,7 @@
 #include "mrs_uav_bluetooth/bridge/generic_message_bridge.hpp"
 
 #include "mrs_uav_bluetooth/bridge/payload_codec.hpp"
+#include "mrs_uav_bluetooth/bridge/math_expression.hpp"
 
 #include <rclcpp/create_generic_publisher.hpp>
 #include <rclcpp/create_generic_subscription.hpp>
@@ -14,11 +15,13 @@
 #include <rosidl_typesupport_introspection_cpp/message_introspection.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
 
 namespace mrs_uav_bluetooth::bridge {
@@ -470,32 +473,6 @@ const MessageMember& resolve_leaf_member_mutable(const MessageMembers& root_memb
     return *current_member;
 }
 
-uint64_t read_time_ns(const MessageMember& member, const void* value_ptr) {
-    if (member.type_id_ != rosidl_typesupport_introspection_cpp::ROS_TYPE_MESSAGE) {
-        throw std::runtime_error("time_ns bridge member must target a ROS time field");
-    }
-    const auto& nested_members = get_nested_members(member);
-    const auto& sec_member = find_member(nested_members, "sec");
-    const auto& nanosec_member = find_member(nested_members, "nanosec");
-    const auto* sec_ptr = static_cast<const uint8_t*>(value_ptr) + sec_member.offset_;
-    const auto* nanosec_ptr = static_cast<const uint8_t*>(value_ptr) + nanosec_member.offset_;
-    return stamp_to_ns(*reinterpret_cast<const int32_t*>(sec_ptr), *reinterpret_cast<const uint32_t*>(nanosec_ptr));
-}
-
-void write_time_ns(const MessageMember& member, void* value_ptr, uint64_t value_ns) {
-    if (member.type_id_ != rosidl_typesupport_introspection_cpp::ROS_TYPE_MESSAGE) {
-        throw std::runtime_error("time_ns bridge member must target a ROS time field");
-    }
-    const auto& nested_members = get_nested_members(member);
-    const auto& sec_member = find_member(nested_members, "sec");
-    const auto& nanosec_member = find_member(nested_members, "nanosec");
-    auto [sec, nanosec] = ns_to_stamp(value_ns);
-    auto* sec_ptr = static_cast<uint8_t*>(value_ptr) + sec_member.offset_;
-    auto* nanosec_ptr = static_cast<uint8_t*>(value_ptr) + nanosec_member.offset_;
-    *reinterpret_cast<int32_t*>(sec_ptr) = sec;
-    *reinterpret_cast<uint32_t*>(nanosec_ptr) = nanosec;
-}
-
 double read_numeric(const MessageMember& member, const void* value_ptr) {
     switch (member.type_id_) {
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_BOOL:
@@ -525,34 +502,131 @@ double read_numeric(const MessageMember& member, const void* value_ptr) {
     }
 }
 
+std::optional<ExactInteger> read_integer(const MessageMember& member,
+                                          const void* value_ptr) {
+    switch (member.type_id_) {
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_BOOL:
+            return *static_cast<const bool*>(value_ptr) ? 1 : 0;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT8:
+            return *static_cast<const int8_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT8:
+            return *static_cast<const uint8_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT16:
+            return *static_cast<const int16_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT16:
+            return *static_cast<const uint16_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT32:
+            return *static_cast<const int32_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT32:
+            return *static_cast<const uint32_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT64:
+            return *static_cast<const int64_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT64:
+            return *static_cast<const uint64_t*>(value_ptr);
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_FLOAT:
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_DOUBLE:
+            return std::nullopt;
+        default:
+            throw std::runtime_error("Unsupported bridge member leaf type");
+    }
+}
+
+template<typename Integer>
+Integer checked_ros_exact(ExactInteger value) {
+    if (value < static_cast<ExactInteger>(std::numeric_limits<Integer>::min()) ||
+        value > static_cast<ExactInteger>(std::numeric_limits<Integer>::max())) {
+        throw std::runtime_error("Decoded value is outside its ROS integer field range");
+    }
+    return static_cast<Integer>(value);
+}
+
+void write_integer(const MessageMember& member, void* value_ptr,
+                   ExactInteger value) {
+    switch (member.type_id_) {
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_BOOL:
+            *static_cast<bool*>(value_ptr) = value != 0;
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT8:
+            *static_cast<int8_t*>(value_ptr) = checked_ros_exact<int8_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT8:
+            *static_cast<uint8_t*>(value_ptr) = checked_ros_exact<uint8_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT16:
+            *static_cast<int16_t*>(value_ptr) = checked_ros_exact<int16_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT16:
+            *static_cast<uint16_t*>(value_ptr) = checked_ros_exact<uint16_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT32:
+            *static_cast<int32_t*>(value_ptr) = checked_ros_exact<int32_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT32:
+            *static_cast<uint32_t*>(value_ptr) = checked_ros_exact<uint32_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT64:
+            *static_cast<int64_t*>(value_ptr) = checked_ros_exact<int64_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT64:
+            *static_cast<uint64_t*>(value_ptr) = checked_ros_exact<uint64_t>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_FLOAT:
+            *static_cast<float*>(value_ptr) = static_cast<float>(value);
+            return;
+        case rosidl_typesupport_introspection_cpp::ROS_TYPE_DOUBLE:
+            *static_cast<double*>(value_ptr) = static_cast<double>(value);
+            return;
+        default:
+            throw std::runtime_error("Unsupported bridge member leaf type");
+    }
+}
+
+template<typename Integer>
+Integer checked_ros_integer(double value) {
+    // Every expression is evaluated as double, even when its literals and
+    // input wire values are integers. Round only at the final ROS assignment.
+    // Use an exclusive power-of-two upper bound so uint64_t and int64_t do
+    // not accidentally admit 2^64 or 2^63 after conversion to double.
+    if (!std::isfinite(value)) {
+        throw std::runtime_error("Cannot assign a non-finite value to a ROS integer field");
+    }
+    const double rounded = std::round(value);
+    const double upper = std::ldexp(1.0, std::numeric_limits<Integer>::digits);
+    const double lower = std::numeric_limits<Integer>::is_signed ? -upper : 0.0;
+    if (rounded < lower || rounded >= upper) {
+        throw std::runtime_error("Decoded value is outside its ROS integer field range");
+    }
+    return static_cast<Integer>(rounded);
+}
+
 void write_numeric(const MessageMember& member, void* value_ptr, double value) {
     switch (member.type_id_) {
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_BOOL:
             *static_cast<bool*>(value_ptr) = value != 0.0;
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT8:
-            *static_cast<int8_t*>(value_ptr) = static_cast<int8_t>(value);
+            *static_cast<int8_t*>(value_ptr) = checked_ros_integer<int8_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT8:
-            *static_cast<uint8_t*>(value_ptr) = static_cast<uint8_t>(value);
+            *static_cast<uint8_t*>(value_ptr) = checked_ros_integer<uint8_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT16:
-            *static_cast<int16_t*>(value_ptr) = static_cast<int16_t>(value);
+            *static_cast<int16_t*>(value_ptr) = checked_ros_integer<int16_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT16:
-            *static_cast<uint16_t*>(value_ptr) = static_cast<uint16_t>(value);
+            *static_cast<uint16_t*>(value_ptr) = checked_ros_integer<uint16_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT32:
-            *static_cast<int32_t*>(value_ptr) = static_cast<int32_t>(value);
+            *static_cast<int32_t*>(value_ptr) = checked_ros_integer<int32_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT32:
-            *static_cast<uint32_t*>(value_ptr) = static_cast<uint32_t>(value);
+            *static_cast<uint32_t*>(value_ptr) = checked_ros_integer<uint32_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_INT64:
-            *static_cast<int64_t*>(value_ptr) = static_cast<int64_t>(value);
+            *static_cast<int64_t*>(value_ptr) = checked_ros_integer<int64_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_UINT64:
-            *static_cast<uint64_t*>(value_ptr) = static_cast<uint64_t>(value);
+            *static_cast<uint64_t*>(value_ptr) = checked_ros_integer<uint64_t>(value);
             return;
         case rosidl_typesupport_introspection_cpp::ROS_TYPE_FLOAT:
             *static_cast<float*>(value_ptr) = static_cast<float>(value);
@@ -563,6 +637,42 @@ void write_numeric(const MessageMember& member, void* value_ptr, double value) {
         default:
             throw std::runtime_error("Unsupported bridge member leaf type");
     }
+}
+
+/// Resolve an expression identifier against a numeric ROS leaf. Parsing the
+/// member path here keeps the expression evaluator independent of ROS types.
+double read_expression_field(const MessageMembers& members,
+                             const void* message, const std::string& path) {
+    const void* field = nullptr;
+    const auto& member = resolve_leaf_member(
+        members, message, parse_member_path(path), &field);
+    return read_numeric(member, field);
+}
+
+std::optional<ExactInteger> read_expression_integer_field(
+    const MessageMembers& members, const void* message,
+    const std::string& path) {
+    const void* field = nullptr;
+    const auto& member = resolve_leaf_member(
+        members, message, parse_member_path(path), &field);
+    return read_integer(member, field);
+}
+
+void write_expression_field(const MessageMembers& members, void* message,
+                            const std::string& path, double value) {
+    void* field = nullptr;
+    const auto& member = resolve_leaf_member_mutable(
+        members, message, parse_member_path(path), &field);
+    write_numeric(member, field, value);
+}
+
+void write_expression_integer_field(const MessageMembers& members,
+                                    void* message, const std::string& path,
+                                    ExactInteger value) {
+    void* field = nullptr;
+    const auto& member = resolve_leaf_member_mutable(
+        members, message, parse_member_path(path), &field);
+    write_integer(member, field, value);
 }
 
 std::vector<uint8_t> serialized_to_bytes(const rclcpp::SerializedMessage& serialized_message) {
@@ -648,18 +758,36 @@ std::vector<uint8_t> GenericMessageBridge::encode_payload(
     std::vector<ScalarValue> values;
     std::vector<config::BridgeMemberSpec> flattened_specs;
     for (const auto& spec : member_specs) {
-        const auto path = parse_member_path(spec.path);
+        if (!spec.expression.empty()) {
+            const auto exact = try_evaluate_integer_expression(
+                spec.expression, [&](const std::string& identifier) {
+                    return read_expression_integer_field(
+                        impl_->members, instance.data(), identifier);
+                });
+            if (exact) {
+                values.push_back(coerce_outgoing_integer(*exact, spec));
+            } else {
+                const auto numeric = evaluate_math_expression(
+                    spec.expression, [&](const std::string& identifier) {
+                        return read_expression_field(
+                            impl_->members, instance.data(), identifier);
+                    });
+                values.push_back(coerce_outgoing(numeric, spec));
+            }
+            flattened_specs.push_back(spec);
+            continue;
+        }
+        const auto path = parse_member_path(spec.target);
         std::vector<ConstLeafBinding> bindings;
         collect_const_leaf_bindings(impl_->members, instance.data(), path, 0, bindings);
         flattened_specs.reserve(flattened_specs.size() + bindings.size());
         values.reserve(values.size() + bindings.size());
         for (const auto& binding : bindings) {
-            flattened_specs.push_back({spec.path, spec.value_type});
-            if (spec.value_type == "time_ns") {
-                values.push_back(static_cast<uint64_t>(read_time_ns(*binding.member, binding.pointer)));
-            } else {
-                values.push_back(coerce_outgoing(read_numeric(*binding.member, binding.pointer), spec.value_type));
-            }
+            flattened_specs.push_back(spec);
+            const auto exact = read_integer(*binding.member, binding.pointer);
+            values.push_back(exact
+                ? coerce_outgoing_integer(*exact, spec)
+                : coerce_outgoing(read_numeric(*binding.member, binding.pointer), spec));
         }
     }
     return encode_struct_payload(values, flattened_specs);
@@ -668,7 +796,8 @@ std::vector<uint8_t> GenericMessageBridge::encode_payload(
 rclcpp::SerializedMessage GenericMessageBridge::decode_payload(
     const std::vector<uint8_t>& payload,
     const std::vector<config::BridgeMemberSpec>& member_specs,
-    const std::string& payload_format) const {
+    const std::string& payload_format,
+    const std::vector<config::BridgeAssignmentSpec>& decode_assignments) const {
     if (payload_format == "ros2" || member_specs.empty()) {
         return bytes_to_serialized(payload);
     }
@@ -680,9 +809,11 @@ rclcpp::SerializedMessage GenericMessageBridge::decode_payload(
     std::optional<size_t> dynamic_spec_index;
     size_t dynamic_value_size = 0;
     for (size_t index = 0; index < member_specs.size(); ++index) {
-        const auto path = parse_member_path(member_specs[index].path);
-        const size_t binding_count = selection_count_for_path(impl_->members, path, 0);
-        const size_t value_size = wire_size(member_specs[index].value_type);
+        const size_t binding_count = member_specs[index].expression.empty()
+            ? selection_count_for_path(impl_->members,
+                                       parse_member_path(member_specs[index].target), 0)
+            : 1;
+        const size_t value_size = wire_size(member_specs[index]);
         if (binding_count == kDynamicBindingCount) {
             if (dynamic_spec_index.has_value()) {
                 throw std::runtime_error("At most one open-ended dynamic array member may be decoded per bridge payload");
@@ -709,9 +840,14 @@ rclcpp::SerializedMessage GenericMessageBridge::decode_payload(
     }
 
     std::vector<config::BridgeMemberSpec> flattened_specs;
-    std::vector<MutableLeafBinding> flattened_bindings;
+    std::vector<std::optional<MutableLeafBinding>> flattened_bindings;
     for (size_t index = 0; index < member_specs.size(); ++index) {
-        const auto path = parse_member_path(member_specs[index].path);
+        if (!member_specs[index].expression.empty()) {
+            flattened_specs.push_back(member_specs[index]);
+            flattened_bindings.push_back(std::nullopt);
+            continue;
+        }
+        const auto path = parse_member_path(member_specs[index].target);
         std::vector<MutableLeafBinding> bindings;
         collect_mutable_leaf_bindings(
             impl_->members,
@@ -723,23 +859,58 @@ rclcpp::SerializedMessage GenericMessageBridge::decode_payload(
         flattened_specs.reserve(flattened_specs.size() + bindings.size());
         flattened_bindings.reserve(flattened_bindings.size() + bindings.size());
         for (auto& binding : bindings) {
-            flattened_specs.push_back({member_specs[index].path, member_specs[index].value_type});
+            flattened_specs.push_back(member_specs[index]);
             flattened_bindings.push_back(binding);
         }
     }
 
     const auto values = decode_struct_payload(payload, flattened_specs);
+    std::unordered_map<std::string, double> decoded_names;
+    std::unordered_map<std::string, ExactInteger> decoded_integers;
     for (size_t index = 0; index < flattened_bindings.size(); ++index) {
-        const auto& binding = flattened_bindings[index];
         const auto& spec = flattened_specs[index];
-        if (spec.value_type == "time_ns") {
-            const auto value_ns = std::visit([](auto&& value) {
-                return static_cast<uint64_t>(value);
-            }, values[index]);
-            write_time_ns(*binding.member, binding.pointer, value_ns);
+        decoded_names.emplace(spec.target, coerce_incoming(values[index], spec));
+        const auto exact = coerce_incoming_integer(values[index]);
+        if (exact) decoded_integers.emplace(spec.target, *exact);
+        if (!flattened_bindings[index]) continue;
+        const auto& binding = *flattened_bindings[index];
+        if (exact) {
+            write_integer(*binding.member, binding.pointer, *exact);
         } else {
-            write_numeric(*binding.member, binding.pointer, coerce_incoming(values[index], spec.value_type));
+            write_numeric(*binding.member, binding.pointer,
+                          coerce_incoming(values[index], spec));
         }
+    }
+
+    // Run reconstruction after all wire scalars are decoded. This allows any
+    // assignment to depend on several members, such as three orientation
+    // angles yielding four quaternion fields, without a codec-specific path.
+    for (const auto& assignment : decode_assignments) {
+        const auto exact = try_evaluate_integer_expression(
+            assignment.expression, [&](const std::string& name)
+                -> std::optional<ExactInteger> {
+                const auto found = decoded_integers.find(name);
+                if (found != decoded_integers.end()) return found->second;
+                if (decoded_names.find(name) == decoded_names.end()) {
+                    throw std::runtime_error("Unknown decoded member: " + name);
+                }
+                return std::nullopt;
+            });
+        if (exact) {
+            write_expression_integer_field(impl_->members, instance.data(),
+                                           assignment.target, *exact);
+            continue;
+        }
+        const double result = evaluate_math_expression(
+            assignment.expression, [&](const std::string& name) {
+                const auto found = decoded_names.find(name);
+                if (found == decoded_names.end()) {
+                    throw std::runtime_error("Unknown decoded member: " + name);
+                }
+                return found->second;
+            });
+        write_expression_field(impl_->members, instance.data(),
+                               assignment.target, result);
     }
 
     rclcpp::SerializedMessage serialized_message;

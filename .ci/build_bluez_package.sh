@@ -32,7 +32,7 @@ PACKAGE_FILENAME=$PACKAGE_NAME"_"$PACKAGE_VERSION"_"$ARCH".deb" ;
 
 # package metadata
 PACKAGE_MAINTAINER="Vojtech Vrba <vrba.vojtech@fel.cvut.cz>" ;
-PACKAGE_DEPENDS="libc6, libdbus-1-3, libglib2.0-0, libjson-c5, libreadline8, libudev1, kmod, udev, dbus" ;
+PACKAGE_DEPENDS="libc6, libdbus-1-3, libglib2.0-0, libjson-c5, libreadline8, libssl3t64, libudev1, kmod, udev, dbus" ;
 PACKAGE_PROVIDES="bluez (= $BLUEZ_VERSION), bluez-obexd (= $BLUEZ_VERSION), bluez-hcidump (= $BLUEZ_VERSION), bluez-meshd (= $BLUEZ_VERSION)" ;
 PACKAGE_CONFLICTS="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-tools" ;
 PACKAGE_REPLACES="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-tools" ;
@@ -48,7 +48,7 @@ cd "$BUILD_DIR" ;
 # install pre-requisites (with sources)
 # sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ; # this enables deb-src for apt
 apt-get -y update ;
-apt-get -y install git libasound2-dev libjson-c-dev python3-docutils ;
+apt-get -y install git libasound2-dev libjson-c-dev libssl-dev python3-docutils ;
 # apt-get -y build-dep bluez ; # this installs packages obtained by: apt-cache showsrc bluez | grep ^Build-Depends
 apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, libebook1.2-dev (>= 3.12)" ;
 
@@ -65,6 +65,8 @@ git apply --check "$PATCH_ROOT/bluez-mesh-local-pb-adv.patch" ;
 git apply "$PATCH_ROOT/bluez-mesh-local-pb-adv.patch" ;
 git apply --check "$PATCH_ROOT/bluez-mesh-joined-provisioner-keyring.patch" ;
 git apply "$PATCH_ROOT/bluez-mesh-joined-provisioner-keyring.patch" ;
+git apply --check "$PATCH_ROOT/bluez-mesh-userspace-aes-ccm.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-userspace-aes-ccm.patch" ;
 
 # recover files (configure.ac etc.) 
 ./bootstrap ;

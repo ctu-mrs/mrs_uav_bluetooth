@@ -166,16 +166,9 @@ MeshApplication::MeshApplication(bluez::DbusConnection& dbus,
     }
 
     if (config_.mesh_device_uuid.empty()) {
-        const std::string namespace_name =
-            config_.mesh_swarm_auto_provisioning && config_.mesh_fleet_id.empty()
-                ? "mrs-uav-bluetooth-mesh-auto:"
-                : "mrs-uav-bluetooth-mesh:" +
-                    (config_.mesh_fleet_id.empty() ? std::string{} :
-                     config_.mesh_fleet_id + ":");
-        uuid_ = config_.mesh_swarm_auto_provisioning &&
-            config_.mesh_fleet_id.empty()
-                ? mesh_auto_uuid_from_name(hostname_)
-                : mesh_uuid_from_name(namespace_name + hostname_);
+        uuid_ = config_.mesh_swarm_auto_provisioning
+            ? mesh_auto_uuid_from_name(hostname_)
+            : mesh_uuid_from_name("mrs-uav-bluetooth-mesh:" + hostname_);
     } else {
         uuid_ = mesh_uuid_from_string(config_.mesh_device_uuid);
         const auto version = static_cast<uint8_t>(uuid_[6] >> 4);
@@ -470,8 +463,7 @@ void MeshApplication::export_provisioner() {
             .withOutputParamNames("net_index", "unicast")
             .implementedAs([this](uint8_t count) -> std::tuple<uint16_t, uint16_t> {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (config_.mesh_swarm_auto_provisioning &&
-                    config_.mesh_fleet_id.empty()) {
+                if (config_.mesh_swarm_auto_provisioning) {
                     if (count != 1 || auto_provisioning_unicast_ == 0)
                         throw sdbus::Error(
                             sdbus::Error::Name{"org.bluez.mesh.Error.Abort"},
@@ -707,12 +699,12 @@ bool MeshApplication::vendor_model_ready() const {
     return status_.attached && vendor_bound_ && vendor_subscribed_;
 }
 
-std::vector<uint8_t> MeshApplication::fleet_device_key() {
+std::vector<uint8_t> MeshApplication::local_device_key() {
     const auto path = config_.mesh_token_path + ".device-key";
     // Never generate replacement identity material for an already enrolled
     // node: an absent backup requires recovery, not resetting replay state.
     if (!std::filesystem::exists(path) && token() != 0)
-        throw std::runtime_error("Fleet Device Key backup missing; restore it before configuring this identity");
+        throw std::runtime_error("Mesh Device Key backup missing; restore it before configuring this identity");
     const auto parent = std::filesystem::path(path).parent_path();
     if (!parent.empty()) std::filesystem::create_directories(parent);
     const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
@@ -728,50 +720,18 @@ std::vector<uint8_t> MeshApplication::fleet_device_key() {
         const bool saved = ::write(fd, fresh.data(), fresh.size()) ==
             static_cast<ssize_t>(fresh.size()) && ::fsync(fd) == 0;
         ::close(fd);
-        if (!saved) throw std::runtime_error("Could not persist fleet Device Key");
+        if (!saved) throw std::runtime_error("Could not persist Mesh Device Key");
     } else if (errno != EEXIST) {
-        throw std::runtime_error("Could not create private fleet Device Key file");
+        throw std::runtime_error("Could not create private Mesh Device Key file");
     }
     const auto permissions = std::filesystem::status(path).permissions();
     if ((permissions & (std::filesystem::perms::group_all |
                         std::filesystem::perms::others_all)) != std::filesystem::perms::none)
-        throw std::runtime_error("Fleet Device Key backup must have mode 0600");
+        throw std::runtime_error("Mesh Device Key backup must have mode 0600");
     std::ifstream input(path, std::ios::binary);
     std::vector<uint8_t> result{std::istreambuf_iterator<char>(input), {}};
-    require_size(result, 16, "persisted fleet Device Key");
+    require_size(result, 16, "persisted Mesh Device Key");
     return result;
-}
-
-void MeshApplication::prepare_fleet_keys() {
-    // Network1.Import creates operational keys, not the Configuration Client
-    // keyring. ImportSubnet is idempotent for identical material in BlueZ.
-    import_subnet(config_.mesh_swarm_network_index, config_.mesh_fleet_network_key);
-    import_remote_node(config_.mesh_fleet_unicast, 1, fleet_device_key());
-    VariantMap exported;
-    management_proxy()->callMethod("ExportKeys")
-        .onInterface(kMeshManagementInterface).storeResultsTo(exported);
-    bool found_network = false;
-    bool found_application = false;
-    if (const auto records = variant_value<std::vector<NetKeyRecord>>(exported, "NetKeys")) {
-        for (const auto& record : *records) {
-            if (std::get<0>(record) != config_.mesh_swarm_network_index) continue;
-            found_network = true;
-            if (std::get<1>(record) != config_.mesh_fleet_network_key)
-                throw std::runtime_error("Stored Mesh NetKey differs from fleet credentials; use a new fleet for new keys");
-            if (const auto apps = variant_value<std::vector<AppKeyRecord>>(std::get<2>(record), "AppKeys")) {
-                for (const auto& app : *apps) {
-                    if (std::get<0>(app) != config_.mesh_swarm_app_key_index) continue;
-                    found_application = true;
-                    if (std::get<1>(app) != config_.mesh_fleet_application_key)
-                        throw std::runtime_error("Stored Mesh AppKey differs from fleet credentials");
-                }
-            }
-        }
-    }
-    if (!found_network) throw std::runtime_error("Fleet NetKey is missing from the BlueZ database");
-    if (!found_application)
-        import_app_key(config_.mesh_swarm_network_index,
-            config_.mesh_swarm_app_key_index, config_.mesh_fleet_application_key);
 }
 
 namespace {
@@ -835,7 +795,7 @@ void MeshApplication::import_auto_identity(uint16_t unicast) {
     if (unicast == 0 || unicast > 0x7fff)
         throw std::invalid_argument("Automatic Mesh address must be in 1..32767");
     const auto secret = auto_credentials(config_.mesh_token_path + ".credentials", true);
-    import_node(uuid_, fleet_device_key(),
+    import_node(uuid_, local_device_key(),
         std::vector<uint8_t>(secret.begin(), secret.begin() + 16),
         config_.mesh_swarm_network_index, false, false, 0, unicast);
 }
@@ -851,7 +811,7 @@ bool MeshApplication::prepare_auto_keys(uint16_t unicast) {
         // that directory exists, so seed it before checking the snapshot.
         import_subnet(config_.mesh_swarm_network_index,
             std::vector<uint8_t>(creator_keys.begin(), creator_keys.begin() + 16));
-        import_remote_node(unicast, 1, fleet_device_key());
+        import_remote_node(unicast, 1, local_device_key());
     }
 
     VariantMap exported;

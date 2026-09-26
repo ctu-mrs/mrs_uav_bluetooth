@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "mrs_uav_bluetooth/bridge/payload_codec.hpp"
 
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 
 namespace mrs_uav_bluetooth::bridge {
@@ -25,17 +28,39 @@ const std::unordered_map<std::string, TypeInfo> kTypeInfo = {
     {"uint64",  {8}},
     {"float32", {4}},
     {"float64", {8}},
-    {"time_ns", {8}},
 };
+
+template<typename T>
+T checked_fixed(double value, const std::string& type) {
+    if (!std::isfinite(value)) {
+        throw std::runtime_error(type + " cannot encode a non-finite value");
+    }
+    const double scaled = std::round(value);
+    // The largest 64-bit integer rounds up when cast to double. An exclusive
+    // power-of-two upper bound rejects that unrepresentable boundary safely.
+    const double upper = std::ldexp(1.0, std::numeric_limits<T>::digits);
+    const double lower = std::numeric_limits<T>::is_signed ? -upper : 0.0;
+    if (scaled < lower || scaled >= upper) {
+        throw std::runtime_error(type + " value is outside its integer range");
+    }
+    return static_cast<T>(scaled);
+}
+
+template<typename T>
+T checked_exact(ExactInteger value, const std::string& type) {
+    if (value < static_cast<ExactInteger>(std::numeric_limits<T>::min()) ||
+        value > static_cast<ExactInteger>(std::numeric_limits<T>::max())) {
+        throw std::runtime_error(type + " value is outside its integer range");
+    }
+    return static_cast<T>(value);
+}
 
 // Pack a single ScalarValue into the buffer at the given offset.
 void pack_value(std::vector<uint8_t>& buf, const ScalarValue& val,
-                const std::string& value_type) {
-    auto it = kTypeInfo.find(value_type);
-    if (it == kTypeInfo.end()) {
-        throw std::runtime_error("Unknown value type: " + value_type);
-    }
-    size_t sz = it->second.size;
+                const config::BridgeMemberSpec& spec) {
+    const auto& value_type = spec.value_type;
+    size_t sz = wire_size(spec);
+    if (!sz) throw std::runtime_error("Unknown value type: " + value_type);
     size_t off = buf.size();
     buf.resize(off + sz);
 
@@ -59,12 +84,10 @@ void pack_value(std::vector<uint8_t>& buf, const ScalarValue& val,
 
 // Unpack a single value from the buffer at the given offset.
 ScalarValue unpack_value(const std::vector<uint8_t>& buf, size_t off,
-                         const std::string& value_type) {
-    auto it = kTypeInfo.find(value_type);
-    if (it == kTypeInfo.end()) {
-        throw std::runtime_error("Unknown value type: " + value_type);
-    }
-    size_t sz = it->second.size;
+                         const config::BridgeMemberSpec& spec) {
+    const auto& value_type = spec.value_type;
+    size_t sz = wire_size(spec);
+    if (!sz) throw std::runtime_error("Unknown value type: " + value_type);
     if (off + sz > buf.size()) {
         throw std::runtime_error("Payload too short while decoding " + value_type);
     }
@@ -109,7 +132,7 @@ ScalarValue unpack_value(const std::vector<uint8_t>& buf, size_t off,
         std::memcpy(&v, buf.data() + off, 8);
         return v;
     }
-    if (value_type == "uint64" || value_type == "time_ns") {
+    if (value_type == "uint64") {
         uint64_t v;
         std::memcpy(&v, buf.data() + off, 8);
         return v;
@@ -226,7 +249,7 @@ std::vector<uint8_t> encode_struct_payload(
     std::vector<uint8_t> buf;
     buf.reserve(total_wire_size(specs));
     for (size_t i = 0; i < specs.size(); ++i) {
-        pack_value(buf, values[i], specs[i].value_type);
+        pack_value(buf, values[i], specs[i]);
     }
     return buf;
 }
@@ -238,41 +261,62 @@ std::vector<ScalarValue> decode_struct_payload(
     values.reserve(specs.size());
     size_t off = 0;
     for (const auto& spec : specs) {
-        values.push_back(unpack_value(payload, off, spec.value_type));
-        off += wire_size(spec.value_type);
+        values.push_back(unpack_value(payload, off, spec));
+        off += wire_size(spec);
     }
     return values;
 }
 
-ScalarValue coerce_outgoing(double value, const std::string& value_type) {
+ScalarValue coerce_outgoing(double value, const config::BridgeMemberSpec& spec) {
+    const auto& value_type = spec.value_type;
     if (value_type == "bool") return static_cast<bool>(value != 0.0);
-    if (value_type == "int8") return static_cast<int8_t>(value);
-    if (value_type == "uint8") return static_cast<uint8_t>(value);
-    if (value_type == "int16") return static_cast<int16_t>(value);
-    if (value_type == "uint16") return static_cast<uint16_t>(value);
-    if (value_type == "int32") return static_cast<int32_t>(value);
-    if (value_type == "uint32") return static_cast<uint32_t>(value);
-    if (value_type == "int64") return static_cast<int64_t>(value);
-    if (value_type == "uint64") return static_cast<uint64_t>(value);
-    if (value_type == "time_ns") return static_cast<uint64_t>(value);
+    if (value_type == "int8") return checked_fixed<int8_t>(value, value_type);
+    if (value_type == "uint8") return checked_fixed<uint8_t>(value, value_type);
+    if (value_type == "int16") return checked_fixed<int16_t>(value, value_type);
+    if (value_type == "uint16") return checked_fixed<uint16_t>(value, value_type);
+    if (value_type == "int32") return checked_fixed<int32_t>(value, value_type);
+    if (value_type == "uint32") return checked_fixed<uint32_t>(value, value_type);
+    if (value_type == "int64") return checked_fixed<int64_t>(value, value_type);
+    if (value_type == "uint64") return checked_fixed<uint64_t>(value, value_type);
     if (value_type == "float32") return static_cast<float>(value);
     if (value_type == "float64") return value;
     throw std::runtime_error("Unknown value type for coercion: " + value_type);
 }
 
-double coerce_incoming(const ScalarValue& value, const std::string& /*value_type*/) {
-    return std::visit([](auto&& v) -> double {
+ScalarValue coerce_outgoing_integer(ExactInteger value,
+                                    const config::BridgeMemberSpec& spec) {
+    const auto& type = spec.value_type;
+    if (type == "bool") return value != 0;
+    if (type == "int8") return checked_exact<int8_t>(value, type);
+    if (type == "uint8") return checked_exact<uint8_t>(value, type);
+    if (type == "int16") return checked_exact<int16_t>(value, type);
+    if (type == "uint16") return checked_exact<uint16_t>(value, type);
+    if (type == "int32") return checked_exact<int32_t>(value, type);
+    if (type == "uint32") return checked_exact<uint32_t>(value, type);
+    if (type == "int64") return checked_exact<int64_t>(value, type);
+    if (type == "uint64") return checked_exact<uint64_t>(value, type);
+    if (type == "float32") return static_cast<float>(value);
+    if (type == "float64") return static_cast<double>(value);
+    throw std::runtime_error("Unknown value type for integer coercion: " + type);
+}
+
+double coerce_incoming(const ScalarValue& value, const config::BridgeMemberSpec& spec) {
+    static_cast<void>(spec);
+    const double encoded = std::visit([](auto&& v) -> double {
         return static_cast<double>(v);
     }, value);
+    return encoded;
 }
 
-std::pair<int32_t, uint32_t> ns_to_stamp(uint64_t ns) {
-    return {static_cast<int32_t>(ns / 1'000'000'000ULL),
-            static_cast<uint32_t>(ns % 1'000'000'000ULL)};
-}
-
-uint64_t stamp_to_ns(int32_t sec, uint32_t nanosec) {
-    return static_cast<uint64_t>(sec) * 1'000'000'000ULL + nanosec;
+std::optional<ExactInteger> coerce_incoming_integer(const ScalarValue& value) {
+    return std::visit([](auto raw) -> std::optional<ExactInteger> {
+        using T = std::decay_t<decltype(raw)>;
+        if constexpr (std::is_floating_point_v<T>) {
+            return std::nullopt;
+        } else {
+            return static_cast<ExactInteger>(raw);
+        }
+    }, value);
 }
 
 size_t wire_size(const std::string& value_type) {
@@ -280,10 +324,14 @@ size_t wire_size(const std::string& value_type) {
     return it != kTypeInfo.end() ? it->second.size : 0;
 }
 
+size_t wire_size(const config::BridgeMemberSpec& spec) {
+    return wire_size(spec.value_type);
+}
+
 size_t total_wire_size(const std::vector<config::BridgeMemberSpec>& specs) {
     size_t total = 0;
     for (const auto& s : specs) {
-        total += wire_size(s.value_type);
+        total += wire_size(s);
     }
     return total;
 }

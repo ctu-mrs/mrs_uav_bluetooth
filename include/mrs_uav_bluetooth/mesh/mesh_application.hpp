@@ -107,10 +107,8 @@ public:
     Status status() const;
     /// True only after BlueZ confirms the vendor AppKey binding and subscription.
     bool vendor_model_ready() const;
-    /// Verify imported keys without logging them; import the AppKey if absent.
-    void prepare_fleet_keys();
-    /// Load/create a private Device Key before importing a new fleet identity.
-    std::vector<uint8_t> fleet_device_key();
+    /// Load or create the private Device Key for this UAV's Mesh identity.
+    std::vector<uint8_t> local_device_key();
     /// Import this node as the first member of a new private, random-key Mesh.
     /// Credentials are generated once and stored mode 0600 beside its token.
     void import_auto_identity(uint16_t unicast);

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "mrs_uav_bluetooth/config/config_models.hpp"
+#include "mrs_uav_bluetooth/bridge/math_expression.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,21 +57,25 @@ std::vector<ScalarValue> decode_struct_payload(
     const std::vector<config::BridgeMemberSpec>& specs);
 
 /// Coerce a double into the appropriate ScalarValue for the given type.
-/// time_ns: interprets the double as nanoseconds (uint64_t).
-ScalarValue coerce_outgoing(double value, const std::string& value_type);
+/// Integer types round and reject values outside their representable range.
+ScalarValue coerce_outgoing(double value, const config::BridgeMemberSpec& spec);
+
+/// Coerce an exact integer relation without passing through double.
+ScalarValue coerce_outgoing_integer(ExactInteger value,
+                                    const config::BridgeMemberSpec& spec);
 
 /// Coerce a decoded ScalarValue into a double.
-/// time_ns: returns nanoseconds as double.
-double coerce_incoming(const ScalarValue& value, const std::string& value_type);
+/// The expression engine handles any inverse conversion separately.
+double coerce_incoming(const ScalarValue& value, const config::BridgeMemberSpec& spec);
 
-/// For time_ns: split nanoseconds into (sec, nanosec).
-std::pair<int32_t, uint32_t> ns_to_stamp(uint64_t ns);
-
-/// For time_ns: combine (sec, nanosec) into nanoseconds.
-uint64_t stamp_to_ns(int32_t sec, uint32_t nanosec);
+/// Return an exact value for integer wire types, or none for floating types.
+std::optional<ExactInteger> coerce_incoming_integer(const ScalarValue& value);
 
 /// Return the packed wire size in bytes for a single value_type string.
 size_t wire_size(const std::string& value_type);
+
+/// Return the final scalar wire size of a declarative member.
+size_t wire_size(const config::BridgeMemberSpec& spec);
 
 /// Compute total packed size for a list of member specs.
 size_t total_wire_size(const std::vector<config::BridgeMemberSpec>& specs);

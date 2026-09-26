@@ -34,7 +34,6 @@ const std::unordered_map<std::string, TypeMeta> kTypeMeta = {
     {"uint64",  {'Q', 8}},
     {"float32", {'f', 4}},
     {"float64", {'d', 8}},
-    {"time_ns", {'Q', 8}},
 };
 
 }  // namespace
@@ -71,8 +70,8 @@ void validate_shared_topics(const std::vector<SharedTopicConfig>& topics) {
             std::string vt = normalize_value_type(m.value_type);
             if (kTypeMeta.find(vt) == kTypeMeta.end()) {
                 throw std::runtime_error(
-                    "shared_topics[" + std::to_string(i) + "].members: unsupported type '" +
-                    m.value_type + "' for path '" + m.path + "'");
+                    "shared_topics[" + std::to_string(i) + "].members_encode: unsupported type '" +
+                    m.value_type + "' for target '" + m.target + "'");
             }
         }
     }

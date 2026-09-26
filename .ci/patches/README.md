@@ -34,11 +34,17 @@ fails and the joined host cannot configure its local model or provision later
 hosts. Existing entries are preserved, so a daemon restart repairs a missing
 keyring without changing an established identity.
 
+`bluez-mesh-userspace-aes-ccm.patch` uses OpenSSL for the Mesh AES-CCM
+operation and keeps BlueZ's known-answer crypto check. This removes the
+dependency on the kernel `algif_aead` interface. The service package does not
+load that module or change the host's module policy. `mrs-bluez` depends on
+`libssl3t64` and its build installs `libssl-dev`.
+
 On NUC (x86_64) and RPi (aarch64), unpatched raw HCI delivered heartbeats
 but repeatedly failed bounded full-topic probes. Patching the sender restored
 delivery. Patching both senders restored bidirectional delivery.
 
-The three patches were applied and compiled on both host architectures. Their
+The radio and provisioning patches were applied and compiled on both host architectures. Their
 order was also checked against a clean BlueZ 5.87 tree. The host trial used
 the patched daemons directly. A fresh binary package install was not part of
 that trial.

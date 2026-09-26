@@ -3,4 +3,4 @@ Version: 1.1.0
 Architecture: all
 Maintainer: Vojtech Vrba <vojtech.vrba@fel.cvut.cz>
 Description: System service for ROS 2 MRS UAV Bluetooth service node.
-Depends: ros-jazzy-mrs-uav-bluetooth, mrs-bluez (>= 5.87), kmod, polkitd, systemd, python3
+Depends: ros-jazzy-mrs-uav-bluetooth, mrs-bluez (>= 5.87), polkitd, systemd, python3

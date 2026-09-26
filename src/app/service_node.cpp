@@ -28,6 +28,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -118,7 +119,7 @@ std::string manual_bridge_key(const std::string& direction,
     source << direction << '|' << mac << '|' << topic_name << '|' << message_type << '|'
            << characteristic;
     for (const auto& spec : member_specs) {
-        source << '|' << spec.path << ':' << spec.value_type;
+        source << '|' << spec.target << ':' << spec.value_type << ':' << spec.expression;
     }
     std::string uuid = mrs_uav_bluetooth::util::uuid_from_name(source.str());
     uuid.erase(std::remove(uuid.begin(), uuid.end(), '-'), uuid.end());
@@ -211,10 +212,13 @@ size_t advertising_generic_data_size(const std::map<uint8_t, std::vector<uint8_t
 size_t estimate_primary_advertisement_bytes(
     const std::string& local_name,
     const mrs_uav_bluetooth::config::NodeConfig& cfg,
-    const std::map<uint8_t, std::vector<uint8_t>>& advertising_data) {
+    const std::map<uint8_t, std::vector<uint8_t>>& advertising_data,
+    bool name_in_primary) {
     size_t total = kAdvFlagsBytes;
 
-    if (!local_name.empty()) {
+    // BlueZ puts LocalName in the scan response for legacy advertisements.
+    // A connectable extended advertisement instead carries it in primary data.
+    if (name_in_primary && !local_name.empty()) {
         total += advertising_structure_size(local_name.size());
     }
     total += advertising_uuid_list_size(cfg.advertise_solicit_uuids);
@@ -386,7 +390,18 @@ std::string gatt_layout_signature_for_config(const mrs_uav_bluetooth::config::No
             (shared_topic.mode != "export" && shared_topic.mode != "both")) {
             continue;
         }
-        tokens.push_back("bridge:" + shared_topic.bridge_name);
+        // GATT descriptors expose the encoder layout. Changing a type or an
+        // expression must rebuild that service even when the topic name stays
+        // the same, otherwise nearby clients can see stale metadata.
+        std::ostringstream bridge_layout;
+        bridge_layout << "bridge:" << shared_topic.bridge_name << ':'
+                      << shared_topic.message_type << ':'
+                      << shared_topic.payload_format << ':' << shared_topic.rate_hz;
+        for (const auto& member : shared_topic.member_specs) {
+            bridge_layout << '|' << member.target << ':'
+                          << member.value_type << ':' << member.expression;
+        }
+        tokens.push_back(bridge_layout.str());
     }
 
     std::sort(tokens.begin(), tokens.end());
@@ -804,9 +819,7 @@ void ServiceNode::refresh_advertisement_registration() {
         return;
     }
 
-    const auto local_name = active_config_.advertise_local_name.empty()
-        ? hostname_
-        : active_config_.advertise_local_name;
+    const auto& local_name = active_config_.advertise_local_name;
     std::vector<std::string> service_uuids;
     if (gatt_app_) {
         service_uuids.reserve(gatt_app_->services().size());
@@ -882,7 +895,8 @@ void ServiceNode::refresh_advertisement_registration() {
     advertisement_->set_tx_power(active_config_.advertise_tx_power);
 
     const auto estimated_primary_bytes = estimate_primary_advertisement_bytes(
-        local_name, effective_config, advertise_data);
+        local_name, effective_config, advertise_data,
+        !secondary_channel.empty() && active_config_.advertise_mode == "peripheral");
     const size_t remaining_uuid_payload_bytes = estimated_primary_bytes + 2 >= advertisement_max_bytes
         ? 0
         : (advertisement_max_bytes - estimated_primary_bytes - 2);
@@ -904,8 +918,6 @@ void ServiceNode::refresh_advertisement_registration() {
     add_attempt(service_uuids);
     add_attempt({});
 
-    advertisement_->unregister_advertisement(adapter_path_);
-
     bool advertisement_registered = false;
     std::string last_error_message;
     for (const auto& advertised_uuids : attempts) {
@@ -920,12 +932,17 @@ void ServiceNode::refresh_advertisement_registration() {
                         log_secondary_channel.c_str(), estimated_primary_bytes, advertisement_max_bytes);
             if (active_config_.advertise_mode == "broadcast" && client_) {
                 // Legacy controllers share the scan/advertising random address.
-                // Pause for every broadcast registration/data refresh, then
-                // resume reception once the controller acknowledges it.
+                // Keep discovery paused across both removal and registration.
+                // BlueZ can return from removal before the controller has
+                // finished freeing its advertisement instance, so leave a
+                // short settling interval before registering the new data.
                 client_->with_discovery_paused([this]() {
+                    advertisement_->unregister_advertisement(adapter_path_);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     advertisement_->register_advertisement(adapter_path_);
                 });
             } else {
+                advertisement_->unregister_advertisement(adapter_path_);
                 advertisement_->register_advertisement(adapter_path_);
             }
             advertisement_registered = true;
@@ -1051,9 +1068,7 @@ void ServiceNode::set_advertisement_payload(std::vector<uint8_t> payload,
         // never let stale connectionless data mutate a GATT or Mesh advert.
         return;
     }
-    const auto local_name = active_config_.advertise_local_name.empty()
-        ? hostname_
-        : active_config_.advertise_local_name;
+    const auto& local_name = active_config_.advertise_local_name;
     const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
     const auto secondary_channel = select_secondary_channel(active_config_, adapter_info);
     const size_t max_advertisement_bytes =
@@ -1747,7 +1762,7 @@ void ServiceNode::handle_configure_notification_bridge(const std::shared_ptr<mrs
         response->resolved_message_type = message_type;
         response->resolved_rate_hz = std::max(0.0f, request->rate_hz);
         for (const auto& spec : member_specs) {
-            response->resolved_member_paths.push_back(spec.path + ":" + spec.value_type);
+            response->resolved_member_paths.push_back(spec.target + ":" + spec.value_type);
         }
     } catch (const std::exception& e) {
         response->success = false;

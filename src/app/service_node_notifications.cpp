@@ -279,6 +279,7 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
             state.bridge_uuid = util::named_characteristic_uuid(
                 bridge_characteristic_name_for_host(peer_name, shared_topic.bridge_topic_path));
             state.member_specs = shared_topic.member_specs;
+            state.decode_assignments = shared_topic.decode_assignments;
             state.rate_hz = shared_topic.rate_hz;
             state.payload_format = shared_topic.payload_format;
             state.auto_managed = true;

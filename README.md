@@ -49,9 +49,9 @@ When Bluetooth serial access is enabled on a UAV, press `h` in the TUI for SSH. 
 
 Choose one Bluetooth mode for all UAVs. These modes cannot run together on one Bluetooth adapter. Ordered by increasing complexity:
 
-| Mode | What it does | Payload limit | Sample configuration |
+| Mode | What it does | User payload limit | Sample configuration |
 | --- | --- | --- | --- |
-| Advertisement | Sends small messages to nearby UAVs without connecting. | 17 B | [Odometry advertisement](config/examples/swarm_odom_advertisement_overlay.yaml) |
+| Advertisement | Sends small messages to nearby UAVs without connecting. | 26 B (legacy) / 246 B | [Odometry advertisement](config/examples/swarm_odom_advertisement_overlay.yaml) |
 | GATT | Connects to nearby UAVs and sends larger messages. | 512 B | [Odometry GATT](config/examples/swarm_odom_gatt_overlay.yaml) |
 | Mesh | Passes messages through other UAVs to reach farther away (multi-hop). | 377 B | [Odometry Mesh](config/examples/swarm_odom_mesh_overlay.yaml) |
 
@@ -67,7 +67,7 @@ If you do not have real odometry yet, start a test source on each UAV:
 ros2 launch mrs_uav_bluetooth random_odometry_publisher.launch.py rate_hz:=5.0
 ```
 
-The advertisement sample sends time and X position at 1 Hz, keeping its payload within 17 bytes. The GATT sample sends time, pose, and velocity at 10 Hz. The Mesh sample sends time, pose, and velocity at 0.2 Hz. These samples do not include frame IDs or covariance. Edit the fields and rates in the overlay if your application needs something different.
+The advertisement sample sends timestamp, orientation, and 3D position at 1 Hz in 26 bytes. The Mesh sample uses a smaller 21-byte timestamp and pose mapping at 0.2 Hz to reduce radio segments. The GATT sample sends time, pose, and velocities as 32-bit floats at 10 Hz. These samples do not include frame IDs or covariance fields. Edit the fields and rates in the overlay if your application needs something different.
 
 Received GATT and advertisement topics appear below `/{hostname}/bluetooth/le/peers/<peer>/`. Mesh uses `/{hostname}/bluetooth/mesh/peers/<peer>/`. The peer segment is the hostname when it can be resolved. GATT and advertisements fall back to `mac_<address>`. Mesh packets contain a unicast address but no Bluetooth MAC, so a Mesh overlay without a peer list falls back to `unicast_<address>`. The `user_node` prints status for the active mode while it runs.
 
@@ -83,7 +83,9 @@ The `shared_topics` section tells the service what to send and how to rebuild it
 
 Each entry needs a `transport` of `gatt`, `advertisement`, or `mesh`, a `mode` of `export`, `import`, or `both`, and a ROS `message_type`. `export_topic` is the local source. `import_topic_suffix` names the received topic below the peer prefix. A positive `rate_hz` limits sending to the latest sample at that rate. Set it to zero to send each source sample.
 
-`payload_format: struct` sends only the ordered fields listed in `members`. Each member has a ROS field `path` and a compact wire `type`, such as `float32` or `time_ns`. This is the best choice for small radio packets. `raw` sends a `std_msgs/msg/UInt8MultiArray` byte array. `ros2` sends the whole serialized message and is usually too large for legacy advertisements. Advertisement and Mesh bridges also need a unique `channel_id` so the receiver knows which declaration should decode the bytes. Mesh bridges may additionally set `destination`, `app_key_index`, `element_index`, `force_segmented`, `vendor_opcode`, and `company_id`.
+`payload_format: struct` uses only the ordered fields in `members_encode`. Each entry has a `target` and a `type`, which is the final transmission type such as `float32`, `uint8`, or `int16`. Without an `expression`, `target` is a ROS field copied directly. With an `expression`, `target` names the computed transmission value. In `members_decode`, each entry uses the same `target` and `expression` keys. There, `target` is the ROS field to fill and the expression refers to transmission-value names. Direct fields are reconstructed automatically.  Integer destinations are rounded when needed and always range-checked. Exporters and importers must use the same layout.
+
+`payload_format: raw` uses a `std_msgs/msg/UInt8MultiArray` byte array. `payload_format: ros2` uses the whole serialized message and is usually too large for legacy advertisements. Mesh bridges and multi-topic advertisement bridges need a unique `channel_id` so the receiver knows which declaration should decode the bytes. The single advertisement bridge in the sample uses `framing: bare` to make all 26 data bytes available in legacy advertisements (e.g., on RPi5). Mesh bridges may additionally set `destination`, `app_key_index`, `element_index`, `force_segmented`, `vendor_opcode`, and `company_id`, leaving less space for user payloads.
 
 An overlay remains active while its `user_node` is running. The service returns to [default.yaml](config/default.yaml) when that node exits. The service package also offers time sharing, Wi-Fi setup over GATT, and optional Bluetooth serial access for SSH. These features are configured in the default file or an overlay. Only one radio mode can own an adapter at a time.
 

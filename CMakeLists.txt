@@ -168,6 +168,7 @@ ament_target_dependencies(${PROJECT_NAME}_config
 # =====================================================================
 
 add_library(${PROJECT_NAME}_bridge STATIC
+  src/bridge/math_expression.cpp
   src/bridge/payload_codec.cpp
   src/bridge/generic_message_bridge.cpp
 )

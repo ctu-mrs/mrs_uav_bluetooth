@@ -106,7 +106,6 @@ MeshSwarmCoordinator::MeshSwarmCoordinator(
       hostname_(util::lower_trim_copy(hostname)),
       logger_(logger),
       local_number_(uav_number(hostname_)) {
-    automatic_private_ = config_.mesh_fleet_id.empty();
     for (const auto& raw_member : config_.peer_whitelist) {
         const auto member = util::lower_trim_copy(raw_member);
         const auto number = uav_number(member);
@@ -137,15 +136,14 @@ MeshSwarmCoordinator::MeshSwarmCoordinator(
     RCLCPP_INFO(
         logger_,
         "Automatic Mesh %s uses preference '%s', swarm fingerprint %06x, and local UAV ID %u",
-        automatic_private_ ? "PB-ADV enrollment" : "pre-shared fleet",
+        "PB-ADV enrollment",
         preference.c_str(), whitelist_fingerprint_, local_number_);
 }
 
 void MeshSwarmCoordinator::handle_event(const Event& event) {
-    if (!automatic_private_ ||
-        (event.event != "scan_result" &&
-         event.event != "add_node_complete" &&
-         event.event != "add_node_failed")) return;
+    if (event.event != "scan_result" &&
+        event.event != "add_node_complete" &&
+        event.event != "add_node_failed") return;
     std::lock_guard<std::mutex> lock(mutex_);
     if (pending_events_.size() < 128) pending_events_.push_back(event);
 }
@@ -371,7 +369,7 @@ void MeshSwarmCoordinator::maintain(const Status& status) {
                 now - last_bootstrap_action_ < kRetryDelay) return;
             last_bootstrap_action_ = now;
             application_.attach(status.token);
-        } else if (automatic_private_) {
+        } else {
             const auto elapsed = std::chrono::duration<double>(
                 now - bootstrap_started_at_).count();
             size_t priority = 0;
@@ -407,26 +405,18 @@ void MeshSwarmCoordinator::maintain(const Status& status) {
                 last_bootstrap_action_ = now;
                 application_.join();
             }
-        } else if (status.state != "importing") {
-            if (last_bootstrap_action_ != Clock::time_point{} &&
-                now - last_bootstrap_action_ < kRetryDelay) return;
-            last_bootstrap_action_ = now;
-            const auto device_key = application_.fleet_device_key();
-            application_.import_node(application_.uuid(), device_key,
-                config_.mesh_fleet_network_key, config_.mesh_swarm_network_index,
-                false, false, config_.mesh_fleet_iv_index, config_.mesh_fleet_unicast);
         }
         return;
     }
     if (status.addresses.size() != 1 ||
         status.addresses.front() != local_number_) {
-        throw std::runtime_error("Stored Mesh address differs from fleet address; refusing unsafe reuse");
+        throw std::runtime_error("Stored Mesh address differs from this UAV number; refusing unsafe reuse");
     }
     if (std::chrono::duration<double>(now - bootstrap_started_at_).count() >=
         config_.mesh_swarm_startup_grace) update_selection(now);
     maintain_local_model(status, now);
     publish_coordination_heartbeat(now);
-    if (automatic_private_) maintain_auto_enrollment(status, now);
+    maintain_auto_enrollment(status, now);
     return;
 }
 
@@ -466,13 +456,9 @@ void MeshSwarmCoordinator::maintain_local_model(
     const uint16_t local_address = status.addresses.front();
     try {
         if (local_model_stage_ == 0) {
-            if (automatic_private_) {
-                if (!application_.prepare_auto_keys(local_address)) {
-                    next_local_model_action_ = now + kRetryDelay;
-                    return;
-                }
-            } else {
-                application_.prepare_fleet_keys();
+            if (!application_.prepare_auto_keys(local_address)) {
+                next_local_model_action_ = now + kRetryDelay;
+                return;
             }
             ++local_model_stage_;
         } else if (local_model_stage_ == 1) {
@@ -630,6 +616,15 @@ void MeshSwarmCoordinator::maintain_auto_enrollment(
             now - previous < std::chrono::seconds(55)) continue;
         last_direct_attempt_[number] = now;
         try {
+            // A momentarily lost heartbeat does not make an attached node
+            // unprovisioned. BlueZ retains the remote Device Key for members
+            // already enrolled in this network. Reopening PB-ADV for such a
+            // member can only time out and steals radio time from Mesh data.
+            const auto known_nodes = application_.export_device_keys();
+            const bool enrolled = std::any_of(
+                known_nodes.begin(), known_nodes.end(),
+                [number](const auto& node) { return node.unicast == number; });
+            if (enrolled) continue;
             const auto uuid = mesh_auto_uuid_from_name(member_name(number));
             application_.set_auto_provisioning_unicast(
                 static_cast<uint16_t>(number));

@@ -88,12 +88,20 @@ struct TransportBridgeManager::Impl {
     Impl(rclcpp::Node& selected_node, rclcpp::Logger selected_logger)
         : node(selected_node), logger(selected_logger) {}
 
-    void dispatch(Entry& entry, const std::vector<uint8_t>& payload) {
-        auto framed = frame_payload(entry.config.channel_id, payload);
-        if (entry.config.transport == "advertisement") {
+    // A transport callback can make a synchronous D-Bus call. Never invoke it
+    // while holding mutex: a Mesh receive callback runs on the D-Bus thread
+    // and needs this same mutex to publish an incoming bridge message.
+    static void dispatch(const config::SharedTopicConfig& config,
+                         const std::vector<uint8_t>& payload,
+                         const AdvertisementSender& advertisement_sender,
+                         const MeshSender& mesh_sender) {
+        if (config.transport == "advertisement") {
             if (!advertisement_sender) {
                 throw std::runtime_error("advertisement bridge sender is unavailable");
             }
+            auto framed = config.advertisement_bare
+                ? payload
+                : frame_payload(config.channel_id, payload);
             advertisement_sender(framed);
             return;
         }
@@ -102,46 +110,65 @@ struct TransportBridgeManager::Impl {
             throw std::runtime_error("Mesh bridge sender is unavailable");
         }
         std::vector<uint8_t> access_payload{
-            entry.config.mesh_vendor_opcode,
-            static_cast<uint8_t>(entry.config.mesh_company_id & 0xffU),
-            static_cast<uint8_t>(entry.config.mesh_company_id >> 8)};
+            config.mesh_vendor_opcode,
+            static_cast<uint8_t>(config.mesh_company_id & 0xffU),
+            static_cast<uint8_t>(config.mesh_company_id >> 8)};
+        const auto framed = frame_payload(config.channel_id, payload);
         access_payload.insert(access_payload.end(), framed.begin(), framed.end());
-        mesh_sender(entry.config, access_payload);
+        mesh_sender(config, access_payload);
     }
 
     void handle_local_message(
         const std::string& key,
         const std::shared_ptr<rclcpp::SerializedMessage>& message) {
-        std::lock_guard<std::recursive_mutex> lock(mutex);
-        const auto found = entries.find(key);
-        if (found == entries.end()) return;
-        auto& entry = found->second;
+        config::SharedTopicConfig config;
+        AdvertisementSender advertisement;
+        MeshSender mesh;
+        std::vector<uint8_t> payload;
         try {
-            auto payload = entry.runtime->encode_payload(
-                *message, entry.config.member_specs, entry.config.payload_format);
-            if (entry.config.rate_hz > 0.0) {
-                entry.pending_payload = std::move(payload);
-            } else {
-                dispatch(entry, payload);
+            {
+                std::lock_guard<std::recursive_mutex> lock(mutex);
+                const auto found = entries.find(key);
+                if (found == entries.end()) return;
+                auto& entry = found->second;
+                payload = entry.runtime->encode_payload(
+                    *message, entry.config.member_specs, entry.config.payload_format);
+                if (entry.config.rate_hz > 0.0) {
+                    entry.pending_payload = std::move(payload);
+                    return;
+                }
+                config = entry.config;
+                advertisement = advertisement_sender;
+                mesh = mesh_sender;
             }
+            dispatch(config, payload, advertisement, mesh);
         } catch (const std::exception& error) {
             RCLCPP_WARN_THROTTLE(
                 logger, *node.get_clock(), 5000,
                 "Could not encode %s bridge channel %u: %s",
-                entry.config.transport.c_str(), entry.config.channel_id,
+                config.transport.c_str(), config.channel_id,
                 error.what());
         }
     }
 
     void flush(const std::string& key) {
-        std::lock_guard<std::recursive_mutex> lock(mutex);
-        const auto found = entries.find(key);
-        if (found == entries.end() || !found->second.pending_payload) return;
-        auto& entry = found->second;
-        auto payload = std::move(*entry.pending_payload);
-        entry.pending_payload.reset();
+        config::SharedTopicConfig config;
+        AdvertisementSender advertisement;
+        MeshSender mesh;
+        std::vector<uint8_t> payload;
+        {
+            std::lock_guard<std::recursive_mutex> lock(mutex);
+            const auto found = entries.find(key);
+            if (found == entries.end() || !found->second.pending_payload) return;
+            auto& entry = found->second;
+            config = entry.config;
+            advertisement = advertisement_sender;
+            mesh = mesh_sender;
+            payload = std::move(*entry.pending_payload);
+            entry.pending_payload.reset();
+        }
         try {
-            dispatch(entry, payload);
+            dispatch(config, payload, advertisement, mesh);
         } catch (const std::exception& error) {
             // A transport may legitimately be unavailable while BlueZ is
             // starting or a Mesh member is being provisioned. Keep that state
@@ -149,7 +176,7 @@ struct TransportBridgeManager::Impl {
             RCLCPP_WARN_THROTTLE(
                 logger, *node.get_clock(), 5000,
                 "Could not send %s bridge channel %u: %s",
-                entry.config.transport.c_str(), entry.config.channel_id,
+                config.transport.c_str(), config.channel_id,
                 error.what());
         }
     }
@@ -184,7 +211,8 @@ struct TransportBridgeManager::Impl {
                 std::dynamic_pointer_cast<rclcpp::GenericPublisher>(base_publisher);
             if (!publisher) return false;
             auto serialized = entry.runtime->decode_payload(
-                payload, entry.config.member_specs, entry.config.payload_format);
+                payload, entry.config.member_specs, entry.config.payload_format,
+                entry.config.decode_assignments);
             publisher->publish(serialized);
             if (deduplicate) entry.last_received_payload[token] = payload;
             return true;
@@ -303,8 +331,6 @@ bool TransportBridgeManager::handle_advertisement(
     const std::string& hostname,
     const std::string& mac,
     const std::vector<uint8_t>& payload) {
-    const auto frame = unframe_payload(payload, 0);
-    if (!frame) return false;
     std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     const auto normalized_peer = util::lower_trim_copy(hostname);
     const auto normalized_mac = util::lower_trim_copy(mac);
@@ -312,13 +338,17 @@ bool TransportBridgeManager::handle_advertisement(
         std::find(impl_->peer_whitelist.begin(), impl_->peer_whitelist.end(),
                   normalized_peer) == impl_->peer_whitelist.end() &&
         std::find(impl_->peer_whitelist.begin(), impl_->peer_whitelist.end(),
-                  normalized_mac) == impl_->peer_whitelist.end()) {
-        return false;
-    }
-    const auto found = impl_->entries.find(
-        entry_key("advertisement", frame->first));
-    if (found == impl_->entries.end() || !imports(found->second.config)) return false;
+                  normalized_mac) == impl_->peer_whitelist.end()) return false;
     const auto peer = hostname.empty() ? "mac_" + mac : hostname;
+    const auto bare = impl_->entries.find(entry_key("advertisement", 0));
+    if (bare != impl_->entries.end() && bare->second.config.advertisement_bare) {
+        if (!imports(bare->second.config)) return false;
+        return impl_->publish(bare->second, peer, payload, true);
+    }
+    const auto frame = unframe_payload(payload, 0);
+    if (!frame) return false;
+    const auto found = impl_->entries.find(entry_key("advertisement", frame->first));
+    if (found == impl_->entries.end() || !imports(found->second.config)) return false;
     return impl_->publish(found->second, peer, frame->second, true);
 }
 

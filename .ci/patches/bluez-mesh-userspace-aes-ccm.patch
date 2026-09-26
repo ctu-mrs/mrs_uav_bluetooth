@@ -1,0 +1,166 @@
+diff --git a/Makefile.mesh b/Makefile.mesh
+index bd3a542..b9a5343 100644
+--- a/Makefile.mesh
++++ b/Makefile.mesh
+@@ -45,7 +45,7 @@ mesh/mesh.$(OBJEXT): ell/internal
+ mesh/main.$(OBJEXT): src/builtin.h lib/bluetooth/bluetooth.h
+ 
+ mesh_bluetooth_meshd_SOURCES = $(mesh_sources) mesh/main.c
+-mesh_bluetooth_meshd_LDADD = src/libshared-ell.la $(ell_ldadd) -ljson-c
++mesh_bluetooth_meshd_LDADD = src/libshared-ell.la $(ell_ldadd) -ljson-c -lcrypto
+ 
+ if MANPAGES
+ man_MANS += doc/bluetooth-meshd.8
+diff --git a/mesh/crypto.c b/mesh/crypto.c
+index a03dc94..e3597dc 100644
+--- a/mesh/crypto.c
++++ b/mesh/crypto.c
+@@ -17,6 +17,7 @@
+ #include <sys/socket.h>
+ #include <time.h>
+ #include <ell/ell.h>
++#include <openssl/evp.h>
+ 
+ #include "mesh/mesh-defs.h"
+ #include "mesh/net.h"
+@@ -86,16 +87,33 @@ bool mesh_crypto_aes_ccm_encrypt(const uint8_t nonce[13], const uint8_t key[16],
+ 					const void *msg, uint16_t msg_len,
+ 					void *out_msg, size_t mic_size)
+ {
+-	void *cipher;
+-	bool result;
+-
+-	cipher = l_aead_cipher_new(L_AEAD_CIPHER_AES_CCM, key, 16, mic_size);
++	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
++	uint8_t *tag = (uint8_t *) out_msg + msg_len;
++	int len;
++	bool result = false;
+ 
+-	result = l_aead_cipher_encrypt(cipher, msg, msg_len, aad, aad_len,
+-					nonce, 13, out_msg, msg_len + mic_size);
++	if (!ctx)
++		return false;
+ 
+-	l_aead_cipher_free(cipher);
++	/* CCM requires the nonce, tag size, and total plaintext length before
++	 * the single payload update. OpenSSL performs this entirely in userspace,
++	 * so a host need not expose the kernel algif_aead interface. */
++	if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ccm(), NULL, NULL, NULL) != 1 ||
++		EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 13, NULL) != 1 ||
++		EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
++					mic_size, NULL) != 1 ||
++		EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) != 1 ||
++		EVP_EncryptUpdate(ctx, NULL, &len, NULL, msg_len) != 1 ||
++		(aad_len && EVP_EncryptUpdate(ctx, NULL, &len, aad,
++						aad_len) != 1) ||
++		EVP_EncryptUpdate(ctx, out_msg, &len, msg, msg_len) != 1 ||
++		EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG,
++					mic_size, tag) != 1)
++		goto done;
+ 
++	result = true;
++done:
++	EVP_CIPHER_CTX_free(ctx);
+ 	return result;
+ }
+ 
+@@ -105,15 +123,36 @@ bool mesh_crypto_aes_ccm_decrypt(const uint8_t nonce[13], const uint8_t key[16],
+ 				void *out_msg,
+ 				void *out_mic, size_t mic_size)
+ {
+-	void *cipher;
+-	bool result;
+-	size_t out_msg_len = enc_msg_len - mic_size;
++	EVP_CIPHER_CTX *ctx;
++	const uint8_t *tag;
++	size_t out_msg_len;
++	int len;
++	bool result = false;
++
++	if (enc_msg_len < mic_size)
++		return false;
+ 
+-	cipher = l_aead_cipher_new(L_AEAD_CIPHER_AES_CCM, key, 16, mic_size);
++	out_msg_len = enc_msg_len - mic_size;
++	tag = (const uint8_t *) enc_msg + out_msg_len;
++	ctx = EVP_CIPHER_CTX_new();
++	if (!ctx)
++		return false;
++
++	/* EVP_DecryptUpdate authenticates the CCM payload with the supplied tag.
++	 * Never release an unauthenticated plaintext to the Mesh caller. */
++	if (EVP_DecryptInit_ex(ctx, EVP_aes_128_ccm(), NULL, NULL, NULL) != 1 ||
++		EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 13, NULL) != 1 ||
++		EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
++					mic_size, (void *) tag) != 1 ||
++		EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce) != 1 ||
++		EVP_DecryptUpdate(ctx, NULL, &len, NULL, out_msg_len) != 1 ||
++		(aad_len && EVP_DecryptUpdate(ctx, NULL, &len, aad,
++						aad_len) != 1) ||
++		EVP_DecryptUpdate(ctx, out_msg, &len, enc_msg,
++						out_msg_len) != 1)
++		goto done;
+ 
+-	result = l_aead_cipher_decrypt(cipher, enc_msg, enc_msg_len,
+-							aad, aad_len, nonce, 13,
+-							out_msg, out_msg_len);
++	result = true;
+ 
+ 	if (result && out_mic) {
+ 		if (mic_size == 4)
+@@ -124,8 +163,8 @@ bool mesh_crypto_aes_ccm_decrypt(const uint8_t nonce[13], const uint8_t key[16],
+ 				l_get_be64(enc_msg + enc_msg_len - mic_size);
+ 	}
+ 
+-	l_aead_cipher_free(cipher);
+-
++done:
++	EVP_CIPHER_CTX_free(ctx);
+ 	return result;
+ }
+ 
+@@ -1023,7 +1062,6 @@ static const uint8_t crypto_test_result[] = {
+ 
+ bool mesh_crypto_check_avail(void)
+ {
+-	void *cipher;
+ 	bool result;
+ 	uint8_t i;
+ 	union {
+@@ -1043,22 +1081,13 @@ bool mesh_crypto_check_avail(void)
+ 		u.bytes[i] = 0x60 + i;
+ 	}
+ 
+-	cipher = l_aead_cipher_new(L_AEAD_CIPHER_AES_CCM, u.crypto.key,
+-				sizeof(u.crypto.key), sizeof(u.crypto.mic));
+-
+-	if (!cipher)
+-		return false;
+-
+-	result = l_aead_cipher_encrypt(cipher,
+-				u.crypto.data, sizeof(u.crypto.data),
++	result = mesh_crypto_aes_ccm_encrypt(u.crypto.nonce, u.crypto.key,
+ 				u.crypto.aad, sizeof(u.crypto.aad),
+-				u.crypto.nonce, sizeof(u.crypto.nonce),
+-				out_msg, sizeof(out_msg));
++				u.crypto.data, sizeof(u.crypto.data),
++				out_msg, sizeof(u.crypto.mic));
+ 
+ 	if (result)
+ 		result = !memcmp(out_msg, crypto_test_result, sizeof(out_msg));
+ 
+-	l_aead_cipher_free(cipher);
+-
+ 	return result;
+ }
+diff --git a/Makefile.tools b/Makefile.tools
+--- a/Makefile.tools
++++ b/Makefile.tools
+@@ -405,6 +405,6 @@ tools_mesh_cfgclient_SOURCES = tools/mesh-cfgclient.c \
+ 				mesh/crypto.h mesh/crypto.c
+ 
+ tools_mesh_cfgclient_LDADD = lib/libbluetooth-internal.la src/libshared-ell.la \
+-						$(ell_ldadd) -ljson-c -lreadline
++						$(ell_ldadd) -ljson-c -lreadline -lcrypto
+ 
+ bin_PROGRAMS +=  tools/mesh-cfgtest

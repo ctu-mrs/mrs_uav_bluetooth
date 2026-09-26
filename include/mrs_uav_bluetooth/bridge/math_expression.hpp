@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#pragma once
+
+#include <functional>
+#include <optional>
+#include <string>
+
+namespace mrs_uav_bluetooth::bridge {
+
+/// Evaluate a small arithmetic relation from an overlay declaration.
+/// Identifiers are resolved by the caller, so the same evaluator works on
+/// source ROS fields during encoding and on named wire values during decoding.
+/// Supported operators are +, -, *, and /. Supported functions include
+/// sin, cos, asin, atan2, sqrt, abs, floor, round, min, max, and clamp.
+double evaluate_math_expression(
+    const std::string& expression,
+    const std::function<double(const std::string&)>& resolve_identifier);
+
+using ExactInteger = __int128_t;
+
+/// Evaluate a relation exactly when all literals and resolved fields are
+/// integers. Decimal literals, floating-point fields, pi, and functions
+/// select the floating-point evaluator instead. Integer division truncates
+/// toward zero and % gives the remainder. Overflow and division by zero fail.
+std::optional<ExactInteger> try_evaluate_integer_expression(
+    const std::string& expression,
+    const std::function<std::optional<ExactInteger>(const std::string&)>& resolve_identifier);
+
+}  // namespace mrs_uav_bluetooth::bridge

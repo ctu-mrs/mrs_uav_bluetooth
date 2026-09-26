@@ -54,7 +54,7 @@ mesh_provisioner: false
 # Client/Server as an advertising-bearer relay. This is disabled in the base
 # config and enabled by the automatic swarm Mesh service overlay.
 mesh_auto_configure_relay: false
-# Default access-message hop limit. Valid values are 0 or 2..127; the swarm
+# Default access-message hop limit. Valid values are 0 or 2..127. The swarm
 # examples use 127 so topology, rather than a small TTL, limits reachability.
 mesh_default_ttl: 127
 # Relay retransmit count (0..7) and 10 ms interval steps (0..31). A count of 1
@@ -65,8 +65,7 @@ mesh_relay_retransmit_interval_steps: 2
 # Automatic swarm enrollment creates a private network when necessary and
 # provisions nearby listed peers. Identity and keys are stored by the service.
 mesh_swarm_auto_provisioning: false
-# Optional legacy mesh_fleet credentials are accepted, but normal automatic
-# operation does not need users to generate, copy, or maintain any key file.
+# The service generates and stores Mesh identity and keys automatically.
 mesh_swarm_id: 1
 mesh_swarm_participating: true
 mesh_swarm_state_path: "/var/lib/mrs_uav_bluetooth/swarm-{hostname}.txt"
@@ -76,11 +75,14 @@ mesh_provisioner_preference: ordered
 # Observe heartbeats for this long before selecting the first live coordinator.
 mesh_swarm_startup_grace: 5.0
 mesh_swarm_heartbeat_period: 1.0
-mesh_swarm_provisioner_timeout: 4.0
+# Keep a peer present across brief losses of its one-second Mesh heartbeat.
+# A short lease causes unnecessary role changes and PB-ADV attempts while
+# segmented application messages occupy the radio.
+mesh_swarm_provisioner_timeout: 20.0
 mesh_swarm_group_address: 0xc000
 mesh_swarm_network_index: 0
 mesh_swarm_app_key_index: 0
-# Manual PB-ADV allocation cursor; fleet import uses the UAV number instead.
+# Persistent address cursor for provisioning through the general Mesh API.
 mesh_unicast_cursor_path: "/var/lib/mrs_uav_bluetooth/mesh-unicast-{hostname}.cursor"
 
 # Empty derives a stable 128-bit UUID from the local hostname.
@@ -168,9 +170,12 @@ advertise_mode: peripheral
 # - legacy: 31-byte advertisements visible to older BLE controllers (e.g. Raspberry Pi boards).
 # - extended: use adapter MaxAdvLen and secondary-channel advertising when supported (e.g. Intel NUC boards).
 advertise_size: legacy
+# The advertised local name is this UAV's hostname. On the tested legacy
+# adapters BlueZ puts it in the scan response, outside the primary data value.
+advertise_local_name: "{hostname}"
 
 # Optional ROS input for a raw advertisement payload. It is consumed only by
-# an explicit advertise_mode: broadcast overlay with Mesh disabled; peripheral
+# an explicit advertise_mode: broadcast overlay with Mesh disabled. Peripheral
 # GATT and Mesh modes ignore it to preserve exclusive radio ownership.
 advertise_extra_data_topic: "/{hostname}/bluetooth/le/advertisement"
 
@@ -186,30 +191,45 @@ scan_mode: le
 # Common fields:
 # - transport: gatt | advertisement | mesh (default: gatt).
 # - mode: export | import | both.
-# - export_topic: local ROS topic; {hostname} is expanded automatically.
+# - export_topic: local ROS topic. {hostname} is expanded automatically.
 # - import_topic_suffix: optional peer-topic suffix. By default the canonical
 #   export topic is used below bluetooth/<transport>/peers/<peer>/.
 # - message_type: introspectable ROS interface, e.g. nav_msgs/msg/Odometry.
-# - rate_hz: 0 sends every source sample; positive values retain only the newest
+# - rate_hz: 0 sends every source sample. Positive values retain only the newest
 #   sample and transmit at the requested rate.
 # - payload_format: struct | raw | ros2.
 #   * struct packs the ordered numeric members below, little-endian.
 #   * raw is shorthand for std_msgs/msg/UInt8MultiArray member data[:].
 #   * ros2 sends the complete serialized message and is normally too large for
 #     legacy advertisements.
-# - members: ordered {path, type} codec definitions. Nested fields, indices,
-#   fixed slices, and one open-ended final dynamic array are supported.
-# - channel_id: required unique 1..65535 routing ID for advertisement and mesh.
+# - members_encode: ordered {target, type} direct fields or
+#   {target, type, expression} computed wire fields. The type is always the
+#   final scalar wire type. Without an expression, target is a ROS field path.
+# - members_decode: optional {target, expression} relations. Here target is a
+#   ROS field path and expressions use the encoded targets as wire-value names.
+#   Direct encode members are decoded automatically.
+#   Integer-only expressions are evaluated exactly, including / and %.
+#   Integer division truncates toward zero. Decimal literals, floating fields,
+#   and math functions select floating-point arithmetic instead. Integer
+#   destinations are rounded if needed and range-checked after evaluation.
+#   Nested fields, indices, fixed slices, and one open-ended final dynamic
+#   array are supported for direct fields.
+# - channel_id: required unique 1..65535 routing ID for framed advertisement
+#   and mesh bridges. A sole advertisement bridge can use framing: bare.
 #
 # Mesh-only routing fields mirror /{hostname}/bluetooth/mesh/send:
 # destination, app_key_index, element_index, force_segmented, vendor_opcode,
 # and company_id. Defaults follow the mesh_swarm_* and mesh_company_id values.
 #
 # Advertisement has one local dynamic Data field, so only one configured export
-# may be active. Its encoded data plus the five-byte bridge envelope must fit
-# the controller budget (usually 26 bytes with legacy advertising). GATT compact
-# values should normally stay below 244 bytes; Mesh can segment larger frames.
+# may be active. Its encoded data plus the optional five-byte bridge envelope
+# must fit the controller budget. A legacy 31-byte packet normally leaves 26
+# bytes for a Data value when the local name goes in the scan response and no
+# other primary fields compete for space.
+# GATT struct values should normally stay below 244 bytes. Mesh can segment
+# larger frames.
 #
 # Supported compact types: bool, int8, uint8, int16, uint16, int32, uint32,
-# int64, uint64, float32, float64, time_ns. `time_ns` maps a ROS Time member.
+# int64, uint64, float32, float64. Split ROS Time into scalar sec and nanosec
+# declarations as shown in the GATT and Mesh examples.
 shared_topics: []

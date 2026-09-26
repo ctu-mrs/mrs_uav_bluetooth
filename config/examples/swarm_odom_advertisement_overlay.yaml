@@ -9,6 +9,10 @@ node_topics_prefix: "/{hostname}/bluetooth"
 # and disabled GATT/pairing settings prevent a connection from stopping the
 # controller's advertisement data stream.
 advertise_mode: broadcast
+advertise_size: legacy
+# The 26-byte bare value occupies the full primary legacy packet after BLE
+# overhead. BlueZ places this local name in the scan response on both test UAVs.
+advertise_local_name: "{hostname}"
 advertise_discoverable: false
 enable_server: true
 enable_scan: true
@@ -23,24 +27,81 @@ peer_whitelist:
   - uav42
   - uav99
 
-# Legacy advertisements have a very small payload budget. The generalized
-# compact codec below selects an 8-byte timestamp and 4-byte X position.
-# The 5-byte bridge envelope brings the total to 17 bytes, which fits the
-# smallest user-data budget observed on the test UAVs. Add more fields only
-# when every radio supports the larger advertisement. Received samples appear below:
+# A legacy advertisement holds 31 bytes. BLE flags use 3 bytes and the
+# advertisement Data field header uses 2. The bare codec fills the remaining
+# 26 bytes with an 8-byte Unix nanosecond timestamp, 6 bytes for
+# quaternion-derived roll/pitch/yaw, and three float32 XYZ coordinates (12 B).
+# Types below describe the final wire representation. The general encode and
+# decode expressions perform every conversion, with no odometry-specific codec.
+# Received samples appear below:
 # /{hostname}/bluetooth/le/peers/<peer>/mavros/local_position/odom
 shared_topics:
   - name: swarm_odometry_advertisement
     transport: advertisement
-    channel_id: 1001
+    framing: bare
     mode: both
     payload_format: struct
     export_topic: /{hostname}/mavros/local_position/odom
     import_topic_suffix: mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
     rate_hz: 1.0
-    members:
-      - path: header.stamp
-        type: time_ns
-      - path: pose.pose.position.x
+    members_encode:
+      # Integer-only arithmetic preserves the full Unix nanosecond value.
+      - target: timestamp_ns
+        type: uint64
+        expression: header.stamp.sec * 1000000000 + header.stamp.nanosec
+
+      # The source quaternion is expected to be normalized, as ROS odometry
+      # quaternions normally are. Each signed 16-bit integer stores an angle
+      # in units of pi / 32767. The four reconstruction relations below turn
+      # the decoded integers back into a unit quaternion in members_decode.
+      - target: roll
+        type: int16
+        expression: >-
+          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.x +
+          pose.pose.orientation.y * pose.pose.orientation.z),
+          1.0 - 2.0 * (pose.pose.orientation.x * pose.pose.orientation.x +
+          pose.pose.orientation.y * pose.pose.orientation.y))
+      - target: pitch
+        type: int16
+        expression: >-
+          (32767.0 / pi) * asin(clamp(2.0 * (pose.pose.orientation.w * pose.pose.orientation.y -
+          pose.pose.orientation.z * pose.pose.orientation.x), -1.0, 1.0))
+      - target: yaw
+        type: int16
+        expression: >-
+          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.z +
+          pose.pose.orientation.x * pose.pose.orientation.y),
+          1.0 - 2.0 * (pose.pose.orientation.y * pose.pose.orientation.y +
+          pose.pose.orientation.z * pose.pose.orientation.z))
+
+      # The three position members are copied directly as float32 metres.
+      - target: pose.pose.position.x
         type: float32
+      - target: pose.pose.position.y
+        type: float32
+      - target: pose.pose.position.z
+        type: float32
+
+    # These relations rebuild ROS fields from the named wire values above.
+    members_decode:
+      - target: header.stamp.sec
+        expression: timestamp_ns / 1000000000
+      - target: header.stamp.nanosec
+        expression: timestamp_ns % 1000000000
+      - target: pose.pose.orientation.w
+        expression: >-
+          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
+          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.x
+        expression: >-
+          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) -
+          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.y
+        expression: >-
+          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
+          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.z
+        expression: >-
+          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0) -
+          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0)
