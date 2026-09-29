@@ -727,11 +727,17 @@ std::string ServiceNode::build_detailed_status_report(
         }
     }
 
+    // A silent peer's last rolling rate is historical, so render zero after its deadline.
+    const auto live_hz = [now_mono](double rate, double last_at, double idle_limit) {
+        return last_at > 0.0 && now_mono - last_at <= idle_limit ? rate : 0.0;
+    };
     std::map<std::string, std::vector<std::string>> peer_topics;
     if (peers_) {
         for (const auto& [mac, state] : peers_->time_bridges()) {
             std::ostringstream hz_stream;
-            hz_stream << std::fixed << std::setprecision(2) << state.current_hz;
+            hz_stream << std::fixed << std::setprecision(2)
+                      << live_hz(state.current_hz, state.last_publish_monotonic,
+                                 std::max(3.0, 3.0 * active_config_.time_update_period));
             peer_topics[mac].push_back(state.status_topic_name + " @ " + hz_stream.str() + " Hz");
         }
     }
@@ -740,7 +746,9 @@ std::string ServiceNode::build_detailed_status_report(
             continue;
         }
         std::ostringstream hz_stream;
-        hz_stream << std::fixed << std::setprecision(2) << state.current_hz;
+        hz_stream << std::fixed << std::setprecision(2)
+                  << live_hz(state.current_hz, state.last_publish_monotonic,
+                             state.rate_hz > 0.0 ? std::max(3.0, 3.0 / state.rate_hz) : 3.0);
         peer_topics[state.mac].push_back(state.resolved_topic_name + " @ " + hz_stream.str() + " Hz");
     }
     if (!peer_topics.empty()) {

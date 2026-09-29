@@ -226,17 +226,39 @@ MeshApplication::MeshApplication(bluez::DbusConnection& dbus,
     status_.state = "configured";
     status_.token = config_.mesh_token;
     if (status_.token == 0 && !config_.mesh_token_path.empty()) {
-        std::ifstream token_file(config_.mesh_token_path);
-        std::string token_text;
-        if (token_file >> token_text) {
+        // An unreadable existing token still owns a BlueZ node. Fail clearly so
+        // bootstrap cannot retry Join/Import with the same UUID.
+        std::error_code file_error;
+        const auto file_status =
+            std::filesystem::status(config_.mesh_token_path, file_error);
+        if (file_error &&
+            file_error != std::errc::no_such_file_or_directory) {
+            throw std::runtime_error(
+                "Cannot access persisted Mesh token " + config_.mesh_token_path +
+                ": " + file_error.message());
+        }
+        if (std::filesystem::exists(file_status) &&
+            !std::filesystem::is_regular_file(file_status)) {
+            throw std::runtime_error(
+                "Persisted Mesh token is not a regular file: " +
+                config_.mesh_token_path);
+        }
+        if (std::filesystem::is_regular_file(file_status)) {
+            std::ifstream token_file(config_.mesh_token_path);
+            std::string token_text;
+            if (!(token_file >> token_text)) {
+                throw std::runtime_error(
+                    "Cannot read persisted Mesh token " + config_.mesh_token_path);
+            }
             try {
                 size_t parsed = 0;
                 status_.token = std::stoull(token_text, &parsed, 16);
-                if (parsed != token_text.size()) status_.token = 0;
-            } catch (...) {
-                status_.token = 0;
-                RCLCPP_WARN(logger_, "Ignoring invalid Mesh token file %s",
-                            config_.mesh_token_path.c_str());
+                if (parsed != token_text.size() || status_.token == 0) {
+                    throw std::invalid_argument("invalid token value");
+                }
+            } catch (const std::exception&) {
+                throw std::runtime_error(
+                    "Invalid persisted Mesh token " + config_.mesh_token_path);
             }
         }
     }

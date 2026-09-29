@@ -6,6 +6,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <deque>
 #include <string>
 
 namespace mrs_uav_bluetooth::peer {
@@ -20,6 +21,8 @@ struct PeerTimeBridge {
     rclcpp::PublisherBase::SharedPtr publisher;
     double last_activity_monotonic{0.0};
     double last_publish_monotonic{0.0};
+    double first_publish_monotonic{0.0};
+    std::deque<double> recent_publish_times;
     double current_hz{0.0};
     uint64_t last_time_value_ns{0};
     double last_rtt_s{0.0};

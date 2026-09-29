@@ -9,6 +9,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -56,6 +57,8 @@ struct TopicImportBridgeState {
     std::vector<uint8_t> pending_payload;
     std::vector<uint8_t> last_payload;
     double last_publish_monotonic{0.0};
+    double first_publish_monotonic{0.0};
+    std::deque<double> recent_publish_times;
     double current_hz{0.0};
     std::shared_ptr<GenericMessageBridge> runtime;
 };

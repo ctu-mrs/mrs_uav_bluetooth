@@ -6,29 +6,8 @@
 
 #include "mrs_uav_bluetooth/bridge/generic_message_bridge.hpp"
 
+#include <algorithm>
 #include <chrono>
-
-namespace {
-
-struct PublishRateSample {
-    double monotonic_now;
-    double hz;
-};
-
-/// \brief Calculate the latest publication timestamp and observed one-sample frequency.
-/// \param last_publish_monotonic steady-clock time of the preceding publication for rate calculation.
-/// \return Current monotonic timestamp and frequency since the preceding publication.
-PublishRateSample update_publish_rate(double last_publish_monotonic) {
-    // Measure frequency from the previous successful publication, leaving the first sample at zero.
-    const auto now = std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
-        return {now, 1.0 / (now - last_publish_monotonic)};
-    }
-    return {now, 0.0};
-}
-
-}  // namespace
 
 namespace mrs_uav_bluetooth::bridge {
 
@@ -60,9 +39,18 @@ bool ImportBridgeManager::publish_payload(TopicImportBridgeState& state,
         publisher->publish(serialized);
         state.last_payload = payload;
         state.pending_payload.clear();
-        const auto publish_rate = update_publish_rate(state.last_publish_monotonic);
-        state.last_publish_monotonic = publish_rate.monotonic_now;
-        state.current_hz = publish_rate.hz;
+        // A rolling delivery window prevents individual callback bursts from inflating Hz.
+        const auto now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (state.first_publish_monotonic == 0.0) state.first_publish_monotonic = now;
+        state.recent_publish_times.push_back(now);
+        while (!state.recent_publish_times.empty() &&
+               now - state.recent_publish_times.front() > 20.0) {
+            state.recent_publish_times.pop_front();
+        }
+        state.last_publish_monotonic = now;
+        state.current_hz = static_cast<double>(state.recent_publish_times.size()) /
+            std::clamp(now - state.first_publish_monotonic, 2.0, 20.0);
         return true;
     } catch (const std::exception& e) {
         RCLCPP_WARN(logger_, "Failed to decode import bridge %s: %s",
@@ -213,6 +201,8 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
         state.pending_payload.clear();
         state.last_payload.clear();
         state.last_publish_monotonic = 0.0;
+        state.first_publish_monotonic = 0.0;
+        state.recent_publish_times.clear();
         state.current_hz = 0.0;
 
         if (!previous_path.empty()) {
@@ -283,6 +273,8 @@ bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
         state.pending_payload.clear();
         state.last_payload.clear();
         state.last_publish_monotonic = 0.0;
+        state.first_publish_monotonic = 0.0;
+        state.recent_publish_times.clear();
         state.current_hz = 0.0;
     }
 

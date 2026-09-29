@@ -77,24 +77,6 @@ std::string trim_topic_segment(const std::string& value) {
     return value.substr(start, end - start + 1);
 }
 
-struct PublishRateSample {
-    double monotonic_now;
-    double hz;
-};
-
-/// \brief Calculate the latest publication timestamp and observed one-sample frequency.
-/// \param last_publish_monotonic steady-clock time of the preceding publication for rate calculation.
-/// \return Current monotonic timestamp and frequency since the preceding publication.
-PublishRateSample update_publish_rate(double last_publish_monotonic) {
-    // Measure frequency from the previous successful publication, leaving the first sample at zero.
-    const auto now = std::chrono::duration<double>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
-        return {now, 1.0 / (now - last_publish_monotonic)};
-    }
-    return {now, 0.0};
-}
-
 }  // namespace
 
 namespace mrs_uav_bluetooth::app {
@@ -328,6 +310,8 @@ void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& dev
                 state.pending_payload = existing->second.pending_payload;
                 state.last_payload = existing->second.last_payload;
                 state.last_publish_monotonic = existing->second.last_publish_monotonic;
+                state.first_publish_monotonic = existing->second.first_publish_monotonic;
+                state.recent_publish_times = existing->second.recent_publish_times;
                 state.current_hz = existing->second.current_hz;
                 if (existing->second.resolved_topic_name == state.resolved_topic_name &&
                     existing->second.message_type == state.message_type) {
@@ -452,6 +436,18 @@ void ServiceNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const {
     msg.peer_stamp.nanosec = static_cast<uint32_t>(bridge.last_time_value_ns % 1000000000ULL);
     msg.last_rtt_s = bridge.last_rtt_s;
     publisher->publish(msg);
+    // Measure only completed notification/writeback reports published to ROS.
+    const auto now = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (bridge.first_publish_monotonic == 0.0) bridge.first_publish_monotonic = now;
+    bridge.recent_publish_times.push_back(now);
+    while (!bridge.recent_publish_times.empty() &&
+           now - bridge.recent_publish_times.front() > 20.0) {
+        bridge.recent_publish_times.pop_front();
+    }
+    bridge.last_publish_monotonic = now;
+    bridge.current_hz = static_cast<double>(bridge.recent_publish_times.size()) /
+        std::clamp(now - bridge.first_publish_monotonic, 2.0, 20.0);
 }
 
 void ServiceNode::on_notification(const std::vector<uint8_t>& data,
@@ -510,9 +506,6 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
     bridge.last_activity_monotonic = peers_->now_monotonic();
     bridge.last_time_value_ns = peer_time_ns;
     bridge.time_notification_received = true;
-    const auto publish_rate = update_publish_rate(bridge.last_publish_monotonic);
-    bridge.last_publish_monotonic = publish_rate.monotonic_now;
-    bridge.current_hz = publish_rate.hz;
     if (bridge.time_writeback_received) {
         bridge.status = "ready";
         bridge.detail = "time notification";
@@ -523,7 +516,7 @@ void ServiceNode::on_notification(const std::vector<uint8_t>& data,
             session_it->second.bridge_wait_started_monotonic = 0.0;
             session_it->second.bridge_wait_reason.clear();
         }
-        publish_peer_time_status(bridge);
+        // The matching writeback publishes one complete time/RTT sample.
     } else {
         bridge.status = "subscribing";
         bridge.detail = "time notification received, awaiting writeback";
