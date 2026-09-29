@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bridge/export_bridge_manager.cpp
+/// \brief Implements the export bridge manager component of the transport-independent ROS message bridge.
+
 #include "mrs_uav_bluetooth/bridge/export_bridge_manager.hpp"
 
 #include "mrs_uav_bluetooth/bridge/generic_message_bridge.hpp"
@@ -6,6 +9,7 @@
 namespace mrs_uav_bluetooth::bridge {
 
 std::shared_ptr<GenericMessageBridge> ExportBridgeManager::runtime_for(TopicExportBridgeState& state) {
+    // Create the type-erased ROS codec lazily and reuse it for this bridge.
     if (!state.runtime || state.runtime->message_type() != state.message_type) {
         state.runtime = std::make_shared<GenericMessageBridge>(state.message_type);
     }
@@ -46,19 +50,24 @@ void ExportBridgeManager::configure_export_bridge(const std::string& bridge_key,
 }
 
 ExportBridgeManager::ExportBridgeManager(rclcpp::Node& node, rclcpp::Logger logger)
-    : node_(node), logger_(logger) {}
+    : node_(node), logger_(logger) {
+        // Retain the ROS node and logger used by outgoing subscriptions and GATT services.
+    }
 
 void ExportBridgeManager::set_registry(BridgeRegistry* registry) {
+    // Attach the shared registry that owns all configured export bridge state.
     registry_ = registry;
 }
 
 void ExportBridgeManager::set_state_mutex(std::recursive_mutex* mutex) {
+    // Share the recursive overlay mutex with bridge subscription callbacks.
     state_mutex_ = mutex;
 }
 
 void ExportBridgeManager::rebuild_gatt_services(gatt::GattApplication& app,
                                                 bluez::DbusConnection& dbus,
                                                 const std::string& app_base_path) {
+    // Replace every exported bridge with a fresh service subtree under this application.
     std::unique_lock<std::recursive_mutex> state_lock;
     if (state_mutex_ != nullptr) {
         state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
@@ -111,6 +120,7 @@ void ExportBridgeManager::publish_export_payload(const std::string& bridge_key,
 }
 
 void ExportBridgeManager::destroy_export_bridge(TopicExportBridgeState& state) {
+    // Destroy export bridge.
     if (state.publish_timer) {
         state.publish_timer->cancel();
         state.publish_timer.reset();

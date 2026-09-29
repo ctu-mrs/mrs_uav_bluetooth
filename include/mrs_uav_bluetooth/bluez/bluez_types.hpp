@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/bluez/bluez_types.hpp
+/// \brief Declares the bluez types component of the BlueZ system-D-Bus integration layer.
+
 #pragma once
 
 #include <chrono>
@@ -65,7 +68,7 @@ struct GattDescriptorInfo {
     std::vector<uint8_t> value;
 };
 
-/// Adapter information.
+/// Cached Adapter1 identity, radio state, and advertising capabilities.
 struct AdapterInfo {
     std::string object_path;
     std::string address;

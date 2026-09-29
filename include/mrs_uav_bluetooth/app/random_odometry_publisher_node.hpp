@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/app/random_odometry_publisher_node.hpp
+/// \brief Declares the random odometry publisher node component of the ROS 2 application and operator-tool layer.
+
 #pragma once
 
 #include <nav_msgs/msg/odometry.hpp>
@@ -28,6 +31,7 @@ private:
     /// Draw a uniformly distributed value from the configured PRNG.
     /// @param minimum Inclusive lower bound.
     /// @param maximum Inclusive upper bound as defined by the distribution.
+    /// \return Uniform random value in the closed configured range.
     double sample(double minimum, double maximum);
 
     // Validated ROS interface and sample-distribution parameters.

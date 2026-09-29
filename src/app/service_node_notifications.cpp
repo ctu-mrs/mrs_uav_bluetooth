@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/service_node_notifications.cpp
+/// \brief Implements the service node notifications component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
 #include "mrs_uav_bluetooth/util/device_utils.hpp"
@@ -14,23 +17,43 @@
 
 namespace {
 
+/// \brief Require a resolved GATT tree with the bridge service before starting imports.
+/// \param device Peer checked for the connection and GATT state needed by a bridge.
+/// \param config Bridge enablement and connection-policy settings.
+/// \return True when device can host peer bridge; otherwise false.
 bool device_can_host_peer_bridge(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
                                  const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Require a resolved GATT tree with the bridge service before starting imports.
     (void)config;
     return device.connected && device.services_resolved;
 }
 
+/// \brief Derive the peer-facing characteristic name for a host-specific bridge.
+/// \param host hostname used to derive deterministic bridge names.
+/// \param bridge_topic_path path of the bridge topic.
+/// \return Deterministic remote characteristic name for the peer-specific bridge.
 std::string bridge_characteristic_name_for_host(const std::string& host,
                                                 const std::string& bridge_topic_path) {
+    // Derive the peer-facing characteristic name for a host-specific bridge.
     return "/" + mrs_uav_bluetooth::util::sanitize_topic_suffix(host) + bridge_topic_path;
 }
 
+/// \brief Derive the peer-facing service name for a host-specific bridge.
+/// \param host hostname used to derive deterministic bridge names.
+/// \param bridge_topic_path path of the bridge topic.
+/// \return Deterministic remote service name for the peer-specific bridge.
 std::string bridge_service_name_for_host(const std::string& host,
                                          const std::string& bridge_topic_path) {
+    // Derive the peer-facing service name for a host-specific bridge.
     return "bridge:" + bridge_characteristic_name_for_host(host, bridge_topic_path);
 }
 
+/// \brief Derive a collision-resistant ROS topic component for one peer.
+/// \param peer_name Resolved peer hostname converted into a ROS-safe topic component.
+/// \param mac peer Bluetooth MAC address.
+/// \return ROS-safe peer token with a collision-resistant address suffix.
 std::string peer_topic_token(const std::string& peer_name, const std::string& mac) {
+    // Derive a collision-resistant ROS topic component for one peer.
     auto token = mrs_uav_bluetooth::util::sanitize_topic_suffix(peer_name);
     if (token.empty() || token == "ble_device") {
         token = "mac_" + mrs_uav_bluetooth::util::sanitize_topic_suffix(mac);
@@ -41,7 +64,11 @@ std::string peer_topic_token(const std::string& peer_name, const std::string& ma
     return token;
 }
 
+/// \brief Remove whitespace and slashes around one configured topic component.
+/// \param value ROS topic component to strip of surrounding slashes.
+/// \return Topic component without surrounding whitespace or slashes.
 std::string trim_topic_segment(const std::string& value) {
+    // Trim topic segment.
     const auto start = value.find_first_not_of(" \t\r\n/");
     if (start == std::string::npos) {
         return {};
@@ -55,7 +82,11 @@ struct PublishRateSample {
     double hz;
 };
 
+/// \brief Calculate the latest publication timestamp and observed one-sample frequency.
+/// \param last_publish_monotonic steady-clock time of the preceding publication for rate calculation.
+/// \return Current monotonic timestamp and frequency since the preceding publication.
 PublishRateSample update_publish_rate(double last_publish_monotonic) {
+    // Measure frequency from the previous successful publication, leaving the first sample at zero.
     const auto now = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
@@ -69,6 +100,7 @@ PublishRateSample update_publish_rate(double last_publish_monotonic) {
 namespace mrs_uav_bluetooth::app {
 
 void ServiceNode::note_local_time_notify_state(bool enabled) {
+    // Attribute the single local time subscription to the sole connected desired peer.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !client_) {
         return;
@@ -108,6 +140,7 @@ void ServiceNode::note_local_time_notify_state(bool enabled) {
 }
 
 bool ServiceNode::has_ready_peer_time_bridge(const std::string& mac) const {
+    // Readiness requires a retained per-peer bridge whose handshake completed.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_) {
         return false;
@@ -120,6 +153,7 @@ bool ServiceNode::has_ready_peer_time_bridge(const std::string& mac) const {
 double ServiceNode::healthy_peer_time_bridge_last_activity_monotonic(
     const std::string& mac,
     double max_inactivity_s) const {
+    // Return the latest valid notification or writeback time for lease tracking.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || max_inactivity_s <= 0.0) {
         return 0.0;
@@ -144,6 +178,7 @@ double ServiceNode::healthy_peer_time_bridge_last_activity_monotonic(
 
 bool ServiceNode::should_preserve_peer_bridge_runtime_during_expected_services_rediscovery(
     const bluez::DeviceInfo& device) const {
+    // Keep a healthy bridge only during the bounded post-connect rediscovery window.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !device.connected || device.services_resolved) {
         return false;
@@ -198,6 +233,7 @@ bool ServiceNode::should_preserve_ready_bridge_during_expected_services_rediscov
 }
 
 bool ServiceNode::device_can_host_peer_bridge(const bluez::DeviceInfo& device) const {
+    // Require a resolved GATT tree with the bridge service before starting imports.
     const bool pairing_ready = !active_config_.auto_pair || device.paired || device.bonded;
     return pairing_ready &&
            device.connected &&
@@ -206,13 +242,14 @@ bool ServiceNode::device_can_host_peer_bridge(const bluez::DeviceInfo& device) c
 }
 
 bool ServiceNode::device_can_host_peer_import_bridges(const bluez::DeviceInfo& device) const {
-    return device.connected &&
-           (has_ready_peer_time_bridge(device.mac) ||
-            should_preserve_ready_bridge_during_expected_services_rediscovery(device));
+    // Topic data carries its own ROS timestamp. Clock-offset synchronization
+    // is independent and must not suppress a healthy GATT topic bridge.
+    return device_can_host_peer_bridge(device);
 }
 
 void ServiceNode::clear_peer_runtime(const std::string& mac,
                                      const std::string& skip_characteristic_path) {
+    // Remove notification ownership, time state, and imported topics for this peer.
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !client_ || !import_bridges_) {
         return;
@@ -241,6 +278,7 @@ void ServiceNode::clear_peer_runtime(const std::string& mac,
 }
 
 void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& device) {
+    // Refresh import bridges for device.
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!import_bridges_ || !client_ || !peers_) {
         return;
@@ -321,6 +359,7 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
                                                const std::set<std::string>& desired_keys,
                                                double now_mono,
                                                double missing_path_grace_s) {
+    // Remove paths only after their discovery grace expires, preserving transient rediscovery.
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !import_bridges_ || !client_) {
         return;
@@ -380,6 +419,7 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
 }
 
 std::string ServiceNode::peer_status_topic(const std::string& mac, const std::string& peer_name) const {
+    // Build the normalized per-peer status topic below the active namespace.
     return util::normalize_ros_topic(active_config_.node_topics_prefix + "/le/peers/" +
                                      peer_topic_token(peer_name, mac) + "/time_status");
 }
@@ -387,6 +427,7 @@ std::string ServiceNode::peer_status_topic(const std::string& mac, const std::st
 std::string ServiceNode::peer_bridge_topic(const std::string& mac,
                                            const std::string& peer_name,
                                            const std::string& requested_topic_suffix) const {
+    // Build the normalized topic used for one peer-specific imported bridge.
     std::string topic = active_config_.node_topics_prefix + "/le/peers/" + peer_topic_token(peer_name, mac);
     const auto suffix = trim_topic_segment(requested_topic_suffix);
     if (!suffix.empty()) {
@@ -396,6 +437,7 @@ std::string ServiceNode::peer_bridge_topic(const std::string& mac,
 }
 
 void ServiceNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const {
+    // Report the latest peer clock sample, offset, delay, and handshake state.
     auto publisher = std::dynamic_pointer_cast<rclcpp::Publisher<mrs_uav_bluetooth::msg::BlePeerTimeStatus>>(bridge.publisher);
     if (!publisher) {
         return;

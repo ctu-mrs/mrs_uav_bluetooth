@@ -1,0 +1,55 @@
+diff --git a/mesh/mesh-config-json.c b/mesh/mesh-config-json.c
+--- a/mesh/mesh-config-json.c
++++ b/mesh/mesh-config-json.c
+@@ -2356,6 +2356,13 @@ bool mesh_config_write_seq_number(struct mesh_config *cfg, uint32_t seq,
+ 		return false;
+ 
+ 	if (!cache) {
++		/* A clean shutdown may occur before the reserved range is consumed.
++		 * Never lower the durable high-water mark and risk replay after restart.
++		 */
++		if (get_int(cfg->jnode, sequenceNumber, &value) &&
++				seq < (uint32_t)value)
++			seq = (uint32_t)value;
++
+ 		if (!write_int(cfg->jnode, sequenceNumber, seq))
+ 			return false;
+ 
+diff --git a/mesh/node.c b/mesh/node.c
+--- a/mesh/node.c
++++ b/mesh/node.c
+@@ -45,8 +45,13 @@
+ #define MESH_NODE_PATH_PREFIX "/node"
+ 
+ /* Default values for a new locally created node */
+ #define DEFAULT_NEW_UNICAST 0x0001
+ #define DEFAULT_IV_INDEX 0x0000
+ 
++/* Persist a fresh sequence range before the node can transmit after attach.
++ * A daemon restart must never replay sequence numbers already seen by peers.
++ */
++#define STARTUP_SEQ_RESERVE 1024
++
+ /* Default element location: unknown */
+ #define DEFAULT_LOCATION 0x0000
+@@ -525,7 +530,20 @@ static bool init_from_storage(struct mesh_config_node *db_node,
+ 	prv_beacon_server_init(node, PRIMARY_ELE_IDX);
+ 
+ 	node->cfg = cfg;
+ 
++	/* The on-disk value is the first number available after the previous
++	 * instance. Reserve the next range synchronously before returning this
++	 * node to the Mesh daemon, including on a clean daemon restart.
++	 */
++	if (node->seq_number < 0x1000000U) {
++		uint32_t reserved = node->seq_number + STARTUP_SEQ_RESERVE;
++
++		if (reserved > 0x1000000U)
++			reserved = 0x1000000U;
++		if (!mesh_config_write_seq_number(cfg, reserved, false))
++			goto fail;
++	}
++
+ 	return true;
+ fail:
+ 	node_remove(node);

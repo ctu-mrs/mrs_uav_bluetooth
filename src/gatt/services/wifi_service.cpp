@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/gatt/services/wifi_service.cpp
+/// \brief Implements the wifi service component of the Bluetooth Low Energy GATT layer.
+
 #include "mrs_uav_bluetooth/gatt/services/wifi_service.hpp"
 
 #include "mrs_uav_bluetooth/util/string_utils.hpp"
@@ -50,18 +53,22 @@ WifiService::WifiService(DbusConnection& dbus,
     auto password_write_cb = wifi_password_write_cb;
     auto password_read_cb = wifi_password_read_cb;
     ssid_characteristic_->set_read_callback([name_cb]() -> std::vector<uint8_t> {
+        // Encode the current network name as the SSID characteristic byte value.
         auto s = name_cb();
         return {s.begin(), s.end()};
     });
     password_characteristic_->set_read_callback([password_read_cb]() {
+        // Encode the currently configured password as the writable characteristic value.
         const auto value = password_read_cb();
         return std::vector<uint8_t>(value.begin(), value.end());
     });
     status_characteristic_->set_read_callback([this]() {
+        // Encode the last apply result for the status characteristic.
         const auto value = status_text();
         return std::vector<uint8_t>(value.begin(), value.end());
     });
     ssid_characteristic_->set_write_callback([this, name_cb, password_read_cb, apply_cb](const std::vector<uint8_t>& data) {
+        // Apply the requested network name, then refresh all exposed Wi-Fi values and status.
         std::string requested(data.begin(), data.end());
         requested = trim_ascii_copy(std::move(requested));
         const auto result = apply_cb(requested);
@@ -72,6 +79,7 @@ WifiService::WifiService(DbusConnection& dbus,
         update_status((result.first ? "OK: " : "ERROR: ") + result.second);
     });
     password_characteristic_->set_write_callback([this, name_cb, password_read_cb, password_write_cb](const std::vector<uint8_t>& data) {
+        // Store the requested password, then refresh all exposed Wi-Fi values and status.
         std::string value(data.begin(), data.end());
         const auto result = password_write_cb(value);
         const auto actual_ssid = name_cb();
@@ -94,15 +102,18 @@ WifiService::WifiService(DbusConnection& dbus,
 }
 
 std::string WifiService::uuid() const {
+    // Derive the stable Wi-Fi service UUID from its public service name.
     return named_service_uuid(kWifiServiceName);
 }
 
 void WifiService::update(const std::string& ssid) {
+    // Replace the readable SSID bytes and signal subscribed clients.
     std::vector<uint8_t> payload(ssid.begin(), ssid.end());
     ssid_characteristic_->set_value(payload, true);
 }
 
 void WifiService::update_status(const std::string& status) {
+    // Update the locked status text before publishing the same bytes over GATT.
     {
         std::lock_guard<std::mutex> lock(status_mutex_);
         status_text_ = status;
@@ -112,6 +123,7 @@ void WifiService::update_status(const std::string& status) {
 }
 
 std::string WifiService::status_text() const {
+    // Copy the last Wi-Fi apply result under its mutex.
     std::lock_guard<std::mutex> lock(status_mutex_);
     return status_text_;
 }

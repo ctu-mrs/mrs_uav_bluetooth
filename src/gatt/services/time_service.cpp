@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/gatt/services/time_service.cpp
+/// \brief Implements the time service component of the Bluetooth Low Energy GATT layer.
+
 #include "mrs_uav_bluetooth/gatt/services/time_service.hpp"
 
 #include <chrono>
@@ -8,13 +11,20 @@ namespace mrs_uav_bluetooth::gatt::services {
 
 namespace {
 
+/// \brief Read the system clock as nanoseconds since the Unix epoch.
+/// \return Current system-clock time in nanoseconds.
 uint64_t now_time_ns() {
+    // Read the system clock as nanoseconds since the Unix epoch.
     auto now = std::chrono::time_point_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now());
     return static_cast<uint64_t>(now.time_since_epoch().count());
 }
 
+/// \brief Read and validate the writer's BlueZ device path from GATT call options.
+/// \param options BlueZ GATT call options expected to contain the writer's device path.
+/// \return Validated BlueZ writer device path or an empty string when omitted.
 std::string extract_device_path(const std::map<std::string, sdbus::Variant>& options) {
+    // Extract device path.
     auto it = options.find("device");
     if (it == options.end()) {
         return {};
@@ -32,21 +42,37 @@ std::string extract_device_path(const std::map<std::string, sdbus::Variant>& opt
 
 class TimeWritebackDescriptor final : public GattDescriptor {
 public:
+    /// \brief Extend the writable descriptor with a callback that identifies the writing peer.
+    /// \param dbus shared D-Bus connection used for BlueZ calls.
+    /// \param object_path D-Bus path where the time-writeback descriptor is exported.
+    /// \param uuid Stable UUID exported for the writeback descriptor.
+    /// \param flags BlueZ descriptor capabilities such as read or write.
+    /// \param parent Characteristic that owns and exposes this descriptor.
+    /// \param write_cb consumer invoked after a peer writes the descriptor.
     TimeWritebackDescriptor(bluez::DbusConnection& dbus,
                             const std::string& object_path,
                             const std::string& uuid,
                             const std::vector<std::string>& flags,
                             GattCharacteristic& parent,
                             std::function<void(const std::vector<uint8_t>&, const std::string&)> write_cb)
-        : GattDescriptor(dbus, object_path, uuid, flags, parent), write_cb_(std::move(write_cb)) {}
+        : GattDescriptor(dbus, object_path, uuid, flags, parent), write_cb_(std::move(write_cb)) {
+            // Extend the writable descriptor with a callback that identifies the writing peer.
+        }
 
 protected:
+    /// \brief Return the descriptor bytes last stored by the time-service owner.
+    /// \return Current system time encoded as eight little-endian nanosecond bytes.
     std::vector<uint8_t> on_read(const std::map<std::string, sdbus::Variant>&) override {
+        // Return the descriptor bytes last stored by the time-service owner.
         return value();
     }
 
+    /// \brief Cache the peer write, emit Value, and identify which device sent it.
+    /// \param data Bytes supplied by the remote GATT client.
+    /// \param options BlueZ write options such as peer device path offset and write type.
     void on_write(const std::vector<uint8_t>& data,
                   const std::map<std::string, sdbus::Variant>& options) override {
+        // Cache the peer write, emit Value, and identify which device sent it.
         set_value(data, true);
         if (write_cb_) {
             write_cb_(data, extract_device_path(options));
@@ -72,6 +98,7 @@ TimeService::TimeService(DbusConnection& dbus,
                          int index,
                          TimeWritebackCb writeback_cb)
     : writeback_cb_(std::move(writeback_cb)), last_writeback_(8, 0) {
+    // Build the time characteristic, readable value descriptor, and peer writeback descriptor.
     auto svc_uuid = named_service_uuid(kTimeServiceName);
     auto chrc_uuid = named_characteristic_uuid(kTimeCharacteristicName);
     auto desc_uuid = named_descriptor_uuid(kTimeDescriptorName);
@@ -86,7 +113,10 @@ TimeService::TimeService(DbusConnection& dbus,
     characteristic_ = std::make_shared<GattCharacteristic>(
         dbus, chrc_path, chrc_uuid,
         std::vector<std::string>{"read", "notify"}, *service_);
-    characteristic_->set_read_callback([this]() { return read_time(); });
+    characteristic_->set_read_callback([this]() {
+        // Encode the current system time whenever a peer reads the characteristic.
+        return read_time();
+    });
 
     time_descriptor_ = std::make_shared<GattDescriptor>(
         dbus, desc0_path, desc_uuid,
@@ -96,6 +126,7 @@ TimeService::TimeService(DbusConnection& dbus,
         dbus, desc1_path, writeback_uuid,
         std::vector<std::string>{"read", "write"}, *characteristic_,
         [this](const std::vector<uint8_t>& payload, const std::string& device_path) {
+            // Validate and forward a peer time sample together with its device path.
             handle_writeback(payload, device_path);
         });
 
@@ -111,10 +142,12 @@ TimeService::TimeService(DbusConnection& dbus,
 }
 
 std::string TimeService::uuid() const {
+    // Derive the stable time service UUID from its public service name.
     return named_service_uuid(kTimeServiceName);
 }
 
 std::vector<uint8_t> TimeService::read_time() {
+    // Encode the current nanosecond timestamp into the fixed eight-byte GATT value.
     uint64_t ns = now_time_ns();
     std::vector<uint8_t> payload(sizeof(ns));
     std::memcpy(payload.data(), &ns, sizeof(ns));
@@ -123,6 +156,7 @@ std::vector<uint8_t> TimeService::read_time() {
 
 void TimeService::handle_writeback(const std::vector<uint8_t>& payload,
                                    const std::string& device_path) {
+    // Mirror the peer bytes into the descriptor, then timestamp their callback locally.
     last_writeback_ = payload;
     if (writeback_descriptor_) {
         writeback_descriptor_->set_value(last_writeback_);
@@ -133,6 +167,7 @@ void TimeService::handle_writeback(const std::vector<uint8_t>& payload,
 }
 
 void TimeService::update() {
+    // Refresh both readable time locations and notify characteristic subscribers.
     auto payload = read_time();
     time_descriptor_->set_value(payload, true);
     characteristic_->publish(payload);

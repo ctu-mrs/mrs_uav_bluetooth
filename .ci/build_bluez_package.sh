@@ -1,9 +1,10 @@
 #!/bin/bash
 set -e ; # terminate the script if any command fails
 
-# check if the script is run as root
-if [ "$(id -u)" -ne 0 ]; then
-    echo "This script must be run as root. Please use sudo." ;
+# Dependency installation needs root. Builders with the prerequisites already
+# installed may set MRS_BLUEZ_SKIP_DEPENDENCIES=1 and package as an ordinary user.
+if [ "${MRS_BLUEZ_SKIP_DEPENDENCIES:-0}" != "1" ] && [ "$(id -u)" -ne 0 ]; then
+    echo "Run as root, or set MRS_BLUEZ_SKIP_DEPENDENCIES=1 when dependencies are installed." ;
     exit 1
 fi
 
@@ -45,28 +46,38 @@ PACKAGE_REPLACES="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-too
 BUILD_DIR="$(mktemp -d /tmp/mrs-bluez-package.XXXXXX)" ;
 cd "$BUILD_DIR" ;
 
-# install pre-requisites (with sources)
-# sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ; # this enables deb-src for apt
-apt-get -y update ;
-apt-get -y install git libasound2-dev libjson-c-dev libssl-dev python3-docutils ;
-# apt-get -y build-dep bluez ; # this installs packages obtained by: apt-cache showsrc bluez | grep ^Build-Depends
-apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, libebook1.2-dev (>= 3.12)" ;
+# Install prerequisites unless the caller has already provisioned the builder.
+if [ "${MRS_BLUEZ_SKIP_DEPENDENCIES:-0}" != "1" ] ; then
+    # sed -i '/^#\sdeb-src /s/^# *//' "/etc/apt/sources.list" ; # enables deb-src for apt
+    apt-get -y update ;
+    apt-get -y install git libasound2-dev libjson-c-dev libssl-dev python3-docutils ;
+    # apt-get -y build-dep bluez ; # packages from: apt-cache showsrc bluez | grep ^Build-Depends
+    apt-get -y satisfy "debhelper (>= 9), autotools-dev, dh-autoreconf, flex, bison, libdbus-glib-1-dev, libglib2.0-dev (>= 2.28), libcap-ng-dev, udev, libudev-dev, libreadline-dev, libical-dev, check (>= 0.9.8-1.1), systemd, libsystemd-dev, libebook1.2-dev (>= 3.12)" ;
+fi
 
 # clone the bluez and ell repositories
 git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
 git clone https://git.kernel.org/pub/scm/libs/ell/ell.git --branch $ELL_VERSION --depth 1 ;
 
-# enter the bluez directory and apply the verified source-level queue fix.
+# Enter the BlueZ directory and apply the audited daemon fixes in order.
 # A changed upstream context fails the build, rather than silently omitting it.
 cd bluez ;
-git apply --check "$PATCH_ROOT/bluez-mesh-single-tx-worker.patch" ;
-git apply "$PATCH_ROOT/bluez-mesh-single-tx-worker.patch" ;
+git apply --check "$PATCH_ROOT/bluez-adapter-mode-completion.patch" ;
+git apply "$PATCH_ROOT/bluez-adapter-mode-completion.patch" ;
+git apply --check "$PATCH_ROOT/bluez-mesh-radio-scheduler.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-radio-scheduler.patch" ;
+git apply --check "$PATCH_ROOT/bluez-mesh-sar-queue.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-sar-queue.patch" ;
 git apply --check "$PATCH_ROOT/bluez-mesh-local-pb-adv.patch" ;
 git apply "$PATCH_ROOT/bluez-mesh-local-pb-adv.patch" ;
 git apply --check "$PATCH_ROOT/bluez-mesh-joined-provisioner-keyring.patch" ;
 git apply "$PATCH_ROOT/bluez-mesh-joined-provisioner-keyring.patch" ;
+git apply --check "$PATCH_ROOT/bluez-mesh-reconcile-local-devkey.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-reconcile-local-devkey.patch" ;
 git apply --check "$PATCH_ROOT/bluez-mesh-userspace-aes-ccm.patch" ;
 git apply "$PATCH_ROOT/bluez-mesh-userspace-aes-ccm.patch" ;
+git apply --check "$PATCH_ROOT/bluez-mesh-sequence-reservation.patch" ;
+git apply "$PATCH_ROOT/bluez-mesh-sequence-reservation.patch" ;
 
 # recover files (configure.ac etc.) 
 ./bootstrap ;
@@ -210,16 +221,22 @@ EOT
 chmod +x "$PACKAGE_ROOT/DEBIAN/prerm" ;
 
 # create the new deb package
-dpkg-deb --build "$PACKAGE_ROOT" "$PACKAGE_FILENAME" ;
+# Unprivileged audit builds must still install system files as root-owned.
+dpkg-deb --root-owner-group --build "$PACKAGE_ROOT" "$PACKAGE_FILENAME" ;
 
 # move the deb package to the parent directory
 #chmod 644 ./$PACKAGE_FILENAME ;
 mv "./$PACKAGE_FILENAME" "$OUTPUT_DIR/$PACKAGE_FILENAME" ;
 
-# create a world-readable copy outside private home directories for apt validation
-if [ -d /var/tmp ] ; then
-    cp "$OUTPUT_DIR/$PACKAGE_FILENAME" "/var/tmp/$PACKAGE_FILENAME" ;
-    chmod 644 /var/tmp/$PACKAGE_FILENAME ;
+# Create a convenient apt-validation copy when the destination is writable.
+# A previous root build may own the same /var/tmp name, which must not turn a
+# completed unprivileged package build into a failure.
+APT_VALIDATION_COPY="" ;
+if [ -d /var/tmp ] && cp "$OUTPUT_DIR/$PACKAGE_FILENAME" "/var/tmp/$PACKAGE_FILENAME" 2>/dev/null ; then
+    chmod 644 "/var/tmp/$PACKAGE_FILENAME" || true ;
+    APT_VALIDATION_COPY="/var/tmp/$PACKAGE_FILENAME" ;
+else
+    echo "Skipping optional /var/tmp copy; package remains in $OUTPUT_DIR." ;
 fi
 
 echo "" ;
@@ -227,8 +244,8 @@ echo "###### FINISHED PACKAGE INFO START ######" ;
 stat "$OUTPUT_DIR/$PACKAGE_FILENAME" ;
 dpkg-deb --info "$OUTPUT_DIR/$PACKAGE_FILENAME" ;
 echo "Build sources retained for inspection: $BUILD_DIR" ;
-if [ -f /var/tmp/$PACKAGE_FILENAME ] ; then
-    echo "APT validation copy: /var/tmp/$PACKAGE_FILENAME" ;
+if [ -n "$APT_VALIDATION_COPY" ] ; then
+    echo "APT validation copy: $APT_VALIDATION_COPY" ;
 fi
 echo "###### FINISHED PACKAGE INFO END ######" ;
 echo "" ;

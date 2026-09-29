@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/raw_terminal.cpp
+/// \brief Implements the raw terminal component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/raw_terminal.hpp"
 
 #include <cerrno>
@@ -14,12 +17,21 @@ namespace mrs_uav_bluetooth::app {
 
 namespace {
 
+/// \brief Read one terminal byte while treating interruption and no-data as nonfatal.
+/// \param fd Terminal descriptor read in nonblocking raw mode.
+/// \param ch Output byte read from the terminal when data is available.
+/// \return True when read single byte; otherwise false.
 bool read_single_byte(int fd, char& ch) {
+    // Read exactly one terminal byte while retrying interrupted system calls.
     const auto rc = ::read(fd, &ch, 1);
     return rc == 1;
 }
 
+/// \brief Drain one rendered dashboard frame to the terminal descriptor.
+/// \param fd Open descriptor receiving the complete buffer.
+/// \param text terminal or log text written in full.
 void write_all(int fd, const std::string& text) {
+    // Drain the full output buffer despite short or interrupted writes.
     const char* data = text.data();
     size_t remaining = text.size();
     while (remaining > 0) {
@@ -35,6 +47,7 @@ void write_all(int fd, const std::string& text) {
 }  // namespace
 
 RawTerminal::RawTerminal() {
+    // Switch the input terminal to noncanonical mode and install a wake pipe for shutdown.
     const char* term = std::getenv("TERM");
     if (term == nullptr || std::strcmp(term, "dumb") == 0) {
         return;
@@ -81,6 +94,7 @@ RawTerminal::RawTerminal() {
 }
 
 RawTerminal::~RawTerminal() {
+    // Wake the reader and restore the original terminal settings before closing descriptors.
     if (flags_saved_ && tty_fd_ >= 0) {
         ::fcntl(tty_fd_, F_SETFL, original_flags_);
     }
@@ -97,10 +111,12 @@ RawTerminal::~RawTerminal() {
 }
 
 bool RawTerminal::active() const {
+    // Report whether raw terminal mode and its wake descriptors are still active.
     return active_;
 }
 
 void RawTerminal::suspend() {
+    // Suspend raw terminal.
     if (!active_ || tty_fd_ < 0) {
         return;
     }
@@ -115,6 +131,7 @@ void RawTerminal::suspend() {
 }
 
 void RawTerminal::resume() {
+    // Resume raw terminal.
     if (active_ || tty_fd_ < 0 || !termios_saved_ || original_termios_ == nullptr) {
         return;
     }
@@ -135,6 +152,7 @@ void RawTerminal::resume() {
 }
 
 std::optional<TerminalKeyEvent> RawTerminal::read_key() {
+    // Decode escape sequences into navigation keys while preserving ordinary bytes.
     if (!active_) {
         return std::nullopt;
     }
@@ -180,6 +198,7 @@ std::optional<TerminalKeyEvent> RawTerminal::read_key() {
 }
 
 TerminalSize RawTerminal::size() const {
+    // Query terminal dimensions, using conservative defaults when ioctl is unavailable.
     TerminalSize result;
     struct winsize ws {};
     if (tty_fd_ >= 0 && ::ioctl(tty_fd_, TIOCGWINSZ, &ws) == 0) {
@@ -194,6 +213,7 @@ TerminalSize RawTerminal::size() const {
 }
 
 void RawTerminal::write_text(const std::string& text) const {
+    // Write the complete rendered frame to the terminal output descriptor.
     if (!active_ || tty_fd_ < 0) {
         return;
     }

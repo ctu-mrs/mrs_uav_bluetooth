@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/util/uuid_utils.cpp
+/// \brief Implements the uuid utils component of the shared utility layer.
+
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
 #include <algorithm>
@@ -44,11 +47,19 @@ struct MD5 {
         0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
     };
 
+    /// \brief Rotate a 32-bit word for the MD5 compression rounds.
+    /// \param x first 32-bit word used by the digest round.
+    /// \param c Number of bits to rotate the 32-bit word left.
+    /// \return Input word rotated left by the requested bit count.
     static uint32_t left_rotate(uint32_t x, uint32_t c) {
+        // Rotate a 32-bit word for the MD5 compression rounds.
         return (x << c) | (x >> (32 - c));
     }
 
+    /// \brief Transform MD5.
+    /// \param block fixed-size byte block processed by the digest transform.
     void transform(const uint8_t block[64]) {
+        // Process one 64-byte MD5 block into the running digest state.
         uint32_t M[16];
         for (int i = 0; i < 16; ++i) {
             std::memcpy(&M[i], block + i * 4, 4);
@@ -81,7 +92,11 @@ struct MD5 {
         state[3] += d;
     }
 
+    /// \brief Feed arbitrary bytes into the buffered MD5 compression state.
+    /// \param data Input bytes included in the MD5 digest.
+    /// \param len number of input bytes to hash or encode.
     void update(const uint8_t* data, size_t len) {
+        // Complete any partial block first, then transform every full 64-byte block.
         size_t index = static_cast<size_t>(count % 64);
         count += len;
         size_t i = 0;
@@ -101,6 +116,8 @@ struct MD5 {
         }
     }
 
+    /// \brief Finalize MD5 padding and return the 16-byte digest.
+    /// \return Sixteen-byte MD5 digest after padding and length encoding.
     std::array<uint8_t, 16> finalize() {
         uint8_t pad[64]{};
         size_t index = static_cast<size_t>(count % 64);
@@ -138,7 +155,10 @@ struct MD5Context {
     uint8_t buffer[64];
 };
 
+/// \brief Initialize the MD5 state words and clear buffered byte counts.
+/// \param ctx MD5 digest context being initialized, updated, or finalized.
 void md5_init(MD5Context& ctx) {
+    // Initialize the MD5 state words and clear buffered byte counts.
     ctx.state[0] = 0x67452301;
     ctx.state[1] = 0xefcdab89;
     ctx.state[2] = 0x98badcfe;
@@ -147,13 +167,56 @@ void md5_init(MD5Context& ctx) {
     std::memset(ctx.buffer, 0, 64);
 }
 
-constexpr uint32_t md5_F(uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (~x & z); }
-constexpr uint32_t md5_G(uint32_t x, uint32_t y, uint32_t z) { return (x & z) | (y & ~z); }
-constexpr uint32_t md5_H(uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z; }
-constexpr uint32_t md5_I(uint32_t x, uint32_t y, uint32_t z) { return y ^ (x | ~z); }
-constexpr uint32_t md5_rotl(uint32_t x, uint32_t n) { return (x << n) | (x >> (32 - n)); }
+/// \brief Apply the first MD5 nonlinear round function.
+/// \param x first 32-bit word used by the digest round.
+/// \param y second 32-bit word used by the digest round.
+/// \param z third 32-bit word used by the digest round.
+/// \return MD5 f.
+constexpr uint32_t md5_F(uint32_t x, uint32_t y, uint32_t z) {
+    // Apply the first MD5 nonlinear round function.
+    return (x & y) | (~x & z);
+}
+/// \brief Apply the second MD5 nonlinear round function.
+/// \param x first 32-bit word used by the digest round.
+/// \param y second 32-bit word used by the digest round.
+/// \param z third 32-bit word used by the digest round.
+/// \return MD5 g.
+constexpr uint32_t md5_G(uint32_t x, uint32_t y, uint32_t z) {
+    // Apply the second MD5 nonlinear round function.
+    return (x & z) | (y & ~z);
+}
+/// \brief Apply the third MD5 nonlinear round function.
+/// \param x first 32-bit word used by the digest round.
+/// \param y second 32-bit word used by the digest round.
+/// \param z third 32-bit word used by the digest round.
+/// \return MD5 h.
+constexpr uint32_t md5_H(uint32_t x, uint32_t y, uint32_t z) {
+    // Apply the third MD5 nonlinear round function.
+    return x ^ y ^ z;
+}
+/// \brief Apply the fourth MD5 nonlinear round function.
+/// \param x first 32-bit word used by the digest round.
+/// \param y second 32-bit word used by the digest round.
+/// \param z third 32-bit word used by the digest round.
+/// \return MD5 i.
+constexpr uint32_t md5_I(uint32_t x, uint32_t y, uint32_t z) {
+    // Apply the fourth MD5 nonlinear round function.
+    return y ^ (x | ~z);
+}
+/// \brief Rotate a 32-bit MD5 word left by the specified count.
+/// \param x first 32-bit word used by the digest round.
+/// \param n Number of bits to rotate the MD5 word left.
+/// \return MD5 word rotated left by the requested bit count.
+constexpr uint32_t md5_rotl(uint32_t x, uint32_t n) {
+    // Rotate a 32-bit MD5 word left by the specified count.
+    return (x << n) | (x >> (32 - n));
+}
 
+/// \brief Expand one MD5 block and apply all four digest rounds.
+/// \param state Four-word MD5 chaining state updated by this block.
+/// \param block fixed-size byte block processed by the digest transform.
 void md5_transform(uint32_t state[4], const uint8_t block[64]) {
+    // Expand one MD5 block and apply all four digest rounds.
     static constexpr uint32_t S[64] = {
          7,12,17,22, 7,12,17,22, 7,12,17,22, 7,12,17,22,
          5, 9,14,20, 5, 9,14,20, 5, 9,14,20, 5, 9,14,20,
@@ -212,7 +275,12 @@ void md5_transform(uint32_t state[4], const uint8_t block[64]) {
     state[3] += d;
 }
 
+/// \brief Feed arbitrary bytes into MD5, transforming each completed 64-byte block.
+/// \param ctx MD5 digest context being initialized, updated, or finalized.
+/// \param data Input bytes included in the MD5 digest.
+/// \param len number of input bytes to hash or encode.
 void md5_update(MD5Context& ctx, const uint8_t* data, size_t len) {
+    // Feed arbitrary bytes into MD5, transforming each completed 64-byte block.
     size_t index = static_cast<size_t>(ctx.count % 64);
     ctx.count += len;
 
@@ -233,6 +301,9 @@ void md5_update(MD5Context& ctx, const uint8_t* data, size_t len) {
     }
 }
 
+/// \brief Pad with 0x80 followed by zeros, then 8-byte little-endian bit count.
+/// \param ctx MD5 digest context being initialized, updated, or finalized.
+/// \return Sixteen digest bytes after MD5 padding and length encoding.
 std::array<uint8_t, 16> md5_finalize(MD5Context& ctx) {
     uint64_t bit_count = ctx.count * 8;
     // Pad with 0x80 followed by zeros, then 8-byte little-endian bit count.
@@ -253,7 +324,12 @@ std::array<uint8_t, 16> md5_finalize(MD5Context& ctx) {
     return digest;
 }
 
+/// \brief Finalize a copy of the MD5 context and encode its 16-byte digest.
+/// \param data Input bytes included in the MD5 digest.
+/// \param len number of input bytes to hash or encode.
+/// \return Lowercase 32-character MD5 digest.
 std::string md5_hex(const uint8_t* data, size_t len) {
+    // Finalize a copy of the MD5 context and encode its 16-byte digest.
     MD5Context ctx;
     md5_init(ctx);
     md5_update(ctx, data, len);
@@ -268,7 +344,11 @@ std::string md5_hex(const uint8_t* data, size_t len) {
     return result;
 }
 
+/// \brief Remove surrounding ASCII whitespace from a UUID input.
+/// \param sv Text whose surrounding ASCII whitespace is removed.
+/// \return Copy of the input without surrounding ASCII whitespace.
 std::string trim(std::string_view sv) {
+    // Locate the first and last non-whitespace characters before copying.
     auto start = sv.find_first_not_of(" \t\r\n");
     if (start == std::string_view::npos) return {};
     auto end = sv.find_last_not_of(" \t\r\n");
@@ -280,6 +360,9 @@ const std::regex kUuidRe(
 
 }  // namespace
 
+/// \brief Derive an RFC 4122 version-3 UUID from a stable namespace name.
+/// \param name Stable application name used as the UUID seed.
+/// \return RFC 4122 version-3 UUID derived from the package namespace and name.
 std::string uuid_from_name(std::string_view name) {
     auto hex = md5_hex(reinterpret_cast<const uint8_t*>(name.data()), name.size());
     // Format: 8-4-4-4-12
@@ -297,33 +380,56 @@ std::string uuid_from_name(std::string_view name) {
     return result;
 }
 
+/// \brief Validate canonical UUID syntax after trimming surrounding whitespace.
+/// \param value Text to validate as a UUID.
+/// \return True if the text is a syntactically valid canonical UUID; otherwise false.
 bool is_uuid(std::string_view value) {
+    // Require the complete trimmed value to match the canonical UUID pattern.
     auto trimmed = trim(value);
     return std::regex_match(trimmed, kUuidRe);
 }
 
+/// \brief Accept a literal UUID or derive a stable UUID from an application name.
+/// \param value Literal UUID or stable application name to resolve.
+/// \return Canonical literal UUID or deterministic name-derived UUID.
 std::string resolve_uuid(std::string_view value) {
+    // Canonicalize literal UUIDs; derive deterministic UUIDs for symbolic names.
     auto trimmed = trim(value);
     if (is_uuid(trimmed)) {
         std::string lower(trimmed);
         std::transform(lower.begin(), lower.end(), lower.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) {
+                           // Canonicalize literal UUID hex digits before returning them.
+                           return std::tolower(c);
+                       });
         return lower;
     }
     return uuid_from_name(trimmed);
 }
 
+/// \brief Derive a stable service UUID from its package namespace name.
+/// \param name Service name used to derive a stable UUID.
+/// \return Deterministic service UUID for the supplied name.
 std::string named_service_uuid(std::string_view name) {
+    // Derive a stable service UUID from its package namespace name.
     auto trimmed = trim(name);
     return uuid_from_name(trimmed);
 }
 
+/// \brief Derive a stable characteristic UUID from its package namespace name.
+/// \param name Characteristic name used to derive a stable UUID.
+/// \return Deterministic characteristic UUID for the supplied name.
 std::string named_characteristic_uuid(std::string_view name) {
+    // Derive a stable characteristic UUID from its package namespace name.
     auto trimmed = trim(name);
     return uuid_from_name(trimmed);
 }
 
+/// \brief Derive a stable descriptor UUID from its package namespace name.
+/// \param name Descriptor name used to derive a stable UUID.
+/// \return Deterministic descriptor UUID for the supplied name.
 std::string named_descriptor_uuid(std::string_view name) {
+    // Derive a stable descriptor UUID from its package namespace name.
     auto trimmed = trim(name);
     return uuid_from_name(trimmed);
 }

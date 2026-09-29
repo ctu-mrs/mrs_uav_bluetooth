@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/main_serial_proxy.cpp
+/// \brief Implements the main serial proxy component of the ROS 2 application and operator-tool layer.
+
 // Serial forwarding behavior inspired by b1f6c1c4/ttyssh (MIT).
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -14,7 +17,13 @@
 
 namespace {
 
+/// \brief Forward a complete byte buffer to the selected proxy endpoint.
+/// \param fd Open descriptor receiving the complete buffer.
+/// \param data First byte of the contiguous buffer to write.
+/// \param size Exact number of bytes that must be written.
+/// \return True only after every requested byte was written; otherwise false.
 bool write_all(int fd, const char* data, size_t size) {
+    // Retry short and interrupted writes until the full terminal buffer is forwarded.
     size_t offset = 0;
     while (offset < size) {
         const auto written = ::write(fd, data + offset, size - offset);
@@ -32,7 +41,12 @@ bool write_all(int fd, const char* data, size_t size) {
 
 }  // namespace
 
+/// \brief Proxy this terminal process to one owned Bluetooth pseudo-terminal.
+/// \param argc number of command-line arguments.
+/// \param argv command-line argument vector.
+/// \return Zero on success, or a nonzero process status on failure.
 int main(int argc, char** argv) {
+    // Validate the owned Bluetooth PTY and proxy standard input/output until either side closes.
     if (argc != 2) {
         std::fprintf(stderr, "usage: %s /dev/ttyBLE_<hostname-or-AA-BB-CC-DD-EE-FF>\n", argv[0]);
         return 64;

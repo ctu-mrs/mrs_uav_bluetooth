@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/serial/serial_link.cpp
+/// \brief Implements the serial link component of the RFCOMM serial and SSH layer.
+
 #include "mrs_uav_bluetooth/serial/serial_link.hpp"
 
 #include <pty.h>
@@ -26,21 +29,41 @@ namespace {
 
 class OwnedFd {
 public:
-    explicit OwnedFd(int fd = -1) : fd_(fd) {}
-    ~OwnedFd() { reset(); }
+    /// \brief Take ownership of this descriptor so every later exit path closes it once.
+    /// \param fd File descriptor whose ownership is transferred into the guard.
+    explicit OwnedFd(int fd = -1) : fd_(fd) {
+        // Take ownership of this descriptor so every later exit path closes it once.
+    }
+    /// \brief Close the descriptor unless ownership was explicitly released.
+    ~OwnedFd() {
+        // Close the descriptor unless ownership was explicitly released.
+        reset();
+    }
 
+    /// \brief Disable copying of the owned fd.
     OwnedFd(const OwnedFd&) = delete;
+    /// \brief Assign state from another owned fd.
     OwnedFd& operator=(const OwnedFd&) = delete;
 
-    int get() const { return fd_; }
+    /// \brief Return the descriptor without transferring ownership.
+    /// \return Borrowed file descriptor without changing ownership.
+    int get() const {
+        // Return the descriptor without transferring ownership.
+        return fd_;
+    }
 
+    /// \brief Transfer descriptor ownership to the caller and invalidate this guard.
+    /// \return File descriptor transferred to the caller or -1 when empty.
     int release() {
+        // Transfer descriptor ownership to the caller and invalidate this guard.
         const int fd = fd_;
         fd_ = -1;
         return fd;
     }
 
+    /// \brief Close the owned descriptor and clear it to prevent double close.
     void reset() {
+        // Close the owned descriptor and clear it to prevent double close.
         if (fd_ >= 0) {
             ::close(fd_);
             fd_ = -1;
@@ -51,7 +74,14 @@ private:
     int fd_;
 };
 
+/// \brief Deliver a complete buffer to either the RFCOMM socket or its pseudo-terminal.
+/// \param fd Open descriptor receiving the complete buffer.
+/// \param data First byte of the contiguous buffer to write.
+/// \param size Exact number of bytes that must be written.
+/// \param socket whether output uses send with SIGPIPE suppression instead of write.
+/// \return True only after every requested byte was written; otherwise false.
 bool write_all(int fd, const uint8_t* data, size_t size, bool socket) {
+    // Retry interruptions and short writes until the entire buffer reaches the socket or PTY.
     size_t offset = 0;
     while (offset < size) {
         const auto written = socket
@@ -69,7 +99,10 @@ bool write_all(int fd, const uint8_t* data, size_t size, bool socket) {
     return true;
 }
 
+/// \brief Choose a private runtime directory for PTY links when /dev is not writable.
+/// \return Private runtime directory used when the preferred terminal-link directory is unavailable.
 std::string default_fallback_directory() {
+    // Choose a private runtime directory for PTY links when /dev is not writable.
     if (const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
         runtime_dir != nullptr && runtime_dir[0] != '\0') {
         return std::string{runtime_dir} + "/mrs-uav-bluetooth";
@@ -77,7 +110,10 @@ std::string default_fallback_directory() {
     return "/tmp/mrs-uav-bluetooth-" + std::to_string(::getuid());
 }
 
+/// \brief Create a runtime directory and enforce owner-only permissions.
+/// \param path Runtime directory that must exist with owner-only access.
 void ensure_private_directory(const std::string& path) {
+    // Create the fallback PTY directory and restrict it to the owning user.
     std::error_code error;
     std::filesystem::create_directories(path, error);
     if (error && !std::filesystem::is_directory(path)) {
@@ -86,7 +122,10 @@ void ensure_private_directory(const std::string& path) {
     }
     (void)::chmod(path.c_str(), S_IRWXU);
 }
+/// \brief Return whether readable system SSH host key is present.
+/// \return True if at least one supported system SSH host key is readable; otherwise false.
 bool has_readable_system_ssh_host_key() {
+    // Any supported private host key is enough for the SSH endpoint to start.
     constexpr const char* paths[] = {
         "/etc/ssh/ssh_host_ed25519_key",
         "/etc/ssh/ssh_host_ecdsa_key",
@@ -100,7 +139,10 @@ bool has_readable_system_ssh_host_key() {
     return false;
 }
 
+/// \brief Choose the per-user persistent path for a generated SSH host key.
+/// \return Per-user Ed25519 host-key path under the package state directory.
 std::string user_ssh_host_key_path() {
+    // Choose the per-user persistent path for a generated SSH host key.
     if (const char* state_home = std::getenv("XDG_STATE_HOME");
         state_home != nullptr && state_home[0] != '\0' &&
         std::filesystem::path{state_home}.is_absolute()) {
@@ -116,7 +158,11 @@ std::string user_ssh_host_key_path() {
     return default_fallback_directory() + "/ssh_host_ed25519_key";
 }
 
+/// \brief Install a private per-user SSH host key from a readable system key when absent.
+/// \param key_path path of the key.
+/// \return True if a private user host key exists after the call; otherwise false.
 bool ensure_user_ssh_host_key(const std::string& key_path) {
+    // Ensure user SSH host key.
     struct stat key_stat {};
     if (::lstat(key_path.c_str(), &key_stat) == 0) {
         if (!S_ISREG(key_stat.st_mode)) {
@@ -207,14 +253,18 @@ SerialLinkManager::SerialLinkManager(rclcpp::Logger logger,
       preferred_directory_(std::move(preferred_directory)),
       fallback_directory_(fallback_directory.empty()
           ? default_fallback_directory()
-          : std::move(fallback_directory)) {}
+          : std::move(fallback_directory)) {
+              // Select a private fallback directory when the preferred device directory is unavailable.
+          }
 
 SerialLinkManager::~SerialLinkManager() {
+    // Stop every bridge thread and remove only symlinks created by this manager.
     detach_all();
 }
 
 std::string SerialLinkManager::tty_basename_for_peer(const std::string& peer_name,
                                                      const std::string& peer_mac) {
+    // Prefer a safe hostname in the tty name, otherwise encode the peer address.
     if (!peer_name.empty()) {
         bool valid = true;
         for (const unsigned char ch : peer_name) {
@@ -254,6 +304,7 @@ std::string SerialLinkManager::tty_basename_for_peer(const std::string& peer_nam
 
 void SerialLinkManager::remove_owned_link(const std::string& link_path,
                                           const std::string& pty_path) {
+    // Unlink only when the current symlink still targets this session’s PTY.
     if (link_path.empty()) {
         return;
     }
@@ -272,6 +323,7 @@ void SerialLinkManager::remove_owned_link(const std::string& link_path,
 std::string SerialLinkManager::create_tty_link(const std::string& basename,
                                                 const std::string& pty_path,
                                                 bool& used_fallback) const {
+    // Link the new PTY under the preferred directory, falling back to the private runtime directory.
     used_fallback = false;
     const auto preferred = preferred_directory_ + "/" + basename;
     if (::symlink(pty_path.c_str(), preferred.c_str()) == 0) {
@@ -313,6 +365,7 @@ SerialLinkInfo SerialLinkManager::attach(const std::string& device_path,
                                          const std::string& peer_name,
                                          const std::string& peer_mac,
                                          int socket_fd) {
+    // Take socket ownership, create a PTY pair, publish its stable link, and start forwarding.
     if (socket_fd < 0) {
         throw std::invalid_argument("invalid RFCOMM socket descriptor");
     }
@@ -357,7 +410,10 @@ SerialLinkInfo SerialLinkManager::attach(const std::string& device_path,
             throw std::runtime_error("serial link already exists for device");
         }
         try {
-            link->worker = std::thread([link]() { run_bridge(link); });
+            link->worker = std::thread([link]() {
+                // Forward bytes bidirectionally between the RFCOMM socket and PTY until either side closes.
+                run_bridge(link);
+            });
         } catch (...) {
             links_.erase(iterator);
             throw;
@@ -385,6 +441,7 @@ SerialLinkInfo SerialLinkManager::attach(const std::string& device_path,
 }
 
 void SerialLinkManager::run_bridge(const std::shared_ptr<Link>& link) {
+    // Poll the RFCOMM socket and PTY together, forwarding readable bytes in either direction.
     std::vector<uint8_t> buffer(4096);
     while (!link->stop.load()) {
         pollfd descriptors[2] = {
@@ -429,6 +486,7 @@ void SerialLinkManager::run_bridge(const std::shared_ptr<Link>& link) {
 }
 
 void SerialLinkManager::detach(const std::string& device_path) {
+    // Detach serial link manager.
     std::shared_ptr<Link> link;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -462,6 +520,7 @@ void SerialLinkManager::detach(const std::string& device_path) {
 }
 
 void SerialLinkManager::detach_all() {
+    // Detach all.
     std::vector<std::string> paths;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -477,6 +536,7 @@ void SerialLinkManager::detach_all() {
 
 std::optional<SerialLinkInfo> SerialLinkManager::link_for_device(
     const std::string& device_path) const {
+    // Snapshot the active PTY link associated with one BlueZ device path.
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = links_.find(device_path);
     if (it == links_.end() || !it->second->active.load()) {
@@ -493,6 +553,7 @@ std::optional<SerialLinkInfo> SerialLinkManager::link_for_device(
 }
 
 std::vector<SerialLinkInfo> SerialLinkManager::links() const {
+    // Snapshot active links under lock without exposing mutable worker state.
     std::vector<SerialLinkInfo> result;
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& [_, link] : links_) {
@@ -513,6 +574,7 @@ std::vector<SerialLinkInfo> SerialLinkManager::links() const {
 bool SerialLinkManager::wait_for_link(const std::string& device_path,
                                       std::chrono::milliseconds timeout,
                                       SerialLinkInfo* result) const {
+    // Poll until the device link becomes active or the caller timeout expires.
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     do {
         if (const auto link = link_for_device(device_path)) {
@@ -534,16 +596,19 @@ struct SerialSshServer::Session {
 
 SerialSshServer::SerialSshServer(rclcpp::Logger logger, std::string sshd_path)
     : logger_(logger), sshd_path_(std::move(sshd_path)) {
+    // Select the SSH daemon and prepare a per-user host key when no system key is readable.
     if (!has_readable_system_ssh_host_key()) {
         host_key_path_ = user_ssh_host_key_path();
     }
 }
 
 SerialSshServer::~SerialSshServer() {
+    // Terminate and reap every SSH child before destroying session records.
     stop_all();
 }
 
 void SerialSshServer::start_session(const std::string& device_path, int socket_fd) {
+    // Establish session.
     if (socket_fd < 0) {
         throw std::invalid_argument("invalid RFCOMM socket descriptor");
     }
@@ -601,6 +666,7 @@ void SerialSshServer::start_session(const std::string& device_path, int socket_f
         }
         try {
             session->waiter = std::thread([session]() {
+                // Reap the SSH child after exit and mark its session inactive.
                 int status = 0;
                 while (::waitpid(session->pid, &status, 0) < 0 && errno == EINTR) {
                 }
@@ -623,6 +689,7 @@ void SerialSshServer::start_session(const std::string& device_path, int socket_f
 }
 
 void SerialSshServer::stop_session(const std::string& device_path) {
+    // Tear down session.
     std::shared_ptr<Session> session;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -644,6 +711,7 @@ void SerialSshServer::stop_session(const std::string& device_path) {
 }
 
 void SerialSshServer::stop_all() {
+    // Tear down all.
     std::vector<std::string> paths;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -658,6 +726,7 @@ void SerialSshServer::stop_all() {
 }
 
 bool SerialSshServer::active(const std::string& device_path) const {
+    // Check under lock whether this device still owns a live SSH child.
     std::lock_guard<std::mutex> lock(mutex_);
     const auto it = sessions_.find(device_path);
     return it != sessions_.end() && it->second->active.load();

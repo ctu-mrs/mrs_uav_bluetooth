@@ -1,0 +1,876 @@
+diff --git a/mesh/net.c b/mesh/net.c
+index 2c1be1f..923dbe9 100644
+--- a/mesh/net.c
++++ b/mesh/net.c
+@@ -134,6 +134,7 @@ struct mesh_net {
+ 	struct l_queue *sar_in;
+ 	struct l_queue *sar_out;
+ 	struct l_queue *sar_queue;
++	struct l_queue *pending_tx;
+ 	struct l_queue *frnd_msgs;
+ 	struct l_queue *friends;
+ 	struct l_queue *negotiations;
+@@ -147,6 +148,15 @@ struct mesh_msg {
+ };
+ 
+ struct mesh_sar {
++	/* Keep the encrypted packets owned by each SAR transaction. Retry
++	 * timers reuse queued work. Completion cancels remaining repeats.
++	 */
++	struct mesh_net *owner;
++	uint8_t ack_len;
++	uint8_t ack_packet[MESH_AD_MAX_LEN];
++	uint32_t ack_flags;
++	uint8_t queued_len[32];
++	uint8_t queued[32][MESH_AD_MAX_LEN];
+ 	unsigned int id;
+ 	struct l_timeout *seg_timeout;
+ 	struct l_timeout *msg_timeout;
+@@ -162,6 +172,7 @@ struct mesh_sar {
+ 	uint16_t len;
+ 	bool szmic;
+ 	bool segmented;
++	bool application_owned;
+ 	bool frnd;
+ 	bool frnd_cred;
+ 	bool delete;
+@@ -191,6 +202,7 @@ struct net_queue_data {
+ 
+ struct oneshot_tx {
+ 	struct mesh_net *net;
++	struct l_idle *idle;
+ 	uint16_t interval;
+ 	uint8_t cnt;
+ 	uint8_t size;
+@@ -498,6 +510,53 @@ static struct mesh_sar *mesh_sar_new(size_t len)
+ 	return sar;
+ }
+ 
++/* Packets remain owned by their network while waiting for the local
++ * delivery idle callback. SAR cancellation must cover that stage as well as
++ * the bearer queue, otherwise a cancelled retry can still reach the radio.
++ */
++struct packet_pattern {
++	const uint8_t *data;
++	uint8_t len;
++};
++
++static bool pending_tx_match(const void *a, const void *b)
++{
++	const struct oneshot_tx *tx = a;
++	const struct packet_pattern *pattern = b;
++
++	return tx->size == pattern->len &&
++			!memcmp(tx->packet, pattern->data, pattern->len);
++}
++
++static void pending_tx_free(void *data)
++{
++	struct oneshot_tx *tx = data;
++
++	l_idle_remove(tx->idle);
++	l_free(tx);
++}
++
++static bool net_packet_pending(struct mesh_net *net,
++					const uint8_t *packet, uint8_t len)
++{
++	struct packet_pattern pattern = { packet, len };
++
++	return l_queue_find(net->pending_tx, pending_tx_match, &pattern) ||
++					mesh_io_send_pending(net->io, packet, len);
++}
++
++static void net_cancel_packet(struct mesh_net *net,
++					const uint8_t *packet, uint8_t len)
++{
++	struct packet_pattern pattern = { packet, len };
++	struct oneshot_tx *tx;
++
++	while ((tx = l_queue_remove_if(net->pending_tx, pending_tx_match,
++								&pattern)))
++		pending_tx_free(tx);
++	mesh_io_send_cancel(net->io, packet, len);
++}
++
+ static void mesh_sar_free(void *data)
+ {
+ 	struct mesh_sar *sar = data;
+@@ -507,6 +566,17 @@ static void mesh_sar_free(void *data)
+ 
+ 	l_timeout_remove(sar->seg_timeout);
+ 	l_timeout_remove(sar->msg_timeout);
++	if (sar->owner) {
++		unsigned int i;
++
++		if (sar->ack_len)
++			net_cancel_packet(sar->owner, sar->ack_packet, sar->ack_len);
++
++		for (i = 0; i < L_ARRAY_SIZE(sar->queued_len); i++)
++			if (sar->queued_len[i])
++				net_cancel_packet(sar->owner, sar->queued[i],
++							sar->queued_len[i]);
++	}
+ 	l_free(sar);
+ }
+ 
+@@ -630,6 +700,7 @@ struct mesh_net *mesh_net_new(struct mesh_node *node)
+ 	net->sar_in = l_queue_new();
+ 	net->sar_out = l_queue_new();
+ 	net->sar_queue = l_queue_new();
++	net->pending_tx = l_queue_new();
+ 	net->frnd_msgs = l_queue_new();
+ 	net->destinations = l_queue_new();
+ 	net->app_keys = l_queue_new();
+@@ -657,6 +728,7 @@ void mesh_net_free(void *user_data)
+ 	l_queue_destroy(net->sar_in, mesh_sar_free);
+ 	l_queue_destroy(net->sar_out, mesh_sar_free);
+ 	l_queue_destroy(net->sar_queue, mesh_sar_free);
++	l_queue_destroy(net->pending_tx, pending_tx_free);
+ 	l_queue_destroy(net->frnd_msgs, l_free);
+ 	l_queue_destroy(net->friends, mesh_friend_free);
+ 	l_queue_destroy(net->negotiations, mesh_friend_free);
+@@ -1064,12 +1136,25 @@ static bool msg_in_cache(struct mesh_net *net, uint16_t src, uint32_t seq,
+ 	return false;
+ }
+ 
+-static bool match_sar_seq0(const void *a, const void *b)
++struct sar_ack {
++	uint16_t src;
++	uint16_t dst;
++	uint16_t net_idx;
++	uint16_t seq_zero;
++	bool obo;
++};
++
++static bool match_sar_ack(const void *a, const void *b)
+ {
+ 	const struct mesh_sar *sar = a;
+-	uint16_t seqZero = L_PTR_TO_UINT(b);
++	const struct sar_ack *ack = b;
+ 
+-	return sar->seqZero == seqZero;
++	/* A Friend may acknowledge for the destination only with OBO set.
++	 * SeqZero alone does not identify an ACK across elements or subnets.
++	 */
++	return sar->seqZero == ack->seq_zero && sar->src == ack->dst &&
++			sar->net_idx == ack->net_idx &&
++			(sar->remote == ack->src || ack->obo);
+ }
+ 
+ static bool match_sar_remote(const void *a, const void *b)
+@@ -1450,6 +1535,12 @@ static void send_frnd_ack(struct mesh_net *net, uint16_t src, uint16_t dst,
+ 	}
+ }
+ 
++static void transport_send_queued(struct mesh_net *net, uint32_t net_key_id,
++				uint16_t net_idx, uint32_t iv_index,
++				uint8_t ttl, uint32_t seq, uint16_t src,
++				uint16_t dst, const uint8_t *msg, uint16_t msg_len,
++				uint8_t *queued, uint8_t *queued_len);
++
+ static void send_net_ack(struct mesh_net *net, struct mesh_sar *sar,
+ 								uint32_t flags)
+ {
+@@ -1458,6 +1549,17 @@ static void send_net_ack(struct mesh_net *net, struct mesh_sar *sar,
+ 	uint16_t src = sar->src;
+ 	uint16_t dst = sar->remote;
+ 
++	/* Repeated segments can request the same ACK while its configured
++	 * network repetitions are still queued. Keep one copy of that ACK
++	 * transaction and replace an older partial bitmap with newer progress.
++	 */
++	if (sar->ack_len && net_packet_pending(net, sar->ack_packet,
++							sar->ack_len)) {
++		if (sar->ack_flags == flags)
++			return;
++		net_cancel_packet(net, sar->ack_packet, sar->ack_len);
++	}
++
+ 	/* We don't ACK from multicast destinations */
+ 	if (src & 0x8000)
+ 		return;
+@@ -1479,10 +1581,11 @@ static void send_net_ack(struct mesh_net *net, struct mesh_sar *sar,
+ 		return;
+ 	}
+ 
+-	mesh_net_transport_send(net, 0, sar->net_idx,
++	sar->ack_flags = flags;
++	transport_send_queued(net, 0, sar->net_idx,
+ 				mesh_net_get_iv_index(net), DEFAULT_TTL,
+-				0, src, dst, msg,
+-				sizeof(msg));
++				0, src, dst, msg, sizeof(msg),
++				sar->ack_packet, &sar->ack_len);
+ }
+ 
+ static void inseg_to(struct l_timeout *seg_timeout, void *user_data)
+@@ -1529,6 +1632,8 @@ static void inmsg_to(struct l_timeout *msg_timeout, void *user_data)
+ 	mesh_sar_free(sar);
+ }
+ 
++static void send_queued_sar(struct mesh_net *net, uint16_t dst);
++
+ static void outmsg_to(struct l_timeout *msg_timeout, void *user_data)
+ {
+ 	struct mesh_net *net = user_data;
+@@ -1540,6 +1645,7 @@ static void outmsg_to(struct l_timeout *msg_timeout, void *user_data)
+ 		return;
+ 
+ 	sar->msg_timeout = NULL;
++	send_queued_sar(net, sar->remote);
+ 	mesh_sar_free(sar);
+ }
+ 
+@@ -1561,30 +1667,35 @@ static void send_queued_sar(struct mesh_net *net, uint16_t dst)
+ }
+ 
+ static void ack_received(struct mesh_net *net, bool timeout,
+-				uint16_t src, uint16_t dst,
+-				uint16_t seq0, uint32_t ack_flag)
++				uint16_t src, uint16_t dst, uint16_t net_idx,
++				bool obo, uint16_t seq0, uint32_t ack_flag)
+ {
++	const struct sar_ack ack = { src, dst, net_idx, seq0, obo };
+ 	struct mesh_sar *outgoing;
+ 	uint32_t seg_flag = 0x00000001;
+ 	uint16_t i;
+ 
+ 	l_debug("ACK Rxed (%x) (to:%d): %8.8x", seq0, timeout, ack_flag);
+ 
+-	outgoing = l_queue_find(net->sar_out, match_sar_seq0,
+-							L_UINT_TO_PTR(seq0));
++	outgoing = l_queue_find(net->sar_out, match_sar_ack, &ack);
+ 
+ 	if (!outgoing) {
+ 		l_debug("Not Found: %4.4x", seq0);
+ 		return;
+ 	}
+ 
+-	/*
+-	 * TODO -- If we receive from different
+-	 * SRC than we are sending to, make sure the OBO flag is set
++	/* Reject impossible segment bits. Repeated partial ACKs add no progress
++	 * and must not cancel and replace work already queued for the radio.
++	 * The retransmission timer remains responsible when progress stops.
+ 	 */
++	if (ack_flag & ~outgoing->flags)
++		return;
++	if (!timeout && ack_flag && !(ack_flag & ~outgoing->last_nak))
++		return;
+ 
++	outgoing->last_nak |= ack_flag;
+ 	if ((!timeout && !ack_flag) ||
+-			(outgoing->flags & ack_flag) == outgoing->flags) {
++			(outgoing->flags & outgoing->last_nak) == outgoing->flags) {
+ 		l_debug("ob_sar_removal (%x)", outgoing->flags);
+ 
+ 		/* Note: ack_flags == 0x00000000 is a remote Cancel request */
+@@ -1596,15 +1707,31 @@ static void ack_received(struct mesh_net *net, bool timeout,
+ 		return;
+ 	}
+ 
+-	outgoing->last_nak |= ack_flag;
+-
+ 	for (i = 0; i <= SEG_MAX(true, outgoing->len); i++, seg_flag <<= 1) {
+-		if (seg_flag & ack_flag) {
++		if (seg_flag & outgoing->last_nak) {
++			/* Acknowledged segments no longer need queued retries. */
++			if (outgoing->queued_len[i]) {
++				net_cancel_packet(net, outgoing->queued[i],
++							outgoing->queued_len[i]);
++				outgoing->queued_len[i] = 0;
++			}
+ 			l_debug("Skipping Seg %d of %d",
+ 					i, SEG_MAX(true, outgoing->len));
+ 			continue;
+ 		}
+ 
++		/* A peer's partial ACK requests a new lower-transport attempt.
++		 * Replace its missing segments with fresh network sequence numbers.
++		 * Old bearer repeats may already be behind the receiver's replay
++		 * watermark after another access message was delivered. Timer-only
++		 * retries still wait for queued work, keeping the queue bounded.
++		 */
++		if (!timeout && outgoing->queued_len[i]) {
++			net_cancel_packet(net, outgoing->queued[i],
++						outgoing->queued_len[i]);
++			outgoing->queued_len[i] = 0;
++		}
++
+ 		l_debug("Resend Seg %d net:%p dst:%x app_idx:%3.3x",
+ 				i, net, outgoing->remote, outgoing->app_idx);
+ 
+@@ -1628,8 +1755,8 @@ static void outseg_to(struct l_timeout *seg_timeout, void *user_data)
+ 	sar->seg_timeout = NULL;
+ 
+ 	/* Re-Send missing segments by faking NACK */
+-	ack_received(net, true, sar->remote, sar->src,
+-					sar->seqZero, sar->last_nak);
++	ack_received(net, true, sar->remote, sar->src, sar->net_idx,
++					false, sar->seqZero, sar->last_nak);
+ }
+ 
+ static bool match_replay_cache(const void *a, const void *b)
+@@ -1926,6 +2053,17 @@ static void friend_seg_rxed(struct mesh_net *net,
+ 	frnd_msg->cnt_in++;
+ }
+ 
++/* Reassembly belongs to a source/destination pair. A group message from
++ * the same source must not replace an in-progress unicast transaction.
++ */
++static bool match_sar_pair(const void *a, const void *b)
++{
++	const struct mesh_sar *sar = a;
++	uint32_t pair = L_PTR_TO_UINT(b);
++
++	return sar->remote == (pair >> 16) && sar->src == (pair & 0xffff);
++}
++
+ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
+ 					uint8_t ttl, uint32_t seq,
+ 					uint16_t net_idx,
+@@ -1940,12 +2078,22 @@ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
+ 	uint32_t expected, this_seg_flag, largest, seqAuth;
+ 	bool reset_seg_to = true;
+ 
++	/* Check each segment before acknowledging or storing it. A segment
++	 * overtaken by a newer valid message must remain missing so that the
++	 * sender retransmits it with a fresh network sequence number. Marking
++	 * it received here would ACK a message that the access replay check
++	 * then rejects, preventing the transport from recovering it.
++	 */
++	if (msg_check_replay_cache(net, src, node_get_crpl(net->node),
++							seq, iv_index))
++		return false;
++
+ 	/*
+ 	 * DST could receive additional Segments after
+ 	 * completing due to a lost ACK, so re-ACK and discard
+ 	 */
+-	sar_in = l_queue_find(net->sar_in, match_sar_remote,
+-						L_UINT_TO_PTR(src));
++	sar_in = l_queue_find(net->sar_in, match_sar_pair,
++				L_UINT_TO_PTR(((uint32_t) src << 16) | dst));
+ 
+ 	/* Discard *old* incoming-SAR-in-progress if this segment newer */
+ 	seqAuth = seq_auth(seq, seqZero);
+@@ -1996,6 +2144,7 @@ static bool seg_rxed(struct mesh_net *net, bool frnd, uint32_t iv_index,
+ 		sar_in = mesh_sar_new(len);
+ 		sar_in->seqAuth = seqAuth;
+ 		sar_in->iv_index = iv_index;
++		sar_in->owner = net;
+ 		sar_in->src = dst;
+ 		sar_in->remote = src;
+ 		sar_in->seqZero = seqZero;
+@@ -2253,7 +2402,7 @@ static bool simple_match(const void *a, const void *b)
+ 	return a == b;
+ }
+ 
+-static void send_msg_pkt_oneshot(void *user_data)
++static void send_msg_pkt_oneshot(struct l_idle *idle, void *user_data)
+ {
+ 	struct oneshot_tx *tx = user_data;
+ 	struct mesh_net *net;
+@@ -2265,6 +2414,10 @@ static void send_msg_pkt_oneshot(void *user_data)
+ 		.relay_advice = RELAY_NONE,
+ 	};
+ 
++	l_idle_remove(idle);
++	tx->idle = NULL;
++	l_queue_remove(tx->net->pending_tx, tx);
++
+ 	/* Send to local nodes first */
+ 	l_queue_foreach(nets, net_rx, &net_data);
+ 
+@@ -2298,7 +2451,8 @@ static void send_msg_pkt(struct mesh_net *net, uint8_t cnt, uint16_t interval,
+ 	tx->size = size;
+ 	memcpy(tx->packet, packet, size);
+ 
+-	l_idle_oneshot(send_msg_pkt_oneshot, tx, NULL);
++	l_queue_push_tail(net->pending_tx, tx);
++	tx->idle = l_idle_create(send_msg_pkt_oneshot, tx, NULL);
+ }
+ 
+ static enum _relay_advice packet_received(struct mesh_net *net,
+@@ -2368,8 +2522,8 @@ static enum _relay_advice packet_received(struct mesh_net *net,
+ 							net_src, net_dst, msg);
+ 				else
+ 					ack_received(net, false,
+-							net_src, net_dst,
+-							net_seqZero,
++							net_src, net_dst, net_idx,
++							net_relay, net_seqZero,
+ 							l_get_be32(msg + 3));
+ 			} else {
+ 				ctl_received(net, net_key_id, iv_index, net_ttl,
+@@ -3121,6 +3275,14 @@ static bool send_seg(struct mesh_net *net, uint8_t cnt, uint16_t interval,
+ 	uint16_t seg_off = SEG_OFF(segO);
+ 	uint32_t seq_num;
+ 
++	/* Keep one bearer transmission per segment while its repetitions
++	 * are pending, even when a retry timer expires under radio load.
++	 */
++	if (msg->owner && msg->queued_len[segO] &&
++			net_packet_pending(net, msg->queued[segO],
++						msg->queued_len[segO]))
++		return true;
++
+ 	if (msg->segmented) {
+ 		/* Send each segment on unique seq_num */
+ 		seq_num = mesh_net_next_seq_num(net);
+@@ -3166,6 +3328,8 @@ static bool send_seg(struct mesh_net *net, uint8_t cnt, uint16_t interval,
+ 		return false;
+ 	}
+ 
++	msg->queued_len[segO] = packet_len + 1;
++	memcpy(msg->queued[segO], packet, packet_len + 1);
+ 	send_msg_pkt(net, cnt, interval, packet, packet_len + 1);
+ 
+ 	msg->last_seg = segO;
+@@ -3223,6 +3387,95 @@ void mesh_net_send_seg(struct mesh_net *net, uint32_t net_key_id,
+ 	print_packet("TX: Friend", packet + 1, packet_len);
+ }
+ 
++/* The application may choose bounded delivery instead of appending another
++ * segmented transaction behind one that lower transport is still repairing.
++ * Unsegmented control messages remain independent of this serialization.
++ */
++bool mesh_net_sar_pending(struct mesh_net *net, uint16_t dst)
++{
++	return net && (l_queue_find(net->sar_out, match_sar_remote,
++						L_UINT_TO_PTR(dst)) ||
++			l_queue_find(net->sar_queue, match_sar_remote,
++						L_UINT_TO_PTR(dst)));
++}
++
++/* SeqAuth identifies a transfer across retries. The reserved network sequence
++ * numbers keep it unique across daemon restarts within this node identity.
++ * Zero denotes sends that do not leave an outstanding unicast SAR.
++ */
++static uint64_t sar_token(const struct mesh_sar *sar)
++{
++	return (((uint64_t) sar->iv_index << 24) | sar->seqAuth) + 1;
++}
++
++uint64_t mesh_net_sar_token(struct mesh_net *net, uint16_t src, uint16_t dst)
++{
++	struct mesh_sar *sar;
++
++	if (!net)
++		return 0;
++
++	sar = l_queue_find(net->sar_out, match_sar_remote, L_UINT_TO_PTR(dst));
++	if (!sar || sar->src != src)
++		return 0;
++
++	sar->application_owned = true;
++	return sar_token(sar);
++}
++
++static bool match_sar_token(const void *a, const void *b)
++{
++	const struct mesh_sar *sar = a;
++	const uint64_t *token = b;
++
++	return sar->application_owned && sar_token(sar) == *token;
++}
++
++bool mesh_net_sar_active(struct mesh_net *net, uint64_t token)
++{
++	return net && token &&
++			l_queue_find(net->sar_out, match_sar_token, &token);
++}
++
++bool mesh_net_sar_cancel(struct mesh_net *net, uint64_t token)
++{
++	struct mesh_sar *sar;
++	uint16_t dst;
++
++	if (!net || !token)
++		return false;
++
++	sar = l_queue_remove_if(net->sar_out, match_sar_token, &token);
++	if (!sar)
++		return false;
++
++	dst = sar->remote;
++	/* Cancel both deferred local delivery and queued bearer repetitions
++	 * before admitting the next transaction for this destination.
++	 */
++	mesh_sar_free(sar);
++	send_queued_sar(net, dst);
++	return true;
++}
++
++static bool match_application_sar(const void *a, const void *b)
++{
++	const struct mesh_sar *sar = a;
++
++	return sar->application_owned;
++}
++
++void mesh_net_sar_cancel_application(struct mesh_net *net)
++{
++	struct mesh_sar *sar;
++
++	/* An application's D-Bus disconnect ends ownership of its tracked
++	 * transfers. Configuration-model traffic retains its own lifecycle.
++	 */
++	while ((sar = l_queue_find(net->sar_out, match_application_sar, NULL)))
++		mesh_net_sar_cancel(net, sar_token(sar));
++}
++
+ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
+ 				uint16_t dst, uint8_t key_aid, uint16_t net_idx,
+ 				uint8_t ttl, uint8_t cnt, uint16_t interval,
+@@ -3290,6 +3543,9 @@ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
+ 		payload->seqZero = seq & SEQ_ZERO_MASK;
+ 		payload->id = ++net->sar_id_next;
+ 
++		if (IS_UNICAST(dst))
++			payload->owner = net;
++
+ 		/* Single thread SAR messages to same Unicast DST */
+ 		if (l_queue_find(net->sar_out, match_sar_remote,
+ 							L_UINT_TO_PTR(dst))) {
+@@ -3380,16 +3636,19 @@ void mesh_net_ack_send(struct mesh_net *net, uint32_t net_key_id,
+ 	print_packet("TX: Friend ACK", pkt + 1, pkt_len);
+ }
+ 
+-void mesh_net_transport_send(struct mesh_net *net, uint32_t net_key_id,
++static void transport_send_queued(struct mesh_net *net, uint32_t net_key_id,
+ 				uint16_t net_idx, uint32_t iv_index,
+ 				uint8_t ttl, uint32_t seq, uint16_t src,
+-				uint16_t dst, const uint8_t *msg,
+-				uint16_t msg_len)
++				uint16_t dst, const uint8_t *msg, uint16_t msg_len,
++				uint8_t *queued, uint8_t *queued_len)
+ {
+ 	uint8_t pkt_len;
+ 	uint8_t pkt[MESH_AD_MAX_LEN];
+ 	bool result = false;
+ 
++	if (queued_len)
++		*queued_len = 0;
++
+ 	if (!net->src_addr)
+ 		return;
+ 
+@@ -3454,9 +3713,23 @@ void mesh_net_transport_send(struct mesh_net *net, uint32_t net_key_id,
+ 		return;
+ 	}
+ 
+-	if (!(IS_UNASSIGNED(dst)))
++	if (!(IS_UNASSIGNED(dst))) {
++		if (queued && queued_len) {
++			memcpy(queued, pkt, pkt_len + 1);
++			*queued_len = pkt_len + 1;
++		}
+ 		send_msg_pkt(net, net->tx_cnt, net->tx_interval, pkt,
+ 								pkt_len + 1);
++	}
++}
++
++void mesh_net_transport_send(struct mesh_net *net, uint32_t net_key_id,
++				uint16_t net_idx, uint32_t iv_index,
++				uint8_t ttl, uint32_t seq, uint16_t src,
++				uint16_t dst, const uint8_t *msg, uint16_t msg_len)
++{
++	transport_send_queued(net, net_key_id, net_idx, iv_index, ttl, seq,
++				src, dst, msg, msg_len, NULL, NULL);
+ }
+ 
+ int mesh_net_key_refresh_phase_set(struct mesh_net *net, uint16_t idx,
+diff --git a/mesh/net.h b/mesh/net.h
+index 5200beb..5976e7a 100644
+--- a/mesh/net.h
++++ b/mesh/net.h
+@@ -257,6 +257,11 @@ void mesh_net_transport_send(struct mesh_net *net, uint32_t net_key_id,
+ 				uint16_t dst, const uint8_t *msg,
+ 				uint16_t msg_len);
+ 
++bool mesh_net_sar_pending(struct mesh_net *net, uint16_t dst);
++uint64_t mesh_net_sar_token(struct mesh_net *net, uint16_t src, uint16_t dst);
++bool mesh_net_sar_active(struct mesh_net *net, uint64_t token);
++bool mesh_net_sar_cancel(struct mesh_net *net, uint64_t token);
++void mesh_net_sar_cancel_application(struct mesh_net *net);
+ bool mesh_net_app_send(struct mesh_net *net, bool frnd_cred, uint16_t src,
+ 				uint16_t dst, uint8_t key_aid, uint16_t net_idx,
+ 				uint8_t ttl, uint8_t cnt, uint16_t interval,
+diff --git a/mesh/mesh-io.h b/mesh/mesh-io.h
+index d9e0c13..e98d392 100644
+--- a/mesh/mesh-io.h
++++ b/mesh/mesh-io.h
+@@ -83,5 +83,7 @@ bool mesh_io_deregister_recv_cb(struct mesh_io *io, const uint8_t *filter,
+ 
+ bool mesh_io_send(struct mesh_io *io, struct mesh_io_send_info *info,
+ 					const uint8_t *data, uint16_t len);
++/* Whether an identical packet still owns a queued or active transmission. */
++bool mesh_io_send_pending(struct mesh_io *io, const uint8_t *data, uint8_t len);
+ bool mesh_io_send_cancel(struct mesh_io *io, const uint8_t *pattern,
+ 								uint8_t len);
+diff --git a/mesh/mesh-io-api.h b/mesh/mesh-io-api.h
+index ae51cbc..a3e4f28 100644
+--- a/mesh/mesh-io-api.h
++++ b/mesh/mesh-io-api.h
+@@ -32,6 +32,7 @@ struct mesh_io_api {
+ 	mesh_io_register_t	reg;
+ 	mesh_io_deregister_t	dereg;
+ 	mesh_io_tx_cancel_t	cancel;
++	mesh_io_tx_cancel_t	pending;
+ };
+ 
+ struct mesh_io_reg {
+diff --git a/mesh/mesh-io.c b/mesh/mesh-io.c
+index cbc59c3..cd83c3f 100644
+--- a/mesh/mesh-io.c
++++ b/mesh/mesh-io.c
+@@ -305,6 +305,18 @@ bool mesh_io_send(struct mesh_io *io, struct mesh_io_send_info *info,
+ 	return false;
+ }
+ 
++bool mesh_io_send_pending(struct mesh_io *io, const uint8_t *data, uint8_t len)
++{
++	if (io && io != default_io)
++		return false;
++	if (!io)
++		io = default_io;
++	if (!data || !len)
++		return false;
++	return io && io->api && io->api->pending &&
++			io->api->pending(io, data, len);
++}
++
+ bool mesh_io_send_cancel(struct mesh_io *io, const uint8_t *pattern,
+ 								uint8_t len)
+ {
+diff --git a/mesh/mesh-io-mgmt.c b/mesh/mesh-io-mgmt.c
+index c1fd654..fde65a6 100644
+--- a/mesh/mesh-io-mgmt.c
++++ b/mesh/mesh-io-mgmt.c
+@@ -691,6 +691,18 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+ 	return true;
+ }
+ 
++static bool tx_pending(struct mesh_io *io, const uint8_t *data, uint8_t len)
++{
++	struct mesh_io_private *pvt = io->pvt;
++	struct tx_pattern pattern = { .data = data, .len = len };
++
++	if (!pvt)
++		return false;
++	if (pvt->tx && find_by_pattern(pvt->tx, &pattern))
++		return true;
++	return l_queue_find(pvt->tx_pkts, find_by_pattern, &pattern) != NULL;
++}
++
+ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
+ {
+ 	struct mesh_io_private *pvt = io->pvt;
+@@ -783,4 +795,5 @@ const struct mesh_io_api mesh_io_mgmt = {
+ 	.reg = recv_register,
+ 	.dereg = recv_deregister,
+ 	.cancel = tx_cancel,
++	.pending = tx_pending,
+ };
+diff --git a/mesh/mesh-io-unit.c b/mesh/mesh-io-unit.c
+index f9a5aaa..31c3629 100644
+--- a/mesh/mesh-io-unit.c
++++ b/mesh/mesh-io-unit.c
+@@ -451,6 +451,16 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+ 	return true;
+ }
+ 
++static bool tx_pending(struct mesh_io *io, const uint8_t *data, uint8_t len)
++{
++	struct mesh_io_private *pvt = io->pvt;
++	struct tx_pattern pattern = { .data = data, .len = len };
++
++	if (!pvt)
++		return false;
++	return l_queue_find(pvt->tx_pkts, find_by_pattern, &pattern) != NULL;
++}
++
+ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
+ {
+ 	struct mesh_io_private *pvt = io->pvt;
+@@ -508,4 +518,5 @@ const struct mesh_io_api mesh_io_unit = {
+ 	.reg = recv_register,
+ 	.dereg = recv_deregister,
+ 	.cancel = tx_cancel,
++	.pending = tx_pending,
+ };
+diff --git a/doc/mesh-api.txt b/doc/mesh-api.txt
+index 6abf3cb..101a90b 100644
+--- a/doc/mesh-api.txt
++++ b/doc/mesh-api.txt
+@@ -267,6 +267,39 @@ Methods:
+ 			org.bluez.mesh.Error.InvalidArguments
+ 			org.bluez.mesh.Error.NotFound
+ 
++	uint64 SendUnqueued(object element_path, uint16 destination, uint16 key_index,
++						dict options, array{byte} data)
++
++		Package extension with the same arguments and authorization as
++		Send. If a segmented transfer to this destination is active or
++		queued, returns org.bluez.mesh.Error.Busy without enqueueing data
++		or allocating a network sequence number. The application can keep
++		its newest pending value and retry after the active transfer ends.
++
++		Unsegmented messages remain available for application receipts
++		and other control traffic. The returned transfer identifier is
++		nonzero for an outstanding unicast segmented transaction. Zero
++		means that this send has no outstanding unicast transaction.
++		Identifiers are scoped to this node's provisioned identity.
++		An application disconnect cancels its tracked transactions.
++
++	boolean SendPending(uint64 transfer)
++
++		Package extension with the same owner authorization as Send.
++		Returns true while the tracked unicast transaction is outstanding.
++		False means that lower transport no longer owns this transaction.
++		Application delivery is established by the receiving application.
++
++	boolean CancelSend(uint64 transfer)
++
++		Package extension with the same owner authorization as Send.
++		Cancels the exact outstanding transaction returned by SendUnqueued,
++		including its timers and pending bearer repetitions. Returns true
++		when a transaction was cancelled, or false when it already ended.
++		Repeated cancellation is safe. The next queued transaction for
++		the destination can then start. Use identifiers only with the
++		node identity that issued them.
++
+ 	void DevKeySend(object element_path, uint16 destination, boolean remote,
+ 			uint16 net_index, dict options, array{byte} data)
+ 
+diff --git a/mesh/node.c b/mesh/node.c
+index 1796eea..9785247 100644
+--- a/mesh/node.c
++++ b/mesh/node.c
+@@ -1268,6 +1268,7 @@ static void app_disc_cb(struct l_dbus *bus, void *user_data)
+ 	if (node->provisioner)
+ 		manager_scan_cancel(node);
+ 
++	mesh_net_sar_cancel_application(node_get_net(node));
+ 	free_node_dbus_resources(node);
+ }
+ 
+@@ -2079,15 +2080,17 @@ static bool parse_send_options(struct l_dbus_message_iter *itr,
+ 	return true;
+ }
+ 
+-static struct l_dbus_message *send_call(struct l_dbus *dbus,
+-						struct l_dbus_message *msg,
+-						void *user_data)
++static struct l_dbus_message *send_call_common(struct l_dbus *dbus,
++					struct l_dbus_message *msg,
++					void *user_data, bool queue)
+ {
+ 	struct mesh_node *node = user_data;
+ 	const char *sender, *ele_path;
+ 	struct l_dbus_message_iter dict, iter_data;
+ 	struct send_options opts;
+ 	struct node_element *ele;
++	struct l_dbus_message *reply;
++	uint64_t transfer = 0;
+ 	uint16_t dst, app_idx, net_idx, src;
+ 	uint8_t *data;
+ 	uint32_t len;
+@@ -2127,11 +2130,79 @@ static struct l_dbus_message *send_call(struct l_dbus *dbus,
+ 		return dbus_error(msg, MESH_ERROR_INVALID_ARGS,
+ 							"Key not found");
+ 
++	/* Check before encryption allocates a sequence number or changes any
++	 * transport state. An unsegmented receipt can still pass an active SAR.
++	 */
++	if (!queue && (opts.segmented || len > 11) &&
++			mesh_net_sar_pending(node_get_net(node), dst))
++		return dbus_error(msg, MESH_ERROR_BUSY,
++					"Segmented destination is busy");
++
+ 	if (!mesh_model_send(node, src, dst, app_idx, net_idx, DEFAULT_TTL,
+ 						opts.segmented, len, data))
+ 		return dbus_error(msg, MESH_ERROR_FAILED, NULL);
+ 
+-	return l_dbus_message_new_method_return(msg);
++	reply = l_dbus_message_new_method_return(msg);
++	if (!queue) {
++		if (opts.segmented || len > 11)
++			transfer = mesh_net_sar_token(node_get_net(node), src, dst);
++		l_dbus_message_set_arguments(reply, "t", transfer);
++	}
++	return reply;
++}
++
++static struct l_dbus_message *send_pending_call(struct l_dbus *dbus,
++			struct l_dbus_message *msg, void *user_data)
++{
++	struct mesh_node *node = user_data;
++	struct l_dbus_message *reply;
++	uint64_t transfer;
++	bool pending;
++
++	if (!node->owner ||
++			strcmp(l_dbus_message_get_sender(msg), node->owner))
++		return dbus_error(msg, MESH_ERROR_NOT_AUTHORIZED, NULL);
++
++	if (!l_dbus_message_get_arguments(msg, "t", &transfer))
++		return dbus_error(msg, MESH_ERROR_INVALID_ARGS, NULL);
++
++	pending = mesh_net_sar_active(node_get_net(node), transfer);
++	reply = l_dbus_message_new_method_return(msg);
++	l_dbus_message_set_arguments(reply, "b", pending);
++	return reply;
++}
++
++static struct l_dbus_message *cancel_send_call(struct l_dbus *dbus,
++			struct l_dbus_message *msg, void *user_data)
++{
++	struct mesh_node *node = user_data;
++	struct l_dbus_message *reply;
++	uint64_t transfer;
++	bool cancelled;
++
++	if (!node->owner ||
++			strcmp(l_dbus_message_get_sender(msg), node->owner))
++		return dbus_error(msg, MESH_ERROR_NOT_AUTHORIZED, NULL);
++
++	if (!l_dbus_message_get_arguments(msg, "t", &transfer))
++		return dbus_error(msg, MESH_ERROR_INVALID_ARGS, NULL);
++
++	cancelled = mesh_net_sar_cancel(node_get_net(node), transfer);
++	reply = l_dbus_message_new_method_return(msg);
++	l_dbus_message_set_arguments(reply, "b", cancelled);
++	return reply;
++}
++
++static struct l_dbus_message *send_call(struct l_dbus *dbus,
++			struct l_dbus_message *msg, void *user_data)
++{
++	return send_call_common(dbus, msg, user_data, true);
++}
++
++static struct l_dbus_message *send_unqueued_call(struct l_dbus *dbus,
++			struct l_dbus_message *msg, void *user_data)
++{
++	return send_call_common(dbus, msg, user_data, false);
+ }
+ 
+ static struct l_dbus_message *dev_key_send_call(struct l_dbus *dbus,
+@@ -2497,6 +2568,14 @@ static void setup_node_interface(struct l_dbus_interface *iface)
+ 	l_dbus_interface_method(iface, "Send", 0, send_call, "", "oqqa{sv}ay",
+ 						"element_path", "destination",
+ 						"key_index", "options", "data");
++	l_dbus_interface_method(iface, "SendUnqueued", 0, send_unqueued_call,
++						"t", "oqqa{sv}ay", "transfer",
++						"element_path", "destination",
++						"key_index", "options", "data");
++	l_dbus_interface_method(iface, "SendPending", 0, send_pending_call,
++						"b", "t", "pending", "transfer");
++	l_dbus_interface_method(iface, "CancelSend", 0, cancel_send_call,
++						"b", "t", "cancelled", "transfer");
+ 	l_dbus_interface_method(iface, "DevKeySend", 0, dev_key_send_call, "",
+ 						"oqbqa{sv}ay", "element_path",
+ 						"destination", "remote",

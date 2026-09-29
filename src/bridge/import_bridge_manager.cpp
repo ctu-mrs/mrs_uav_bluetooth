@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bridge/import_bridge_manager.cpp
+/// \brief Implements the import bridge manager component of the transport-independent ROS message bridge.
+
 #include "mrs_uav_bluetooth/bridge/import_bridge_manager.hpp"
 
 #include "mrs_uav_bluetooth/bridge/generic_message_bridge.hpp"
@@ -12,7 +15,11 @@ struct PublishRateSample {
     double hz;
 };
 
+/// \brief Calculate the latest publication timestamp and observed one-sample frequency.
+/// \param last_publish_monotonic steady-clock time of the preceding publication for rate calculation.
+/// \return Current monotonic timestamp and frequency since the preceding publication.
 PublishRateSample update_publish_rate(double last_publish_monotonic) {
+    // Measure frequency from the previous successful publication, leaving the first sample at zero.
     const auto now = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     if (last_publish_monotonic > 0.0 && now > last_publish_monotonic) {
@@ -26,6 +33,7 @@ PublishRateSample update_publish_rate(double last_publish_monotonic) {
 namespace mrs_uav_bluetooth::bridge {
 
 std::shared_ptr<GenericMessageBridge> ImportBridgeManager::runtime_for(TopicImportBridgeState& state) {
+    // Create the type-erased ROS codec lazily and reuse it for this bridge.
     if (!state.runtime || state.runtime->message_type() != state.message_type) {
         state.runtime = std::make_shared<GenericMessageBridge>(state.message_type);
     }
@@ -34,6 +42,7 @@ std::shared_ptr<GenericMessageBridge> ImportBridgeManager::runtime_for(TopicImpo
 
 bool ImportBridgeManager::publish_payload(TopicImportBridgeState& state,
                                           const std::vector<uint8_t>& payload) {
+    // Decode the wire fields into a serialized ROS message and publish it.
     if (payload.empty()) {
         return false;
     }
@@ -63,17 +72,22 @@ bool ImportBridgeManager::publish_payload(TopicImportBridgeState& state,
 }
 
 ImportBridgeManager::ImportBridgeManager(rclcpp::Node& node, rclcpp::Logger logger)
-    : node_(node), logger_(logger) {}
+    : node_(node), logger_(logger) {
+        // Retain the ROS node and logger used by incoming bridge publishers and timers.
+    }
 
 void ImportBridgeManager::set_registry(BridgeRegistry* registry) {
+    // Attach the shared registry that owns all configured import bridge state.
     registry_ = registry;
 }
 
 void ImportBridgeManager::set_state_mutex(std::recursive_mutex* mutex) {
+    // Share the recursive overlay mutex with bridge creation and timer callbacks.
     state_mutex_ = mutex;
 }
 
 void ImportBridgeManager::destroy_import_bridge(TopicImportBridgeState& state) {
+    // Destroy import bridge.
     if (state.poll_timer) {
         state.poll_timer->cancel();
         state.poll_timer.reset();
@@ -85,6 +99,7 @@ void ImportBridgeManager::destroy_import_bridge(TopicImportBridgeState& state) {
 void ImportBridgeManager::configure_import_bridge(const std::string& bridge_key,
                                                   TopicImportBridgeState& state,
                                                   bluez::BluezClient& client) {
+    // Create the type-erased publisher, then add polling only for a positive rate.
     auto runtime = runtime_for(state);
     state.publisher = runtime->create_publisher(node_, state.resolved_topic_name, 10);
     configure_import_poll_timer(bridge_key, state, client);
@@ -93,6 +108,7 @@ void ImportBridgeManager::configure_import_bridge(const std::string& bridge_key,
 void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_key,
                                                       TopicImportBridgeState& state,
                                                       bluez::BluezClient& client) {
+    // Replace any old timer and leave notification-driven bridges untimed.
     if (state.poll_timer) {
         state.poll_timer->cancel();
         state.poll_timer.reset();
@@ -104,6 +120,7 @@ void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_
     state.poll_timer = node_.create_wall_timer(
         std::chrono::duration<double>(period_s),
         [this, &client, bridge_key]() {
+            // Poll this remote bridge at its configured rate and publish a decoded ROS message.
             (void)client;
             std::unique_lock<std::recursive_mutex> state_lock;
             if (state_mutex_ != nullptr) {
@@ -134,6 +151,7 @@ void ImportBridgeManager::configure_import_poll_timer(const std::string& bridge_
 bool ImportBridgeManager::buffer_notification_payload(const std::string& mac,
                                                       const std::string& characteristic_path,
                                                       const std::vector<uint8_t>& payload) {
+    // Coalesce an incoming notification so bridge processing can run outside cache callbacks.
     std::unique_lock<std::recursive_mutex> state_lock;
     if (state_mutex_ != nullptr) {
         state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
@@ -163,6 +181,7 @@ bool ImportBridgeManager::buffer_notification_payload(const std::string& mac,
 
 bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
                                                        bluez::BluezClient& client) {
+    // Resolve this peer remote GATT paths and stage notification changes outside the state lock.
     std::unique_lock<std::recursive_mutex> state_lock;
     if (state_mutex_ != nullptr) {
         state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);
@@ -234,6 +253,7 @@ bool ImportBridgeManager::refresh_import_paths_for_mac(const std::string& mac,
 
 bool ImportBridgeManager::clear_import_paths_for_mac(const std::string& mac,
                                                      bluez::BluezClient& client) {
+    // Detach every cached characteristic and publisher owned by this peer.
     std::unique_lock<std::recursive_mutex> state_lock;
     if (state_mutex_ != nullptr) {
         state_lock = std::unique_lock<std::recursive_mutex>(*state_mutex_);

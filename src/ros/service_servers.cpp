@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/ros/service_servers.cpp
+/// \brief Implements the service servers component of the ROS 2 interface layer.
+
 #include "mrs_uav_bluetooth/ros/service_servers.hpp"
 
 namespace mrs_uav_bluetooth::ros {
 
 ServiceServers::ServiceServers(rclcpp::Node& node)
-    : node_(node) {}
+    : node_(node) {
+        // Retain the node used to create all Bluetooth control service endpoints.
+    }
 
 std::vector<rclcpp::ServiceBase::SharedPtr> ServiceServers::register_all(
     rclcpp::Node& owner,

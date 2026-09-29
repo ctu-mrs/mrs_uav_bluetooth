@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/util/logging_utils.cpp
+/// \brief Implements the logging utils component of the shared utility layer.
+
 #include "mrs_uav_bluetooth/util/logging_utils.hpp"
 
 #include <chrono>
@@ -10,6 +13,7 @@
 namespace mrs_uav_bluetooth::util {
 
 void VerboseLogger::open_file(const std::string& path) {
+    // Open file.
     std::lock_guard<std::mutex> lock(mutex_);
     if (file_.is_open()) {
         file_.close();
@@ -55,11 +59,13 @@ void VerboseLogger::log(const std::string& message) {
 
 void VerboseLogger::set_topic_publisher(
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pub) {
+    // Replace the optional ROS sink used to mirror verbose log messages.
     std::lock_guard<std::mutex> lock(mutex_);
     log_pub_ = std::move(pub);
 }
 
 void VerboseLogger::set_topic_enabled(bool enabled) {
+    // Enable or disable ROS log mirroring without affecting normal logger output.
     std::lock_guard<std::mutex> lock(mutex_);
     topic_enabled_ = enabled;
 }

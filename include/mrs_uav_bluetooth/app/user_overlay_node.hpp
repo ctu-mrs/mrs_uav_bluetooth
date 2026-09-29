@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/app/user_overlay_node.hpp
+/// \brief Declares the user overlay node component of the ROS 2 application and operator-tool layer.
+
 #pragma once
 
 #include "mrs_uav_bluetooth/config/config_models.hpp"
@@ -23,12 +26,17 @@
 
 namespace mrs_uav_bluetooth::app {
 
+/// Experiment-side node that leases a temporary service-node configuration.
+/// Destruction or loss of its keepalive publisher makes the service revert safely.
 class UserOverlayNode : public rclcpp::Node {
 public:
+    /// \brief Load, activate, and keep alive one example overlay.
     UserOverlayNode();
+    /// \brief Release the overlay lease and request restoration of the default configuration.
     ~UserOverlayNode() override;
 
 private:
+    /// \brief Load overlay path, service names, lease timing, and transport-report topics.
     void configure_parameters();
     /// Load the merged default/overlay config and select diagnostics from the
     /// transports actually declared by the overlay.
@@ -36,21 +44,33 @@ private:
     /// Create subscriptions and a periodic reporter for advertisement/Mesh
     /// details. GATT keeps using the service's comprehensive text report.
     void configure_transport_reporting();
+    /// \brief Acquire the overlay lease and ask the service node to activate its YAML file.
     void activate_overlay();
+    /// \brief Release this node's overlay lease and request the default configuration.
     void revert_overlay();
+    /// \brief Renew the overlay lease while this client remains alive.
     void publish_keepalive();
+    /// \brief Wait briefly for configuration control and return its completed response.
+    /// \param config_path path of the config.
+    /// \return Completed configuration-service response or null when unavailable.
     mrs_uav_bluetooth::srv::SetActiveConfig::Response::SharedPtr call_config_service(const std::string& config_path);
+    /// \brief Print a transport-aware snapshot in response to a ROS text command.
+    /// \param message Text command requesting an immediate status report.
     void handle_print(const std_msgs::msg::String::SharedPtr message);
     /// Keep recently seen advertisement peers across empty scan snapshots.
+    /// \param message Latest advertisement scan snapshot.
     void handle_advertisements(
         const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message);
     /// Cache current Mesh lifecycle and topology state.
+    /// \param message Latest Mesh lifecycle and topology snapshot.
     void handle_mesh_status(
         const mrs_uav_bluetooth::msg::MeshStatus::SharedPtr message);
     /// Retain the newest Mesh lifecycle event and a cumulative event count.
+    /// \param message Latest Mesh lifecycle event.
     void handle_mesh_event(
         const mrs_uav_bluetooth::msg::MeshEvent::SharedPtr message);
     /// Retain the newest raw Mesh packet and a cumulative receive count.
+    /// \param message Latest raw Mesh message.
     void handle_mesh_message(
         const mrs_uav_bluetooth::msg::MeshMessage::SharedPtr message);
     /// Print one transport-aware report from cached non-blocking callbacks.

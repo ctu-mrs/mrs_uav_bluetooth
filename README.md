@@ -37,7 +37,7 @@ features. Open `/etc/bluetooth/main.conf`, set `Experimental = true` in the `[Ge
 
 ### Use Text User Interface (TUI)
 
-The TUI finds nearby UAVs and can open their Wi-Fi settings or an SSH connection. It does not need the UAV service running on your laptop.
+The TUI runs on your laptop and connects to nearby UAVs for Wi-Fi setup or SSH.
 
 ```bash
 ros2 launch mrs_uav_bluetooth tui_node.launch.py
@@ -47,13 +47,13 @@ When Bluetooth serial access is enabled on a UAV, press `h` in the TUI for SSH. 
 
 ### Share ROS topics
 
-Choose one Bluetooth mode for all UAVs. These modes cannot run together on one Bluetooth adapter. Ordered by increasing complexity:
+Choose the same topic-sharing mode on the participating UAVs. The service switches the adapter to that mode when you load an overlay.
 
 | Mode | What it does | User payload limit | Sample configuration |
 | --- | --- | --- | --- |
 | Advertisement | Sends small messages to nearby UAVs without connecting. | 26 B (legacy) / 246 B | [Odometry advertisement](config/examples/swarm_odom_advertisement_overlay.yaml) |
 | GATT | Connects to nearby UAVs and sends larger messages. | 512 B | [Odometry GATT](config/examples/swarm_odom_gatt_overlay.yaml) |
-| Mesh | Passes messages through other UAVs to reach farther away (multi-hop). | 377 B | [Odometry Mesh](config/examples/swarm_odom_mesh_overlay.yaml) |
+| Mesh | Passes messages through other UAVs to reach farther away (multi-hop). | 370 B | [Odometry Mesh](config/examples/swarm_odom_mesh_overlay.yaml) |
 
 Copy the sample for your mode and edit the UAV names in `peer_whitelist` and the source topic in `shared_topics`. The samples use `/uavXX/mavros/local_position/odom`. Start the overlay on each participating UAV with an absolute path to your edited file:
 
@@ -61,21 +61,21 @@ Copy the sample for your mode and edit the UAV names in `peer_whitelist` and the
 ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/absolute/path/to/your-overlay.yaml
 ```
 
-If you do not have real odometry yet, start a test source on each UAV:
+For generated odometry, start a test source on each UAV:
 
 ```bash
 ros2 launch mrs_uav_bluetooth random_odometry_publisher.launch.py rate_hz:=5.0
 ```
 
-The advertisement sample sends timestamp, orientation, and 3D position at 1 Hz in 26 bytes. The Mesh sample uses a smaller 21-byte timestamp and pose mapping at 0.2 Hz to reduce radio segments. The GATT sample sends time, pose, and velocities as 32-bit floats at 10 Hz. These samples do not include frame IDs or covariance fields. Edit the fields and rates in the overlay if your application needs something different.
+The advertisement sample packs the original nanosecond timestamp, three orientation angles, and XYZ position into 26 bytes. GATT and Mesh use the same 60-byte timestamp, pose, and velocity layout. All three samples are configured for 10 Hz. Add frame IDs or covariance fields to the declaration if your application needs them.
 
 Received GATT and advertisement topics appear below `/{hostname}/bluetooth/le/peers/<peer>/`. Mesh uses `/{hostname}/bluetooth/mesh/peers/<peer>/`. The peer segment is the hostname when it can be resolved. GATT and advertisements fall back to `mac_<address>`. Mesh packets contain a unicast address but no Bluetooth MAC, so a Mesh overlay without a peer list falls back to `unicast_<address>`. The `user_node` prints status for the active mode while it runs.
 
 #### First use of Mesh
 
-Copy the [Mesh sample](config/examples/swarm_odom_mesh_overlay.yaml) to every UAV and put the same nonempty ordered `peer_whitelist` in each copy. Start `user_node` on each UAV. The first reachable candidate starts a private Mesh with random keys. Other listed UAVs join automatically over nearby Bluetooth provisioning. Every member can relay and provision another listed UAV. The service stores each UAV's identity and keys locally, so you do not need to create or copy key files. Each UAV number must be unique and within 1..32767.
+Copy the [Mesh sample](config/examples/swarm_odom_mesh_overlay.yaml) to every UAV and put the same nonempty ordered `peer_whitelist` in each copy. Start `user_node` on each UAV. The first reachable candidate starts a private Mesh with random keys. Other listed UAVs join automatically over nearby Bluetooth provisioning. Every member can relay and provision another listed UAV. The service creates and stores each UAV's identity and keys automatically. Each UAV number must be unique and within 1..32767.
 
-The preferred active provisioner follows the peer list. If it disappears, the next reachable member takes over, and the preferred member takes the role again when it returns. Do not delete or copy a UAV's stored Mesh identity to another UAV. Independently formed private Mesh networks do not yet merge automatically when they meet. Start the preferred candidate first when you need one common network.
+The preferred active provisioner follows the peer list. If it disappears, the next reachable member takes over, and the preferred member takes the role again when it returns. Keep each stored Mesh identity on its original UAV. Independently formed private Mesh networks currently remain separate when they meet.
 
 ### Use your own data or ROS node
 
@@ -85,13 +85,11 @@ Each entry needs a `transport` of `gatt`, `advertisement`, or `mesh`, a `mode` o
 
 `payload_format: struct` uses only the ordered fields in `members_encode`. Each entry has a `target` and a `type`, which is the final transmission type such as `float32`, `uint8`, or `int16`. Without an `expression`, `target` is a ROS field copied directly. With an `expression`, `target` names the computed transmission value. In `members_decode`, each entry uses the same `target` and `expression` keys. There, `target` is the ROS field to fill and the expression refers to transmission-value names. Direct fields are reconstructed automatically.  Integer destinations are rounded when needed and always range-checked. Exporters and importers must use the same layout.
 
-`payload_format: raw` uses a `std_msgs/msg/UInt8MultiArray` byte array. `payload_format: ros2` uses the whole serialized message and is usually too large for legacy advertisements. Mesh bridges and multi-topic advertisement bridges need a unique `channel_id` so the receiver knows which declaration should decode the bytes. The single advertisement bridge in the sample uses `framing: bare` to make all 26 data bytes available in legacy advertisements (e.g., on RPi5). Mesh bridges may additionally set `destination`, `app_key_index`, `element_index`, `force_segmented`, `vendor_opcode`, and `company_id`, leaving less space for user payloads.
+`payload_format: raw` uses a `std_msgs/msg/UInt8MultiArray` byte array. `payload_format: ros2` uses the whole serialized message and is usually too large for legacy advertisements. Mesh bridges and multi-topic advertisement bridges need a unique `channel_id` so the receiver knows which declaration should decode the bytes. The single advertisement bridge in the sample uses `framing: bare` to make all 26 data bytes available in legacy advertisements (e.g., on RPi5). Mesh destinations and keys are managed automatically. See the [configuration](config/default.yaml) for advanced settings.
 
-An overlay remains active while its `user_node` is running. The service returns to [default.yaml](config/default.yaml) when that node exits. The service package also offers time sharing, Wi-Fi setup over GATT, and optional Bluetooth serial access for SSH. These features are configured in the default file or an overlay. Only one radio mode can own an adapter at a time.
+An overlay remains active while its `user_node` is running. The service returns to [default.yaml](config/default.yaml) when that node exits. The service package also offers time sharing, Wi-Fi setup over GATT, and optional Bluetooth serial access for SSH. These features are configured in the default file or an overlay. The service selects one topic-sharing mode per adapter.
 
-The service also exposes ROS topics and services under `/{hostname}/bluetooth/le`, `/{hostname}/bluetooth/mesh`, and `/{hostname}/bluetooth/config` for advanced integrations. These are not needed to run the automatic samples. Mesh provides a send service and topics for received messages, events, and status. Use `ros2 service list`, `ros2 topic list`, and `ros2 interface show` to inspect them.
-
-The first GATT connection may need several pairing attempts. Larger multi-hop swarms have not yet been tested.
+The service also exposes ROS topics and services under `/{hostname}/bluetooth/le`, `/{hostname}/bluetooth/mesh`, and `/{hostname}/bluetooth/config` for advanced integrations. Mesh provides a send service and topics for received messages, events, and status. Use `ros2 service list`, `ros2 topic list`, and `ros2 interface show` to inspect them.
 
 ## ROS topic reference
 

@@ -1,37 +1,19 @@
-# Node: user_node (overlay applied to the background service_node)
-# Purpose: share the configured odometry topic over connected-peer GATT bridges.
-#
-#   ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/opt/ros/jazzy/share/mrs_uav_bluetooth/config/examples/swarm_odom_gatt_overlay.yaml
-#
-# Make a copy of this file and adjust it as needed for your experiment.
-# On launch, the system bluetooth service merges it on top of config/default.yaml
-# while the user node keeps the lease alive.
+# GATT example: shares complete odometry over fast private connections.
+# Copy this file, list all UAVs below, and deploy the same copy everywhere.
+# Start user_node with config_path:=<absolute path to the copy>.
+# Received data appears below /<this-uav>/bluetooth/le/peers.
 
-# Enable automatic peer connection only for the swarm members involved in the
-# experiment. The verbose topic preserves user_node detailed GATT reporting.
+# -----------------------------------------------------------------------------
+# Allowed UAVs. Empty accepts all.
 log_topic_enable: true
 auto_connect_enable: true
 peer_whitelist:
   - uav42
   - uav99
 
-# Share one compact odometry packet in both directions.
-# Packet layout:
-#   uint32  timestamp_seconds
-#   uint32  timestamp_nanoseconds
-#   float32 position.x
-#   float32 position.y
-#   float32 position.z
-#   float32 orientation.x
-#   float32 orientation.y
-#   float32 orientation.z
-#   float32 orientation.w
-#   float32 linear.x
-#   float32 linear.y
-#   float32 linear.z
-#   float32 angular.x
-#   float32 angular.y
-#   float32 angular.z
+# -----------------------------------------------------------------------------
+# Data to send
+# Keep this section identical on all UAVs.
 shared_topics:
   - transport: gatt
     mode: both
@@ -72,8 +54,7 @@ shared_topics:
         type: float32
       - target: twist.twist.angular.z
         type: float32
-    # Direct path members are restored automatically. Computed wire members
-    # need explicit assignments to the corresponding ROS message fields.
+    # Rebuild the usual ROS time fields.
     members_decode:
       - target: header.stamp.sec
         expression: seconds

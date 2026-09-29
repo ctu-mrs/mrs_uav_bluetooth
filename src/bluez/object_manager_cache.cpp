@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bluez/object_manager_cache.cpp
+/// \brief Implements the object manager cache component of the BlueZ system-D-Bus integration layer.
+
 #include "mrs_uav_bluetooth/bluez/object_manager_cache.hpp"
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <set>
 
 namespace mrs_uav_bluetooth::bluez {
 
@@ -12,14 +16,23 @@ namespace {
 using ManagedObjectMap = std::map<sdbus::ObjectPath,
                                   std::map<std::string, std::map<std::string, sdbus::Variant>>>;
 
+/// \brief Deliver a copied event batch after releasing the cache mutation lock.
+/// \param notifications event batch queued for delivery after releasing the cache lock.
+/// \param notify callback that receives each queued cache event.
 void dispatch_notifications(const std::vector<std::pair<CacheEvent, std::string>>& notifications,
                            const std::function<void(CacheEvent, const std::string&)>& notify) {
+    // Deliver a copied event batch after releasing the cache mutation lock.
     for (const auto& [event, path] : notifications) {
         notify(event, path);
     }
 }
 
+/// \brief Test whether a D-Bus object lies strictly below a parent path.
+/// \param parent_path path of the parent.
+/// \param candidate_path path of the candidate.
+/// \return True if the candidate equals the parent or lies in its D-Bus subtree; otherwise false.
 bool is_child_path(const std::string& parent_path, const std::string& candidate_path) {
+    // Check the slash boundary so similarly prefixed sibling names do not match.
     return candidate_path.size() > parent_path.size() &&
            candidate_path.compare(0, parent_path.size(), parent_path) == 0 &&
            candidate_path[parent_path.size()] == '/';
@@ -29,9 +42,16 @@ bool is_child_path(const std::string& parent_path, const std::string& candidate_
 
 // ---- Variant helpers ----
 
+/// \brief Decode a typed property while tolerating missing or mismatched variants.
+/// \tparam T Expected D-Bus property type.
+/// \param m Property dictionary returned by BlueZ.
+/// \param key Property name to read.
+/// \param fallback Value returned when decoding is impossible.
+/// \return Decoded property value or fallback.
 template <typename T>
 T ObjectManagerCache::get_or(const std::map<std::string, sdbus::Variant>& m,
                              const std::string& key, T fallback) {
+    // Return the typed D-Bus value, falling back when the key is absent or has another type.
     auto it = m.find(key);
     if (it == m.end()) return fallback;
     try {
@@ -43,11 +63,13 @@ T ObjectManagerCache::get_or(const std::map<std::string, sdbus::Variant>& m,
 
 std::string ObjectManagerCache::get_string(
     const std::map<std::string, sdbus::Variant>& m, const std::string& key) {
+    // Read an optional string property without propagating D-Bus type errors.
     return get_or<std::string>(m, key, "");
 }
 
 std::vector<std::string> ObjectManagerCache::get_string_vector(
     const std::map<std::string, sdbus::Variant>& m, const std::string& key) {
+    // Read an optional string-list property without propagating D-Bus type errors.
     return get_or<std::vector<std::string>>(m, key, {});
 }
 
@@ -56,9 +78,13 @@ std::vector<std::string> ObjectManagerCache::get_string_vector(
 ObjectManagerCache::ObjectManagerCache(DbusConnection& dbus, rclcpp::Logger logger)
     : dbus_(dbus), logger_(logger)
 {
+    // Retain the event connection used for signals and the logger used for reconciliation.
 }
 
-ObjectManagerCache::~ObjectManagerCache() = default;
+ObjectManagerCache::~ObjectManagerCache() {
+    // Remove the daemon-owner signal match before releasing the D-Bus connection.
+    daemon_owner_match_.reset();
+}
 
 void ObjectManagerCache::start() {
     om_proxy_ = sdbus::createProxy(dbus_.connection(),
@@ -69,6 +95,7 @@ void ObjectManagerCache::start() {
     om_proxy_->uponSignal("InterfacesAdded")
              .onInterface(std::string(kDbusObjectManagerIface))
              .call([this](const sdbus::ObjectPath& path, const InterfaceMap& ifaces) {
+                 // Merge newly exported BlueZ interfaces into the typed cache.
                  on_interfaces_added(path, ifaces);
              });
 
@@ -76,6 +103,7 @@ void ObjectManagerCache::start() {
              .onInterface(std::string(kDbusObjectManagerIface))
              .call([this](const sdbus::ObjectPath& path,
                           const std::vector<std::string>& ifaces) {
+                 // Remove vanished BlueZ interfaces and notify dependent state machines.
                  on_interfaces_removed(path, ifaces);
              });
 
@@ -85,12 +113,22 @@ void ObjectManagerCache::start() {
     // Actually, we subscribe at the proxy level but the OM proxy only sees its
     // own path.  For PropertiesChanged on all paths we need a match rule:
     auto& conn = dbus_.connection();
+    daemon_owner_match_ = conn.addMatch(
+        "type='signal',sender='org.freedesktop.DBus',"
+        "interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.bluez'",
+        [this](sdbus::Message message) {
+            // Clear daemon-owned objects on exit and reload them after a BlueZ restart.
+            std::string name, previous_owner, owner;
+            message >> name >> previous_owner >> owner;
+            on_bluez_owner_changed(previous_owner, owner);
+        }, sdbus::return_slot);
     conn.addMatch(
         "type='signal',"
         "sender='org.bluez',"
         "interface='org.freedesktop.DBus.Properties',"
         "member='PropertiesChanged'",
         [this](sdbus::Message msg) {
+            // Apply changed and invalidated D-Bus properties to the matching cached object.
             std::string interface;
             std::map<std::string, sdbus::Variant> changed;
             std::vector<std::string> invalidated;
@@ -107,6 +145,7 @@ void ObjectManagerCache::start() {
 }
 
 int ObjectManagerCache::add_observer(CacheEventCallback cb) {
+    // Allocate a stable token and register the cache-event subscriber under lock.
     std::lock_guard lock(mutex_);
     const int token = next_observer_token_++;
     observers_.emplace(token, std::move(cb));
@@ -114,6 +153,7 @@ int ObjectManagerCache::add_observer(CacheEventCallback cb) {
 }
 
 void ObjectManagerCache::remove_observer(int token) {
+    // Erase only the callback associated with the caller’s registration token.
     std::lock_guard lock(mutex_);
     observers_.erase(token);
 }
@@ -121,12 +161,14 @@ void ObjectManagerCache::remove_observer(int token) {
 // ---- Queries ----
 
 std::optional<AdapterInfo> ObjectManagerCache::adapter(const std::string& path) const {
+    // Copy one cached Adapter1 record under lock.
     std::lock_guard lock(mutex_);
     auto it = adapters_.find(path);
     return it != adapters_.end() ? std::optional{it->second} : std::nullopt;
 }
 
 std::vector<AdapterInfo> ObjectManagerCache::adapters() const {
+    // Snapshot all cached Adapter1 records under lock.
     std::lock_guard lock(mutex_);
     std::vector<AdapterInfo> result;
     result.reserve(adapters_.size());
@@ -135,12 +177,14 @@ std::vector<AdapterInfo> ObjectManagerCache::adapters() const {
 }
 
 std::optional<DeviceInfo> ObjectManagerCache::device(const std::string& path) const {
+    // Copy one device record under lock so callers cannot observe an in-place update.
     std::lock_guard lock(mutex_);
     auto it = devices_.find(path);
     return it != devices_.end() ? std::optional{it->second} : std::nullopt;
 }
 
 std::optional<DeviceInfo> ObjectManagerCache::device_by_mac(const std::string& mac) const {
+    // Find a cached device by normalized address.
     std::lock_guard lock(mutex_);
     for (const auto& [_, dev] : devices_) {
         if (dev.mac == mac) return dev;
@@ -149,6 +193,7 @@ std::optional<DeviceInfo> ObjectManagerCache::device_by_mac(const std::string& m
 }
 
 std::vector<DeviceInfo> ObjectManagerCache::devices() const {
+    // Snapshot every cached device under lock for consistent service responses.
     std::lock_guard lock(mutex_);
     std::vector<DeviceInfo> result;
     result.reserve(devices_.size());
@@ -157,6 +202,7 @@ std::vector<DeviceInfo> ObjectManagerCache::devices() const {
 }
 
 std::vector<DeviceInfo> ObjectManagerCache::connected_devices() const {
+    // Snapshot only cached Device1 records whose Connected flag is true.
     std::lock_guard lock(mutex_);
     std::vector<DeviceInfo> result;
     for (const auto& [_, v] : devices_) {
@@ -166,18 +212,21 @@ std::vector<DeviceInfo> ObjectManagerCache::connected_devices() const {
 }
 
 std::optional<GattServiceInfo> ObjectManagerCache::service(const std::string& path) const {
+    // Copy one cached service record while holding the cache lock.
     std::lock_guard lock(mutex_);
     auto it = gatt_services_.find(path);
     return it != gatt_services_.end() ? std::optional{it->second} : std::nullopt;
 }
 
 std::optional<GattCharacteristicInfo> ObjectManagerCache::characteristic(const std::string& path) const {
+    // Expose the value characteristic owned by this topic bridge service.
     std::lock_guard lock(mutex_);
     auto it = gatt_characteristics_.find(path);
     return it != gatt_characteristics_.end() ? std::optional{it->second} : std::nullopt;
 }
 
 std::optional<GattDescriptorInfo> ObjectManagerCache::descriptor(const std::string& path) const {
+    // Copy one cached descriptor record while holding the cache lock.
     std::lock_guard lock(mutex_);
     auto it = gatt_descriptors_.find(path);
     return it != gatt_descriptors_.end() ? std::optional{it->second} : std::nullopt;
@@ -185,6 +234,7 @@ std::optional<GattDescriptorInfo> ObjectManagerCache::descriptor(const std::stri
 
 std::vector<GattServiceInfo> ObjectManagerCache::services_for_device(
     const std::string& device_path) const {
+    // Collect cached GATT services whose Device path belongs to this peer.
     std::lock_guard lock(mutex_);
     std::vector<GattServiceInfo> result;
     for (const auto& [path, svc] : gatt_services_) {
@@ -198,6 +248,7 @@ std::vector<GattServiceInfo> ObjectManagerCache::services_for_device(
 
 std::vector<GattCharacteristicInfo> ObjectManagerCache::characteristics_for_service(
     const std::string& service_path) const {
+    // Collect cached characteristics belonging to one service subtree.
     std::lock_guard lock(mutex_);
     std::vector<GattCharacteristicInfo> result;
     for (const auto& [path, chrc] : gatt_characteristics_) {
@@ -211,6 +262,7 @@ std::vector<GattCharacteristicInfo> ObjectManagerCache::characteristics_for_serv
 
 std::vector<GattDescriptorInfo> ObjectManagerCache::descriptors_for_characteristic(
     const std::string& chrc_path) const {
+    // Collect cached descriptors belonging to one characteristic subtree.
     std::lock_guard lock(mutex_);
     std::vector<GattDescriptorInfo> result;
     for (const auto& [path, desc] : gatt_descriptors_) {
@@ -224,15 +276,22 @@ std::vector<GattDescriptorInfo> ObjectManagerCache::descriptors_for_characterist
 
 std::optional<GattCharacteristicInfo> ObjectManagerCache::find_characteristic_by_uuid(
     const std::string& device_path, const std::string& uuid) const {
+    // Find a case-insensitive characteristic UUID within one device subtree.
     std::lock_guard lock(mutex_);
     std::string lower_uuid = uuid;
     std::transform(lower_uuid.begin(), lower_uuid.end(), lower_uuid.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+                   [](unsigned char c) {
+                       // Fold each UUID byte so BlueZ's mixed-case spelling cannot break characteristic lookup.
+                       return std::tolower(c);
+                   });
     for (const auto& [path, chrc] : gatt_characteristics_) {
         if (path.find(device_path + "/") != 0) continue;
         std::string chrc_uuid = chrc.uuid;
         std::transform(chrc_uuid.begin(), chrc_uuid.end(), chrc_uuid.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) {
+                           // Normalize each cached characteristic UUID before comparison.
+                           return std::tolower(c);
+                       });
         if (chrc_uuid == lower_uuid) return chrc;
     }
     return std::nullopt;
@@ -240,16 +299,23 @@ std::optional<GattCharacteristicInfo> ObjectManagerCache::find_characteristic_by
 
 std::optional<GattDescriptorInfo> ObjectManagerCache::find_descriptor_by_uuid(
     const std::string& chrc_path, const std::string& uuid) const {
+    // Find a case-insensitive descriptor UUID within one characteristic subtree.
     std::lock_guard lock(mutex_);
     std::string lower_uuid = uuid;
     std::transform(lower_uuid.begin(), lower_uuid.end(), lower_uuid.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+                   [](unsigned char c) {
+                       // Fold each UUID byte so BlueZ's mixed-case spelling cannot break descriptor lookup.
+                       return std::tolower(c);
+                   });
     for (const auto& [path, desc] : gatt_descriptors_) {
         if (desc.characteristic_path != chrc_path &&
             path.find(chrc_path + "/") != 0) continue;
         std::string desc_uuid = desc.uuid;
         std::transform(desc_uuid.begin(), desc_uuid.end(), desc_uuid.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) {
+                           // Normalize each cached descriptor UUID before comparison.
+                           return std::tolower(c);
+                       });
         if (desc_uuid == lower_uuid) return desc;
     }
     return std::nullopt;
@@ -278,8 +344,54 @@ bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) 
     PendingNotifications notifications;
     size_t refreshed_count = 0;
     size_t refreshed_gatt_count = 0;
+    std::set<std::string> snapshot_paths;
+    for (const auto& [path, ifaces] : objects) {
+        const auto path_string = static_cast<std::string>(path);
+        if (path_string == device_path || is_child_path(device_path, path_string)) {
+            snapshot_paths.insert(path_string);
+        }
+    }
+
+    size_t stale_removal_count = 0;
     {
         std::lock_guard lock(mutex_);
+
+        // GetManagedObjects is authoritative. Reconcile paths that vanished
+        // even if an InterfacesRemoved signal was lost during a daemon or
+        // remote GATT-server transition; merging alone leaves duplicate UUIDs
+        // and makes callers select the oldest, invalid object path.
+        std::vector<std::string> stale_descriptors;
+        std::vector<std::string> stale_characteristics;
+        std::vector<std::string> stale_services;
+        for (const auto& [path, _] : gatt_descriptors_) {
+            if (is_child_path(device_path, path) && snapshot_paths.count(path) == 0) {
+                stale_descriptors.push_back(path);
+            }
+        }
+        for (const auto& [path, _] : gatt_characteristics_) {
+            if (is_child_path(device_path, path) && snapshot_paths.count(path) == 0) {
+                stale_characteristics.push_back(path);
+            }
+        }
+        for (const auto& [path, _] : gatt_services_) {
+            if (is_child_path(device_path, path) && snapshot_paths.count(path) == 0) {
+                stale_services.push_back(path);
+            }
+        }
+        for (const auto& path : stale_descriptors) {
+            gatt_descriptors_.erase(path);
+            notifications.emplace_back(CacheEvent::GattDescriptorRemoved, path);
+        }
+        for (const auto& path : stale_characteristics) {
+            gatt_characteristics_.erase(path);
+            notifications.emplace_back(CacheEvent::GattCharacteristicRemoved, path);
+        }
+        for (const auto& path : stale_services) {
+            gatt_services_.erase(path);
+            notifications.emplace_back(CacheEvent::GattServiceRemoved, path);
+        }
+        stale_removal_count = notifications.size();
+
         for (const auto& [path, ifaces] : objects) {
             const auto path_string = static_cast<std::string>(path);
             if (path_string != device_path && !is_child_path(device_path, path_string)) {
@@ -299,10 +411,12 @@ bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) 
         return false;
     }
 
-    RCLCPP_INFO(logger_, "[cache] refreshed %zu object(s) for %s from GetManagedObjects (%zu GATT, %zu new event%s)",
+    RCLCPP_INFO(logger_, "[cache] reconciled %zu object(s) for %s from GetManagedObjects (%zu GATT, %zu stale removal%s, %zu total event%s)",
                 refreshed_count, device_path.c_str(), refreshed_gatt_count,
+                stale_removal_count, stale_removal_count == 1 ? "" : "s",
                 notifications.size(), notifications.size() == 1 ? "" : "s");
     dispatch_notifications(notifications, [this](CacheEvent event, const std::string& object_path) {
+        // Deliver subtree reconciliation events only after the cache lock is released.
         notify(event, object_path);
     });
     return refreshed_gatt_count != 0;
@@ -311,6 +425,7 @@ bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) 
 // ---- Signal handlers ----
 
 void ObjectManagerCache::load_initial_objects() {
+    // Seed the typed cache from one GetManagedObjects snapshot before signals arrive.
     std::map<sdbus::ObjectPath, InterfaceMap> objects;
     try {
         om_proxy_->callMethod("GetManagedObjects")
@@ -328,8 +443,88 @@ void ObjectManagerCache::load_initial_objects() {
     }
 }
 
+void ObjectManagerCache::on_bluez_owner_changed(
+    const std::string& previous_owner,
+    const std::string& owner) {
+    // Treat a BlueZ owner change as a cache generation boundary.
+    if (previous_owner == owner) {
+        return;
+    }
+
+    PendingNotifications removals;
+    if (!previous_owner.empty()) {
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& [path, _] : gatt_descriptors_) {
+                removals.emplace_back(CacheEvent::GattDescriptorRemoved, path);
+            }
+            for (const auto& [path, _] : gatt_characteristics_) {
+                removals.emplace_back(CacheEvent::GattCharacteristicRemoved, path);
+            }
+            for (const auto& [path, _] : gatt_services_) {
+                removals.emplace_back(CacheEvent::GattServiceRemoved, path);
+            }
+            for (const auto& [path, _] : devices_) {
+                removals.emplace_back(CacheEvent::DeviceRemoved, path);
+            }
+            gatt_descriptors_.clear();
+            gatt_characteristics_.clear();
+            gatt_services_.clear();
+            devices_.clear();
+            adapters_.clear();
+        }
+        RCLCPP_WARN(logger_,
+                    "BlueZ daemon owner changed; invalidated %zu cached object event(s)",
+                    removals.size());
+        dispatch_notifications(removals, [this](CacheEvent event, const std::string& path) {
+            // Announce removals from the retired BlueZ daemon generation.
+            notify(event, path);
+        });
+    }
+
+    if (!owner.empty()) {
+        reload_managed_objects();
+    }
+}
+
+void ObjectManagerCache::reload_managed_objects() {
+    ManagedObjectMap objects;
+    try {
+        // Never make a blocking call on the D-Bus event connection from its
+        // NameOwnerChanged callback. A short-lived connection also binds this
+        // snapshot to the replacement daemon rather than the vanished owner.
+        auto connection = sdbus::createSystemBusConnection();
+        auto proxy = sdbus::createProxy(*connection,
+                                        sdbus::ServiceName{std::string(kBluezServiceName)},
+                                        sdbus::ObjectPath{"/"});
+        proxy->callMethod("GetManagedObjects")
+            .onInterface(std::string(kDbusObjectManagerIface))
+            .storeResultsTo(objects);
+    } catch (const sdbus::Error& error) {
+        RCLCPP_WARN(logger_, "GetManagedObjects after BlueZ restart failed: %s",
+                    error.getMessage().c_str());
+        return;
+    }
+
+    PendingNotifications additions;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [path, ifaces] : objects) {
+            process_object(std::string(path), ifaces, &additions);
+        }
+    }
+    RCLCPP_INFO(logger_,
+                "Reloaded %zu BlueZ managed object(s) after daemon replacement",
+                objects.size());
+    dispatch_notifications(additions, [this](CacheEvent event, const std::string& path) {
+        // Announce objects loaded from the replacement BlueZ daemon generation.
+        notify(event, path);
+    });
+}
+
 void ObjectManagerCache::on_interfaces_added(const sdbus::ObjectPath& path,
                                              const InterfaceMap& ifaces) {
+    // Insert every interface on the new object, then dispatch notifications after unlocking.
     RCLCPP_INFO(logger_, "[cache] InterfacesAdded path=%s  ifaces=%zu", std::string(path).c_str(), ifaces.size());
     for (const auto& [iface, _] : ifaces) {
         RCLCPP_DEBUG(logger_, "[cache]   iface: %s", iface.c_str());
@@ -340,12 +535,14 @@ void ObjectManagerCache::on_interfaces_added(const sdbus::ObjectPath& path,
         process_object(std::string(path), ifaces, &notifications);
     }
     dispatch_notifications(notifications, [this](CacheEvent event, const std::string& object_path) {
+        // Announce newly exported interfaces after their records are complete.
         notify(event, object_path);
     });
 }
 
 void ObjectManagerCache::on_interfaces_removed(const sdbus::ObjectPath& path,
                                                const std::vector<std::string>& ifaces) {
+    // Erase the removed interfaces, then dispatch notifications after unlocking.
     RCLCPP_INFO(logger_, "[cache] InterfacesRemoved path=%s  ifaces=%zu", std::string(path).c_str(), ifaces.size());
     for (const auto& iface : ifaces) {
         RCLCPP_DEBUG(logger_, "[cache]   removed iface: %s", iface.c_str());
@@ -356,6 +553,7 @@ void ObjectManagerCache::on_interfaces_removed(const sdbus::ObjectPath& path,
         remove_interfaces(std::string(path), ifaces, &notifications);
     }
     dispatch_notifications(notifications, [this](CacheEvent event, const std::string& object_path) {
+        // Announce removed interfaces after all dependent records are erased.
         notify(event, object_path);
     });
 }
@@ -506,6 +704,7 @@ void ObjectManagerCache::on_properties_changed(
     }
 
     dispatch_notifications(notifications, [this](CacheEvent event, const std::string& object_path) {
+        // Deliver property-change events only after the cache lock is released.
         notify(event, object_path);
     });
 }
@@ -515,6 +714,7 @@ void ObjectManagerCache::on_properties_changed(
 void ObjectManagerCache::process_object(const std::string& path,
                                         const InterfaceMap& ifaces,
                                         PendingNotifications* notifications) {
+    // Parse each known BlueZ interface into its typed cache entry.
     auto adapter_it = ifaces.find(std::string(kAdapterIface));
     if (adapter_it != ifaces.end()) {
         adapters_[path] = parse_adapter(path, adapter_it->second);
@@ -599,7 +799,9 @@ void ObjectManagerCache::process_object(const std::string& path,
 void ObjectManagerCache::remove_interfaces(const std::string& path,
                                            const std::vector<std::string>& ifaces,
                                            PendingNotifications* notifications) {
+    // Erase the named interfaces and cascade Device1 removal through its GATT subtree.
     auto record_removal = [notifications](CacheEvent event, const std::string& removed_path) {
+        // Queue each removal for post-lock delivery when a listener is present.
         if (notifications) {
             notifications->emplace_back(event, removed_path);
         }
@@ -706,6 +908,7 @@ void ObjectManagerCache::remove_interfaces(const std::string& path,
 DeviceInfo ObjectManagerCache::parse_device(
     const std::string& path,
     const std::map<std::string, sdbus::Variant>& props) const {
+    // Seed a typed Device1 record, apply all supplied properties, and timestamp it.
     DeviceInfo dev;
     dev.object_path = path;
     update_device_props(dev, props);
@@ -716,6 +919,7 @@ DeviceInfo ObjectManagerCache::parse_device(
 void ObjectManagerCache::update_device_props(
     DeviceInfo& dev,
     const std::map<std::string, sdbus::Variant>& props) const {
+    // Merge only properties present in this signal while preserving all other cached fields.
     if (props.count("Address"))       dev.mac = get_string(props, "Address");
     if (props.count("AddressType"))   dev.address_type = get_string(props, "AddressType");
     if (props.count("Name"))          dev.name = get_string(props, "Name");
@@ -780,6 +984,7 @@ void ObjectManagerCache::update_device_props(
 AdapterInfo ObjectManagerCache::parse_adapter(
     const std::string& path,
     const std::map<std::string, sdbus::Variant>& props) const {
+    // Convert the initial Adapter1 property map into the typed adapter snapshot.
     AdapterInfo a;
     a.object_path = path;
     a.address = get_string(props, "Address");
@@ -799,6 +1004,7 @@ AdapterInfo ObjectManagerCache::parse_adapter(
 void ObjectManagerCache::update_advertising_manager_props(
     AdapterInfo& adapter,
     const std::map<std::string, sdbus::Variant>& props) const {
+    // Merge controller channel support and payload capacities when BlueZ supplies them.
     if (props.count("SupportedSecondaryChannels")) {
         adapter.supported_advertising_secondary_channels =
             get_string_vector(props, "SupportedSecondaryChannels");
@@ -824,6 +1030,7 @@ void ObjectManagerCache::update_advertising_manager_props(
 GattServiceInfo ObjectManagerCache::parse_gatt_service(
     const std::string& path,
     const std::map<std::string, sdbus::Variant>& props) const {
+    // Decode service identity, primary role, owning device, and included services.
     GattServiceInfo s;
     s.object_path = path;
     s.uuid = get_string(props, "UUID");
@@ -840,6 +1047,7 @@ GattServiceInfo ObjectManagerCache::parse_gatt_service(
 GattCharacteristicInfo ObjectManagerCache::parse_gatt_characteristic(
     const std::string& path,
     const std::map<std::string, sdbus::Variant>& props) const {
+    // Decode characteristic identity, parent service, capabilities, value, MTU, and notify state.
     GattCharacteristicInfo c;
     c.object_path = path;
     c.uuid = get_string(props, "UUID");
@@ -858,6 +1066,7 @@ GattCharacteristicInfo ObjectManagerCache::parse_gatt_characteristic(
 GattDescriptorInfo ObjectManagerCache::parse_gatt_descriptor(
     const std::string& path,
     const std::map<std::string, sdbus::Variant>& props) const {
+    // Decode descriptor identity, parent characteristic, capabilities, and cached value.
     GattDescriptorInfo d;
     d.object_path = path;
     d.uuid = get_string(props, "UUID");
@@ -872,6 +1081,7 @@ GattDescriptorInfo ObjectManagerCache::parse_gatt_descriptor(
 }
 
 void ObjectManagerCache::notify(CacheEvent event, const std::string& path) {
+    // Notify object manager cache.
     std::vector<CacheEventCallback> callbacks;
     {
         std::lock_guard lock(mutex_);

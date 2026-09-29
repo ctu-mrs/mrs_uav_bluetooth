@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/service_node_cache_events.cpp
+/// \brief Implements the service node cache events component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
 #include "mrs_uav_bluetooth/util/device_utils.hpp"
 
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
 
 #include <algorithm>
 #include <iomanip>
@@ -14,18 +18,30 @@ namespace {
 constexpr double kPairingCancelAssociationTimeout = 20.0;
 constexpr double kPeerInitNotifyFailureResetWindow = 45.0;
 
+/// \brief Treat either Bonded or Paired as evidence of stored security material.
+/// \param device Peer whose BlueZ bond indicator is inspected.
+/// \return True when device has recorded bond; otherwise false.
 bool device_has_recorded_bond(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    // Treat either Bonded or Paired as evidence of stored security material.
     return device.paired || device.bonded;
 }
 
+/// \brief Classify GATT events that transfer characteristic or descriptor data.
+/// \param event_type GATT event name to classify.
+/// \return True if the event represents a GATT read or write; otherwise false.
 bool is_read_write_gatt_event(const std::string& event_type) {
+    // Include both characteristic and descriptor access callbacks.
     return event_type == "client_read" ||
            event_type == "client_write" ||
            event_type == "client_descriptor_read" ||
            event_type == "client_descriptor_write";
 }
 
+/// \brief Classify GATT callback failures by their event-name suffix.
+/// \param event_type GATT event name to classify.
+/// \return True if the event reports a failed GATT operation; otherwise false.
 bool is_failed_gatt_event(const std::string& event_type) {
+    // All failure events use the same suffix regardless of operation type.
     constexpr auto suffix = "_failed";
     return event_type.size() >= std::char_traits<char>::length(suffix) &&
            event_type.compare(event_type.size() - std::char_traits<char>::length(suffix),
@@ -33,10 +49,16 @@ bool is_failed_gatt_event(const std::string& event_type) {
                               suffix) == 0;
 }
 
+/// \brief Map device and GATT cache events back to the owning Device1 path.
+/// \param cache ObjectManager cache whose parent relationships are traversed.
+/// \param event Cache event kind used to interpret the affected path.
+/// \param object_path Affected BlueZ object path resolved back to its owning device.
+/// \return Owning Device1 path or std::nullopt when the event is unrelated to a peer.
 std::optional<std::string> device_path_for_cache_event(
     const mrs_uav_bluetooth::bluez::ObjectManagerCache& cache,
     mrs_uav_bluetooth::bluez::CacheEvent event,
     const std::string& object_path) {
+    // Map device and GATT cache events back to the owning Device1 path.
     using mrs_uav_bluetooth::bluez::CacheEvent;
 
     if (event == CacheEvent::DeviceAdded || event == CacheEvent::DevicePropertyChanged) {
@@ -76,9 +98,14 @@ std::optional<std::string> device_path_for_cache_event(
     return std::nullopt;
 }
 
+/// \brief Walk descriptor, characteristic, and service parents to the owning device.
+/// \param cache ObjectManager cache whose parent relationships are traversed.
+/// \param object_path GATT object path resolved back to its owning device.
+/// \return Owning Device1 path or std::nullopt when parent links are incomplete.
 std::optional<std::string> device_path_for_gatt_object(
     const mrs_uav_bluetooth::bluez::ObjectManagerCache& cache,
     const std::string& object_path) {
+    // Walk descriptor, characteristic, and service parents to the owning device.
     if (const auto device = cache.device(object_path)) {
         return device->object_path;
     }
@@ -127,6 +154,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
     }
 
     const char* event_name = [](bluez::CacheEvent e) -> const char* {
+        // Convert the cache enum to a stable diagnostic name for transition logs.
         switch (e) {
             case bluez::CacheEvent::DeviceAdded:                    return "DeviceAdded";
             case bluez::CacheEvent::DeviceRemoved:                  return "DeviceRemoved";
@@ -147,6 +175,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
     }(event);
 
     const auto maybe_capture_disconnect_transition = [&](const bluez::DeviceInfo& device) {
+        // Capture one connected-to-disconnected transition and its expected or unexpected reason.
         auto session_it = peers_->sessions().find(device.mac);
         if (device.connected) {
             expected_disconnect_reasons_.erase(device.mac);
@@ -234,6 +263,7 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
         std::string removed_mac;
         auto session_it = std::find_if(peers_->sessions().begin(), peers_->sessions().end(),
             [&object_path, this](const auto& pair) {
+                // Recover the removed peer session by matching its former BlueZ object path.
                 const auto& mac = pair.first;
                 auto dev = cache_->device_by_mac(mac);
                 return dev && dev->object_path == object_path;
@@ -453,6 +483,20 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
         return;
     }
 
+    if (event_type == "bluez_daemon_restarted") {
+        // The replacement daemon has no registrations, discovery ownership,
+        // or notification subscriptions from the previous process. Rebuild
+        // them from the active config on the ROS timer thread, never inside
+        // this D-Bus callback.
+        if (!config_apply_in_progress_.load() && !active_config_.enable_mesh) {
+            bluez_daemon_recovery_requested_.store(true);
+        }
+        adapter_state_reconcile_requested_.store(true);
+        state_lock.unlock();
+        schedule_peer_reconcile(std::chrono::milliseconds(1));
+        return;
+    }
+
     if (event_type == "device_disconnected") {
         // BlueZ reports authentication failure even while Paired/Bonded
         // remain true locally. Recover that one stale GATT bond through the
@@ -475,6 +519,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
 
     std::optional<std::string> clear_runtime_mac;
     std::optional<bluez::DeviceInfo> refresh_device;
+    std::optional<std::string> refresh_snapshot_mac;
 
     if (event_type == "client_notify_disabled" || event_type == "client_notify_failed") {
         std::string affected_mac;
@@ -486,6 +531,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
         }
         if (!affected_mac.empty() && peer_runtime_clear_in_progress_.count(affected_mac) == 0) {
             if (event_type == "client_notify_failed") {
+                refresh_snapshot_mac = affected_mac;
                 const auto session_it = peers_->sessions().find(affected_mac);
                 if (session_it != peers_->sessions().end()) {
                     auto& session = session_it->second;
@@ -504,7 +550,14 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                     session.phase = "connected_unready";
                     session.detail = "failed to enable peer time notifications";
 
-                    if (!session.time_bridge_healthy_this_connection) {
+                    const auto normalized_detail = util::lower_trim_copy(detail);
+                    const bool security_failure =
+                        normalized_detail.find("authentication") != std::string::npos ||
+                        normalized_detail.find("not authorized") != std::string::npos ||
+                        normalized_detail.find("not permitted") != std::string::npos ||
+                        normalized_detail.find("notauthorized") != std::string::npos ||
+                        normalized_detail.find("notpermitted") != std::string::npos;
+                    if (!session.time_bridge_healthy_this_connection && security_failure) {
                         if (session.time_bridge_init_notify_failure_monotonic > 0.0 &&
                             (failure_now - session.time_bridge_init_notify_failure_monotonic) <= kPeerInitNotifyFailureResetWindow) {
                             session.time_bridge_init_notify_failure_count += 1;
@@ -548,15 +601,18 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                                     active_config_.peer_whitelist),
                                 preserve_ready_runtime,
                                 preserve_active_bridge_runtime);
-            if (!clear_runtime_mac) {
-                refresh_device = *device;
-            }
+            // A failed time-characteristic subscription clears all per-peer paths.
+            // Rebuild topic imports because they do not depend on clock synchronization.
+            refresh_device = *device;
         }
     }
 
     state_lock.unlock();
     if (clear_runtime_mac) {
         clear_peer_runtime(*clear_runtime_mac, object_path);
+    }
+    if (refresh_snapshot_mac) {
+        (void)client_->refresh_gatt_snapshot(*refresh_snapshot_mac);
     }
     if (refresh_device) {
         refresh_import_bridges_for_device(*refresh_device);
@@ -565,6 +621,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
 }
 
 void ServiceNode::on_pairing_event(const std::string& event_type, const std::string& device_path) {
+    // Reconcile the affected peer after the pairing agent accepts, rejects, or cancels a request.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !cache_) {
         return;

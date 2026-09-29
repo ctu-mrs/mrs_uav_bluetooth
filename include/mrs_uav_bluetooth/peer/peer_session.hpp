@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/peer/peer_session.hpp
+/// \brief Declares the peer session component of the peer lifecycle layer.
+
 #pragma once
 
 #include <map>
@@ -6,6 +9,7 @@
 
 namespace mrs_uav_bluetooth::peer {
 
+/// Observable state machine for one configured or discovered Bluetooth peer.
 struct PeerConnectionSession {
     std::string mac;
     bool desired{false};
@@ -27,13 +31,18 @@ struct PeerConnectionSession {
     double pairing_wait_started_monotonic{0.0};
 
     /// Prefer one pairing initiator initially, but never wait for it forever.
+    /// \param now current monotonic time.
+    /// \return True once the fallback deadline passes while pairing is still pending; otherwise false.
     bool pairing_fallback_due(double now) const {
+        // Allow a bounded retry with pairing after an unauthenticated connection failure.
         return pairing_wait_started_monotonic > 0.0 &&
             now - pairing_wait_started_monotonic >= 10.0;
     }
 
     /// Partial handshake traffic starts, but never postpones, the deadline.
+    /// \param now current monotonic time.
     void begin_bridge_wait(double now) {
+        // Begin bridge wait.
         if (bridge_wait_started_monotonic <= 0.0) bridge_wait_started_monotonic = now;
     }
     double last_policy_action_monotonic{0.0};

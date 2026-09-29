@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/central_client_runtime.cpp
+/// \brief Implements the central client runtime component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/central_client_runtime.hpp"
 
 #include <stdexcept>
@@ -9,6 +12,7 @@ CentralClientRuntime::CentralClientRuntime(rclcpp::Logger logger,
                                            CentralClientRuntimeOptions options)
     : logger_(logger),
       options_(std::move(options)) {
+    // Open the system bus, select the adapter, and start the shared BlueZ object cache.
     dbus_ = std::make_unique<bluez::DbusConnection>(logger_, "tui-client");
     adapter_path_ = dbus_->find_adapter_path();
     if (adapter_path_.empty()) {
@@ -35,18 +39,22 @@ CentralClientRuntime::CentralClientRuntime(rclcpp::Logger logger,
 }
 
 const std::string& CentralClientRuntime::adapter_path() const {
+    // Expose the immutable adapter path selected during runtime construction.
     return adapter_path_;
 }
 
 bool CentralClientRuntime::is_scanning() const {
+    // Report scanning only while the client exists and BlueZ confirms discovery.
     return client_ != nullptr && client_->is_scanning();
 }
 
 bool CentralClientRuntime::scan_desired() const {
+    // Return the requested discovery state, distinct from BlueZ current state.
     return scan_desired_;
 }
 
 void CentralClientRuntime::set_scan_enabled(bool enabled, const std::string& transport) {
+    // Converge BlueZ discovery to the requested state without duplicating start or stop calls.
     if (!client_) {
         return;
     }
@@ -59,6 +67,7 @@ void CentralClientRuntime::set_scan_enabled(bool enabled, const std::string& tra
 }
 
 void CentralClientRuntime::refresh_scan(const std::string& transport) {
+    // Reapply the requested discovery state after adapter or daemon changes.
     if (!client_ || !scan_desired_) {
         return;
     }
@@ -68,14 +77,17 @@ void CentralClientRuntime::refresh_scan(const std::string& transport) {
 }
 
 bluez::DbusConnection& CentralClientRuntime::dbus() {
+    // Provide the shared event-loop D-Bus connection used by client components.
     return *dbus_;
 }
 
 bluez::ObjectManagerCache& CentralClientRuntime::cache() {
+    // Provide the shared, signal-driven snapshot of BlueZ managed objects.
     return *cache_;
 }
 
 bluez::BluezClient& CentralClientRuntime::client() {
+    // Provide the high-level BlueZ client bound to this adapter and cache.
     return *client_;
 }
 

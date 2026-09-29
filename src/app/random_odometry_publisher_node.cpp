@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/random_odometry_publisher_node.cpp
+/// \brief Implements the random odometry publisher node component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/random_odometry_publisher_node.hpp"
 
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
@@ -15,7 +18,12 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr std::string_view kHostnameToken = "{hostname}";
 
+/// \brief Replace every hostname placeholder before creating ROS topics.
+/// \param value Configuration text in which placeholders are replaced.
+/// \param hostname UAV hostname used to identify the node.
+/// \return Input text with every hostname placeholder replaced.
 std::string expand_hostname(std::string value, const std::string& hostname) {
+    // Continue after each replacement so multiple placeholders are supported.
     std::size_t position = 0;
     while ((position = value.find(kHostnameToken, position)) != std::string::npos) {
         value.replace(position, kHostnameToken.size(), hostname);
@@ -24,7 +32,11 @@ std::string expand_hostname(std::string value, const std::string& hostname) {
     return value;
 }
 
+/// \brief Reject nonfinite zero or negative random-publisher limits.
+/// \param value Configured numeric value to validate.
+/// \param name Configuration key reported when validation fails.
 void require_positive_finite(double value, const char* name) {
+    // Reject NaN and infinities as well as nonpositive limits.
     if (!std::isfinite(value) || value <= 0.0) {
         throw std::runtime_error(std::string(name) + " must be finite and greater than zero");
     }
@@ -43,7 +55,10 @@ RandomOdometryPublisherNode::RandomOdometryPublisherNode()
     publisher_ = create_publisher<nav_msgs::msg::Odometry>(odometry_topic_, qos_depth_);
     timer_ = create_wall_timer(
         std::chrono::duration<double>(1.0 / rate_hz_),
-        [this]() { publish_odometry(); });
+        [this]() {
+            // Publish the next deterministic random odometry sample at the configured rate.
+            publish_odometry();
+        });
     RCLCPP_INFO(get_logger(), "Publishing random odometry at %.3f Hz on %s",
                 rate_hz_, odometry_topic_.c_str());
 }
@@ -140,6 +155,7 @@ void RandomOdometryPublisherNode::publish_odometry() {
 }
 
 double RandomOdometryPublisherNode::sample(double minimum, double maximum) {
+    // Sample random odometry publisher node.
     return std::uniform_real_distribution<double>(minimum, maximum)(random_engine_);
 }
 

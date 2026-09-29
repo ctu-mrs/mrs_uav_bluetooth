@@ -1,93 +1,79 @@
-# Node: service_node
-# Default runtime configuration for the system bluetooth service node.
-# This file is loaded directly by the service node at startup.
-#
-# The system service always starts from this file. A separate experiment-side
-# user node can temporarily apply an overlay YAML file that overrides any of the
-# keys below while it remains alive.
+# Safe settings used when no example is running.
+# Start with config/README.md and copy one file from config/examples.
 
-# Topic root used by all publishers created by the bluetooth service node.
-# The value supports {hostname}. Transport topics live below le/, mesh/, or system/.
+# -----------------------------------------------------------------------------
+# General settings
+# Root name for this UAV's ROS topics.
 node_topics_prefix: "/{hostname}/bluetooth"
 
-# BLE scan publishing period for the discovered device list topic.
+# Seconds between device-list updates.
 scan_publish_period: 2.0
 
-# Period of the built-in time service characteristic updates.
+# Seconds between clock updates.
 time_update_period: 1.0
 
-# Period of refreshing the built-in Wi-Fi service characteristic.
+# Seconds between Wi-Fi list updates.
 wifi_refresh_period: 2.0
 
-# Retry interval used by the automatic peer connector.
+# Seconds between connection attempts.
 auto_connect_period: 3.0
 
-# When the BLE server is enabled, the adapter is made explicitly discoverable.
-# This timeout controls how long it stays discoverable. 0 means indefinitely.
+# Seconds to remain visible; 0 means always.
 discoverable_timeout: 0
 
-# BlueZ pairing agent and peer-security behaviour.
+# -----------------------------------------------------------------------------
+# Access and optional features
+# Approve and remember allowed UAVs automatically.
 auto_pair: true
 auto_trust: true
 
-# Enable the built-in services hosted by the system node.
+# Share clock and Wi-Fi choices with connected UAVs.
 enable_time_service: true
 enable_wifi_service: true
 
-# Publish the standard Bluetooth Serial Port Profile and serve OpenSSH over
-# each authenticated RFCOMM connection. Disable this on hosts that must not
-# offer shell access.
+# Allow remote shell access through GATT.
 enable_serial_port_profile: true
 serial_port_channel: 22
 serial_sshd_path: /usr/sbin/sshd
 
-# BlueZ Mesh support. This is opt-in because bluetooth-meshd exclusively owns
-# the controller's advertising/scanning bearer. Automatic swarm mode derives
-# the required LE shutdown switches and enables the provisioner and relay roles
-# on every UAV. A non-swarm Mesh application may choose its roles explicitly.
+# -----------------------------------------------------------------------------
+# Mesh settings. Copy them from the Mesh example.
 enable_mesh: false
 mesh_auto_attach: true
 mesh_auto_join: false
 mesh_auto_create_network: false
 mesh_provisioner: false
-# Automatically configure this attached node through its local Configuration
-# Client/Server as an advertising-bearer relay. This is disabled in the base
-# config and enabled by the automatic swarm Mesh service overlay.
+# Relay Mesh data for other UAVs.
 mesh_auto_configure_relay: false
-# Default access-message hop limit. Valid values are 0 or 2..127. The swarm
-# examples use 127 so topology, rather than a small TTL, limits reachability.
+# Maximum Mesh relay hops.
 mesh_default_ttl: 127
-# Relay retransmit count (0..7) and 10 ms interval steps (0..31). A count of 1
-# means one retransmission in addition to the first forwarded transmission.
+# Repeat forwarded data.
 mesh_relay_retransmit_count: 1
 mesh_relay_retransmit_interval_steps: 2
+# Repeat this UAV's data.
+mesh_network_retransmit_count: 1
+mesh_network_retransmit_interval_steps: 19
 
-# Automatic swarm enrollment creates a private network when necessary and
-# provisions nearby listed peers. Identity and keys are stored by the service.
+# Create or join the Mesh automatically.
 mesh_swarm_auto_provisioning: false
-# The service generates and stores Mesh identity and keys automatically.
 mesh_swarm_id: 1
 mesh_swarm_participating: true
 mesh_swarm_state_path: "/var/lib/mrs_uav_bluetooth/swarm-{hostname}.txt"
-# "ordered" selects the first live peer in peer_whitelist. A hostname such as
-# "uav42" gives that UAV priority while live, then falls back to list order.
+# Select the first available UAV as Mesh provisioner.
 mesh_provisioner_preference: ordered
-# Observe heartbeats for this long before selecting the first live coordinator.
+# Seconds to wait before creating the Mesh.
 mesh_swarm_startup_grace: 5.0
 mesh_swarm_heartbeat_period: 1.0
-# Keep a peer present across brief losses of its one-second Mesh heartbeat.
-# A short lease causes unnecessary role changes and PB-ADV attempts while
-# segmented application messages occupy the radio.
+# Seconds before a silent UAV is considered gone.
 mesh_swarm_provisioner_timeout: 20.0
 mesh_swarm_group_address: 0xc000
 mesh_swarm_network_index: 0
 mesh_swarm_app_key_index: 0
-# Persistent address cursor for provisioning through the general Mesh API.
+# Remembers which Mesh addresses are free.
 mesh_unicast_cursor_path: "/var/lib/mrs_uav_bluetooth/mesh-unicast-{hostname}.cursor"
 
-# Empty derives a stable 128-bit UUID from the local hostname.
+# Empty values are filled and saved automatically.
 mesh_device_uuid: ""
-# A non-zero token overrides the token loaded from mesh_token_path.
 mesh_token: 0
 mesh_token_path: "/var/lib/mrs_uav_bluetooth/mesh-{hostname}.token"
 mesh_company_id: 0x05f1
@@ -96,7 +82,6 @@ mesh_version_id: 0x0001
 mesh_crpl: 100
 mesh_vendor_model_id: 0x0001
 mesh_next_unicast: 0x0100
-# Empty capabilities select Bluetooth Mesh No-OOB provisioning.
 mesh_agent_capabilities: []
 mesh_agent_oob_info: []
 mesh_agent_static_oob: []
@@ -105,32 +90,29 @@ mesh_agent_public_key: []
 mesh_agent_numeric_oob: 0
 mesh_agent_uri: ""
 
-# Optional org.bluez.GattProfile1 UUIDs. BlueZ automatically reconnects to
-# devices exposing any of these remote GATT services.
+# -----------------------------------------------------------------------------
+# GATT settings
+# Optional connection filter; normally empty.
 gatt_profile_uuids: []
 
-# Global gate for outbound automatic peer discovery/connection logic.
-# When false, the node never initiates automatic connections or pairing. Incoming
-# pairing and connections remain allowed when auto_pair and BlueZ permit them.
+# Whether this UAV starts GATT connections.
 auto_connect_enable: true
 
-# Global peer admission list shared by GATT, advertisement, and Mesh modes.
-# Empty permits all peers accepted by each transport. A non-empty list should be
-# identical on every swarm member: only listed hostnames are connected/imported,
-# admitted to Mesh, or accepted as advertisement sources. It also fingerprints
-# the Mesh swarm so a nearby network configured with another list is left alone.
+# Allowed UAV names. Empty accepts every matching UAV.
 peer_whitelist: []
 
-# Hostname pattern used to identify UAV peers.
+# Names must match this pattern.
 auto_connect_pattern: "^uav[0-9]{1,5}$"
 
-# Disconnect a peer if the time bridge stays inactive for too long.
+# Seconds before closing an unused GATT connection.
 peer_connection_timeout: 15.0
 
-# Netplan file updated by the BLE Wi-Fi service.
+# -----------------------------------------------------------------------------
+# Wi-Fi choices
+# System file changed after an approved choice.
 wifi_netplan_config_path: /etc/netplan/01-netcfg.yaml
 
-# Allowed Wi-Fi SSIDs that may be selected over BLE.
+# Networks another UAV may select.
 allowed_wifi_networks:
   - mrs_ctu
   - mrs_ctu_1
@@ -143,40 +125,38 @@ allowed_wifi_networks:
   - mrs_ctu_8
   - mrs_ctu_9
 
-# Periodic human-readable status logging. Set to 0 to disable.
+# -----------------------------------------------------------------------------
+# Status and example lifetime
+# Seconds between status lines; 0 disables them.
 status_report_period: 1.0
 
-# Enable publishing verbose service logs on /{hostname}/bluetooth/system/log.
-# Keep disabled by default to avoid high-rate chatter on ROS topics.
-# Must be enabled for user node reports using "log" as "print_source".
+# Publish detailed logs as a ROS topic.
 log_topic_enable: false
 
-# If true, peers that connected while an overlay is active are disconnected
-# when the overlay is reverted because keepalive sentinel publishers disappear
-# or when it is explicitly reverted.
+# End links made by an example when it stops.
 expire_connections_with_overlay: true
 
-# Sentinel topic suffix used by experiment user nodes. Overlay mode stays active
-# while a publisher exists on /{hostname}/bluetooth/config/<overlay_keepalive_topic_suffix>.
+# Internal signal that keeps an example active.
 overlay_keepalive_topic_suffix: overlay_keepalive
 
-# Optional extra file sink for verbose log lines.
+# Detailed log file; empty disables it.
 verbose_log_file: ""
 
-# Static runtime settings for the system service.
+# -----------------------------------------------------------------------------
+# Advertisement settings. Copy them from the Advertisement example.
 advertise_mode: peripheral
 
-# Advertisement size/PHY mode:
-# - legacy: 31-byte advertisements visible to older BLE controllers (e.g. Raspberry Pi boards).
-# - extended: use adapter MaxAdvLen and secondary-channel advertising when supported (e.g. Intel NUC boards).
+# "legacy" works with older radios; "extended" carries more data.
 advertise_size: legacy
-# The advertised local name is this UAV's hostname. On the tested legacy
-# adapters BlueZ puts it in the scan response, outside the primary data value.
+# Tested update method.
+advertise_update_strategy: reregister
+# Repeat interval in milliseconds.
+advertise_min_interval: 100
+advertise_max_interval: 100
+# Include this UAV's name.
 advertise_local_name: "{hostname}"
 
-# Optional ROS input for a raw advertisement payload. It is consumed only by
-# an explicit advertise_mode: broadcast overlay with Mesh disabled. Peripheral
-# GATT and Mesh modes ignore it to preserve exclusive radio ownership.
+# ROS topic for raw Advertisements; empty disables it.
 advertise_extra_data_topic: "/{hostname}/bluetooth/le/advertisement"
 
 pairing_agent: NoInputNoOutput
@@ -184,52 +164,6 @@ enable_server: true
 enable_scan: true
 scan_mode: le
 
-# Declarative bridge setup owned directly by service_node.
-# Each entry can export, import, or bidirectionally share one ROS message over
-# GATT, connectionless advertisements, or Bluetooth Mesh.
-#
-# Common fields:
-# - transport: gatt | advertisement | mesh (default: gatt).
-# - mode: export | import | both.
-# - export_topic: local ROS topic. {hostname} is expanded automatically.
-# - import_topic_suffix: optional peer-topic suffix. By default the canonical
-#   export topic is used below bluetooth/<transport>/peers/<peer>/.
-# - message_type: introspectable ROS interface, e.g. nav_msgs/msg/Odometry.
-# - rate_hz: 0 sends every source sample. Positive values retain only the newest
-#   sample and transmit at the requested rate.
-# - payload_format: struct | raw | ros2.
-#   * struct packs the ordered numeric members below, little-endian.
-#   * raw is shorthand for std_msgs/msg/UInt8MultiArray member data[:].
-#   * ros2 sends the complete serialized message and is normally too large for
-#     legacy advertisements.
-# - members_encode: ordered {target, type} direct fields or
-#   {target, type, expression} computed wire fields. The type is always the
-#   final scalar wire type. Without an expression, target is a ROS field path.
-# - members_decode: optional {target, expression} relations. Here target is a
-#   ROS field path and expressions use the encoded targets as wire-value names.
-#   Direct encode members are decoded automatically.
-#   Integer-only expressions are evaluated exactly, including / and %.
-#   Integer division truncates toward zero. Decimal literals, floating fields,
-#   and math functions select floating-point arithmetic instead. Integer
-#   destinations are rounded if needed and range-checked after evaluation.
-#   Nested fields, indices, fixed slices, and one open-ended final dynamic
-#   array are supported for direct fields.
-# - channel_id: required unique 1..65535 routing ID for framed advertisement
-#   and mesh bridges. A sole advertisement bridge can use framing: bare.
-#
-# Mesh-only routing fields mirror /{hostname}/bluetooth/mesh/send:
-# destination, app_key_index, element_index, force_segmented, vendor_opcode,
-# and company_id. Defaults follow the mesh_swarm_* and mesh_company_id values.
-#
-# Advertisement has one local dynamic Data field, so only one configured export
-# may be active. Its encoded data plus the optional five-byte bridge envelope
-# must fit the controller budget. A legacy 31-byte packet normally leaves 26
-# bytes for a Data value when the local name goes in the scan response and no
-# other primary fields compete for space.
-# GATT struct values should normally stay below 244 bytes. Mesh can segment
-# larger frames.
-#
-# Supported compact types: bool, int8, uint8, int16, uint16, int32, uint32,
-# int64, uint64, float32, float64. Split ROS Time into scalar sec and nanosec
-# declarations as shown in the GATT and Mesh examples.
+# -----------------------------------------------------------------------------
+# Shared ROS topics. Copy an example entry unchanged on every UAV.
 shared_topics: []

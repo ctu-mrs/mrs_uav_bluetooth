@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/service_node_peer_orchestration.cpp
+/// \brief Implements the service node peer orchestration component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
 #include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
@@ -17,46 +20,65 @@
 
 namespace {
 
-constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr double kRemoteGattSnapshotFallbackDelay = 2.0;
 constexpr double kRemoteGattSnapshotRetryInterval = 2.0;
 constexpr double kPeerNotifyRetryBackoff = 1.0;
-constexpr int kPeerNotifyFailureReconnectThreshold = 3;
-constexpr double kPeerInitNotifyFailureResetWindow = 45.0;
 constexpr double kPeerNotifyHandshakeTimeout = 10.0;
 constexpr double kPeerPairTimeout = 20.0;
 constexpr auto kPeerWaitReconcileDelay = std::chrono::milliseconds(1000);
 
+/// \brief Detect cached pairing, bonding, or trust state that may need cleanup.
+/// \param device Peer whose paired bonded or trusted flags are inspected.
+/// \return True when device has local security; otherwise false.
 bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    // Detect cached pairing, bonding, or trust state that may need cleanup.
     return device.paired || device.bonded || device.trusted;
 }
 
+/// \brief Require pairing only when the active configuration or cached peer state needs it.
+/// \param device Peer whose pairing state is checked against policy.
+/// \param config Security policy against which the peer flags are checked.
+/// \return True when device has required pairing; otherwise false.
 bool device_has_required_pairing(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
                                  const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Require pairing only when the active configuration or cached peer state needs it.
     return !config.auto_pair || device.paired || device.bonded;
 }
 
+/// \brief Treat either Bonded or Paired as evidence of stored security material.
+/// \param device Peer whose BlueZ bond indicator is inspected.
+/// \return True when device has recorded bond; otherwise false.
 bool device_has_recorded_bond(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    // Treat either Bonded or Paired as evidence of stored security material.
     return device.paired || device.bonded;
 }
 
+/// \brief Identify pairing requests that require operator input or confirmation.
+/// \param event_type Pairing-agent request name checked for user interaction.
+/// \return True if the event asks the operator for pairing input or confirmation; otherwise false.
 bool is_interactive_pairing_request_event(const std::string& event_type) {
+    // PIN, passkey, and numeric confirmation cannot be accepted silently.
     return event_type == "request_confirmation" ||
            event_type == "request_passkey" ||
            event_type == "request_pin";
 }
 
-bool is_stale_bond_sensitive_pairing_event(const std::string& event_type) {
-    return is_interactive_pairing_request_event(event_type);
-}
-
+/// \brief Identify pairing events that authorize a requested remote service.
+/// \param event_type Pairing-agent request name checked for explicit authorization.
+/// \return True if the event needs explicit device or service authorization; otherwise false.
 bool is_manual_security_authorization_event(const std::string& event_type) {
+    // BlueZ uses AuthorizeService as the sole service-policy request here.
     return event_type == "authorize_service";
 }
 
+/// \brief Accept all peers for an empty list, otherwise match hostname or address.
+/// \param config Peer allow-list and hostname matching policy.
+/// \param device Discovered peer whose address and inferred hostname are matched against the allow-list.
+/// \return True when peer allowed by whitelist; otherwise false.
 bool peer_allowed_by_whitelist(
     const mrs_uav_bluetooth::config::NodeConfig& config,
     const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    // Accept all peers for an empty list, otherwise match hostname or address.
     if (config.peer_whitelist.empty()) return true;
     const auto peer_name = mrs_uav_bluetooth::util::lower_trim_copy(
         mrs_uav_bluetooth::util::device_hostname_guess(
@@ -66,6 +88,7 @@ bool peer_allowed_by_whitelist(
     return std::any_of(config.peer_whitelist.begin(),
                        config.peer_whitelist.end(),
                        [&peer_name, &mac](const auto& entry) {
+                           // Admit a peer when either its normalized hostname or address is whitelisted.
                            const auto normalized =
                                mrs_uav_bluetooth::util::lower_trim_copy(entry);
                            return normalized == peer_name || normalized == mac;
@@ -73,11 +96,18 @@ bool peer_allowed_by_whitelist(
 }
 
 template<typename DurationT, typename CallbackT>
+/// \brief Bind peer reconciliation to its mutually exclusive callback group.
+/// \param node ROS node that owns the interfaces.
+/// \param period timer interval used to schedule the callback.
+/// \param callback Timer body invoked on each scheduled expiry.
+/// \param group ROS callback group that serializes the timer or service.
+/// \return New grouped wall timer.
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
     DurationT period,
     CallbackT&& callback,
     const rclcpp::CallbackGroup::SharedPtr& group) {
+    // Bind peer reconciliation to its mutually exclusive callback group.
     return rclcpp::create_wall_timer(
         period,
         std::forward<CallbackT>(callback),
@@ -115,27 +145,13 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
     session.pairing_failures += 1;
     session.pairing_in_progress = false;
     const auto normalized_error = util::lower_trim_copy(error_detail);
-    const bool stale_bond_detected = normalized_error.find("already exists") != std::string::npos ||
-        normalized_error.find("already paired") != std::string::npos ||
-        normalized_error.find("already bonded") != std::string::npos;
-    const bool authentication_failed = normalized_error.find("authentication failed") != std::string::npos ||
-        normalized_error.find("authentication rejected") != std::string::npos ||
-        normalized_error.find("authentication canceled") != std::string::npos;
+    const bool authentication_failed = normalized_error.find("authentication") != std::string::npos;
+    const bool bridge_ready = has_ready_peer_time_bridge(mac);
 
-    const bool bridge_ready = [&]() {
-        const auto bridge_it = peers_->time_bridges().find(mac);
-        return bridge_it != peers_->time_bridges().end() && bridge_it->second.status == "ready";
-    }();
-
+    // Pair errors do not prove that a stored bond is stale. BlueZ owns key
+    // replacement through its pairing protocol. Preserve working links and
+    // report the actual error instead of deleting the peer and trying again.
     session.repair_in_progress = false;
-    if ((stale_bond_detected || authentication_failed) && !bridge_ready && session.phase != "ready") {
-        peers_->request_device_reset(session,
-                                     stale_bond_detected
-                                         ? "stale local bond detected, resetting peer device state"
-                                         : "pair authentication failed, resetting peer device state",
-                                     true);
-        return;
-    }
     if (bridge_ready || session.phase == "ready") {
         session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
         return;
@@ -173,7 +189,6 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
                         preserve_ready_runtime,
                         preserve_active_bridge_runtime);
 
-    const bool stale_bond_sensitive_event = is_stale_bond_sensitive_pairing_event(event_type);
     const bool manual_security_authorization_event =
         is_manual_security_authorization_event(event_type);
 
@@ -204,31 +219,10 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
         return false;
     }
 
-    if (active_config_.auto_pair && stale_bond_sensitive_event && device_has_recorded_bond(*device)) {
-        peers_->note_pairing_event(device_path, event_type, *cache_);
-        session.pairing_in_progress = false;
-        peers_->request_device_reset(session,
-                                     "incoming pairing request conflicts with local bond",
-                                     true);
-        log_warn_coalesced("pairing-rejected-bond-reset:" + device->mac + ":" + event_type,
-                           "[node] rejecting pairing request for " + device->mac +
-                               " because local bond is stale; resetting BlueZ device state");
-        schedule_peer_reconcile(std::chrono::milliseconds(1));
-        return false;
-    }
-
-    if (device->blocked) {
-        return false;
-    }
-
-    const auto now = peers_->now_monotonic();
-    const double retry_period_s = std::max(0.5, active_config_.auto_connect_period);
-    const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
-    if (local_server_rebuild_monotonic_ > 0.0 &&
-        (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s) {
-        log_warn_coalesced("pairing-rejected-reconfigure:" + device->mac + ":" + event_type,
-                           "[node] rejecting pairing request for " + device->mac +
-                               " while local GATT/server rebuild is still settling");
+    // A peer can legitimately request new keys after losing its own bond.
+    // JustWorksRepairing=confirm makes BlueZ ask this agent, so the same
+    // whitelist policy applies without removing either Device1 object.
+    if (device->blocked || config_apply_in_progress_.load()) {
         return false;
     }
 
@@ -236,6 +230,7 @@ bool ServiceNode::should_allow_pairing_request(const std::string& event_type,
 }
 
 void ServiceNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
+    // Schedule peer reconcile.
     if (!can_run_callbacks() || !peers_ || !client_) {
         return;
     }
@@ -255,6 +250,7 @@ void ServiceNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
 
     peer_reconcile_deadline_ = requested_deadline;
     peer_timer_ = create_grouped_wall_timer(*this, arm_delay, [this]() {
+        // Consume the armed deadline once and run reconciliation if shutdown has not started.
         if (!can_run_callbacks()) {
             peer_timer_.reset();
             peer_reconcile_deadline_ = std::chrono::steady_clock::time_point{};
@@ -273,6 +269,7 @@ void ServiceNode::schedule_peer_reconcile(std::chrono::milliseconds delay) {
 bool ServiceNode::run_peer_task_once(const std::string& mac,
                                      const std::string& label,
                                      std::function<void()> task) {
+    // Reap a completed worker, then claim the single serialized peer-operation slot.
     if (shutting_down_.load()) {
         return false;
     }
@@ -288,6 +285,7 @@ bool ServiceNode::run_peer_task_once(const std::string& mac,
     }
 
     auto future = std::async(std::launch::async, [this, mac, label, task = std::move(task)]() mutable {
+        // Run the claimed peer task off-executor and always release its in-flight label afterward.
         try {
             task();
         } catch (const std::exception& exception) {
@@ -313,6 +311,7 @@ bool ServiceNode::run_peer_task_once(const std::string& mac,
 }
 
 void ServiceNode::wait_for_peer_tasks() {
+    // Detach the recorded task from shared state, then wait without holding its mutex.
     std::shared_future<void> task;
     {
         std::lock_guard<std::mutex> lock(peer_task_mutex_);
@@ -345,6 +344,7 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     std::string stop_notify_path;
 
     const auto clear_time_bridge = [this, &mac, &bridge_it, &stop_notify_path]() {
+        // Remove stale time-bridge state and remember the old path for notification teardown.
         if (bridge_it == peers_->time_bridges().end()) {
             return;
         }
@@ -418,18 +418,6 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
         session.last_service_retry_monotonic = 0.0;
         session.phase = "connected_unready";
         session.detail = "connected, waiting for services";
-        return false;
-    }
-
-    if (session.services_resolved_since_monotonic > 0.0 &&
-        (now_mono - session.services_resolved_since_monotonic) < 1.5) {
-        if (session.bridge_wait_started_monotonic <= 0.0) {
-            session.bridge_wait_started_monotonic = now_mono;
-        }
-        session.bridge_wait_reason = "gatt-cache";
-        session.phase = "connected_unready";
-        session.detail = "waiting for remote GATT cache";
-        schedule_peer_reconcile(kPeerWaitReconcileDelay);
         return false;
     }
 
@@ -659,13 +647,12 @@ bool ServiceNode::update_peer_time_bridge(const std::string& mac,
     }
 
     if (bridge_it->second.status == "notify_failed") {
-        if (session.bridge_wait_started_monotonic <= 0.0) {
-            session.bridge_wait_started_monotonic = peers_->now_monotonic();
-        }
-        session.bridge_wait_reason = "notify";
-        session.phase = "connected_unready";
-        session.detail = "failed to enable peer time notifications";
-        return false;
+        // A remote GATT rebuild can invalidate the object between discovery
+        // and StartNotify, and daemon replacement invalidates every old path.
+        // notify_failed is only the backoff state handled above: once that
+        // backoff expires, retry against the current cache.
+        bridge_it->second.status.clear();
+        bridge_it->second.detail = "retrying peer time notifications";
     }
 
     bridge_it->second.status = "subscribing";
@@ -733,6 +720,16 @@ void ServiceNode::reconcile_peers() {
     // pairing/bond recovery here: that machinery may repair or remove a bond,
     // while this mode only needs to close a transient link and keep scanning.
     if (active_config_.advertise_mode == "broadcast") {
+        // Broadcast peers may rotate their private advertisement address at
+        // every data update. Do not retain a session for each expired address.
+        std::set<std::string> current_macs;
+        const auto cache_now = std::chrono::steady_clock::now();
+        for (const auto& device : client_->get_devices()) {
+            if (device.connected || cache_now - device.last_seen < std::chrono::seconds(5)) {
+                current_macs.insert(device.mac);
+            }
+        }
+        peers_->prune_sessions(current_macs, now, 5.0);
         std::vector<std::string> connected_macs;
         for (const auto& device : client_->get_connected_devices()) {
             connected_macs.push_back(device.mac);
@@ -742,6 +739,7 @@ void ServiceNode::reconcile_peers() {
             (void)run_peer_task_once(
                 mac, "disconnect connectionless-mode peer",
                 [this, mac, retry_period_s]() {
+                    // Disconnect a peer that remains linked while the active mode is connectionless.
                     (void)client_->disconnect(mac, retry_period_s);
                 });
         }
@@ -754,21 +752,19 @@ void ServiceNode::reconcile_peers() {
     }
 
     bool should_suspend_scan = false;
-    const auto reconnect_incomplete_time_bridge =
-        [this, retry_period_s](const std::string& mac,
+    const auto report_incomplete_time_bridge =
+        [this](const std::string& mac,
                                const std::string& device_label,
                                peer::PeerConnectionSession& session,
                                const std::string& reason) {
-            if (!run_peer_task_once(mac, "recover incomplete time bridge", [this, mac, retry_period_s]() {
-                    (void)client_->disconnect(mac, retry_period_s);
-                })) {
-                return false;
-            }
-            expected_disconnect_reasons_[mac] = reason;
-            RCLCPP_WARN(get_logger(),
-                        "[reconcile] %s: %s; reconnecting without removing the bond",
+            // A missing optional clock acknowledgement must not tear down a
+            // connected data bearer. Leave StartNotify retry and the GATT
+            // cache repair path running while topic imports stay active.
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                        "[reconcile] %s: %s; keeping GATT data link active",
                         device_label.c_str(), reason.c_str());
-            session.phase = "recovering";
+            session.bridge_wait_started_monotonic = peers_->now_monotonic();
+            session.phase = "connected_unready";
             session.detail = reason;
             return true;
         };
@@ -803,6 +799,7 @@ void ServiceNode::reconcile_peers() {
             const bool started = run_peer_task_once(
                 mac, "disconnect peer outside whitelist",
                 [this, mac, retry_period_s]() {
+                    // Disconnect a connected peer that no longer satisfies the active whitelist.
                     (void)client_->disconnect(mac, retry_period_s);
                 });
             state_lock.lock();
@@ -976,13 +973,6 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        if (!active_config_.auto_pair && session.desired && device && device_has_recorded_bond(*device)) {
-            peers_->request_device_reset(session,
-                                         "pairing disabled by config, removing unexpected peer bond",
-                                         true);
-            continue;
-        }
-
         if (is_connected && device &&
             peers_->should_attempt_trust(session, *device, active_config_, now, retry_period_s)) {
             if (run_peer_task_once(mac, "trust", [this, mac]() {
@@ -1021,15 +1011,6 @@ void ServiceNode::reconcile_peers() {
                 continue;
             }
 
-            if (session.pairing_in_progress &&
-                session.last_security_attempt_monotonic > 0.0 &&
-                (now - session.last_security_attempt_monotonic) >= kPeerPairTimeout) {
-                peers_->request_device_reset(session,
-                                             "pairing stalled, resetting peer device state",
-                                             true);
-                continue;
-            }
-
             if (peers_->should_attempt_pair(session, *device, active_config_, now, retry_period_s)) {
                 if (run_peer_task_once(mac, "pair", [this, mac]() {
                         std::string error_detail;
@@ -1059,10 +1040,56 @@ void ServiceNode::reconcile_peers() {
         }
 
         if (!is_connected) {
-            const double local_reconfigure_grace_s = std::max(kLocalReconfigureGraceMin, retry_period_s * 2.0);
-            if (local_server_rebuild_in_progress_.load() ||
-                (local_server_rebuild_monotonic_ > 0.0 &&
-                 (now - local_server_rebuild_monotonic_) < local_reconfigure_grace_s)) {
+            // Broadcast overlays create a new unbonded random address for
+            // each payload. BlueZ can retain those Device1 objects after the
+            // peer switches back to GATT. Prefer its bonded identity instead
+            // of spending a full connection timeout on every stale advert.
+            if (device && device->address_type == "random" &&
+                !device_has_recorded_bond(*device) && !session.peer_name.empty()) {
+                const bool bonded_identity_available = std::any_of(
+                    current_macs.begin(), current_macs.end(),
+                    [this, &session, &mac](const std::string& candidate_mac) {
+                        // Prefer an existing bonded identity for the same peer over a stale random address.
+                        if (candidate_mac == mac) return false;
+                        const auto candidate = client_->get_device(candidate_mac);
+                        return candidate && device_has_recorded_bond(*candidate) &&
+                            util::device_hostname_guess(
+                                *candidate, active_config_.auto_connect_pattern,
+                                active_config_.peer_whitelist) == session.peer_name;
+                    });
+                if (bonded_identity_available) {
+                    session.phase = "idle";
+                    session.detail = "stale broadcast address, using bonded identity";
+                    continue;
+                }
+            }
+            // Both UAVs host a GATT server and could issue Connect at the same
+            // time. Pick one initiator for each pair so BlueZ never has two
+            // competing outgoing LE connections. The other side still accepts
+            // the incoming link and runs its own client bridge on that link.
+            const auto local_name = util::lower_trim_copy(hostname_);
+            const auto remote_name = util::lower_trim_copy(session.peer_name);
+            const bool named_pair =
+                util::is_uav_hostname(local_name, active_config_.auto_connect_pattern) &&
+                util::is_uav_hostname(remote_name, active_config_.auto_connect_pattern) &&
+                local_name != remote_name;
+            bool local_owns_connection = true;
+            if (named_pair) {
+                local_owns_connection = local_name < remote_name;
+            } else if (device && cache_) {
+                const auto adapter = cache_->adapter(adapter_path_);
+                if (adapter && !adapter->address.empty()) {
+                    local_owns_connection =
+                        util::lower_trim_copy(adapter->address) < util::lower_trim_copy(mac);
+                }
+            }
+            if (!local_owns_connection) {
+                session.phase = "discovered";
+                session.detail = "waiting for peer-initiated connection";
+                continue;
+            }
+
+            if (local_server_rebuild_in_progress_.load()) {
                 session.phase = session.last_connect_attempt_monotonic > 0.0 ? "disconnected" : "discovered";
                 session.detail = "waiting for local GATT rebuild";
                 continue;
@@ -1078,7 +1105,7 @@ void ServiceNode::reconcile_peers() {
                                 device_label.c_str(), session.phase.c_str());
                     peers_->note_local_connect_attempt(session, now);
                     session.phase = "connecting";
-                    session.detail = "auto-connect requested (explicit LE when available)";
+                    session.detail = "auto-connect requested";
                 }
             }
             continue;
@@ -1117,7 +1144,7 @@ void ServiceNode::reconcile_peers() {
                     bridge_it != peers_->time_bridges().end() &&
                     bridge_it->second.time_notification_received &&
                     !bridge_it->second.time_writeback_received;
-                (void)reconnect_incomplete_time_bridge(
+                (void)report_incomplete_time_bridge(
                     mac,
                     device_label,
                     session,
@@ -1137,18 +1164,11 @@ void ServiceNode::reconcile_peers() {
                 (now - services_wait_started_monotonic) >= services_wait_grace_s;
 
             if (services_wait_expired) {
-                if (run_peer_task_once(mac, "recover unresolved services", [this, mac, retry_period_s]() {
-                        (void)client_->disconnect(mac, retry_period_s);
-                    })) {
-                    expected_disconnect_reasons_[mac] = "services unresolved too long, reconnecting";
-                    RCLCPP_WARN(get_logger(),
-                                "[reconcile] %s: services unresolved for %.1fs, forcing reconnect",
-                                device_label.c_str(),
-                                now - services_wait_started_monotonic);
-                    session.phase = "recovering";
-                    session.detail = "services unresolved too long, reconnecting";
-                }
-                continue;
+                // Service discovery belongs to BlueZ. A slow or missing
+                // service is not evidence of a broken ACL link or stale keys.
+                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                    "[reconcile] %s: BlueZ has not resolved remote services after %.1fs",
+                    device_label.c_str(), now - services_wait_started_monotonic);
             }
 
             schedule_peer_reconcile(kPeerWaitReconcileDelay);
@@ -1193,7 +1213,7 @@ void ServiceNode::reconcile_peers() {
                     bridge_it != peers_->time_bridges().end() &&
                     bridge_it->second.time_notification_received &&
                     !bridge_it->second.time_writeback_received;
-                (void)reconnect_incomplete_time_bridge(
+                (void)report_incomplete_time_bridge(
                     mac,
                     device_label,
                     session,
@@ -1203,52 +1223,9 @@ void ServiceNode::reconcile_peers() {
                 continue;
             }
 
-            const bool repeated_notify_failures =
-                session.notify_failure_count >= kPeerNotifyFailureReconnectThreshold &&
-                session.last_notify_failure_monotonic > 0.0 &&
-                (now - session.last_notify_failure_monotonic) < std::max(3.0, retry_period_s * 2.0);
-            const bool repeated_init_notify_failures =
-                session.time_bridge_init_notify_failure_count >= kPeerNotifyFailureReconnectThreshold &&
-                session.time_bridge_init_notify_failure_monotonic > 0.0 &&
-                (now - session.time_bridge_init_notify_failure_monotonic) < kPeerInitNotifyFailureResetWindow;
-            if (repeated_notify_failures) {
-                const bool notify_failures_during_time_bridge_init =
-                    !session.time_bridge_healthy_this_connection;
-                if (notify_failures_during_time_bridge_init && device_has_recorded_bond(*device)) {
-                    peers_->request_device_reset(session,
-                                                 "bonded peer repeatedly rejected time notifications, resetting peer device state",
-                                                 true);
-                    RCLCPP_WARN(get_logger(),
-                                "[reconcile] %s: repeated notify failures during initial bonded time-bridge bring-up, resetting BlueZ device state",
-                                device_label.c_str());
-                    schedule_peer_reconcile(std::chrono::milliseconds(1));
-                    continue;
-                }
-                if (run_peer_task_once(mac, "recover failed notify", [this, mac, retry_period_s]() {
-                        (void)client_->disconnect(mac, retry_period_s);
-                    })) {
-                    expected_disconnect_reasons_[mac] = "peer time notifications failing, reconnecting";
-                    RCLCPP_WARN(get_logger(),
-                                "[reconcile] %s: repeated notify failures on peer time bridge after health or without bond evidence, forcing reconnect",
-                                device_label.c_str());
-                    session.phase = "recovering";
-                    session.detail = "peer time notifications failing, reconnecting";
-                }
-                continue;
-            }
-
-            if (repeated_init_notify_failures &&
-                !session.time_bridge_healthy_this_connection &&
-                device_has_recorded_bond(*device)) {
-                peers_->request_device_reset(session,
-                                             "bonded peer repeatedly rejected time notifications, resetting peer device state",
-                                             true);
-                RCLCPP_WARN(get_logger(),
-                            "[reconcile] %s: repeated init-time notify failures persisted across reconnect churn, resetting BlueZ device state",
-                            device_label.c_str());
-                schedule_peer_reconcile(std::chrono::milliseconds(1));
-                continue;
-            }
+            // StartNotify already retries the failed operation with backoff.
+            // An optional time characteristic can be missing or temporarily
+            // unavailable without invalidating this ACL link or its bond.
 
             continue;
         }

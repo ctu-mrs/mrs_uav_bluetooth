@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/service_node_status.cpp
+/// \brief Implements the service node status component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
 #include "mrs_uav_bluetooth/gatt/bridge_naming.hpp"
@@ -11,6 +14,7 @@
 #include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -21,7 +25,12 @@ constexpr auto kStatusSummaryLogInterval = std::chrono::seconds(15);
 constexpr auto kPeerStatusLogInterval = std::chrono::seconds(30);
 constexpr auto kRepeatedLogWindow = std::chrono::seconds(5);
 
+/// \brief Test a peer phase against the allowed states used by status aggregation.
+/// \param phase Current peer lifecycle phase to compare.
+/// \param values Accepted peer phase names.
+/// \return True when phase matches; otherwise false.
 bool phase_matches(const std::string& phase, std::initializer_list<const char*> values) {
+    // Test a peer phase against the allowed states used by status aggregation.
     for (const char* value : values) {
         if (phase == value) {
             return true;
@@ -30,22 +39,39 @@ bool phase_matches(const std::string& phase, std::initializer_list<const char*> 
     return false;
 }
 
+/// \brief Enforce an independent quiet interval for each diagnostic key.
+/// \param last Steady-clock time at which this diagnostic was last emitted.
+/// \param now current monotonic time.
+/// \param interval delay between predicate checks.
+/// \return True for the first log or after the quiet interval; otherwise false.
 bool is_log_interval_elapsed(std::chrono::steady_clock::time_point last,
                              std::chrono::steady_clock::time_point now,
                              std::chrono::steady_clock::duration interval) {
+    // Permit the first log immediately and later logs only after the quiet interval.
     return last == std::chrono::steady_clock::time_point{} || (now - last) >= interval;
 }
 
+/// \brief Decide whether a peer has non-idle state worth reporting.
+/// \param session Peer session whose phase and errors determine whether it is reported.
+/// \param connected current Device1 connection state.
+/// \param services_resolved latest BlueZ indication that remote service discovery completed.
+/// \param bridge_status formatted bridge state included in disconnect diagnostics.
+/// \return True if active degraded or bridge-specific state should be reported; otherwise false.
 bool is_interesting_peer_status(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
                                 bool connected,
                                 bool services_resolved,
                                 const std::string& bridge_status) {
+    // Desired, connected, discovered, bridged, or degraded peers remain visible.
     return session.desired || connected || services_resolved || bridge_status != "none" ||
            !phase_matches(session.phase, {"idle"});
 }
 
 template<typename MapT>
+/// \brief Flatten configured YAML byte groups into one validated payload.
+/// \param values Ordered advertisement field map whose byte vectors are concatenated.
+/// \return All mapped byte vectors concatenated in key order.
 std::vector<uint8_t> concatenate_byte_values(const MapT& values) {
+    // Flatten configured YAML byte groups into one validated payload.
     std::vector<uint8_t> bytes;
     for (const auto& [key, value] : values) {
         (void)key;
@@ -54,9 +80,14 @@ std::vector<uint8_t> concatenate_byte_values(const MapT& values) {
     return bytes;
 }
 
+/// \brief Extract the configured raw advertising field from a cached device record.
+/// \param device Discovered peer containing the configured raw advertisement field.
+/// \param data_type Raw advertisement field type from which application bytes are read.
+/// \return Selected raw advertising field bytes, or an empty vector.
 std::vector<uint8_t> advertisement_user_payload(
     const mrs_uav_bluetooth::bluez::DeviceInfo& device,
     uint8_t data_type) {
+    // Extract the configured raw advertising field from a cached device record.
     const auto it = device.advertising_data.find(data_type);
     if (it == device.advertising_data.end()) {
         return {};
@@ -64,22 +95,31 @@ std::vector<uint8_t> advertisement_user_payload(
     return it->second;
 }
 
+/// \brief Describe the active pairing and trust policy in operator-facing text.
+/// \param config Pairing trust and authorization policy to render.
+/// \return Human-readable active pairing and trust policy.
 std::string security_mode_summary(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Describe the active pairing and trust policy in operator-facing text.
     if (config.auto_pair) {
         return config.auto_trust ? "pair=auto trust=auto" : "pair=auto trust=manual";
     }
     return config.auto_trust ? "pair=off trust=auto" : "pair=off trust=manual";
 }
 
+/// \brief Describe cached pairing, bond, and trust flags for diagnostics.
+/// \param device Optional BlueZ peer snapshot rendered into the security summary.
+/// \param config Active security policy included in the diagnostic summary.
+/// \return Human-readable pairing, bond, and trust state.
 std::string peer_security_summary(const std::optional<mrs_uav_bluetooth::bluez::DeviceInfo>& device,
                                   const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Describe cached pairing, bond, and trust flags for diagnostics.
     if (!device) {
         return config.auto_pair ? "pairing" : "manual";
     }
 
     if (!config.auto_pair) {
         if (device->paired || device->bonded) {
-            return "forbidden-bond";
+            return device->trusted ? "bonded+trusted" : "bonded";
         }
         if (device->trusted) {
             return "trusted";
@@ -108,10 +148,17 @@ std::string peer_security_summary(const std::optional<mrs_uav_bluetooth::bluez::
     return "pairing";
 }
 
+/// \brief Summarize resolved services, notification state, and active bridge paths.
+/// \param session Peer session supplying discovery bridge and error state.
+/// \param connected current Device1 connection state.
+/// \param services_resolved latest BlueZ indication that remote service discovery completed.
+/// \param bridge_status formatted bridge state included in disconnect diagnostics.
+/// \return Human-readable remote GATT and bridge readiness state.
 std::string peer_gatt_summary(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
                               bool connected,
                               bool services_resolved,
                               const std::string& bridge_status) {
+    // Summarize resolved services, notification state, and active bridge paths.
     if (!connected) {
         return "down";
     }
@@ -126,6 +173,16 @@ std::string peer_gatt_summary(const mrs_uav_bluetooth::peer::PeerConnectionSessi
     return "loading";
 }
 
+/// \brief Serialize the peer phase, transport state, and diagnostics for status publication.
+/// \param mac peer Bluetooth MAC address.
+/// \param device_label human-readable peer label included in warnings.
+/// \param session Peer session supplying lifecycle retry ownership and error state.
+/// \param device Optional BlueZ peer snapshot included in the diagnostic line.
+/// \param config Active security policy included in the diagnostic summary.
+/// \param connected current Device1 connection state.
+/// \param services_resolved latest BlueZ indication that remote service discovery completed.
+/// \param bridge_status formatted bridge state included in disconnect diagnostics.
+/// \return Serialized peer phase and transport diagnostics.
 std::string peer_status_snapshot(const std::string& mac,
                                  const std::string& device_label,
                                  const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
@@ -134,6 +191,7 @@ std::string peer_status_snapshot(const std::string& mac,
                                  bool connected,
                                  bool services_resolved,
                                  const std::string& bridge_status) {
+    // Serialize the peer phase, transport state, and diagnostics for status publication.
     std::ostringstream stream;
     stream << "peer=" << mac
            << " name='" << device_label << "'"
@@ -148,6 +206,14 @@ std::string peer_status_snapshot(const std::string& mac,
     return stream.str();
 }
 
+/// \brief Reduce adapter, transport, and peer phases into the public node health state.
+/// \param devices_map address-indexed device snapshot used to derive aggregate status.
+/// \param peers Peer manager supplying active connection and error phases.
+/// \param server_active whether a local GATT application is currently exported.
+/// \param advertisement_active whether a local advertisement is currently registered.
+/// \param scan_active whether adapter discovery is currently active.
+/// \param dbus_ready whether the BlueZ D-Bus service is available for this status sample.
+/// \return Aggregate node state such as ready, connecting, blocked, or idle.
 std::string overall_status_word(
     const std::map<std::string, mrs_uav_bluetooth::bluez::DeviceInfo>& devices_map,
     const mrs_uav_bluetooth::peer::PeerManager* peers,
@@ -155,6 +221,7 @@ std::string overall_status_word(
     bool advertisement_active,
     bool scan_active,
     bool dbus_ready) {
+    // Reduce adapter, transport, and peer phases into the public node health state.
     if (!dbus_ready) {
         return "error";
     }
@@ -208,7 +275,10 @@ std::string overall_status_word(
     }
 
     const auto connected = std::count_if(devices_map.begin(), devices_map.end(),
-        [](const auto& item) { return item.second.connected; });
+        [](const auto& item) {
+            // Count cached devices whose latest Device1 state is connected.
+            return item.second.connected;
+        });
     if (connected > 0 || server_active || advertisement_active || scan_active) {
         return "active";
     }
@@ -225,9 +295,13 @@ void ServiceNode::publish_scan_snapshot() {
     }
 
     std::map<std::string, bluez::DeviceInfo> devices_map;
+    const auto now = std::chrono::steady_clock::now();
     for (const auto& device : client_->get_devices()) {
         devices_map[device.mac] = device;
-        if (transport_bridges_) {
+        // Ignore cached random-address records after their radio updates stop.
+        if (transport_bridges_ && active_config_.advertise_mode == "broadcast" &&
+            device.last_seen != std::chrono::steady_clock::time_point{} &&
+            now - device.last_seen < std::chrono::seconds(3)) {
             const auto payload = advertisement_user_payload(
                 device, bluez::kDefaultAdvertisementExtraDataType);
             if (!payload.empty()) {
@@ -243,6 +317,7 @@ void ServiceNode::publish_scan_snapshot() {
 }
 
 void ServiceNode::publish_periodic_status() {
+    // Snapshot devices and sessions under the state lock for one coherent report.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     std::map<std::string, bluez::DeviceInfo> devices_map;
     if (client_) {
@@ -251,12 +326,15 @@ void ServiceNode::publish_periodic_status() {
         }
     }
     const auto connected_count = std::count_if(devices_map.begin(), devices_map.end(),
-                                               [](const auto& pair) { return pair.second.connected; });
+                                               [](const auto& pair) {
+                                                   // Count connected devices for the periodic health summary.
+                                                   return pair.second.connected;
+                                               });
     const auto status_word = overall_status_word(
         devices_map,
         peers_.get(),
         static_cast<bool>(gatt_app_),
-        static_cast<bool>(advertisement_),
+        (advertisement_ && advertisement_->is_registered()),
         client_ && client_->is_scanning(),
         client_ != nullptr && !adapter_path_.empty());
     std::vector<std::pair<std::string, std::string>> peer_snapshots;
@@ -304,7 +382,8 @@ void ServiceNode::publish_periodic_status() {
         " suppressed_peers=" + std::to_string(suppressed_peers) +
         " time_bridges=" + std::to_string(peers_ ? peers_->time_bridges().size() : 0u) +
         " server=" + std::string(gatt_app_ ? "active" : "off") +
-        " adv=" + std::string(advertisement_ ? "active" : "off") +
+        " adv=" + std::string(advertisement_ && advertisement_->is_registered() ? "active" :
+            (advertisement_ && advertisement_->was_released() ? "released" : "off")) +
         " scan=" + std::string(client_ && client_->is_scanning() ? "on" : "off");
     const auto now = std::chrono::steady_clock::now();
     bool emit_summary = false;
@@ -355,6 +434,7 @@ void ServiceNode::publish_periodic_status() {
 }
 
 void ServiceNode::log_info_coalesced(const std::string& key, const std::string& message) {
+    // Suppress repeated informational text until its coalescing interval elapses.
     size_t suppressed_count = 0;
     {
         std::lock_guard<std::mutex> lock(repeated_log_mutex_);
@@ -379,6 +459,7 @@ void ServiceNode::log_info_coalesced(const std::string& key, const std::string& 
 }
 
 void ServiceNode::log_warn_coalesced(const std::string& key, const std::string& message) {
+    // Suppress repeated warning text until its coalescing interval elapses.
     size_t suppressed_count = 0;
     {
         std::lock_guard<std::mutex> lock(repeated_log_mutex_);
@@ -404,6 +485,7 @@ void ServiceNode::log_warn_coalesced(const std::string& key, const std::string& 
 
 std::string ServiceNode::build_detailed_status_report(
     const std::map<std::string, bluez::DeviceInfo>& devices_map) const {
+    // Snapshot time and render adapter, transport, peer, bridge, and Mesh sections.
     std::vector<std::string> lines;
 
     const auto now_wall = std::time(nullptr);
@@ -413,9 +495,11 @@ std::string ServiceNode::build_detailed_status_report(
     ts << std::put_time(&local_tm, "%Y-%m-%d %H:%M:%S");
 
     const auto bool_text = [](bool value) {
+        // Render booleans consistently with the detailed report's existing operator-facing vocabulary.
         return value ? "True" : "False";
     };
     const auto upper_state = [](bool value) {
+        // Render enabled service states as fixed-width ACTIVE or OFF labels.
         return value ? "ACTIVE" : "OFF";
     };
     const auto& wifi_service_uuid = gatt::wifi_service_uuid();
@@ -431,6 +515,7 @@ std::string ServiceNode::build_detailed_status_report(
     const auto descriptor_name_for = [&](const std::string& service_uuid,
                                          const bridge::TopicExportBridgeState* export_state,
                                          const std::string& descriptor_uuid) {
+        // Resolve built-in names first, then match deterministic topic-bridge descriptor UUIDs.
         if (service_uuid == time_service_uuid) {
             return gatt::builtin_descriptor_name(service_uuid, descriptor_uuid);
         }
@@ -466,7 +551,7 @@ std::string ServiceNode::build_detailed_status_report(
     }
     lines.push_back("  scanning:   " + std::string(bool_text(client_ && client_->is_scanning())));
     lines.push_back("  server:     " + std::string(upper_state(static_cast<bool>(gatt_app_))));
-    lines.push_back("  advertise:  " + std::string(upper_state(static_cast<bool>(advertisement_))));
+    lines.push_back("  advertise:  " + std::string(upper_state((advertisement_ && advertisement_->is_registered()))));
     if (wifi_service_) {
         lines.push_back("  wifi-svc:   enabled");
     }
@@ -692,6 +777,7 @@ std::string ServiceNode::build_detailed_status_report(
 }
 
 mrs_uav_bluetooth::msg::BleDevice ServiceNode::to_device_msg(const bluez::DeviceInfo& device) const {
+    // Copy a cached BlueZ device record into the public ROS message shape.
     mrs_uav_bluetooth::msg::BleDevice msg;
     msg.mac = device.mac;
     msg.path = device.object_path;
@@ -725,6 +811,7 @@ mrs_uav_bluetooth::msg::BleDevice ServiceNode::to_device_msg(const bluez::Device
 }
 
 mrs_uav_bluetooth::msg::BleGattService ServiceNode::to_service_msg(const bluez::GattServiceInfo& item) const {
+    // Copy a cached GATT service record into its ROS response message.
     mrs_uav_bluetooth::msg::BleGattService msg;
     msg.path = item.object_path;
     msg.uuid = item.uuid;
@@ -735,6 +822,7 @@ mrs_uav_bluetooth::msg::BleGattService ServiceNode::to_service_msg(const bluez::
 }
 
 mrs_uav_bluetooth::msg::BleGattCharacteristic ServiceNode::to_characteristic_msg(const bluez::GattCharacteristicInfo& item) const {
+    // Copy a cached GATT characteristic record into its ROS response message.
     mrs_uav_bluetooth::msg::BleGattCharacteristic msg;
     msg.path = item.object_path;
     msg.service_path = item.service_path;
@@ -746,6 +834,7 @@ mrs_uav_bluetooth::msg::BleGattCharacteristic ServiceNode::to_characteristic_msg
 }
 
 mrs_uav_bluetooth::msg::BleGattDescriptor ServiceNode::to_descriptor_msg(const bluez::GattDescriptorInfo& item) const {
+    // Copy a cached GATT descriptor record into its ROS response message.
     mrs_uav_bluetooth::msg::BleGattDescriptor msg;
     msg.path = item.object_path;
     msg.characteristic_path = item.characteristic_path;

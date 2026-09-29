@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/util/topic_utils.cpp
+/// \brief Implements the topic utils component of the shared utility layer.
+
 #include "mrs_uav_bluetooth/util/topic_utils.hpp"
 
 #include <algorithm>
@@ -6,8 +9,11 @@
 
 namespace mrs_uav_bluetooth::util {
 
+/// \brief Convert arbitrary peer text into a nonempty ROS-safe topic component.
+/// \param value Arbitrary text to convert into one ROS topic component.
+/// \return ROS-safe topic component derived from arbitrary text.
 std::string sanitize_topic_suffix(std::string_view value) {
-    // Trim whitespace.
+    // Remove surrounding ASCII whitespace before replacing characters unsafe in a ROS name.
     auto start = value.find_first_not_of(" \t\r\n");
     if (start == std::string_view::npos) return "ble_device";
     auto end = value.find_last_not_of(" \t\r\n");
@@ -32,8 +38,11 @@ std::string sanitize_topic_suffix(std::string_view value) {
     return result.empty() ? "ble_device" : result;
 }
 
+/// \brief Make a ROS topic absolute and collapse repeated separators.
+/// \param value ROS topic path to make absolute and canonical.
+/// \return Canonical absolute ROS topic without duplicate separators.
 std::string normalize_ros_topic(std::string_view value) {
-    // Trim whitespace.
+    // Remove surrounding whitespace before canonicalizing separators and the leading slash.
     auto start = value.find_first_not_of(" \t\r\n");
     if (start == std::string_view::npos) return "/";
     auto end = value.find_last_not_of(" \t\r\n");

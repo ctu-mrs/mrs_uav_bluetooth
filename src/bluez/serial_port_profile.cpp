@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bluez/serial_port_profile.cpp
+/// \brief Implements the serial port profile component of the BlueZ system-D-Bus integration layer.
+
 #include "mrs_uav_bluetooth/bluez/serial_port_profile.hpp"
 
 #include <stdexcept>
@@ -13,9 +16,12 @@ SerialPortProfile::SerialPortProfile(DbusConnection& dbus,
     : dbus_(dbus),
       path_(std::move(object_path)),
       logger_(logger),
-      options_(std::move(options)) {}
+      options_(std::move(options)) {
+          // Retain the RFCOMM profile identity and options until explicit BlueZ registration.
+      }
 
 SerialPortProfile::~SerialPortProfile() {
+    // Unregister the RFCOMM profile while the D-Bus manager remains available.
     try {
         unregister_profile();
     } catch (...) {
@@ -23,22 +29,27 @@ SerialPortProfile::~SerialPortProfile() {
 }
 
 void SerialPortProfile::set_connection_handler(ConnectionHandler handler) {
+    // Install the owner that accepts and takes ownership of new RFCOMM sockets.
     connection_handler_ = std::move(handler);
 }
 
 void SerialPortProfile::set_disconnection_handler(DisconnectionHandler handler) {
+    // Install the owner notified when BlueZ requests a peer link shutdown.
     disconnection_handler_ = std::move(handler);
 }
 
 void SerialPortProfile::set_release_handler(ReleaseHandler handler) {
+    // Install the owner notified when BlueZ drops the whole profile registration.
     release_handler_ = std::move(handler);
 }
 
 void SerialPortProfile::export_object() {
+    // Export Profile1 connection, disconnection, and release methods at the configured path.
     exported_ = sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_});
     exported_->addVTable(
         sdbus::registerMethod("Release")
             .implementedAs([this]() {
+                // Mark the profile unregistered and let the owner rebuild it after BlueZ releases it.
                 registered_ = false;
                 RCLCPP_INFO(logger_, "BlueZ released serial profile %s", path_.c_str());
                 if (release_handler_) {
@@ -51,6 +62,7 @@ void SerialPortProfile::export_object() {
                 [this](const sdbus::ObjectPath& device,
                        sdbus::UnixFd fd,
                        const std::map<std::string, sdbus::Variant>& properties) {
+                    // Transfer ownership of the accepted RFCOMM file descriptor to the local link manager.
                     const auto device_path = static_cast<std::string>(device);
                     if (!fd.isValid() || !connection_handler_) {
                         throw sdbus::Error(
@@ -76,6 +88,7 @@ void SerialPortProfile::export_object() {
         sdbus::registerMethod("RequestDisconnection")
             .withInputParamNames("device")
             .implementedAs([this](const sdbus::ObjectPath& device) {
+                // Ask the local link manager to close the RFCOMM connection for this device.
                 const auto device_path = static_cast<std::string>(device);
                 if (disconnection_handler_) {
                     disconnection_handler_(device_path);
@@ -85,6 +98,7 @@ void SerialPortProfile::export_object() {
 }
 
 void SerialPortProfile::register_profile() {
+    // Register profile.
     if (registered_) {
         return;
     }
@@ -128,6 +142,7 @@ void SerialPortProfile::register_profile() {
 }
 
 void SerialPortProfile::unregister_profile() {
+    // Unregister profile.
     if (registered_) {
         try {
             auto manager = sdbus::createProxy(

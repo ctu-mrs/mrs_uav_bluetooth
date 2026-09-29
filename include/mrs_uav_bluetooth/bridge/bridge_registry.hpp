@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/bridge/bridge_registry.hpp
+/// \brief Declares the bridge registry component of the transport-independent ROS message bridge.
+
 #pragma once
 
 #include "mrs_uav_bluetooth/config/config_models.hpp"
@@ -15,6 +18,7 @@ namespace mrs_uav_bluetooth::bridge {
 
 class GenericMessageBridge;
 
+/// Runtime state for one locally exported ROS topic and its optional GATT service.
 struct TopicExportBridgeState {
     std::string topic_name;
     std::string message_type;
@@ -32,6 +36,7 @@ struct TopicExportBridgeState {
     std::shared_ptr<gatt::services::TopicBridgeService> service;
 };
 
+/// Runtime state for one peer topic imported into the local ROS graph.
 struct TopicImportBridgeState {
     std::string mac;
     std::string requested_topic_name;
@@ -55,13 +60,35 @@ struct TopicImportBridgeState {
     std::shared_ptr<GenericMessageBridge> runtime;
 };
 
+/// Thread-safe registry shared by discovery, GATT, and transport managers.
+/// Registry entries own bridge runtimes so callbacks cannot outlive their codec.
 class BridgeRegistry {
 public:
-    std::map<std::string, TopicExportBridgeState>& exports() { return exports_; }
-    const std::map<std::string, TopicExportBridgeState>& exports() const { return exports_; }
+    /// \brief Return the configured outgoing bridges.
+    /// \return Configured outgoing bridge map.
+    std::map<std::string, TopicExportBridgeState>& exports() {
+        // Expose mutable outgoing bridge state to configuration and publishers.
+        return exports_;
+    }
+    /// \brief Return the configured outgoing bridges.
+    /// \return Configured outgoing bridge map.
+    const std::map<std::string, TopicExportBridgeState>& exports() const {
+        // Expose outgoing bridge state read-only for status and lookup.
+        return exports_;
+    }
 
-    std::map<std::string, TopicImportBridgeState>& imports() { return imports_; }
-    const std::map<std::string, TopicImportBridgeState>& imports() const { return imports_; }
+    /// \brief Return the configured incoming bridges.
+    /// \return Configured incoming bridge map.
+    std::map<std::string, TopicImportBridgeState>& imports() {
+        // Expose mutable incoming bridge state to path and notification reconciliation.
+        return imports_;
+    }
+    /// \brief Return the configured incoming bridges.
+    /// \return Configured incoming bridge map.
+    const std::map<std::string, TopicImportBridgeState>& imports() const {
+        // Expose incoming bridge state read-only for status and lookup.
+        return imports_;
+    }
 
 private:
     std::map<std::string, TopicExportBridgeState> exports_;

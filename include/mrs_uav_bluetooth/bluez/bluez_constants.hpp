@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/bluez/bluez_constants.hpp
+/// \brief Declares the bluez constants component of the BlueZ system-D-Bus integration layer.
+
 #pragma once
 
 #include <cstdint>

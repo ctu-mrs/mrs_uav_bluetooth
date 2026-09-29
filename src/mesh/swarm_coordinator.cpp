@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/mesh/swarm_coordinator.cpp
+/// \brief Implements the swarm coordinator component of the Bluetooth Mesh D-Bus layer.
+
 #include "mrs_uav_bluetooth/mesh/swarm_coordinator.hpp"
 
 #include "mrs_uav_bluetooth/util/string_utils.hpp"
@@ -30,7 +33,11 @@ constexpr uint8_t kFrameVersion = 4;
 constexpr size_t kFrameSize = 8;
 constexpr uint8_t kSwarmParticipatingFlag = 0x02;
 
+/// \brief Parse and validate the numeric suffix used as this member Mesh address.
+/// \param hostname UAV hostname used to identify the node.
+/// \return Validated numeric UAV suffix used as the Mesh unicast identity.
 uint32_t uav_number(const std::string& hostname) {
+    // Parse and validate the numeric suffix used as this member Mesh address.
     const auto first_digit = hostname.find_last_not_of("0123456789");
     const auto digits = first_digit == std::string::npos
         ? hostname
@@ -48,32 +55,54 @@ uint32_t uav_number(const std::string& hostname) {
     return static_cast<uint32_t>(value);
 }
 
+/// \brief Decode a three-byte little-endian integer from a validated control frame.
+/// \param data Control-message bytes containing the little-endian integer.
+/// \param offset byte offset at which processing starts.
+/// \return Decoded u24.
 uint32_t read_u24(const std::vector<uint8_t>& data, size_t offset) {
+    // Read and decode u24.
     return static_cast<uint32_t>(data[offset]) |
         (static_cast<uint32_t>(data[offset + 1]) << 8U) |
         (static_cast<uint32_t>(data[offset + 2]) << 16U);
 }
 
+/// \brief Decode a two-byte little-endian integer from a validated control frame.
+/// \param data Control-message bytes containing the little-endian integer.
+/// \param offset byte offset at which processing starts.
+/// \return Decoded u16.
 uint16_t read_u16(const std::vector<uint8_t>& data, size_t offset) {
+    // Read and decode u16.
     return static_cast<uint16_t>(data[offset]) |
         (static_cast<uint16_t>(data[offset + 1]) << 8U);
 }
 
+/// \brief Append the low 24 bits in little-endian order to a control frame.
+/// \param data Control-message buffer receiving the encoded integer.
+/// \param value 24-bit integer to append in little-endian order.
 void append_u24(std::vector<uint8_t>& data, uint32_t value) {
+    // Control frames transmit the least-significant byte first.
     data.push_back(static_cast<uint8_t>(value));
     data.push_back(static_cast<uint8_t>(value >> 8U));
     data.push_back(static_cast<uint8_t>(value >> 16U));
 }
 
+/// \brief Append a 16-bit integer in little-endian order to a control frame.
+/// \param data Control-message buffer receiving the encoded integer.
+/// \param value 16-bit integer to append in little-endian order.
 void append_u16(std::vector<uint8_t>& data, uint16_t value) {
+    // Match the little-endian layout used by the paired read helper.
     data.push_back(static_cast<uint8_t>(value));
     data.push_back(static_cast<uint8_t>(value >> 8U));
 }
 
 /// FNV-1a truncated to 24 bits keeps the Mesh control access message compact
 /// while strongly separating independently configured swarm admission lists.
+/// \param members Canonical Mesh member hostnames included in the topology fingerprint.
+/// \param preference configured provisioner hostname or ordered-election policy.
+/// \return Deterministic 32-bit hash of admitted members and provisioner preference.
 uint32_t swarm_fingerprint(const std::vector<std::string>& members,
                            const std::string& preference) {
+    // Hash the sorted member numbers into a deterministic network identity.
     std::vector<std::string> normalized;
     normalized.reserve(members.size());
     for (const auto& member : members) {
@@ -121,7 +150,7 @@ MeshSwarmCoordinator::MeshSwarmCoordinator(
     if (preference != "ordered") preferred_number_ = uav_number(preference);
     whitelist_fingerprint_ = swarm_fingerprint(
         config_.peer_whitelist, preference);
-    // Candidate order is common fleet policy; enrollment itself needs no leader.
+    // Candidate order is common swarm policy; enrollment itself needs no leader.
     active_number_ = preferred_number_ != 0
         ? preferred_number_
         : (member_priority_.empty() ? local_number_ : member_priority_.front());
@@ -141,6 +170,7 @@ MeshSwarmCoordinator::MeshSwarmCoordinator(
 }
 
 void MeshSwarmCoordinator::handle_event(const Event& event) {
+    // Queue only provisioning events used by the coordinator, with a bounded backlog.
     if (event.event != "scan_result" &&
         event.event != "add_node_complete" &&
         event.event != "add_node_failed") return;
@@ -150,6 +180,7 @@ void MeshSwarmCoordinator::handle_event(const Event& event) {
 
 void MeshSwarmCoordinator::persist_swarm_state(
     uint16_t swarm_id, bool participating) const {
+    // Atomically store logical swarm membership separately from Mesh network credentials.
     if (config_.mesh_swarm_state_path.empty()) return;
     const std::filesystem::path path(config_.mesh_swarm_state_path);
     if (!path.parent_path().empty()) {
@@ -169,6 +200,7 @@ void MeshSwarmCoordinator::persist_swarm_state(
 }
 
 void MeshSwarmCoordinator::load_swarm_state() {
+    // Restore only a well-formed persisted logical swarm ID and participation flag.
     if (config_.mesh_swarm_state_path.empty()) return;
     std::ifstream input(config_.mesh_swarm_state_path);
     if (!input) return;
@@ -187,6 +219,7 @@ void MeshSwarmCoordinator::load_swarm_state() {
 }
 
 void MeshSwarmCoordinator::join_swarm(uint16_t swarm_id) {
+    // Join swarm.
     if (swarm_id == 0) {
         throw std::invalid_argument("swarm_id must be in 1..65535");
     }
@@ -200,6 +233,7 @@ void MeshSwarmCoordinator::join_swarm(uint16_t swarm_id) {
 }
 
 void MeshSwarmCoordinator::leave_swarm() {
+    // Leave swarm.
     std::lock_guard<std::mutex> lock(mutex_);
     persist_swarm_state(swarm_id_, false);
     swarm_participating_ = false;
@@ -209,11 +243,13 @@ void MeshSwarmCoordinator::leave_swarm() {
 }
 
 uint16_t MeshSwarmCoordinator::swarm_id() const {
+    // Return the configured network identifier shared by admitted mesh peers.
     std::lock_guard<std::mutex> lock(mutex_);
     return swarm_id_;
 }
 
 bool MeshSwarmCoordinator::swarm_participating() const {
+    // Report whether local configuration currently admits this node to the Mesh group.
     std::lock_guard<std::mutex> lock(mutex_);
     return swarm_participating_;
 }
@@ -235,7 +271,43 @@ std::vector<std::string> MeshSwarmCoordinator::swarm_members() const {
     return members;
 }
 
+std::vector<uint16_t> MeshSwarmCoordinator::swarm_member_addresses() const {
+    // Snapshot the currently admitted member unicast addresses under lock.
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
+    std::vector<uint16_t> addresses;
+    if (!swarm_participating_) return addresses;
+    for (const auto& [number, presence] : peer_presence_) {
+        if (number <= 0x7fffU && presence.expires > now &&
+            presence.participating && presence.swarm_id == swarm_id_) {
+            addresses.push_back(static_cast<uint16_t>(number));
+        }
+    }
+    return addresses;
+}
+
+std::vector<uint16_t> MeshSwarmCoordinator::swarm_probe_addresses() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
+    std::vector<uint16_t> addresses;
+    if (!swarm_participating_) return addresses;
+    // An open whitelist has no advance address list. Its newly heard members
+    // enter the ordinary fresh-member set instead.
+    for (const auto number : member_priority_) {
+        if (number == local_number_ || number > 0x7fffU) continue;
+        const auto it = peer_presence_.find(number);
+        if (it != peer_presence_.end() && it->second.expires > now) {
+            // A peer that explicitly joined another logical swarm must not
+            // receive topic-data probes while that information is fresh.
+            continue;
+        }
+        addresses.push_back(static_cast<uint16_t>(number));
+    }
+    return addresses;
+}
+
 bool MeshSwarmCoordinator::accepts_swarm_payload(uint16_t source) const {
+    // Accept only fresh participation from the same logical swarm identity.
     std::lock_guard<std::mutex> lock(mutex_);
     if (!swarm_participating_) return false;
     const auto now = Clock::now();
@@ -247,6 +319,22 @@ bool MeshSwarmCoordinator::accepts_swarm_payload(uint16_t source) const {
         }
     }
     return false;
+}
+
+bool MeshSwarmCoordinator::accepts_swarm_payload(
+    uint16_t source, uint16_t sender_swarm_id) {
+    if (source == 0 || source == local_number_ ||
+        sender_swarm_id == 0 || !peer_allowed(source)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!swarm_participating_ || sender_swarm_id != swarm_id_) return false;
+    // AppKey-authenticated data and ACKs are also evidence of live swarm
+    // membership. This closes a gap where an occasional lost control heartbeat
+    // would remove an otherwise healthy peer from the unicast repair set.
+    const auto lease = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(config_.mesh_swarm_provisioner_timeout));
+    peer_presence_[source] = PeerPresence{
+        source, sender_swarm_id, true, Clock::now() + lease};
+    return true;
 }
 
 bool MeshSwarmCoordinator::handle_message(const ReceivedMessage& message) {
@@ -301,10 +389,12 @@ void MeshSwarmCoordinator::accept_coordination_frame(
 }
 
 bool MeshSwarmCoordinator::peer_allowed(uint32_t number) const {
+    // Apply the current whitelist and hostname rules to a Mesh peer number.
     return config_.peer_whitelist.empty() || member_by_number_.contains(number);
 }
 
 std::string MeshSwarmCoordinator::member_name(uint32_t number) const {
+    // Format a numeric Mesh address as its canonical UAV hostname.
     const auto known = member_by_number_.find(number);
     return known == member_by_number_.end()
         ? std::string{"uav"} + std::to_string(number)
@@ -319,6 +409,7 @@ void MeshSwarmCoordinator::update_selection(Clock::time_point now) {
     }
 
     const auto available = [this](uint32_t number) {
+        // A candidate is electable only while it is local or has an unexpired authenticated heartbeat.
         return number == local_number_ || peer_presence_.contains(number);
     };
     uint32_t selected = local_number_;
@@ -456,7 +547,7 @@ void MeshSwarmCoordinator::maintain_local_model(
     const uint16_t local_address = status.addresses.front();
     try {
         if (local_model_stage_ == 0) {
-            if (!application_.prepare_auto_keys(local_address)) {
+            if (!application_.prepare_auto_keys()) {
                 next_local_model_action_ = now + kRetryDelay;
                 return;
             }
@@ -623,7 +714,10 @@ void MeshSwarmCoordinator::maintain_auto_enrollment(
             const auto known_nodes = application_.export_device_keys();
             const bool enrolled = std::any_of(
                 known_nodes.begin(), known_nodes.end(),
-                [number](const auto& node) { return node.unicast == number; });
+                [number](const auto& node) {
+                    // Skip provisioning when the daemon already stores a device key at this unicast address.
+                    return node.unicast == number;
+                });
             if (enrolled) continue;
             const auto uuid = mesh_auto_uuid_from_name(member_name(number));
             application_.set_auto_provisioning_unicast(
@@ -645,21 +739,25 @@ void MeshSwarmCoordinator::maintain_auto_enrollment(
 }
 
 std::string MeshSwarmCoordinator::active_provisioner() const {
+    // Copy the provisioner elected from the current live member set.
     std::lock_guard<std::mutex> lock(mutex_);
     return active_provisioner_;
 }
 
 std::string MeshSwarmCoordinator::preferred_provisioner() const {
+    // Resolve the configured provisioner choice, falling back to ordered election.
     if (preferred_number_ != 0) return member_name(preferred_number_);
     if (!member_priority_.empty()) return member_name(member_priority_.front());
     return "ordered";
 }
 
 bool MeshSwarmCoordinator::local_is_active_provisioner() const {
+    // Read the atomic election result used to gate provisioning work.
     return local_is_active_.load();
 }
 
 bool MeshSwarmCoordinator::application_ready() const {
+    // Read whether the local Mesh application is attached and configured for data traffic.
     return application_ready_.load();
 }
 

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/network/netplan_manager.cpp
+/// \brief Implements the netplan manager component of the Wi-Fi and netplan integration layer.
+
 #include "mrs_uav_bluetooth/network/netplan_manager.hpp"
 
 #include "mrs_uav_bluetooth/util/string_utils.hpp"
@@ -26,11 +29,20 @@ constexpr const char* kIwGetIdCommand = "iwgetid -r 2>/dev/null";
 constexpr auto kConnectionVerifyTimeout = std::chrono::seconds(20);
 constexpr auto kConnectionVerifyPollInterval = std::chrono::milliseconds(500);
 
+/// \brief Test membership in the configured allow-list without modifying it.
+/// \param values Allowed strings searched for the candidate.
+/// \param candidate Exact string sought in the allowed-value list.
+/// \return True when the candidate is in the configured list; otherwise false.
 bool contains_value(const std::vector<std::string>& values, const std::string& candidate) {
+    // Test membership in the configured allow-list without modifying it.
     return std::find(values.begin(), values.end(), candidate) != values.end();
 }
 
+/// \brief Extract the configured access-point network name from a Netplan document.
+/// \param config Parsed Netplan document containing the access-point definition.
+/// \return Decoded Netplan access-point name.
 std::string read_access_point_ssid(const YAML::Node& config) {
+    // Extract and unquote the access-point name from one Netplan entry.
     const auto access_points = config["network"]["wifis"]["wlan0"]["access-points"];
     if (!access_points || !access_points.IsMap()) {
         return {};
@@ -41,7 +53,11 @@ std::string read_access_point_ssid(const YAML::Node& config) {
     return {};
 }
 
+/// \brief Extract the configured access-point password from a Netplan document.
+/// \param config Parsed Netplan document containing the access-point credentials.
+/// \return Decoded Netplan access-point password.
 std::string read_access_point_password(const YAML::Node& config) {
+    // Extract and unquote the password from one Netplan access-point entry.
     const auto access_points = config["network"]["wifis"]["wlan0"]["access-points"];
     if (!access_points || !access_points.IsMap()) {
         return {};
@@ -56,12 +72,19 @@ std::string read_access_point_password(const YAML::Node& config) {
     return {};
 }
 
+/// \brief Capture a command's standard output and require a successful exit status.
+/// \param command shell command executed while capturing its output and status.
+/// \return Captured command standard output.
 std::string read_command_output(const char* command) {
+    // Capture command output and reject a nonzero exit status.
     std::array<char, 256> buffer{};
     std::string output;
 
     struct PipeCloser {
+        /// \brief Close the captured command stream when leaving scope.
+        /// \param file open command-output stream closed by the local RAII guard.
         void operator()(FILE* file) const {
+            // Apply operator() while preserving class invariants.
             if (file != nullptr) {
                 pclose(file);
             }
@@ -79,7 +102,10 @@ std::string read_command_output(const char* command) {
     return util::trim_ascii_copy(std::move(output));
 }
 
+/// \brief Query NetworkManager for the currently active Wi-Fi network name.
+/// \return Active network name parsed from NetworkManager output.
 std::string read_connected_ssid() {
+    // Parse the active network name from the NetworkManager command output.
     return read_command_output(kIwGetIdCommand);
 }
 
@@ -88,7 +114,11 @@ struct FileSnapshot {
     std::string contents;
 };
 
+/// \brief Read and retain a Netplan file so a failed apply can restore it byte-for-byte.
+/// \param path Netplan file to preserve before modification.
+/// \return Original file presence and bytes for rollback.
 FileSnapshot take_file_snapshot(const std::string& path) {
+    // Read and retain a Netplan file so a failed apply can restore it byte-for-byte.
     FileSnapshot snapshot;
     std::ifstream input(path, std::ios::binary);
     if (!input.good()) {
@@ -102,7 +132,12 @@ FileSnapshot take_file_snapshot(const std::string& path) {
     return snapshot;
 }
 
+/// \brief Rewrite or remove the Netplan file to match the captured pre-change state.
+/// \param path Netplan file to restore.
+/// \param snapshot saved file contents and existence state used for rollback.
+/// \return Whether the original Netplan file state was restored.
 std::string restore_snapshot(const std::string& path, const FileSnapshot& snapshot) {
+    // Rewrite or remove the Netplan file to match the captured pre-change state.
     namespace fs = std::filesystem;
 
     if (!snapshot.existed) {
@@ -125,7 +160,10 @@ std::string restore_snapshot(const std::string& path, const FileSnapshot& snapsh
     return {};
 }
 
+/// \brief Apply Netplan through the privileged helper and capture its diagnostic.
+/// \return Empty string on success otherwise the helper's captured diagnostic.
 std::string run_netplan_apply() {
+    // Preserve the helper’s exit status so callers can trigger rollback.
     const int rc = std::system("netplan apply");
     if (rc == 0) {
         return {};
@@ -133,7 +171,11 @@ std::string run_netplan_apply() {
     return "netplan apply failed with code " + std::to_string(rc);
 }
 
+/// \brief Poll until the requested Wi-Fi network becomes active or times out.
+/// \param expected_ssid network name that must become active before the wait succeeds.
+/// \return True if NetworkManager reports the expected network before timeout; otherwise false.
 bool wait_for_connected_ssid(const std::string& expected_ssid) {
+    // Poll until NetworkManager reports the requested network or the deadline expires.
     const auto deadline = std::chrono::steady_clock::now() + kConnectionVerifyTimeout;
     while (true) {
         if (read_connected_ssid() == expected_ssid) {
@@ -146,9 +188,14 @@ bool wait_for_connected_ssid(const std::string& expected_ssid) {
     }
 }
 
+/// \brief Serialize YAML while quoting mapping keys that Netplan could misinterpret.
+/// \param out destination buffer, stream, or size receiving the result.
+/// \param node YAML value to emit recursively.
+/// \param double_quote_map_keys whether YAML map keys require explicit double quoting.
 void emit_yaml_node(YAML::Emitter& out,
                     const YAML::Node& node,
                     bool double_quote_map_keys = false) {
+    // Recurse through maps and sequences while quoting Netplan-sensitive keys.
     if (node.IsMap()) {
         out << YAML::BeginMap;
         for (auto item = node.begin(); item != node.end(); ++item) {
@@ -179,9 +226,15 @@ void emit_yaml_node(YAML::Emitter& out,
     out << node;
 }
 
+/// \brief Restore the previous file and reapply Netplan after a connection attempt fails.
+/// \param path Netplan file whose saved contents must be restored.
+/// \param snapshot saved file contents and existence state used for rollback.
+/// \param message Original failure explanation to extend with rollback status.
+/// \return Whether file rollback and Netplan reapply both succeeded.
 std::pair<bool, std::string> rollback_netplan_change(const std::string& path,
                                                      const FileSnapshot& snapshot,
                                                      std::string message) {
+    // Restore the previous file and reapply Netplan after a connection attempt fails.
     const auto restore_error = restore_snapshot(path, snapshot);
     const auto rollback_apply_error = restore_error.empty() ? run_netplan_apply() : std::string{};
 
@@ -196,7 +249,10 @@ std::pair<bool, std::string> rollback_netplan_change(const std::string& path,
     return {false, std::move(message)};
 }
 
+/// \brief Derive the default Wi-Fi address from the numeric suffix of the local hostname.
+/// \return Deterministic Wi-Fi address derived from the local UAV number.
 std::string default_uav_static_address() {
+    // Derive the default Wi-Fi address from the numeric suffix of the local hostname.
     char hostname_buf[256]{};
     std::string hostname;
     if (gethostname(hostname_buf, sizeof(hostname_buf) - 1) == 0) {
@@ -205,6 +261,7 @@ std::string default_uav_static_address() {
 
     std::string lowered = hostname;
     std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        // Normalize the hostname before deriving its deterministic static address.
         return static_cast<char>(std::tolower(ch));
     });
 
@@ -234,14 +291,18 @@ std::string default_uav_static_address() {
 NetplanManager::NetplanManager(std::string netplan_config_file,
                                std::vector<std::string> allowed_networks)
     : netplan_config_file_(std::move(netplan_config_file)),
-      allowed_networks_(std::move(allowed_networks)) {}
+      allowed_networks_(std::move(allowed_networks)) {
+    // Construction records policy only; it never changes the host network.
+}
 
 bool NetplanManager::busy() {
+    // Read the transition flag under the same lock used by network changes.
     std::lock_guard<std::mutex> lock(mutex_);
     return busy_;
 }
 
 void NetplanManager::set_config_file(std::string value) {
+    // Normalize an override and restore the system default for an empty path.
     std::lock_guard<std::mutex> lock(mutex_);
     netplan_config_file_ = util::trim_ascii_copy(std::move(value));
     if (netplan_config_file_.empty()) {
@@ -250,11 +311,13 @@ void NetplanManager::set_config_file(std::string value) {
 }
 
 void NetplanManager::set_allowed_networks(std::vector<std::string> value) {
+    // Replace the admission list atomically with respect to service requests.
     std::lock_guard<std::mutex> lock(mutex_);
     allowed_networks_ = std::move(value);
 }
 
 std::string NetplanManager::get_current_ssid() {
+    // Prefer the configured access point, then query the live Wi-Fi link.
     std::lock_guard<std::mutex> lock(mutex_);
     try {
         const auto ssid = read_access_point_ssid(YAML::LoadFile(netplan_config_file_));
@@ -267,6 +330,7 @@ std::string NetplanManager::get_current_ssid() {
 }
 
 std::string NetplanManager::get_configured_password() {
+    // Missing or invalid YAML deliberately appears as no saved password.
     std::lock_guard<std::mutex> lock(mutex_);
     try {
         return read_access_point_password(YAML::LoadFile(netplan_config_file_));
@@ -276,6 +340,7 @@ std::string NetplanManager::get_configured_password() {
 }
 
 std::vector<std::string> NetplanManager::list_known_ssids() {
+    // Preserve policy order while removing empty and duplicate names.
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> result;
     for (const auto& ssid : allowed_networks_) {
@@ -289,6 +354,7 @@ std::vector<std::string> NetplanManager::list_known_ssids() {
 std::pair<bool, std::string> NetplanManager::write_netplan(
     const std::string& ssid,
     const std::optional<std::string>& password) {
+    // Snapshot the file so parse, apply, or connection failures can roll back.
     busy_ = true;
     const auto snapshot = take_file_snapshot(netplan_config_file_);
 
@@ -383,6 +449,7 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
 
 std::pair<bool, std::string> NetplanManager::set_current_network(const std::string& ssid,
                                                                  std::optional<std::string> password) {
+    // Serialize requests and reject targets outside the configured allow-list.
     std::lock_guard<std::mutex> lock(mutex_);
     if (busy_) {
         return {false, "netplan change already in progress"};
@@ -401,6 +468,7 @@ std::pair<bool, std::string> NetplanManager::set_current_network(const std::stri
 }
 
 std::pair<bool, std::string> NetplanManager::set_current_ssid(const std::string& target) {
+    // Reuse the saved password when callers only select a network name.
     return set_current_network(target, std::nullopt);
 }
 

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/mesh/mesh_application.cpp
+/// \brief Implements the mesh application component of the Bluetooth Mesh D-Bus layer.
+
 #include "mrs_uav_bluetooth/mesh/mesh_application.hpp"
 
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
@@ -24,7 +27,11 @@ namespace mrs_uav_bluetooth::mesh {
 namespace {
 
 constexpr auto kCallTimeout = std::chrono::seconds(30);
-constexpr auto kDaemonActivationRetry = std::chrono::seconds(5);
+// Transfer admission/status/cancellation only inspect or update local queues.
+// Bound their waits separately from provisioning, which includes radio work.
+constexpr auto kTransferCallTimeout = std::chrono::seconds(2);
+// The LE-to-Mesh handoff can reject the first activation while the daemon stops.
+constexpr auto kDaemonActivationRetry = std::chrono::seconds(1);
 
 using SigModel = sdbus::Struct<uint16_t, VariantMap>;
 using VendorModel = sdbus::Struct<uint16_t, uint16_t, VariantMap>;
@@ -32,8 +39,14 @@ using NetKeyRecord = sdbus::Struct<uint16_t, std::vector<uint8_t>, VariantMap>;
 using AppKeyRecord = sdbus::Struct<uint16_t, std::vector<uint8_t>, VariantMap>;
 using DevKeyRecord = sdbus::Struct<uint16_t, std::vector<uint8_t>>;
 
+/// \brief Read an optional strongly typed field from a Mesh D-Bus dictionary.
+/// \tparam T Expected value type stored in the variant.
+/// \param values Dictionary returned by the Mesh daemon.
+/// \param key Field name to read.
+/// \return Decoded value, or std::nullopt when absent or typed differently.
 template<typename T>
 std::optional<T> variant_value(const VariantMap& values, const std::string& key) {
+    // Decode an optional typed field from a D-Bus variant dictionary.
     const auto it = values.find(key);
     if (it == values.end() || !it->second.containsValueOfType<T>()) {
         return std::nullopt;
@@ -41,7 +54,11 @@ std::optional<T> variant_value(const VariantMap& values, const std::string& key)
     return it->second.get<T>();
 }
 
+/// \brief Strip separators and validate the 16-byte Mesh UUID representation.
+/// \param value Mesh UUID text to normalize before validation.
+/// \return Canonical 32-digit lowercase Mesh UUID text.
 std::string normalized_uuid_hex(const std::string& value) {
+    // Strip separators and validate the 16-byte Mesh UUID representation.
     std::string result;
     result.reserve(32);
     for (const unsigned char ch : value) {
@@ -57,13 +74,20 @@ std::string normalized_uuid_hex(const std::string& value) {
     return result;
 }
 
+/// \brief Combine the D-Bus error name and message for actionable diagnostics.
+/// \param error error details to report.
+/// \return Stable D-Bus error name followed by its optional explanatory message.
 std::string mesh_error_text(const sdbus::Error& error) {
+    // Combine the D-Bus error name and message for actionable diagnostics.
     const auto name = static_cast<std::string>(error.getName());
     const auto message = error.getMessage();
     return name.empty() ? message : name + ": " + message;
 }
 
+/// \brief Clear attachment-specific fields while retaining daemon availability.
+/// \param status Mesh status whose node-specific fields are reset after detach.
 void clear_node_runtime_status(Status& status) {
+    // Reset values that are valid only while a local Mesh node is attached.
     status.addresses.clear();
     status.friend_feature = false;
     status.low_power_feature = false;
@@ -78,7 +102,11 @@ void clear_node_runtime_status(Status& status) {
 
 }  // namespace
 
+/// \brief Parse a textual 16-byte UUID while accepting conventional separators.
+/// \param value Hexadecimal Mesh UUID text to decode.
+/// \return Parsed 16-byte Mesh UUID.
 std::vector<uint8_t> mesh_uuid_from_string(const std::string& value) {
+    // Parse a textual 16-byte UUID while accepting conventional separators.
     const auto normalized = normalized_uuid_hex(value);
     std::vector<uint8_t> result;
     result.reserve(16);
@@ -89,6 +117,9 @@ std::vector<uint8_t> mesh_uuid_from_string(const std::string& value) {
     return result;
 }
 
+/// \brief Derive an RFC 4122 version-3 UUID for a Mesh name.
+/// \param value Stable name from which to derive a Mesh UUID.
+/// \return Deterministic name-based 16-byte Mesh UUID.
 std::vector<uint8_t> mesh_uuid_from_name(const std::string& value) {
     auto result = mesh_uuid_from_string(util::uuid_from_name(value));
     // RFC 4122 section 4.1.3: deterministic MD5 names are version 3 and use
@@ -98,7 +129,11 @@ std::vector<uint8_t> mesh_uuid_from_name(const std::string& value) {
     return result;
 }
 
+/// \brief Derive a deterministic 16-byte provisioning UUID from a UAV hostname.
+/// \param hostname UAV hostname used to identify the node.
+/// \return Deterministic automatic-provisioning UUID for the UAV hostname.
 std::vector<uint8_t> mesh_auto_uuid_from_name(const std::string& hostname) {
+    // Derive a deterministic 16-byte provisioning UUID from a UAV hostname.
     const auto first_digit = hostname.find_last_not_of("0123456789");
     if (first_digit != std::string::npos && first_digit + 1 == hostname.size())
         throw std::invalid_argument("Automatic Mesh hostname needs a UAV number");
@@ -116,7 +151,11 @@ std::vector<uint8_t> mesh_auto_uuid_from_name(const std::string& hostname) {
     return uuid;
 }
 
+/// \brief Recover the UAV number embedded in a deterministic automatic Mesh UUID.
+/// \param uuid Sixteen-byte Mesh UUID whose numeric node suffix is decoded.
+/// \return UAV number embedded in the automatic Mesh UUID.
 uint16_t mesh_auto_uuid_number(const std::vector<uint8_t>& uuid) {
+    // Recover the UAV number embedded in a deterministic automatic Mesh UUID.
     if (uuid.size() != 16 || uuid[0] != 'M' || uuid[1] != 'R' ||
         uuid[2] != 'S' || uuid[3] != 'B')
         return 0;
@@ -125,7 +164,11 @@ uint16_t mesh_auto_uuid_number(const std::vector<uint8_t>& uuid) {
     return number > 0 && number <= 0x7fff ? number : 0;
 }
 
+/// \brief Encode Mesh bytes as lowercase hexadecimal for status and persistence.
+/// \param value Bytes to render as lowercase hexadecimal.
+/// \return Lowercase hexadecimal representation of the Mesh bytes.
 std::string mesh_bytes_to_hex(const std::vector<uint8_t>& value) {
+    // Encode Mesh bytes as lowercase hexadecimal for status and persistence.
     std::ostringstream stream;
     stream << std::hex << std::setfill('0');
     for (const auto byte : value) {
@@ -237,18 +280,32 @@ void MeshApplication::export_objects() {
 }
 
 void MeshApplication::export_application() {
+    // Export node identity and join-result callbacks required by the mesh Application1 API.
     application_object_->addVTable(
         sdbus::registerProperty("CompanyID")
-            .withGetter([this]() { return config_.mesh_company_id; }),
+            .withGetter([this]() {
+                // Identify the vendor that owns the application model exported below.
+                return config_.mesh_company_id;
+            }),
         sdbus::registerProperty("ProductID")
-            .withGetter([this]() { return config_.mesh_product_id; }),
+            .withGetter([this]() {
+                // Expose the configured product identifier in the node composition data.
+                return config_.mesh_product_id;
+            }),
         sdbus::registerProperty("VersionID")
-            .withGetter([this]() { return config_.mesh_version_id; }),
+            .withGetter([this]() {
+                // Expose the configured firmware version in the node composition data.
+                return config_.mesh_version_id;
+            }),
         sdbus::registerProperty("CRPL")
-            .withGetter([this]() { return config_.mesh_crpl; }),
+            .withGetter([this]() {
+                // Advertise how many replay-protection entries this node can retain.
+                return config_.mesh_crpl;
+            }),
         sdbus::registerMethod("JoinComplete")
             .withInputParamNames("token")
             .implementedAs([this](uint64_t token) {
+                // Persist the daemon-issued token and report that provisioning completed.
                 set_token(token);
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -263,6 +320,7 @@ void MeshApplication::export_application() {
         sdbus::registerMethod("JoinFailed")
             .withInputParamNames("reason")
             .implementedAs([this](const std::string& reason) {
+                // Record the daemon rejection and publish the failed join event.
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.state = "join_failed";
@@ -278,30 +336,43 @@ void MeshApplication::export_application() {
 }
 
 void MeshApplication::export_agent() {
+    // Export the authentication capabilities and prompts used during provisioning.
     agent_object_ = sdbus::createObject(
         dbus_.connection(), sdbus::ObjectPath{agent_path_});
     agent_object_->addVTable(
         sdbus::registerProperty("Capabilities")
-            .withGetter([this]() { return config_.mesh_agent_capabilities; }),
+            .withGetter([this]() {
+                // Tell the mesh daemon which provisioning prompts this agent can handle.
+                return config_.mesh_agent_capabilities;
+            }),
         sdbus::registerProperty("OutOfBandInfo")
-            .withGetter([this]() { return config_.mesh_agent_oob_info; }),
+            .withGetter([this]() {
+                // Describe the external authentication information available during provisioning.
+                return config_.mesh_agent_oob_info;
+            }),
         sdbus::registerProperty("URI")
-            .withGetter([this]() { return config_.mesh_agent_uri; }),
+            .withGetter([this]() {
+                // Expose the optional provisioning URI associated with this node.
+                return config_.mesh_agent_uri;
+            }),
         sdbus::registerMethod("PrivateKey")
             .withOutputParamNames("key")
             .implementedAs([this]() -> std::vector<uint8_t> {
+                // Validate and return the configured 32-byte provisioning private key.
                 require_size(config_.mesh_agent_private_key, 32, "mesh agent private key");
                 return config_.mesh_agent_private_key;
             }),
         sdbus::registerMethod("PublicKey")
             .withOutputParamNames("key")
             .implementedAs([this]() -> std::vector<uint8_t> {
+                // Validate and return the configured 64-byte provisioning public key.
                 require_size(config_.mesh_agent_public_key, 64, "mesh agent public key");
                 return config_.mesh_agent_public_key;
             }),
         sdbus::registerMethod("DisplayString")
             .withInputParamNames("value")
             .implementedAs([this](const std::string& value) {
+                // Forward text that the provisioner asks an operator to display.
                 Event event;
                 event.event = "agent_display_string";
                 event.detail = value;
@@ -310,6 +381,7 @@ void MeshApplication::export_agent() {
         sdbus::registerMethod("DisplayNumeric")
             .withInputParamNames("type", "number")
             .implementedAs([this](const std::string& type, uint32_t number) {
+                // Forward the provisioning number and display format to status consumers.
                 Event event;
                 event.event = "agent_display_numeric";
                 event.detail = type + ":" + std::to_string(number);
@@ -319,6 +391,7 @@ void MeshApplication::export_agent() {
             .withInputParamNames("type")
             .withOutputParamNames("number")
             .implementedAs([this](const std::string& type) -> uint32_t {
+                // Report the prompt and return the configured numeric authentication value.
                 Event event;
                 event.event = "agent_prompt_numeric";
                 event.detail = type;
@@ -329,6 +402,7 @@ void MeshApplication::export_agent() {
             .withInputParamNames("type")
             .withOutputParamNames("value")
             .implementedAs([this](const std::string& type) -> std::vector<uint8_t> {
+                // Report the prompt and return the configured 16-byte static authentication value.
                 Event event;
                 event.event = "agent_prompt_static";
                 event.detail = type;
@@ -338,6 +412,7 @@ void MeshApplication::export_agent() {
             }),
         sdbus::registerMethod("Cancel")
             .implementedAs([this]() {
+                // Notify status consumers that the daemon cancelled the provisioning exchange.
                 Event event;
                 event.event = "agent_cancel";
                 emit_event(std::move(event));
@@ -346,13 +421,18 @@ void MeshApplication::export_agent() {
 }
 
 void MeshApplication::export_element() {
+    // Export the element composition and inbound model-message callbacks.
     element_object_ = sdbus::createObject(
         dbus_.connection(), sdbus::ObjectPath{element_path_});
     element_object_->addVTable(
         sdbus::registerProperty("Index")
-            .withGetter([]() -> uint8_t { return 0; }),
+            .withGetter([]() -> uint8_t {
+                // Export the single local element at composition index zero.
+                return 0;
+            }),
         sdbus::registerProperty("Models")
             .withGetter([this]() {
+                // Include the Configuration Server model when this node manages mesh configuration.
                 std::vector<SigModel> models;
                 if (config_.mesh_provisioner ||
                     config_.mesh_auto_configure_relay) {
@@ -362,18 +442,23 @@ void MeshApplication::export_element() {
             }),
         sdbus::registerProperty("VendorModels")
             .withGetter([this]() {
+                // Expose the vendor model that carries ROS bridge fragments.
                 return std::vector<VendorModel>{VendorModel{
                     config_.mesh_company_id,
                     config_.mesh_vendor_model_id,
                     VariantMap{}}};
             }),
         sdbus::registerProperty("Location")
-            .withGetter([]() -> uint16_t { return 0; }),
+            .withGetter([]() -> uint16_t {
+                // Report an unspecified physical location for the local element.
+                return 0;
+            }),
         sdbus::registerMethod("MessageReceived")
             .withInputParamNames("source", "key_index", "destination", "data")
             .implementedAs([this](uint16_t source, uint16_t key_index,
                                   const sdbus::Variant& destination,
                                   const std::vector<uint8_t>& data) {
+                // Translate an application-key mesh packet into the internal receive event.
                 ReceivedMessage message;
                 message.source = source;
                 message.key_index = key_index;
@@ -387,6 +472,7 @@ void MeshApplication::export_element() {
             .withInputParamNames("source", "remote", "net_index", "data")
             .implementedAs([this](uint16_t source, bool remote, uint16_t net_index,
                                   const std::vector<uint8_t>& data) {
+                // Translate a device-key mesh packet into the internal receive event.
                 ReceivedMessage message;
                 message.source = source;
                 message.net_index = net_index;
@@ -398,6 +484,7 @@ void MeshApplication::export_element() {
         sdbus::registerMethod("UpdateModelConfiguration")
             .withInputParamNames("model_id", "config")
             .implementedAs([this](uint16_t model_id, const VariantMap& model_config) {
+                // Refresh binding and subscription state from the daemon, then publish the change.
                 update_model_configuration(model_id, model_config);
                 Event event;
                 event.event = "model_configuration";
@@ -409,10 +496,12 @@ void MeshApplication::export_element() {
 }
 
 void MeshApplication::export_attention() {
+    // Export the provisioner-controlled attention timer for the local element.
     application_object_->addVTable(
         sdbus::registerMethod("SetTimer")
             .withInputParamNames("element_index", "time")
             .implementedAs([this](uint8_t element_index, uint16_t seconds) {
+                // Start or replace the local attention timer requested by the provisioner.
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     attention_until_ = std::chrono::steady_clock::now() +
@@ -428,6 +517,7 @@ void MeshApplication::export_attention() {
             .withInputParamNames("element")
             .withOutputParamNames("time")
             .implementedAs([this](uint16_t) -> uint16_t {
+                // Return the rounded-up seconds remaining on the local attention timer.
                 std::lock_guard<std::mutex> lock(mutex_);
                 const auto now = std::chrono::steady_clock::now();
                 if (attention_until_ <= now) return 0;
@@ -440,11 +530,13 @@ void MeshApplication::export_attention() {
 }
 
 void MeshApplication::export_provisioner() {
+    // Export discovery results, address allocation, and provisioning completion callbacks.
     application_object_->addVTable(
         sdbus::registerMethod("ScanResult")
             .withInputParamNames("rssi", "data", "options")
             .implementedAs([this](int16_t rssi, const std::vector<uint8_t>& data,
                                   const VariantMap& options) {
+                // Publish an unprovisioned-device beacon discovered by the mesh daemon.
                 Event event;
                 event.event = "scan_result";
                 event.rssi = rssi;
@@ -462,6 +554,7 @@ void MeshApplication::export_provisioner() {
             .withInputParamNames("count")
             .withOutputParamNames("net_index", "unicast")
             .implementedAs([this](uint8_t count) -> std::tuple<uint16_t, uint16_t> {
+                // Allocate a unique unicast range and network index for the node being provisioned.
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (config_.mesh_swarm_auto_provisioning) {
                     if (count != 1 || auto_provisioning_unicast_ == 0)
@@ -493,6 +586,7 @@ void MeshApplication::export_provisioner() {
             .withInputParamNames("original", "count")
             .withOutputParamNames("unicast")
             .implementedAs([this](uint16_t original, uint8_t count) -> uint16_t {
+                // Validate that reprovisioning can retain the node original unicast range.
                 if (count == 0 || original == 0 ||
                     static_cast<uint32_t>(original) + count - 1 > 0x7fff) {
                     throw sdbus::Error(
@@ -505,6 +599,7 @@ void MeshApplication::export_provisioner() {
             .withInputParamNames("uuid", "unicast", "count")
             .implementedAs([this](const std::vector<uint8_t>& uuid,
                                   uint16_t unicast, uint8_t count) {
+                // Publish the UUID and assigned unicast range after provisioning succeeds.
                 Event event;
                 event.event = "add_node_complete";
                 event.uuid = mesh_bytes_to_hex(uuid);
@@ -516,6 +611,7 @@ void MeshApplication::export_provisioner() {
             .withInputParamNames("original", "nppi", "unicast", "count")
             .implementedAs([this](uint16_t original, uint8_t nppi,
                                   uint16_t unicast, uint8_t count) {
+                // Publish the old and new addressing details after reprovisioning succeeds.
                 Event event;
                 event.event = "reprovision_complete";
                 event.original = original;
@@ -528,6 +624,7 @@ void MeshApplication::export_provisioner() {
             .withInputParamNames("uuid", "reason")
             .implementedAs([this](const std::vector<uint8_t>& uuid,
                                   const std::string& reason) {
+                // Publish the target UUID and daemon error after provisioning fails.
                 Event event;
                 event.event = "add_node_failed";
                 event.uuid = mesh_bytes_to_hex(uuid);
@@ -537,6 +634,7 @@ void MeshApplication::export_provisioner() {
         sdbus::registerMethod("ReprovFailed")
             .withInputParamNames("unicast", "reason")
             .implementedAs([this](uint16_t unicast, const std::string& reason) {
+                // Publish the target address and daemon error after reprovisioning fails.
                 Event event;
                 event.event = "reprovision_failed";
                 event.unicast = unicast;
@@ -557,7 +655,23 @@ bool MeshApplication::daemon_available() const {
             .onInterface("org.freedesktop.DBus")
             .withArguments(std::string{kMeshService})
             .storeResultsTo(owner);
-        return owner;
+        if (!owner) return false;
+
+        // BlueZ acquires its bus name before controller initialization. Its
+        // ObjectManager exports Network1 only when Mesh initialization has
+        // finished. Wait for that interface before calling Attach or Join.
+        using ManagedObjects = std::map<sdbus::ObjectPath,
+            std::map<std::string, VariantMap>>;
+        ManagedObjects objects;
+        auto manager = sdbus::createProxy(dbus_.connection(),
+            sdbus::ServiceName{kMeshService}, sdbus::ObjectPath{"/"});
+        manager->callMethod("GetManagedObjects")
+            .onInterface("org.freedesktop.DBus.ObjectManager")
+            .withTimeout(kTransferCallTimeout)
+            .storeResultsTo(objects);
+        const auto network = objects.find(sdbus::ObjectPath{"/org/bluez/mesh"});
+        return network != objects.end() &&
+            network->second.contains(kMeshNetworkInterface);
     } catch (...) {
         return false;
     }
@@ -599,6 +713,7 @@ bool MeshApplication::request_daemon_activation() {
 }
 
 void MeshApplication::refresh_status() {
+    // Verify daemon readiness and refresh the attached node properties exposed through D-Bus.
     bool available = daemon_available();
     if (!available) {
         request_daemon_activation();
@@ -678,6 +793,7 @@ void MeshApplication::refresh_status() {
 
 void MeshApplication::update_model_configuration(
     uint16_t model_id, const VariantMap& config) {
+    // Track whether this package’s vendor model has the expected key binding and group subscription.
     const auto vendor = variant_value<uint16_t>(config, "Vendor");
     if (!vendor || *vendor != config_.mesh_company_id ||
         model_id != config_.mesh_vendor_model_id) return;
@@ -688,6 +804,7 @@ void MeshApplication::update_model_configuration(
     if (const auto subscriptions = variant_value<std::vector<sdbus::Variant>>(config, "Subscriptions")) {
         vendor_subscribed_ = std::any_of(subscriptions->begin(), subscriptions->end(),
             [this](const auto& value) {
+                // Match only the configured group address among the model subscription variants.
                 return value.template containsValueOfType<uint16_t>() &&
                     value.template get<uint16_t>() == config_.mesh_swarm_group_address;
             });
@@ -695,6 +812,7 @@ void MeshApplication::update_model_configuration(
 }
 
 bool MeshApplication::vendor_model_ready() const {
+    // Require both the application-key binding and group subscription before sending data.
     std::lock_guard<std::mutex> lock(mutex_);
     return status_.attached && vendor_bound_ && vendor_subscribed_;
 }
@@ -739,7 +857,11 @@ namespace {
 /// Return the once-generated private NetKey and AppKey for a creator node.
 /// A short or exposed file fails closed instead of silently changing a live
 /// Mesh identity. Joined nodes never create this file.
+/// \param path Persistent file holding automatically generated Mesh credentials.
+/// \param create whether missing automatic Mesh credentials may be created and persisted.
+/// \return Validated credential bytes loaded from disk or generated and persisted.
 std::vector<uint8_t> auto_credentials(const std::string& path, bool create) {
+    // Derive deterministic device and network keys for automatic Mesh bootstrap.
     if (create) {
         const std::filesystem::path target(path);
         std::filesystem::create_directories(target.parent_path());
@@ -792,6 +914,7 @@ std::vector<uint8_t> auto_credentials(const std::string& path, bool create) {
 }  // namespace
 
 void MeshApplication::import_auto_identity(uint16_t unicast) {
+    // Validate the deterministic unicast and import its persisted automatic credentials.
     if (unicast == 0 || unicast > 0x7fff)
         throw std::invalid_argument("Automatic Mesh address must be in 1..32767");
     const auto secret = auto_credentials(config_.mesh_token_path + ".credentials", true);
@@ -800,18 +923,23 @@ void MeshApplication::import_auto_identity(uint16_t unicast) {
         config_.mesh_swarm_network_index, false, false, 0, unicast);
 }
 
-bool MeshApplication::prepare_auto_keys(uint16_t unicast) {
+bool MeshApplication::prepare_auto_keys() {
     const auto credentials_path = config_.mesh_token_path + ".credentials";
-    const bool creator = std::filesystem::exists(credentials_path);
+    bool creator = std::filesystem::exists(credentials_path);
     std::vector<uint8_t> creator_keys;
     if (creator) {
         creator_keys = auto_credentials(credentials_path, false);
         // Network1.Import installs the operational NetKey but does not create
         // Management1's keyring directory. ExportKeys fails outright until
         // that directory exists, so seed it before checking the snapshot.
-        import_subnet(config_.mesh_swarm_network_index,
-            std::vector<uint8_t>(creator_keys.begin(), creator_keys.begin() + 16));
-        import_remote_node(unicast, 1, local_device_key());
+        try {
+            import_subnet(config_.mesh_swarm_network_index,
+                std::vector<uint8_t>(creator_keys.begin(), creator_keys.begin() + 16));
+        } catch (const sdbus::Error& error) {
+            // An attached node can already have this key after an overlay
+            // restart. ExportKeys below verifies the stored key before use.
+            if (error.getName() != "org.bluez.mesh.Error.AlreadyExists") throw;
+        }
     }
 
     VariantMap exported;
@@ -825,9 +953,14 @@ bool MeshApplication::prepare_auto_keys(uint16_t unicast) {
             found_network = true;
             if (creator && !std::equal(
                     std::get<1>(record).begin(), std::get<1>(record).end(),
-                    creator_keys.begin(), creator_keys.begin() + 16))
-                throw std::runtime_error(
-                    "Stored Mesh network differs from this UAV's private creator keys");
+                    creator_keys.begin(), creator_keys.begin() + 16)) {
+                // A UAV may have created a temporary network while isolated,
+                // then joined another provisioner's network. The attached
+                // network is authoritative. Never import the old AppKey into it.
+                creator = false;
+                RCLCPP_WARN(logger_,
+                            "Ignoring private creator keys from an earlier Mesh network");
+            }
             if (const auto apps = variant_value<std::vector<AppKeyRecord>>(
                     std::get<2>(record), "AppKeys")) {
                 for (const auto& app : *apps) {
@@ -858,6 +991,7 @@ bool MeshApplication::prepare_auto_keys(uint16_t unicast) {
 }
 
 void MeshApplication::set_auto_provisioning_unicast(uint16_t unicast) {
+    // Reserve the validated one-node address for the next RequestProvData callback.
     if (unicast == 0 || unicast > 0x7fff)
         throw std::invalid_argument("Automatic provisioning UAV number must be in 1..32767");
     std::lock_guard<std::mutex> lock(mutex_);
@@ -865,45 +999,54 @@ void MeshApplication::set_auto_provisioning_unicast(uint16_t unicast) {
 }
 
 Status MeshApplication::status() const {
+    // Copy the complete mesh status under the lock shared with D-Bus callbacks.
     std::lock_guard<std::mutex> lock(mutex_);
     return status_;
 }
 
 void MeshApplication::set_message_callback(MessageCallback callback) {
+    // Replace the consumer that receives decoded application and device-key packets.
     std::lock_guard<std::mutex> lock(mutex_);
     message_callback_ = std::move(callback);
 }
 
 void MeshApplication::set_event_callback(EventCallback callback) {
+    // Replace the consumer for provisioning and model-configuration events.
     std::lock_guard<std::mutex> lock(mutex_);
     event_callback_ = std::move(callback);
 }
 
 void MeshApplication::set_token_callback(TokenCallback callback) {
+    // Replace the persistence hook invoked whenever the daemon issues a node token.
     std::lock_guard<std::mutex> lock(mutex_);
     token_callback_ = std::move(callback);
 }
 
 std::string MeshApplication::uuid_hex() const {
+    // Return the normalized hexadecimal form of this application Mesh UUID.
     return mesh_bytes_to_hex(uuid_);
 }
 
 uint64_t MeshApplication::token() const {
+    // Read the persisted attachment token under the status lock.
     std::lock_guard<std::mutex> lock(mutex_);
     return status_.token;
 }
 
 std::string MeshApplication::element_path(uint8_t index) const {
+    // Return the exported D-Bus path of the single local Mesh element.
     if (index != 0) throw std::invalid_argument("only Mesh element index 0 exists");
     return element_path_;
 }
 
 std::unique_ptr<sdbus::IProxy> MeshApplication::network_proxy() const {
+    // Bind a D-Bus proxy to the Mesh network manager object.
     return sdbus::createProxy(dbus_.connection(), sdbus::ServiceName{kMeshService},
                               sdbus::ObjectPath{"/org/bluez/mesh"});
 }
 
 std::unique_ptr<sdbus::IProxy> MeshApplication::node_proxy() const {
+    // Bind a D-Bus proxy to the currently attached Mesh node object.
     std::string node_path;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -915,6 +1058,7 @@ std::unique_ptr<sdbus::IProxy> MeshApplication::node_proxy() const {
 }
 
 std::unique_ptr<sdbus::IProxy> MeshApplication::management_proxy() const {
+    // Bind a D-Bus proxy to the Mesh management object.
     return node_proxy();
 }
 
@@ -940,6 +1084,7 @@ void MeshApplication::join(const std::vector<uint8_t>& uuid) {
                 .withArguments(sdbus::ObjectPath{root_path_}, selected)
                 .uponReplyInvoke(
                     [this, proxy](std::optional<sdbus::Error> error) {
+                        // Restore the pre-join state and publish the asynchronous Join failure.
                         (void)proxy;
                         if (!error) return;
                         {
@@ -999,6 +1144,10 @@ void MeshApplication::attach(uint64_t selected_token) {
     set_token(selected_token);
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Shared across application instances so a queued cleanup cannot
+        // target a replacement object after an overlay or network change.
+        static std::atomic<uint64_t> next_attachment{0};
+        attachment_id_ = next_attachment.fetch_add(1) + 1;
         status_.node_path = static_cast<std::string>(node);
         status_.attached = true;
         status_.state = "attached";
@@ -1008,6 +1157,7 @@ void MeshApplication::attach(uint64_t selected_token) {
 }
 
 void MeshApplication::leave(uint64_t selected_token) {
+    // Ask Network1 to erase the selected persistent node, then clear local attachment state.
     if (selected_token == 0) selected_token = token();
     if (selected_token == 0) throw std::invalid_argument("Mesh token is not set");
     network_proxy()->callMethod("Leave")
@@ -1052,6 +1202,7 @@ void MeshApplication::create_network(const std::vector<uint8_t>& uuid) {
                 .withArguments(sdbus::ObjectPath{root_path_}, selected)
                 .uponReplyInvoke(
                     [this, proxy](std::optional<sdbus::Error> error) {
+                        // Restore the pre-create state and publish the asynchronous CreateNetwork failure.
                         (void)proxy;
                         if (!error) return;
                         {
@@ -1106,6 +1257,7 @@ void MeshApplication::import_node(const std::vector<uint8_t>& uuid,
                            network_key, network_index, flags, iv_index, unicast)
             .uponReplyInvoke(
                 [this, proxy](std::optional<sdbus::Error> error) {
+                    // Restore the provisioned state and publish the asynchronous Import failure.
                     (void)proxy;
                     if (!error) return;
                     {
@@ -1120,13 +1272,24 @@ void MeshApplication::import_node(const std::vector<uint8_t>& uuid,
                 }, sdbus::return_slot));
 }
 
-void MeshApplication::configure_local_relay(
-    uint8_t default_ttl,
-    uint8_t retransmit_count,
-    uint8_t retransmit_interval_steps) {
+void MeshApplication::configure_local_default_ttl(uint8_t default_ttl) {
     if (default_ttl == 1 || default_ttl > 127) {
         throw std::invalid_argument("default Mesh TTL must be 0 or in the range 2..127");
     }
+    require_attached();
+    const auto current_status = status();
+    if (current_status.addresses.empty()) {
+        throw std::runtime_error("attached Mesh node has no local unicast address");
+    }
+    // Local Config Server loopback uses BlueZ's remote-device-key path.
+    dev_key_send(0, current_status.addresses.front(), true,
+                 config_.mesh_swarm_network_index, false,
+                 {0x80, 0x0d, default_ttl});
+}
+
+void MeshApplication::configure_local_relay(
+    uint8_t retransmit_count,
+    uint8_t retransmit_interval_steps) {
     if (retransmit_count > 7) {
         throw std::invalid_argument("relay retransmit count must be in the range 0..7");
     }
@@ -1134,7 +1297,6 @@ void MeshApplication::configure_local_relay(
         throw std::invalid_argument(
             "relay retransmit interval steps must be in the range 0..31");
     }
-
     require_attached();
     const auto current_status = status();
     if (current_status.addresses.empty()) {
@@ -1142,19 +1304,33 @@ void MeshApplication::configure_local_relay(
     }
 
     const uint16_t primary_address = current_status.addresses.front();
-    // Config Default TTL Set: two-octet opcode followed by the one-byte TTL.
-    // BlueZ treats a Configuration Client -> local Configuration Server
-    // loopback as remote-device-key traffic (see node.c DevKeySend). Passing
-    // false for a local unicast address is rejected as InvalidArgs.
-    dev_key_send(0, primary_address, true, config_.mesh_swarm_network_index, false,
-                 {0x80, 0x0d, default_ttl});
-
     // Config Relay Set packs the three-bit retransmit count below the five-bit
     // 10 ms interval-step field. Relay state 0x01 means enabled.
     const uint8_t retransmit = static_cast<uint8_t>(
         retransmit_count | (retransmit_interval_steps << 3));
     dev_key_send(0, primary_address, true, config_.mesh_swarm_network_index, false,
                  {0x80, 0x27, 0x01, retransmit});
+}
+
+void MeshApplication::configure_local_network_transmit(
+    uint8_t retransmit_count, uint8_t retransmit_interval_steps) {
+    if (retransmit_count > 7 || retransmit_interval_steps > 31) {
+        throw std::invalid_argument(
+            "network retransmit count and interval steps must be in 0..7 and 0..31");
+    }
+    require_attached();
+    const auto current_status = status();
+    if (current_status.addresses.empty()) {
+        throw std::runtime_error("attached Mesh node has no local unicast address");
+    }
+
+    // Config Network Transmit Set controls repetitions of packets originated
+    // by this node. Relay Set only applies to forwarded packets.
+    const uint8_t network_transmit = static_cast<uint8_t>(
+        retransmit_count | (retransmit_interval_steps << 3));
+    dev_key_send(0, current_status.addresses.front(), true,
+                 config_.mesh_swarm_network_index, false,
+                 {0x80, 0x24, network_transmit});
 }
 
 void MeshApplication::configure_vendor_model(
@@ -1165,6 +1341,7 @@ void MeshApplication::configure_vendor_model(
     uint16_t group_address,
     uint16_t company_id,
     uint16_t model_id) {
+    // Enforce Mesh address and 12-bit key ranges before sending Config Client messages.
     if (destination == 0 || destination > 0x7fff) {
         throw std::invalid_argument("vendor-model destination must be unicast");
     }
@@ -1178,6 +1355,7 @@ void MeshApplication::configure_vendor_model(
         throw std::invalid_argument("vendor-model subscription must use a group address");
     }
     const auto append_u16 = [](std::vector<uint8_t>& payload, uint16_t value) {
+        // Append a 16-bit model field in the little-endian order required by configuration messages.
         payload.push_back(static_cast<uint8_t>(value & 0xff));
         payload.push_back(static_cast<uint8_t>(value >> 8));
     };
@@ -1200,6 +1378,7 @@ void MeshApplication::configure_vendor_model(
 }
 
 void MeshApplication::persist_next_unicast() const {
+    // Atomically store the next provisionable unicast address for restart continuity.
     if (config_.mesh_unicast_cursor_path.empty()) return;
 
     const std::filesystem::path path(config_.mesh_unicast_cursor_path);
@@ -1223,6 +1402,7 @@ void MeshApplication::persist_next_unicast() const {
 }
 
 void MeshApplication::require_attached() const {
+    // Node1 calls are valid only with a current attached node path.
     std::lock_guard<std::mutex> lock(mutex_);
     if (!status_.attached || status_.node_path.empty()) {
         throw std::runtime_error("Mesh node is not attached");
@@ -1231,6 +1411,7 @@ void MeshApplication::require_attached() const {
 
 void MeshApplication::send(uint8_t index, uint16_t destination, uint16_t key_index,
                            bool force_segmented, const std::vector<uint8_t>& data) {
+    // Submit one destination-keyed access message through the attached Node1 object.
     require_attached();
     VariantMap options;
     options.emplace("ForceSegmented", sdbus::Variant{force_segmented});
@@ -1240,9 +1421,80 @@ void MeshApplication::send(uint8_t index, uint16_t destination, uint16_t key_ind
                        key_index, options, data);
 }
 
+std::optional<SendHandle> MeshApplication::try_send(
+    uint8_t index, uint16_t destination, uint16_t key_index,
+    bool force_segmented, const std::vector<uint8_t>& data) {
+    // Retry a transient Mesh send until success or the bounded deadline expires.
+    SendHandle handle;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!status_.attached || status_.node_path.empty())
+            throw std::runtime_error("Mesh node is not attached");
+        handle.attachment = attachment_id_;
+        path = status_.node_path;
+    }
+    auto proxy = sdbus::createProxy(dbus_.connection(),
+        sdbus::ServiceName{kMeshService}, sdbus::ObjectPath{path});
+    VariantMap options;
+    options.emplace("ForceSegmented", sdbus::Variant{force_segmented});
+    try {
+        proxy->callMethod("SendUnqueued")
+            .onInterface(kMeshNodeInterface)
+            .withTimeout(kTransferCallTimeout)
+            .withArguments(sdbus::ObjectPath{element_path(index)}, destination,
+                           key_index, options, data)
+            .storeResultsTo(handle.transfer);
+        return handle;
+    } catch (const sdbus::Error& error) {
+        if (error.getName() == "org.bluez.mesh.Error.Busy") return std::nullopt;
+        throw;
+    }
+}
+
+bool MeshApplication::send_pending(const SendHandle& handle) const {
+    // Ask BlueZ whether this exact transfer remains queued on the current attachment.
+    if (handle.transfer == 0) return false;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!status_.attached || handle.attachment != attachment_id_) return false;
+        path = status_.node_path;
+    }
+    auto proxy = sdbus::createProxy(dbus_.connection(),
+        sdbus::ServiceName{kMeshService}, sdbus::ObjectPath{path});
+    bool pending = false;
+    proxy->callMethod("SendPending")
+        .onInterface(kMeshNodeInterface)
+        .withTimeout(kTransferCallTimeout)
+        .withArguments(handle.transfer)
+        .storeResultsTo(pending);
+    return pending;
+}
+
+void MeshApplication::cancel_send(const SendHandle& handle) {
+    // Cancel send.
+    if (handle.transfer == 0) return;
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!status_.attached || handle.attachment != attachment_id_) return;
+        path = status_.node_path;
+    }
+    auto proxy = sdbus::createProxy(dbus_.connection(),
+        sdbus::ServiceName{kMeshService}, sdbus::ObjectPath{path});
+    bool cancelled = false;
+    proxy->callMethod("CancelSend")
+        .onInterface(kMeshNodeInterface)
+        .withTimeout(kTransferCallTimeout)
+        .withArguments(handle.transfer)
+        .storeResultsTo(cancelled);
+}
+
 void MeshApplication::dev_key_send(uint8_t index, uint16_t destination, bool remote,
                                    uint16_t network_index, bool force_segmented,
                                    const std::vector<uint8_t>& data) {
+    // Send a device-key access message with the requested remote/local key direction.
     require_attached();
     VariantMap options;
     options.emplace("ForceSegmented", sdbus::Variant{force_segmented});
@@ -1255,6 +1507,7 @@ void MeshApplication::dev_key_send(uint8_t index, uint16_t destination, bool rem
 void MeshApplication::add_net_key(uint8_t index, uint16_t destination,
                                   uint16_t subnet_index, uint16_t network_index,
                                   bool update) {
+    // Send a network-key add or update request through the attached node D-Bus API.
     require_attached();
     node_proxy()->callMethod("AddNetKey")
         .onInterface(kMeshNodeInterface)
@@ -1265,6 +1518,7 @@ void MeshApplication::add_net_key(uint8_t index, uint16_t destination,
 void MeshApplication::add_app_key(uint8_t index, uint16_t destination,
                                   uint16_t application_index, uint16_t network_index,
                                   bool update) {
+    // Send an application-key add or update request through the attached node D-Bus API.
     require_attached();
     node_proxy()->callMethod("AddAppKey")
         .onInterface(kMeshNodeInterface)
@@ -1276,6 +1530,7 @@ void MeshApplication::publish(uint8_t index, uint16_t model_id,
                               std::optional<uint16_t> vendor_id,
                               bool force_segmented,
                               const std::vector<uint8_t>& data) {
+    // Publish model data through Node1 with optional vendor and segmentation settings.
     require_attached();
     VariantMap options;
     options.emplace("ForceSegmented", sdbus::Variant{force_segmented});
@@ -1287,11 +1542,13 @@ void MeshApplication::publish(uint8_t index, uint16_t model_id,
 }
 
 void MeshApplication::unprovisioned_scan(const VariantMap& options) {
+    // Start PB-ADV discovery through the Mesh management D-Bus API.
     management_proxy()->callMethod("UnprovisionedScan")
         .onInterface(kMeshManagementInterface).withArguments(options);
 }
 
 void MeshApplication::unprovisioned_scan_cancel() {
+    // Stop the current PB-ADV discovery operation through D-Bus.
     management_proxy()->callMethod("UnprovisionedScanCancel")
         .onInterface(kMeshManagementInterface);
 }
@@ -1318,6 +1575,7 @@ void MeshApplication::add_node(const std::vector<uint8_t>& uuid,
                 .uponReplyInvoke(
                     [this, proxy, selected_uuid](
                         std::optional<sdbus::Error> error) {
+                        // Clear the pending flag and publish an asynchronous AddNode failure.
                         (void)proxy;
                         add_node_start_pending_ = false;
                         if (!error) return;
@@ -1335,43 +1593,51 @@ void MeshApplication::add_node(const std::vector<uint8_t>& uuid,
 }
 
 void MeshApplication::reprovision(uint16_t unicast, const VariantMap& options) {
+    // Forward the requested unicast and reprovisioning options to Management1.
     management_proxy()->callMethod("Reprovision")
         .onInterface(kMeshManagementInterface).withArguments(unicast, options);
 }
 
 void MeshApplication::create_subnet(uint16_t index) {
+    // Ask the management API to allocate a new subnet key at this index.
     management_proxy()->callMethod("CreateSubnet")
         .onInterface(kMeshManagementInterface).withArguments(index);
 }
 
 void MeshApplication::import_subnet(uint16_t index, const std::vector<uint8_t>& key) {
+    // Require a 16-byte network key before forwarding it to Management1.
     require_size(key, 16, "network key");
     management_proxy()->callMethod("ImportSubnet")
         .onInterface(kMeshManagementInterface).withArguments(index, key);
 }
 
 void MeshApplication::update_subnet(uint16_t index) {
+    // Ask Management1 to begin network-key refresh for this subnet.
     management_proxy()->callMethod("UpdateSubnet")
         .onInterface(kMeshManagementInterface).withArguments(index);
 }
 
 void MeshApplication::delete_subnet(uint16_t index) {
+    // Ask Management1 to remove this subnet and its dependent keys.
     management_proxy()->callMethod("DeleteSubnet")
         .onInterface(kMeshManagementInterface).withArguments(index);
 }
 
 void MeshApplication::set_key_phase(uint16_t index, uint8_t phase) {
+    // Advance the requested subnet to the supplied key-refresh phase through D-Bus.
     management_proxy()->callMethod("SetKeyPhase")
         .onInterface(kMeshManagementInterface).withArguments(index, phase);
 }
 
 void MeshApplication::create_app_key(uint16_t network_index, uint16_t app_index) {
+    // Ask the management API to allocate an application key bound to this subnet.
     management_proxy()->callMethod("CreateAppKey")
         .onInterface(kMeshManagementInterface).withArguments(network_index, app_index);
 }
 
 void MeshApplication::import_app_key(uint16_t network_index, uint16_t app_index,
                                      const std::vector<uint8_t>& key) {
+    // Require a 16-byte application key before binding it to the requested subnet.
     require_size(key, 16, "application key");
     management_proxy()->callMethod("ImportAppKey")
         .onInterface(kMeshManagementInterface)
@@ -1379,28 +1645,33 @@ void MeshApplication::import_app_key(uint16_t network_index, uint16_t app_index,
 }
 
 void MeshApplication::update_app_key(uint16_t app_index) {
+    // Ask Management1 to begin refresh of this application key.
     management_proxy()->callMethod("UpdateAppKey")
         .onInterface(kMeshManagementInterface).withArguments(app_index);
 }
 
 void MeshApplication::delete_app_key(uint16_t app_index) {
+    // Ask Management1 to remove this application key from the local node.
     management_proxy()->callMethod("DeleteAppKey")
         .onInterface(kMeshManagementInterface).withArguments(app_index);
 }
 
 void MeshApplication::import_remote_node(uint16_t primary, uint8_t count,
                                          const std::vector<uint8_t>& key) {
+    // Require a 16-byte device key before adding the remote unicast range.
     require_size(key, 16, "remote device key");
     management_proxy()->callMethod("ImportRemoteNode")
         .onInterface(kMeshManagementInterface).withArguments(primary, count, key);
 }
 
 void MeshApplication::delete_remote_node(uint16_t primary, uint8_t count) {
+    // Remove the remote unicast range from the local provisioner keyring.
     management_proxy()->callMethod("DeleteRemoteNode")
         .onInterface(kMeshManagementInterface).withArguments(primary, count);
 }
 
 std::vector<DeviceKey> MeshApplication::export_device_keys() {
+    // Decode the daemon key export into one typed record per provisioned node.
     VariantMap exported;
     management_proxy()->callMethod("ExportKeys")
         .onInterface(kMeshManagementInterface).storeResultsTo(exported);
@@ -1417,6 +1688,7 @@ std::vector<DeviceKey> MeshApplication::export_device_keys() {
 }
 
 std::string MeshApplication::export_keys_yaml() {
+    // Render the daemon key export as YAML for backup or inspection.
     VariantMap exported;
     management_proxy()->callMethod("ExportKeys")
         .onInterface(kMeshManagementInterface).storeResultsTo(exported);
@@ -1461,6 +1733,7 @@ std::string MeshApplication::export_keys_yaml() {
 }
 
 void MeshApplication::set_token(uint64_t value) {
+    // Update the attachment token and invoke its persistence hook outside the lock.
     TokenCallback callback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1494,6 +1767,7 @@ void MeshApplication::set_token(uint64_t value) {
 }
 
 void MeshApplication::emit_event(Event event) const {
+    // Snapshot the lifecycle observer under lock and invoke it without the lock.
     EventCallback callback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1503,6 +1777,7 @@ void MeshApplication::emit_event(Event event) const {
 }
 
 void MeshApplication::emit_message(ReceivedMessage message) const {
+    // Snapshot the access-message observer under lock and invoke it without the lock.
     MessageCallback callback;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1514,6 +1789,7 @@ void MeshApplication::emit_message(ReceivedMessage message) const {
 void MeshApplication::require_size(const std::vector<uint8_t>& value,
                                    size_t expected,
                                    const std::string& name) {
+    // Reject malformed Mesh keys and UUIDs before any D-Bus method call.
     if (value.size() != expected) {
         throw std::invalid_argument(name + " must contain exactly " +
                                     std::to_string(expected) + " bytes");

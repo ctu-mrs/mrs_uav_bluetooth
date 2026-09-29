@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/peer/peer_time_bridge.hpp
+/// \brief Declares the peer time bridge component of the peer lifecycle layer.
+
 #pragma once
 
 #include <rclcpp/rclcpp.hpp>
@@ -7,6 +10,7 @@
 
 namespace mrs_uav_bluetooth::peer {
 
+/// Tracks the remote time characteristic used to judge GATT link health.
 struct PeerTimeBridge {
     std::string mac;
     std::string peer_name;

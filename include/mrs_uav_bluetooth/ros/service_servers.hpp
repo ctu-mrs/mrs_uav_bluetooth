@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/ros/service_servers.hpp
+/// \brief Declares the service servers component of the ROS 2 interface layer.
+
 #pragma once
 
 #include "mrs_uav_bluetooth/srv/configure_notification_bridge.hpp"
@@ -30,6 +33,7 @@
 
 namespace mrs_uav_bluetooth::ros {
 
+/// Creates the public ROS service endpoints and forwards requests to handlers.
 class ServiceServers {
 public:
     struct Handlers {
@@ -71,6 +75,8 @@ public:
                            std::shared_ptr<mrs_uav_bluetooth::srv::SetActiveConfig::Response>)> set_active_config;
     };
 
+    /// \brief Create the factory that registers Bluetooth ROS service endpoints.
+    /// \param node ROS node that owns the created interfaces.
     explicit ServiceServers(rclcpp::Node& node);
 
     /// Register the LE and runtime-configuration services below one root.
@@ -82,16 +88,25 @@ public:
     /// @param owner Node that owns the resulting service servers.
     /// @param handlers Complete callback set for the registered interfaces.
     /// @param service_root Absolute `/{hostname}/bluetooth` root.
+    /// \param callback_group ROS callback group assigned to the created services.
+    /// \return Handles that keep every registered Bluetooth control service alive.
     std::vector<rclcpp::ServiceBase::SharedPtr> register_all(rclcpp::Node& owner,
                                                              const Handlers& handlers,
                                                              const std::string& service_root,
                                                              const rclcpp::CallbackGroup::SharedPtr& callback_group = nullptr);
 
     template<typename ServiceT, typename CallbackT>
+    /// \brief Register one typed ROS service in the optional callback group.
+    /// \param owner ROS node that owns the service server.
+    /// \param name ROS service name to register.
+    /// \param cb ROS service handler invoked for each request.
+    /// \param callback_group ROS callback group assigned to the created services.
+    /// \return Newly registered ROS service handle.
     typename rclcpp::Service<ServiceT>::SharedPtr create(rclcpp::Node& owner,
                                                          const std::string& name,
                                                          CallbackT&& cb,
                                                          const rclcpp::CallbackGroup::SharedPtr& callback_group = nullptr) {
+        // Bind the caller’s handler to the requested ROS service name.
         if (callback_group) {
             auto services_qos = rclcpp::ServicesQoS();
             return owner.create_service<ServiceT>(

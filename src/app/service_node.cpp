@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/service_node.cpp
+/// \brief Implements the service node component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/service_node.hpp"
 
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
@@ -37,35 +40,85 @@ constexpr double kLocalReconfigureGraceMin = 5.0;
 constexpr size_t kPrimaryAdvertisementMaxBytes = 31;
 constexpr size_t kExtendedAdvertisementMaxBytes = 251;
 constexpr size_t kAdvFlagsBytes = 3;
+constexpr auto kAdvertisementScanResumeTimeout = std::chrono::milliseconds(60);
+constexpr auto kAdvertisementScanPollPeriod = std::chrono::milliseconds(5);
+constexpr uint64_t kAdvertisementScanDwellMinMs = 35;
+constexpr uint64_t kAdvertisementScanDwellVariationMs = 31;
 
 /// Marks a potentially long reconfiguration section without relying on every
 /// early return and exception path to clear the state manually.
 class AtomicFlagGuard {
 public:
+    /// \brief Mark the guarded transition active for this scope.
+    /// \param flag atomic transition flag set for the guard lifetime.
     explicit AtomicFlagGuard(std::atomic_bool& flag) : flag_(flag) {
+        // Mark the guarded transition active for this scope.
         flag_.store(true);
     }
 
+    /// \brief Clear the transition flag on every exit path, including exceptions.
     ~AtomicFlagGuard() {
+        // Clear the transition flag on every exit path, including exceptions.
         flag_.store(false);
     }
 
+    /// \brief Disable copying of the atomic flag guard.
     AtomicFlagGuard(const AtomicFlagGuard&) = delete;
+    /// \brief Assign state from another atomic flag guard.
     AtomicFlagGuard& operator=(const AtomicFlagGuard&) = delete;
 
 private:
     std::atomic_bool& flag_;
 };
 
+/// Prevent new outbound links during a radio handoff and restore the selected
+/// connection policy even if a BlueZ operation throws before reconfiguration ends.
+class ConnectionPolicyGuard {
+public:
+    /// \brief Block new peer connections while an overlay transition owns the adapter.
+    /// \param client BlueZ client used for remote discovery and GATT operations.
+    /// \param allow_after connection-policy value restored when the guard leaves scope.
+    ConnectionPolicyGuard(mrs_uav_bluetooth::bluez::BluezClient* client, bool allow_after)
+        : client_(client), allow_after_(allow_after) {
+        // Block new peer connections while an overlay transition owns the adapter.
+        if (client_) client_->set_connections_allowed(false);
+    }
+    /// \brief Restore the caller-selected connection policy after transition cleanup.
+    ~ConnectionPolicyGuard() {
+        // Restore the caller-selected connection policy after transition cleanup.
+        if (client_) client_->set_connections_allowed(allow_after_);
+    }
+    /// \brief Disable copying of the connection policy guard.
+    ConnectionPolicyGuard(const ConnectionPolicyGuard&) = delete;
+    /// \brief Assign state from another connection policy guard.
+    ConnectionPolicyGuard& operator=(const ConnectionPolicyGuard&) = delete;
+private:
+    mrs_uav_bluetooth::bluez::BluezClient* client_;
+    bool allow_after_;
+};
+
+/// \brief Match one string against an initializer list of accepted values.
+/// \param values Strings searched for an exact match.
+/// \param value Exact string to search for.
+/// \return True when one accepted string matches; otherwise false.
 bool contains_string(const std::vector<std::string>& values, const std::string& value) {
+    // Match one string against an initializer list of accepted values.
     return std::find(values.begin(), values.end(), value) != values.end();
 }
 
+/// \brief Include the field header when calculating one encoded advertising structure.
+/// \param payload_bytes application bytes available after transport framing.
+/// \return Encoded bytes including length and type octets or zero for no payload.
 size_t advertising_structure_size(size_t payload_bytes) {
+    // Include the field header when calculating one encoded advertising structure.
     return payload_bytes == 0 ? 0 : 2 + payload_bytes;
 }
 
+/// \brief Map accepted bridge direction aliases to import export or both.
+/// \param raw_direction unvalidated bridge direction text from YAML.
+/// \return Normalized direction.
 std::string normalize_direction(const std::string& raw_direction) {
+    // Normalize direction.
     auto direction = mrs_uav_bluetooth::util::lower_trim_copy(raw_direction);
     if (direction == "in" || direction == "import" || direction == "rx") {
         return "import";
@@ -79,8 +132,12 @@ std::string normalize_direction(const std::string& raw_direction) {
     throw std::runtime_error("direction must be import, export, or both");
 }
 
+/// \brief Parse service-request field selectors and default omitted scalar types to float64.
+/// \param member_paths ROS field paths selected for bridge encoding.
+/// \return Validated member specs.
 std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec> parse_member_specs(
     const std::vector<std::string>& member_paths) {
+    // Split optional `path:type` entries and default omitted wire types to float64.
     std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec> specs;
     specs.reserve(member_paths.size());
     for (const auto& raw_member : member_paths) {
@@ -109,12 +166,21 @@ std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec> parse_member_specs(
     return specs;
 }
 
+/// \brief Build the stable registry key for a manually requested notification bridge.
+/// \param direction normalized bridge direction controlling publisher/subscriber creation.
+/// \param mac peer Bluetooth MAC address.
+/// \param topic_name Resolved ROS topic included in the bridge identity hash.
+/// \param message_type Fully qualified ROS message type included in the bridge identity hash.
+/// \param characteristic Characteristic UUID or name included in the bridge identity hash.
+/// \param member_specs Ordered ROS fields included in the bridge identity hash.
+/// \return Dash-free deterministic UUID identifying the requested bridge definition.
 std::string manual_bridge_key(const std::string& direction,
                               const std::string& mac,
                               const std::string& topic_name,
                               const std::string& message_type,
                               const std::string& characteristic,
                               const std::vector<mrs_uav_bluetooth::config::BridgeMemberSpec>& member_specs) {
+    // Build the stable registry key for a manually requested notification bridge.
     std::ostringstream source;
     source << direction << '|' << mac << '|' << topic_name << '|' << message_type << '|'
            << characteristic;
@@ -127,11 +193,18 @@ std::string manual_bridge_key(const std::string& direction,
 }
 
 template<typename DurationT, typename CallbackT>
+/// \brief Bind the timer to the supplied callback group so overlay work never runs concurrently.
+/// \param node ROS node that owns the interfaces.
+/// \param period timer interval used to schedule the callback.
+/// \param callback Timer body invoked on each scheduled expiry.
+/// \param group ROS callback group that serializes the timer or service.
+/// \return New grouped wall timer.
 rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
     rclcpp::Node& node,
     DurationT period,
     CallbackT&& callback,
     const rclcpp::CallbackGroup::SharedPtr& group) {
+    // Bind the timer to the supplied callback group so overlay work never runs concurrently.
     return rclcpp::create_wall_timer(
         period,
         std::forward<CallbackT>(callback),
@@ -140,7 +213,11 @@ rclcpp::TimerBase::SharedPtr create_grouped_wall_timer(
         node.get_node_timers_interface().get());
 }
 
+/// \brief Return the compressed advertising width supported for this UUID.
+/// \param uuid Service UUID whose encoded advertisement width is calculated.
+/// \return Compressed Bluetooth advertisement width of the UUID: 2 4 or 16 bytes.
 size_t advertising_uuid_size(const std::string& uuid) {
+    // Return the compressed advertising width supported for this UUID.
     std::string compact;
     compact.reserve(uuid.size());
     for (const char ch : uuid) {
@@ -157,7 +234,11 @@ size_t advertising_uuid_size(const std::string& uuid) {
     return 16;
 }
 
+/// \brief Calculate encoded bytes for UUID groups after Bluetooth width compression.
+/// \param uuids Service UUIDs whose encoded advertisement size is calculated.
+/// \return Encoded bytes for grouped 16-bit 32-bit and 128-bit UUID lists.
 size_t advertising_uuid_list_size(const std::vector<std::string>& uuids) {
+    // Calculate encoded bytes for UUID groups after Bluetooth width compression.
     size_t total = 0;
     size_t short_uuid_bytes = 0;
     size_t medium_uuid_bytes = 0;
@@ -182,7 +263,11 @@ size_t advertising_uuid_list_size(const std::vector<std::string>& uuids) {
     return total;
 }
 
+/// \brief Calculate encoded bytes for every service-data entry.
+/// \param service_data service-keyed byte payload included in advertising data.
+/// \return Encoded bytes occupied by every service-data structure.
 size_t advertising_service_data_size(const std::map<std::string, std::vector<uint8_t>>& service_data) {
+    // Calculate encoded bytes for every service-data entry.
     size_t total = 0;
     for (const auto& [uuid, payload] : service_data) {
         total += advertising_structure_size(advertising_uuid_size(uuid) + payload.size());
@@ -190,8 +275,12 @@ size_t advertising_service_data_size(const std::map<std::string, std::vector<uin
     return total;
 }
 
+/// \brief Calculate encoded bytes for every company-data entry.
+/// \param manufacturer_data company-keyed bytes included in advertising data.
+/// \return Encoded bytes occupied by every manufacturer-data structure.
 size_t advertising_manufacturer_data_size(
     const std::map<uint16_t, std::vector<uint8_t>>& manufacturer_data) {
+    // Calculate encoded bytes for every company-data entry.
     size_t total = 0;
     for (const auto& [company_id, payload] : manufacturer_data) {
         static_cast<void>(company_id);
@@ -200,7 +289,11 @@ size_t advertising_manufacturer_data_size(
     return total;
 }
 
+/// \brief Calculate encoded bytes for all raw advertising field entries.
+/// \param advertising_data Raw advertisement fields whose encoded byte count is calculated.
+/// \return Encoded bytes occupied by every raw advertisement structure.
 size_t advertising_generic_data_size(const std::map<uint8_t, std::vector<uint8_t>>& advertising_data) {
+    // Calculate encoded bytes for all raw advertising field entries.
     size_t total = 0;
     for (const auto& [type, payload] : advertising_data) {
         static_cast<void>(type);
@@ -209,6 +302,12 @@ size_t advertising_generic_data_size(const std::map<uint8_t, std::vector<uint8_t
     return total;
 }
 
+/// \brief Calculate all encoded structures competing for primary advertisement space.
+/// \param local_name device name proposed for inclusion in the advertising packet.
+/// \param cfg Advertisement fields whose encoded primary-packet size is estimated.
+/// \param advertising_data Raw fields placed in the primary advertisement size estimate.
+/// \param name_in_primary whether the local name is placed in the primary packet rather than scan response.
+/// \return Total encoded primary-packet bytes before application service data.
 size_t estimate_primary_advertisement_bytes(
     const std::string& local_name,
     const mrs_uav_bluetooth::config::NodeConfig& cfg,
@@ -244,10 +343,16 @@ size_t estimate_primary_advertisement_bytes(
     return total;
 }
 
+/// \brief Calculate fixed advertisement overhead that reduces application payload capacity.
+/// \param cfg Advertisement placement settings that reserve space around user data.
+/// \param advertising_data Raw fields checked for space competition with application data.
+/// \param reserve_primary_flags whether the primary packet must retain space for mandatory flags.
+/// \return Encoded fixed overhead that competes with application bytes.
 size_t estimate_user_data_competing_advertisement_bytes(
     const mrs_uav_bluetooth::config::NodeConfig& cfg,
     const std::map<uint8_t, std::vector<uint8_t>>& advertising_data,
     bool reserve_primary_flags) {
+    // Estimate user data competing advertisement bytes.
     size_t total = 0;
     if (reserve_primary_flags) {
         total += kAdvFlagsBytes;
@@ -275,9 +380,14 @@ size_t estimate_user_data_competing_advertisement_bytes(
     return total;
 }
 
+/// \brief Enable extended advertising only when the controller reports usable secondary channels.
+/// \param cfg Requested extended-advertising channel policy.
+/// \param adapter_info controller limits used to validate advertising payload size and features.
+/// \return Usable extended secondary channel or empty for legacy advertising.
 std::string select_secondary_channel(
     const mrs_uav_bluetooth::config::NodeConfig& cfg,
     const std::optional<mrs_uav_bluetooth::bluez::AdapterInfo>& adapter_info) {
+    // Use legacy advertising unless extended mode and a usable controller channel agree.
     if (cfg.advertise_size != "extended") {
         return {};
     }
@@ -297,10 +407,16 @@ std::string select_secondary_channel(
     return supported.empty() ? std::string{} : supported.front();
 }
 
+/// \brief Choose the legacy or controller-reported extended advertisement byte limit.
+/// \param cfg Configured payload limit and legacy fallback policy.
+/// \param secondary_channel extended-advertising secondary radio mode requested from BlueZ.
+/// \param adapter_info controller limits used to validate advertising payload size and features.
+/// \return Resolved advertisement max bytes.
 size_t resolve_advertisement_max_bytes(
     const mrs_uav_bluetooth::config::NodeConfig& cfg,
     const std::string& secondary_channel,
     const std::optional<mrs_uav_bluetooth::bluez::AdapterInfo>& adapter_info) {
+    // Choose the 31-byte legacy limit or the controller’s extended capacity.
     if (cfg.advertise_size != "extended" || secondary_channel.empty()) {
         return kPrimaryAdvertisementMaxBytes;
     }
@@ -311,12 +427,20 @@ size_t resolve_advertisement_max_bytes(
     return kExtendedAdvertisementMaxBytes;
 }
 
+/// \brief Fit raw application data within remaining advertisement capacity.
+/// \param payload Raw extra bytes competing for advertisement space.
+/// \param local_name device name proposed for inclusion in the advertising packet.
+/// \param cfg Advertisement placement and overflow policy applied to the payload.
+/// \param max_advertisement_bytes controller limit for the complete encoded advertising packet.
+/// \param max_payload_bytes maximum user bytes permitted after framing overhead.
+/// \return Original or truncated bytes that fit or std::nullopt when no payload fits.
 std::optional<std::vector<uint8_t>> constrain_extra_advertisement_payload(
     const std::vector<uint8_t>& payload,
     const std::string& local_name,
     const mrs_uav_bluetooth::config::NodeConfig& cfg,
     size_t max_advertisement_bytes,
     size_t& max_payload_bytes) {
+    // Subtract configured fields and their type/length bytes from controller capacity.
     auto static_advertise_data = cfg.advertise_data;
     static_advertise_data.erase(mrs_uav_bluetooth::bluez::kDefaultAdvertisementExtraDataType);
 
@@ -337,9 +461,14 @@ std::optional<std::vector<uint8_t>> constrain_extra_advertisement_payload(
     return std::vector<uint8_t>(payload.begin(), payload.begin() + max_payload_bytes);
 }
 
+/// \brief Keep the ordered service UUID prefix that fits in the primary packet.
+/// \param service_uuids service identifiers proposed for the primary advertising packet.
+/// \param remaining_uuid_payload_bytes primary-packet capacity still available for service UUIDs.
+/// \return Ordered prefix of service UUIDs that fits the remaining capacity.
 std::vector<std::string> select_advertised_service_uuids(
     const std::vector<std::string>& service_uuids,
     size_t remaining_uuid_payload_bytes) {
+    // Keep the configured UUID order and stop before the next UUID would overflow.
     if (remaining_uuid_payload_bytes == 0) {
         return {};
     }
@@ -358,8 +487,13 @@ std::vector<std::string> select_advertised_service_uuids(
     return advertised;
 }
 
+/// \brief Append configured service UUIDs after runtime UUIDs without duplicates.
+/// \param runtime_uuids UUIDs required by live bridge services.
+/// \param configured_uuids service identifiers explicitly requested by configuration.
+/// \return Runtime UUIDs followed by nonduplicate configured UUIDs.
 std::vector<std::string> merge_service_uuids(const std::vector<std::string>& runtime_uuids,
                                              const std::vector<std::string>& configured_uuids) {
+    // Merge service UUIDs.
     std::vector<std::string> merged = runtime_uuids;
     merged.reserve(runtime_uuids.size() + configured_uuids.size());
     for (const auto& uuid : configured_uuids) {
@@ -370,6 +504,9 @@ std::vector<std::string> merge_service_uuids(const std::vector<std::string>& run
     return merged;
 }
 
+/// \brief GATT descriptors expose the encoder layout. Changing a type or an
+/// \param cfg GATT services and bridge exports serialized for change detection.
+/// \return Stable sorted signature of exported services profiles and bridge metadata.
 std::string gatt_layout_signature_for_config(const mrs_uav_bluetooth::config::NodeConfig& cfg) {
     std::vector<std::string> tokens;
     tokens.reserve(cfg.shared_topics.size() + cfg.gatt_profile_uuids.size() + 3);
@@ -421,11 +558,13 @@ namespace mrs_uav_bluetooth::app {
 
 ServiceNode::ServiceNode()
     : rclcpp::Node("mrs_uav_bluetooth") {
+    // Declare parameters first, then construct the Bluetooth and ROS runtime from them.
     configure_parameters();
     build_runtime();
 }
 
 ServiceNode::~ServiceNode() {
+    // Stop callbacks and timers before tearing down transports and D-Bus objects.
     shutting_down_.store(true);
     if (peer_timer_) {
         peer_timer_->cancel();
@@ -480,6 +619,7 @@ ServiceNode::~ServiceNode() {
 }
 
 void ServiceNode::configure_parameters() {
+    // Resolve package defaults and reject invalid timing paths and topic settings before D-Bus startup.
     const auto share_dir = ament_index_cpp::get_package_share_directory("mrs_uav_bluetooth");
     const auto default_config_path = share_dir + "/config/default.yaml";
 
@@ -547,14 +687,17 @@ void ServiceNode::build_runtime() {
         get_parameter("auto_trust").as_bool());
     cache_observer_token_ = cache_->add_observer(
         [this](bluez::CacheEvent event, const std::string& object_path) {
+            // Reconcile peer state whenever BlueZ adds, removes, or changes a cached object.
             on_cache_event(event, object_path);
         });
     pairing_agent_->set_event_callback(
         [this](const std::string& event_type, const std::string& device_path) {
+            // Feed pairing-agent decisions back into the peer state machine.
             on_pairing_event(event_type, device_path);
         });
     pairing_agent_->set_request_policy_callback(
         [this](const std::string& event_type, const std::string& device_path) {
+            // Admit only pairing requests that match the current peer and overlay policy.
             return should_allow_pairing_request(event_type, device_path);
         });
     pairing_agent_->register_agent(get_parameter("pairing_agent").as_string());
@@ -562,12 +705,14 @@ void ServiceNode::build_runtime() {
         [this](const std::vector<uint8_t>& data,
                const std::string& uuid,
                const std::string& characteristic_path) {
+            // Decode remote GATT notifications into configured import bridges.
             on_notification(data, uuid, characteristic_path);
         });
     gatt_event_token_ = client_->add_gatt_event_handler(
         [this](const std::string& event_type,
                const std::string& object_path,
                const std::string& detail) {
+            // Record GATT operation outcomes for status and recovery logic.
             on_gatt_event(event_type, object_path, detail);
         });
 
@@ -577,6 +722,7 @@ void ServiceNode::build_runtime() {
         get_parameter("default_config_path").as_string(),
         hostname_);
     overlay_config_->on_config_changed([this](const config::NodeConfig& cfg) {
+        // Apply each accepted overlay only while the node still accepts callbacks.
         if (!can_run_callbacks()) {
             return;
         }
@@ -595,18 +741,27 @@ void ServiceNode::build_runtime() {
         std::make_unique<bridge::TransportBridgeManager>(*this, get_logger());
     transport_bridges_->set_advertisement_sender(
         [this](const std::vector<uint8_t>& payload) {
+            // Serialize advertisement updates against overlay changes and reject stale publishers.
+            std::unique_lock<std::mutex> lock(config_apply_mutex_, std::try_to_lock);
+            if (!lock.owns_lock() || !can_run_callbacks()) return false;
             set_advertisement_payload(payload, false);
+            return true;
         });
     transport_bridges_->set_mesh_sender(
         [this](const config::SharedTopicConfig& configured,
                const std::vector<uint8_t>& payload) {
+            // Serialize mesh sends against overlay changes and reject stale publishers.
+            std::unique_lock<std::mutex> lock(config_apply_mutex_, std::try_to_lock);
+            if (!lock.owns_lock() || !can_run_callbacks()) return false;
             send_mesh_bridge_payload(configured, payload);
+            return true;
         });
     peers_ = std::make_unique<peer::PeerManager>(*this, get_logger());
     ros_ = std::make_unique<ros::RosInterfaceManager>(*this);
     create_services();
 
     status_timer_ = create_grouped_wall_timer(*this, std::chrono::seconds(2), [this]() {
+        // Publish health immediately from the default status timer once callbacks are enabled.
         if (!can_run_callbacks()) {
             return;
         }
@@ -618,13 +773,23 @@ void ServiceNode::build_runtime() {
         }
         overlay_config_->check_lease();
         refresh_advertisement_topic_subscription();
+        recover_bluez_daemon_if_requested();
         reconcile_adapter_state_if_requested();
+        // Discovery can stop without a device event after BlueZ changes the
+        // controller role. Keep the requested scan alive even when there is
+        // no peer event to schedule the ordinary connection reconciler.
+        if (!config_apply_in_progress_.load() && active_config_.enable_scan &&
+            !active_config_.enable_mesh && client_ && !client_->is_scanning()) {
+            schedule_peer_reconcile(std::chrono::milliseconds(1));
+        }
+
     }, timer_callback_group_);
 
     overlay_config_->load_initial();
 }
 
 bool ServiceNode::can_run_callbacks() const {
+    // Suppress callbacks once shutdown begins or the ROS context stops.
     return !shutting_down_.load() && rclcpp::ok();
 }
 
@@ -653,6 +818,7 @@ void ServiceNode::apply_adapter_state(const config::NodeConfig& cfg) {
     }
 
     const auto clear_apply_guard = [this]() {
+        // Release the adapter-transition guard after either success or rollback.
         adapter_state_apply_in_progress_.store(false);
     };
 
@@ -736,11 +902,54 @@ void ServiceNode::reconcile_adapter_state_if_requested() {
     RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 5000,
         "[node] adapter state drift persists; applying one coalesced correction");
-    apply_adapter_state(active_config_);
+    try {
+        apply_adapter_state(active_config_);
+    } catch (const std::exception& error) {
+        // Timer callbacks must leave ROS control available when the adapter
+        // rejects a setting. Keep the desired policy pending for recovery.
+        adapter_state_reconcile_requested_.store(true);
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+            "Adapter policy reconciliation failed: %s", error.what());
+    }
     next_adapter_state_reconcile_ = now + std::chrono::seconds(5);
 }
 
+void ServiceNode::recover_bluez_daemon_if_requested() {
+    if (!bluez_daemon_recovery_requested_.load() ||
+        config_apply_in_progress_.load() || !cache_) {
+        return;
+    }
+
+    config::NodeConfig recovery_config;
+    {
+        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+        if (active_config_.enable_mesh) {
+            // bluetoothd is intentionally absent while bluetooth-meshd owns
+            // the controller. The ordinary overlay transition will rebuild
+            // BlueZ objects when Mesh releases it.
+            bluez_daemon_recovery_requested_.store(false);
+            return;
+        }
+        if (!cache_->adapter(adapter_path_)) {
+            return;
+        }
+        recovery_config = active_config_;
+    }
+
+    bluez_daemon_recovery_requested_.store(false);
+    try {
+        RCLCPP_WARN(get_logger(),
+                    "BlueZ daemon was replaced; reapplying the active radio configuration");
+        apply_config(recovery_config);
+    } catch (const std::exception& error) {
+        bluez_daemon_recovery_requested_.store(true);
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
+                            "BlueZ daemon recovery failed: %s", error.what());
+    }
+}
+
 void ServiceNode::configure_serial_profile(const config::NodeConfig& cfg) {
+    // Reuse an identical registered profile or rebuild its RFCOMM and SSH handlers.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
 
     if (!cfg.enable_serial_port_profile) {
@@ -778,6 +987,7 @@ void ServiceNode::configure_serial_profile(const config::NodeConfig& cfg) {
         [this](const std::string& device_path,
                int socket_fd,
                const std::map<std::string, sdbus::Variant>&) {
+            // Hand the accepted RFCOMM socket to the SSH server or close it if shutdown raced.
             std::lock_guard<std::recursive_mutex> callback_lock(state_mutex_);
             if (!can_run_callbacks() || !serial_ssh_server_) {
                 ::close(socket_fd);
@@ -786,12 +996,14 @@ void ServiceNode::configure_serial_profile(const config::NodeConfig& cfg) {
             serial_ssh_server_->start_session(device_path, socket_fd);
         });
     profile->set_disconnection_handler([this](const std::string& device_path) {
+        // Stop the SSH session associated with the peer BlueZ disconnected.
         std::lock_guard<std::recursive_mutex> callback_lock(state_mutex_);
         if (serial_ssh_server_) {
             serial_ssh_server_->stop_session(device_path);
         }
     });
     profile->set_release_handler([this]() {
+        // Stop every SSH session because BlueZ released the entire serial profile.
         std::lock_guard<std::recursive_mutex> callback_lock(state_mutex_);
         if (serial_ssh_server_) {
             serial_ssh_server_->stop_all();
@@ -814,6 +1026,7 @@ void ServiceNode::configure_serial_profile(const config::NodeConfig& cfg) {
 }
 
 void ServiceNode::refresh_advertisement_registration() {
+    // Re-register the advertisement so BlueZ consumes the current payload and properties.
     std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
     if (!advertisement_ || adapter_path_.empty()) {
         return;
@@ -910,6 +1123,7 @@ void ServiceNode::refresh_advertisement_registration() {
 
     std::vector<std::vector<std::string>> attempts;
     auto add_attempt = [&attempts](const std::vector<std::string>& advertised_uuids) {
+        // Queue each reduced UUID set only once while searching for a packet that fits.
         if (std::find(attempts.begin(), attempts.end(), advertised_uuids) == attempts.end()) {
             attempts.push_back(advertised_uuids);
         }
@@ -917,6 +1131,15 @@ void ServiceNode::refresh_advertisement_registration() {
     add_attempt(advertised_service_uuids);
     add_attempt(service_uuids);
     add_attempt({});
+
+    const bool resume_broadcast_scan = client_ && active_config_.enable_scan &&
+        active_config_.advertise_mode == "broadcast";
+    if (resume_broadcast_scan) {
+        // This controller may reject Add Advertising while LE discovery is
+        // physically running. Stop this process's discovery request before
+        // registration; it is recreated below after the packet is active.
+        (void)client_->stop_scan();
+    }
 
     bool advertisement_registered = false;
     std::string last_error_message;
@@ -930,21 +1153,8 @@ void ServiceNode::refresh_advertisement_registration() {
                         "Registering BLE advertisement (name=%s, uuids=%zu, size=%s, secondary=%s, estimated_bytes=%zu, budget=%zu)",
                         local_name.c_str(), advertised_uuids.size(), active_config_.advertise_size.c_str(),
                         log_secondary_channel.c_str(), estimated_primary_bytes, advertisement_max_bytes);
-            if (active_config_.advertise_mode == "broadcast" && client_) {
-                // Legacy controllers share the scan/advertising random address.
-                // Keep discovery paused across both removal and registration.
-                // BlueZ can return from removal before the controller has
-                // finished freeing its advertisement instance, so leave a
-                // short settling interval before registering the new data.
-                client_->with_discovery_paused([this]() {
-                    advertisement_->unregister_advertisement(adapter_path_);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    advertisement_->register_advertisement(adapter_path_);
-                });
-            } else {
-                advertisement_->unregister_advertisement(adapter_path_);
-                advertisement_->register_advertisement(adapter_path_);
-            }
+            advertisement_->unregister_advertisement(adapter_path_);
+            advertisement_->register_advertisement(adapter_path_);
             advertisement_registered = true;
             break;
         } catch (const sdbus::Error& error) {
@@ -960,6 +1170,52 @@ void ServiceNode::refresh_advertisement_registration() {
                                      ? "Failed to register advertisement"
                                      : last_error_message);
     }
+
+    if (resume_broadcast_scan &&
+        !client_->start_scan(active_config_.scan_mode, false)) {
+        throw std::runtime_error(
+            "Advertisement registered, but the receive scan request failed");
+    }
+}
+
+void ServiceNode::open_advertisement_scan_window() {
+    if (!client_ || !advertisement_ || !advertisement_->is_registered() ||
+        !active_config_.enable_scan ||
+        active_config_.advertise_mode != "broadcast") {
+        return;
+    }
+
+    // Removing the packet lets BlueZ resume this process's already-owned
+    // discovery session on controllers that cannot scan and advertise at once.
+    advertisement_->unregister_advertisement(adapter_path_);
+    const auto resume_deadline = std::chrono::steady_clock::now() +
+        kAdvertisementScanResumeTimeout;
+    while (!client_->is_scanning() &&
+           std::chrono::steady_clock::now() < resume_deadline) {
+        std::this_thread::sleep_for(kAdvertisementScanPollPeriod);
+    }
+
+    if (!client_->is_scanning()) {
+        // Recreate a discovery owner if BlueZ dropped rather than suspended
+        // the previous request during the advertisement interval.
+        (void)client_->stop_scan();
+        if (!client_->start_scan(active_config_.scan_mode, false)) {
+            RCLCPP_WARN(get_logger(),
+                        "Could not open the advertisement receive window");
+            return;
+        }
+    }
+
+    uint64_t hostname_phase = 0;
+    for (const unsigned char ch : hostname_) {
+        hostname_phase = hostname_phase * 33U + ch;
+    }
+    const auto dwell_ms = kAdvertisementScanDwellMinMs +
+        ((hostname_phase + advertisement_scan_sequence_++ * 17U) %
+         kAdvertisementScanDwellVariationMs);
+    // Different dwell lengths make equal-rate peers drift through one
+    // another's transmit windows instead of remaining phase locked.
+    std::this_thread::sleep_for(std::chrono::milliseconds(dwell_ms));
 }
 
 void ServiceNode::refresh_advertisement_topic_subscription() {
@@ -972,6 +1228,7 @@ void ServiceNode::refresh_advertisement_topic_subscription() {
     const bool configured_export = std::any_of(
         active_config_.shared_topics.begin(), active_config_.shared_topics.end(),
         [](const auto& bridge) {
+            // Detect whether this overlay exports any topic through advertisements.
             return bridge.transport == "advertisement" &&
                 (bridge.mode == "export" || bridge.mode == "both");
         });
@@ -1038,6 +1295,7 @@ void ServiceNode::refresh_advertisement_topic_subscription() {
         topic,
         rclcpp::QoS(10),
         [this](const std_msgs::msg::UInt8MultiArray::SharedPtr message) {
+            // Replace the live advertisement bytes with the newest ROS payload.
             handle_advertisement_payload(message);
         },
         options);
@@ -1046,6 +1304,7 @@ void ServiceNode::refresh_advertisement_topic_subscription() {
 
 void ServiceNode::handle_advertisement_payload(
     const std_msgs::msg::UInt8MultiArray::SharedPtr message) {
+    // Accept raw bytes only while the exclusive broadcast overlay owns advertising.
     if (!message) return;
     if (active_config_.advertise_mode != "broadcast" ||
         active_config_.enable_mesh) {
@@ -1067,6 +1326,11 @@ void ServiceNode::set_advertisement_payload(std::vector<uint8_t> payload,
         // Re-check under the same lock that protects the advertisement object;
         // never let stale connectionless data mutate a GATT or Mesh advert.
         return;
+    }
+    if (advertisement_ && advertisement_->was_released()) {
+        // Release is a terminal BlueZ lifecycle event, not a request to
+        // repeatedly unregister/register on every incoming ROS sample.
+        throw std::runtime_error("BlueZ released the advertisement. See the Bluetooth daemon error.");
     }
     const auto& local_name = active_config_.advertise_local_name;
     const auto adapter_info = cache_ ? cache_->adapter(adapter_path_) : std::optional<bluez::AdapterInfo>{};
@@ -1106,21 +1370,21 @@ void ServiceNode::set_advertisement_payload(std::vector<uint8_t> payload,
         }
     }
 
-    if (advertisement_extra_payload_ && *advertisement_extra_payload_ == payload) {
+    if (advertisement_ && advertisement_->is_registered() &&
+        advertisement_extra_payload_ && *advertisement_extra_payload_ == payload) {
         return;
     }
 
     const bool data_property_exported = advertisement_extra_payload_.has_value() ||
         !active_config_.advertise_data.empty();
-    // BlueZ refreshes the controller parameters (including its random address)
-    // even for a Data PropertiesChanged signal. That asynchronous path has no
-    // completion acknowledgement and fails on legacy radios while scanning.
-    // Broadcast updates therefore use the synchronous registration transaction
-    // below, which pauses discovery until the controller has accepted the data.
+    // The normal path changes Data on the registered D-Bus object. The
+    // standards-only fallback deliberately unregisters and registers through
+    // LEAdvertisingManager1 for each sample; it is slower, but lets operators
+    // run without BlueZ's asynchronous data-update fix and provides a direct
+    // hardware A/B test of whether that daemon fix is required.
     const bool can_update_in_place = advertisement_ &&
-        advertisement_->is_registered() &&
-        active_config_.advertise_mode != "broadcast" &&
-        data_property_exported;
+        advertisement_->is_registered() && data_property_exported &&
+        active_config_.advertise_update_strategy == "property";
 
     advertisement_extra_payload_ = std::move(payload);
     if (can_update_in_place) {
@@ -1130,36 +1394,89 @@ void ServiceNode::set_advertisement_payload(std::vector<uint8_t> payload,
         }
         advertisement_->set_data(advertise_data);
         advertisement_->emit_property_changed("Data");
-        RCLCPP_INFO(get_logger(),
-                    "Updated BLE advertisement user data in place (%zu bytes)",
+        RCLCPP_DEBUG(get_logger(),
+                    "Submitted BLE advertisement data update (%zu bytes)",
                     advertisement_extra_payload_->size());
     } else if (advertisement_) {
+        open_advertisement_scan_window();
         refresh_advertisement_registration();
     }
 }
 
 void ServiceNode::create_services() {
     ros::ServiceServers::Handlers handlers;
-    handlers.list_devices = [this](auto request, auto response) { handle_list_devices(request, response); };
-    handlers.get_device = [this](auto request, auto response) { handle_get_device(request, response); };
-    handlers.connect_device = [this](auto request, auto response) { handle_connect_device(request, response); };
-    handlers.disconnect_device = [this](auto request, auto response) { handle_disconnect_device(request, response); };
-    handlers.pair_device = [this](auto request, auto response) { handle_pair_device(request, response); };
-    handlers.set_device_trust = [this](auto request, auto response) { handle_set_device_trust(request, response); };
-    handlers.remove_device = [this](auto request, auto response) { handle_remove_device(request, response); };
-    handlers.list_gatt_services = [this](auto request, auto response) { handle_list_gatt_services(request, response); };
-    handlers.list_gatt_characteristics = [this](auto request, auto response) { handle_list_gatt_characteristics(request, response); };
-    handlers.list_gatt_descriptors = [this](auto request, auto response) { handle_list_gatt_descriptors(request, response); };
-    handlers.find_gatt_path = [this](auto request, auto response) { handle_find_gatt_path(request, response); };
-    handlers.read_gatt_value = [this](auto request, auto response) { handle_read_gatt_value(request, response); };
-    handlers.write_gatt_value = [this](auto request, auto response) { handle_write_gatt_value(request, response); };
-    handlers.set_notify = [this](auto request, auto response) { handle_set_notify(request, response); };
-    handlers.set_scan_enabled = [this](auto request, auto response) { handle_set_scan_enabled(request, response); };
+    handlers.list_devices = [this](auto request, auto response) {
+        // Return the current BlueZ device-cache snapshot.
+        handle_list_devices(request, response);
+    };
+    handlers.get_device = [this](auto request, auto response) {
+        // Look up one cached device by its requested address.
+        handle_get_device(request, response);
+    };
+    handlers.connect_device = [this](auto request, auto response) {
+        // Start a bounded connection attempt for the requested device.
+        handle_connect_device(request, response);
+    };
+    handlers.disconnect_device = [this](auto request, auto response) {
+        // Cancel pending work and disconnect the requested device.
+        handle_disconnect_device(request, response);
+    };
+    handlers.pair_device = [this](auto request, auto response) {
+        // Run pairing for the requested device and return its final result.
+        handle_pair_device(request, response);
+    };
+    handlers.set_device_trust = [this](auto request, auto response) {
+        // Apply the requested BlueZ Trusted value to one device.
+        handle_set_device_trust(request, response);
+    };
+    handlers.remove_device = [this](auto request, auto response) {
+        // Remove the requested device and its cached bond from the adapter.
+        handle_remove_device(request, response);
+    };
+    handlers.list_gatt_services = [this](auto request, auto response) {
+        // List cached services belonging to the requested peer.
+        handle_list_gatt_services(request, response);
+    };
+    handlers.list_gatt_characteristics = [this](auto request, auto response) {
+        // List cached characteristics below the requested service.
+        handle_list_gatt_characteristics(request, response);
+    };
+    handlers.list_gatt_descriptors = [this](auto request, auto response) {
+        // List cached descriptors below the requested characteristic.
+        handle_list_gatt_descriptors(request, response);
+    };
+    handlers.find_gatt_path = [this](auto request, auto response) {
+        // Resolve a service, characteristic, or descriptor UUID to its D-Bus path.
+        handle_find_gatt_path(request, response);
+    };
+    handlers.read_gatt_value = [this](auto request, auto response) {
+        // Read the requested remote characteristic or descriptor value.
+        handle_read_gatt_value(request, response);
+    };
+    handlers.write_gatt_value = [this](auto request, auto response) {
+        // Write bytes to the requested remote characteristic or descriptor.
+        handle_write_gatt_value(request, response);
+    };
+    handlers.set_notify = [this](auto request, auto response) {
+        // Enable or disable notifications on the requested characteristic.
+        handle_set_notify(request, response);
+    };
+    handlers.set_scan_enabled = [this](auto request, auto response) {
+        // Start or stop adapter discovery through the scan service.
+        handle_set_scan_enabled(request, response);
+    };
     handlers.configure_notification_bridge = [this](auto request, auto response) {
+        // Create or remove a ROS bridge for one remote notification source.
         handle_configure_notification_bridge(request, response);
     };
-    handlers.reload_config = [this](auto request, auto response) { handle_reload_config(request, response); };
-    handlers.set_active_config = [this](auto request, auto response) { handle_set_active_config(request, response); };
+    handlers.reload_config = [this](auto request, auto response) {
+        // Reload the default and active overlay files from disk.
+        handle_reload_config(request, response);
+    };
+    handlers.set_active_config = [this](auto request, auto response) {
+        // Switch overlays while serializing teardown and setup of every transport.
+        handle_set_active_config(request, response);
+    };
 
     // Service discovery must remain stable while overlays change, so the API
     // root is derived from the machine hostname rather than node_topics_prefix.
@@ -1175,6 +1492,7 @@ void ServiceNode::create_services() {
         service_root + "/mesh/network",
         [this](const std::shared_ptr<mrs_uav_bluetooth::srv::MeshNetwork::Request> request,
                std::shared_ptr<mrs_uav_bluetooth::srv::MeshNetwork::Response> response) {
+            // Attach, join, create, import, leave, or inspect the mesh network through D-Bus.
             handle_mesh_network(request, response);
         },
         qos,
@@ -1183,6 +1501,7 @@ void ServiceNode::create_services() {
         service_root + "/mesh/send",
         [this](const std::shared_ptr<mrs_uav_bluetooth::srv::MeshSend::Request> request,
                std::shared_ptr<mrs_uav_bluetooth::srv::MeshSend::Response> response) {
+            // Send one application or device-key message through the attached mesh node.
             handle_mesh_send(request, response);
         },
         qos,
@@ -1191,6 +1510,7 @@ void ServiceNode::create_services() {
         service_root + "/mesh/manage",
         [this](const std::shared_ptr<mrs_uav_bluetooth::srv::MeshManagement::Request> request,
                std::shared_ptr<mrs_uav_bluetooth::srv::MeshManagement::Response> response) {
+            // Execute key, scan, provisioning, and model-configuration operations through D-Bus.
             handle_mesh_management(request, response);
         },
         qos,
@@ -1199,6 +1519,7 @@ void ServiceNode::create_services() {
         service_root + "/mesh/swarm",
         [this](const std::shared_ptr<mrs_uav_bluetooth::srv::MeshSwarm::Request> request,
                std::shared_ptr<mrs_uav_bluetooth::srv::MeshSwarm::Response> response) {
+            // Execute the automatic multi-peer mesh provisioning operation requested by ROS.
             handle_mesh_swarm(request, response);
         },
         qos,
@@ -1217,18 +1538,18 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     AtomicFlagGuard config_apply_guard(config_apply_in_progress_);
 
     const auto new_gatt_layout_signature = gatt_layout_signature_for_config(cfg);
-    const bool gatt_layout_changed = !local_gatt_layout_signature_.empty() &&
-        local_gatt_layout_signature_ != new_gatt_layout_signature;
-
     active_config_ = cfg;
     // Mesh and ordinary LE roles are exclusive radio data planes. A Mesh
     // overlay never creates a GATT application, ordinary advertisement, or
     // Adapter1 discovery session; bluetooth-meshd exclusively owns the bearer.
     const bool exclusive_radio_mode =
         cfg.enable_mesh || cfg.advertise_mode == "broadcast";
+    // A GATT application re-registration can invalidate remote ATT handles.
+    const bool gatt_link_handoff = !local_gatt_layout_signature_.empty() && !exclusive_radio_mode;
+
     // An older auto-connect task may still be awaiting a D-Bus reply. Gate its
     // fallback/pairing path before cancelling existing and pending connections.
-    if (client_) client_->set_connections_allowed(!exclusive_radio_mode);
+    ConnectionPolicyGuard connection_policy(client_.get(), !exclusive_radio_mode);
     if (cfg.enable_mesh || cfg.advertise_mode != "broadcast") {
         // Dynamic advertisement bridge bytes belong to the overlay that
         // produced them. Clear them before rebuilding another radio mode so a
@@ -1250,29 +1571,45 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     // uninterrupted controller advertising state. Release any prior GATT
     // connections before configuring either connectionless mode. Adapter
     // policy below then remains non-connectable for the overlay lifetime.
-    if (exclusive_radio_mode && client_) {
+    if ((exclusive_radio_mode || gatt_link_handoff) && client_) {
         client_->stop_scan();
         // Stop every notification subscription before disconnecting. BlueZ
         // otherwise treats those subscriptions as auto-connect requests and a
         // bonded peer can repeatedly re-establish GATT while the connectionless
         // advertisement or Mesh data plane is active.
-        for (const auto& device : client_->get_devices()) {
-            clear_peer_runtime(device.mac);
-        }
-        // Include cached disconnected devices: their Connect/Pair request can
-        // already be pending in BlueZ before Connected=true is emitted.
-        for (const auto& device : client_->get_devices()) {
-            // BlueZ can be finishing an already-issued connection while the
-            // first cancellation is delivered. Retry once after its bounded
-            // call; trust is restored on each attempt before retrying.
-            if (!client_->disconnect(device.mac, 1.0, true) &&
-                !client_->disconnect(device.mac, 1.0, true)) {
-                throw std::runtime_error(
-                    "Could not release LE peer " + device.mac +
-                    " before connectionless startup; original trust restoration "
-                    "and pending connection cancellation must succeed");
+        const auto devices = client_->get_devices();
+        std::vector<std::string> disconnect_targets;
+        {
+            std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+            for (const auto& device : devices) {
+                // A connection request can precede Connected=true. Include
+                // peers we contacted and bonded peers with daemon reconnect
+                // policy. Discovery-only addresses have no link to release.
+                bool pending = false;
+                if (peers_) {
+                    const auto session = peers_->sessions().find(device.mac);
+                    pending = session != peers_->sessions().end() &&
+                        (session->second.last_connect_attempt_monotonic > 0.0 ||
+                         session->second.pairing_in_progress);
+                }
+                if (device.connected || device.paired || device.bonded || pending)
+                    disconnect_targets.push_back(device.mac);
             }
         }
+        // Notification teardown waits for D-Bus callbacks, which also take
+        // state_mutex_. Keep those waits outside the snapshot lock.
+        for (const auto& device : devices) clear_peer_runtime(device.mac);
+        for (const auto& mac : disconnect_targets) {
+            if (!client_->disconnect(mac, 5.0)) {
+                throw std::runtime_error(
+                    "Could not release LE peer " + mac +
+                    " before changing the radio mode");
+            }
+        }
+    }
+    if (gatt_link_handoff) {
+        RCLCPP_INFO(get_logger(),
+                    "Released peer links before rebuilding the local GATT server");
     }
     configure_serial_profile(cfg);
     // Stop Mesh before enabling conventional LE roles. In the opposite
@@ -1289,6 +1626,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::duration<double>(cfg.status_report_period)),
             [this]() {
+                // Publish health at the period selected by the newly applied overlay.
                 publish_periodic_status();
             },
             timer_callback_group_);
@@ -1350,7 +1688,9 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
 
     netplan_->set_config_file(cfg.wifi_netplan_config_path);
     netplan_->set_allowed_networks(cfg.allowed_wifi_networks);
-    if (cfg.enable_scan) {
+    const bool defer_broadcast_scan = cfg.advertise_mode == "broadcast" &&
+        cfg.enable_server;
+    if (cfg.enable_scan && !gatt_link_handoff && !defer_broadcast_scan) {
         const bool discoverable_while_scanning =
             cfg.advertise_mode != "broadcast" &&
             cfg.advertise_discoverable.value_or(
@@ -1380,11 +1720,6 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             refresh_import_bridges_for_device(device);
         }
 
-    }
-
-    if (gatt_layout_changed) {
-        RCLCPP_WARN(get_logger(),
-                    "Local GATT layout changed, rebuilding the server without clearing active peer runtime");
     }
 
     if (time_service_timer_) {
@@ -1429,16 +1764,17 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         rebuild_server_objects();
     } catch (const std::exception& error) {
         local_server_rebuild_in_progress_.store(false);
-        // A conventional LE object can fail transiently while BlueZ releases
-        // the previous overlay. Keep ROS control/status alive so the user can
-        // replace or clear the overlay; strict Mesh mode creates no such object.
+        // The caller reports configuration failure and can retry or reset.
+        // Do not report an active bridge when its radio objects were not built.
         RCLCPP_ERROR(get_logger(),
-                     "Local GATT/advertisement rebuild is temporarily degraded: %s",
+                     "Local GATT/advertisement configuration failed: %s",
                      error.what());
+        throw;
     } catch (...) {
         local_server_rebuild_in_progress_.store(false);
         RCLCPP_ERROR(get_logger(),
-                     "Local GATT/advertisement rebuild is temporarily degraded: unknown error");
+                     "Local GATT/advertisement configuration failed: unknown error");
+        throw;
     }
     local_server_rebuild_in_progress_.store(false);
     {
@@ -1448,6 +1784,17 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                                                        std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     local_gatt_layout_signature_ = new_gatt_layout_signature;
+
+    // Do not resume discovery or outbound connections until the replacement
+    // GATT application is registered. Otherwise a trusted peer can reconnect
+    // against a half-built local database and retain stale ATT handles.
+    if (gatt_link_handoff && cfg.enable_scan) {
+        const bool discoverable_while_scanning =
+            cfg.advertise_mode != "broadcast" &&
+            cfg.advertise_discoverable.value_or(
+                cfg.enable_server || cfg.enable_serial_port_profile);
+        client_->start_scan(cfg.scan_mode, discoverable_while_scanning);
+    }
 
     if (cfg.enable_mesh) configure_mesh(cfg);
 
@@ -1462,6 +1809,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::duration<double>(cfg.time_update_period)),
             [this]() {
+                // Refresh the time characteristic only while the service remains enabled.
                 if (time_service_) {
                     time_service_->update();
                 }
@@ -1478,6 +1826,7 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::duration<double>(cfg.wifi_refresh_period)),
             [this]() {
+                // Refresh the Wi-Fi characteristic from the currently applied network configuration.
                 if (wifi_service_ && netplan_) {
                     auto ssid = netplan_->get_current_ssid();
                     wifi_service_->update(ssid.empty() ? "unknown" : ssid);
@@ -1526,6 +1875,7 @@ void ServiceNode::rebuild_server_objects() {
             "/org/bluez/app/profile0",
             active_config_.gatt_profile_uuids);
         profile->set_release_callback([this]() {
+            // Record that BlueZ released the optional local client profile.
             RCLCPP_INFO(get_logger(), "BlueZ released the local GATT client profile");
         });
         gatt_app_->add_profile(std::move(profile));
@@ -1536,13 +1886,16 @@ void ServiceNode::rebuild_server_objects() {
         wifi_service_ = std::make_unique<gatt::services::WifiService>(
             *server_dbus_, "/org/bluez/app", service_index++,
             [this]() {
+                // Read the current network name, substituting a stable value when disconnected.
                 auto ssid = netplan_->get_current_ssid();
                 return ssid.empty() ? std::string("unknown") : ssid;
             },
             [this](const std::string& ssid) {
+                // Treat the written Wi-Fi name as a request to save and activate that network.
                 return netplan_->set_current_network(ssid);
             },
             [this](const std::string& password) {
+                // Trim the peer-supplied password before asking Netplan to change the network.
                 std::string trimmed = password;
                 while (!trimmed.empty() &&
                        (trimmed.back() == ' ' || trimmed.back() == '\n' ||
@@ -1559,7 +1912,10 @@ void ServiceNode::rebuild_server_objects() {
                 }
                 return netplan_->set_current_network(ssid, trimmed);
             },
-            [this]() { return netplan_->get_configured_password(); });
+            [this]() {
+                // Read back the configured password for the writable GATT field.
+                return netplan_->get_configured_password();
+            });
         gatt_app_->add_service(wifi_service_->service());
     } else {
         wifi_service_.reset();
@@ -1571,12 +1927,14 @@ void ServiceNode::rebuild_server_objects() {
             [this](const std::vector<uint8_t>& payload,
                    const std::string& device_path,
                    uint64_t received_time_ns) {
+                // Associate the peer time writeback with its receive timestamp and publish it.
                 handle_time_writeback(payload, device_path, received_time_ns);
             });
         // Wire server-side notify observability for the time characteristic.
         for (const auto& chrc : time_service_->service()->characteristics()) {
             chrc->set_force_emit_value(true);
             chrc->set_notify_callback([this, uuid = chrc->uuid()](bool enabled) {
+                // Track whether any client needs periodic local-time notifications.
                 RCLCPP_INFO(get_logger(), "[server] time characteristic %s: client %s notifications",
                             uuid.c_str(), enabled ? "started" : "stopped");
                 note_local_time_notify_state(enabled);

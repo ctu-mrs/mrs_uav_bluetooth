@@ -1,38 +1,32 @@
-# Node: user_node (overlay applied to the background service_node)
-# Purpose: join one persistent relayed Mesh and dynamically share timestamped
-# odometry only with UAVs in the same logical swarm.
-# Usage: deploy this same overlay to every listed UAV, then run:
-#   ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=<absolute-path-to-this-file>
-# Run random_odometry_publisher.launch.py when no estimator is available.
+# Mesh example: shares complete odometry and relays it through other UAVs.
+# Copy this file, list all UAVs below, and deploy the same copy everywhere.
+# Start user_node with config_path:=<absolute path to the copy>.
+# Received data appears below /<this-uav>/bluetooth/mesh/peers.
 
+# -----------------------------------------------------------------------------
+# Mesh settings
 node_topics_prefix: "/{hostname}/bluetooth"
 enable_mesh: true
 mesh_swarm_auto_provisioning: true
-# The service chooses the initial provisioner, starts or joins the network,
-# stores the private keys, and enables relay on every joined UAV.
+# Start or join automatically and remember the setup.
 
-# Deploy the same ordered admission list to each UAV. A later entry can start a
-# network after waiting for earlier entries. UAV numbers 1..32767 become
-# stable Mesh addresses. Private PB-ADV enrollment needs this list to target
-# each peer's Device UUID. To change the fleet, update the same list on all UAVs.
+# Keep this ordered list the same everywhere.
 peer_whitelist:
   - uav42
   - uav99
 
-# "ordered" follows the written list. A listed hostname can be put first
-# explicitly if that is more convenient. Each UAV falls back to the first
-# currently reachable candidate when the preferred one disappears.
+# The first available UAV becomes the Mesh provisioner.
 mesh_provisioner_preference: ordered
-# Keep a peer present through brief RF losses during segmented odometry traffic.
+# Seconds between check-ins.
+mesh_swarm_heartbeat_period: 3.0
+# Seconds before a silent UAV is considered gone.
 mesh_swarm_provisioner_timeout: 20.0
+# Keep at zero; missing data is retried automatically.
+mesh_network_retransmit_count: 0
 
-# The service turns off ordinary LE roles while this overlay owns the radio.
-# The default logical swarm is 1, and its group address is 0xc000. You can
-# override those settings in this overlay if the application needs them.
-
-# The same generalized codec used by GATT and advertisements frames this data
-# under Mesh channel 1001. Received messages appear below:
-# /{hostname}/bluetooth/mesh/peers/<peer>/mavros/local_position/odom
+# -----------------------------------------------------------------------------
+# Data to send
+# Keep this section identical on all UAVs.
 shared_topics:
   - name: swarm_odometry_mesh
     transport: mesh
@@ -42,82 +36,50 @@ shared_topics:
     export_topic: /{hostname}/mavros/local_position/odom
     import_topic_suffix: mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
-    # The same 21-byte timestamp and pose codec as the advertisement example
-    # needs far fewer Mesh segments than an uncompressed odometry message.
-    # It omits twist, frame IDs, and covariance. Keep the rate conservative to
-    # leave airtime for both directions and multi-hop relay traffic.
-    rate_hz: 0.2
-    destination: 0xc000
+    # Offer the newest value up to ten times per second.
+    rate_hz: 10.0
+    # Internal labels; keep them identical on every UAV.
     app_key_index: 0
     element_index: 0
     force_segmented: true
     vendor_opcode: 0xc1
     company_id: 0x05f1
     members_encode:
-      - target: timestamp_us
-        type: uint64
-        expression: header.stamp.sec * 1000000.0 + floor(header.stamp.nanosec / 1000.0)
-      - target: timestamp_subus
-        type: uint8
-        expression: >-
-          round((header.stamp.nanosec - floor(header.stamp.nanosec / 1000.0) * 1000.0)
-          * 255.0 / 999.0)
-      # Quaternion-derived Euler angles retain signed 16-bit precision.
-      - target: roll
-        type: int16
-        expression: >-
-          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.x +
-          pose.pose.orientation.y * pose.pose.orientation.z),
-          1.0 - 2.0 * (pose.pose.orientation.x * pose.pose.orientation.x +
-          pose.pose.orientation.y * pose.pose.orientation.y))
-      - target: pitch
-        type: int16
-        expression: >-
-          (32767.0 / pi) * asin(clamp(2.0 * (pose.pose.orientation.w * pose.pose.orientation.y -
-          pose.pose.orientation.z * pose.pose.orientation.x), -1.0, 1.0))
-      - target: yaw
-        type: int16
-        expression: >-
-          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.z +
-          pose.pose.orientation.x * pose.pose.orientation.y),
-          1.0 - 2.0 * (pose.pose.orientation.y * pose.pose.orientation.y +
-          pose.pose.orientation.z * pose.pose.orientation.z))
-      # Signed centimetres cover approximately +/-327 m on each axis.
-      - target: x_cm
-        type: int16
-        expression: pose.pose.position.x * 100.0
-      - target: y_cm
-        type: int16
-        expression: pose.pose.position.y * 100.0
-      - target: z_cm
-        type: int16
-        expression: pose.pose.position.z * 100.0
+      - target: seconds
+        type: uint32
+        expression: header.stamp.sec
+      - target: nanoseconds
+        type: uint32
+        expression: header.stamp.nanosec
+      - target: pose.pose.position.x
+        type: float32
+      - target: pose.pose.position.y
+        type: float32
+      - target: pose.pose.position.z
+        type: float32
+      - target: pose.pose.orientation.x
+        type: float32
+      - target: pose.pose.orientation.y
+        type: float32
+      - target: pose.pose.orientation.z
+        type: float32
+      - target: pose.pose.orientation.w
+        type: float32
+      - target: twist.twist.linear.x
+        type: float32
+      - target: twist.twist.linear.y
+        type: float32
+      - target: twist.twist.linear.z
+        type: float32
+      - target: twist.twist.angular.x
+        type: float32
+      - target: twist.twist.angular.y
+        type: float32
+      - target: twist.twist.angular.z
+        type: float32
+    # Rebuild the usual ROS time fields.
     members_decode:
       - target: header.stamp.sec
-        expression: floor(timestamp_us / 1000000.0)
+        expression: seconds
       - target: header.stamp.nanosec
-        expression: >-
-          (timestamp_us - floor(timestamp_us / 1000000.0) * 1000000.0) * 1000.0
-          + round(timestamp_subus * 999.0 / 255.0)
-      - target: pose.pose.orientation.w
-        expression: >-
-          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
-          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
-      - target: pose.pose.orientation.x
-        expression: >-
-          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) -
-          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
-      - target: pose.pose.orientation.y
-        expression: >-
-          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
-          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
-      - target: pose.pose.orientation.z
-        expression: >-
-          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0) -
-          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0)
-      - target: pose.pose.position.x
-        expression: x_cm / 100.0
-      - target: pose.pose.position.y
-        expression: y_cm / 100.0
-      - target: pose.pose.position.z
-        expression: z_cm / 100.0
+        expression: nanoseconds

@@ -1,0 +1,29 @@
+diff --git a/src/adapter.c b/src/adapter.c
+index 92baf30..84c1adf 100644
+--- a/src/adapter.c
++++ b/src/adapter.c
+@@ -749,6 +749,12 @@ static void set_mode_complete(uint8_t status, uint16_t length,
+ 	struct set_mode_data *data = user_data;
+ 	struct btd_adapter *adapter = data->adapter;
+ 
++	/* Command completion releases the request even when the settings
++	 * value did not change. NEW_SETTINGS may have already reported the
++	 * value, or the controller may have accepted an idempotent request.
++	 */
++	adapter->pending_settings &= ~data->setting;
++
+ 	if (status != MGMT_STATUS_SUCCESS) {
+ 		btd_error(adapter->dev_id, "Failed to set mode: %s (0x%02x)",
+ 						mgmt_errstr(status), status);
+@@ -3071,6 +3077,11 @@ static void property_set_mode_complete(uint8_t status, uint16_t length,
+ 	struct property_set_data *data = user_data;
+ 	struct btd_adapter *adapter = data->adapter;
+ 
++	/* A successful no-change reply has no NEW_SETTINGS transition to
++	 * release this D-Bus request. The command completion is authoritative.
++	 */
++	adapter->pending_settings &= ~data->setting;
++
+ 	DBG("%s (0x%02x)", mgmt_errstr(status), status);
+ 
+ 	if (status != MGMT_STATUS_SUCCESS) {

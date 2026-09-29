@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bluez/bluez_pairing_agent.cpp
+/// \brief Implements the bluez pairing agent component of the BlueZ system-D-Bus integration layer.
+
 #include "mrs_uav_bluetooth/bluez/bluez_pairing_agent.hpp"
 
 namespace mrs_uav_bluetooth::bluez {
@@ -7,7 +10,11 @@ namespace {
 
 constexpr auto kPendingPairingCancelTimeout = std::chrono::seconds(20);
 
+/// \brief Classify agent callbacks that require pairing policy rather than service authorization.
+/// \param event Pairing-agent event name to classify.
+/// \return True for agent events that require pairing policy; otherwise false.
 bool request_requires_pairing_flow(const std::string& event) {
+    // Request requires pairing flow.
     return event == "request_pin" ||
            event == "request_passkey" ||
            event == "request_confirmation";
@@ -19,9 +26,12 @@ BluezPairingAgent::BluezPairingAgent(DbusConnection& dbus,
                                      rclcpp::Logger logger,
                                      bool auto_pair,
                                      bool auto_trust)
-    : dbus_(dbus), logger_(logger), auto_pair_(auto_pair), auto_trust_(auto_trust) {}
+    : dbus_(dbus), logger_(logger), auto_pair_(auto_pair), auto_trust_(auto_trust) {
+        // Retain the D-Bus connection and logger; registration is performed explicitly later.
+    }
 
 BluezPairingAgent::~BluezPairingAgent() {
+    // Unregister the agent while its D-Bus connection is still usable.
     if (registered_) {
         try {
             unregister_agent();
@@ -30,7 +40,7 @@ BluezPairingAgent::~BluezPairingAgent() {
 }
 
 void BluezPairingAgent::register_agent(const std::string& capability) {
-    // Create and export the agent object.
+    // Export the Agent1 methods before registering this object with BlueZ AgentManager1.
     exported_object_ = sdbus::createObject(dbus_.connection(),
                                            sdbus::ObjectPath{kAgentPath});
 
@@ -40,11 +50,13 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
     exported_object_->addVTable(
         sdbus::registerMethod("Release")
             .implementedAs([this]() {
+                // Notify the owner that BlueZ discarded this pairing-agent registration.
                 emit("agent_release");
             }),
         sdbus::registerMethod("AuthorizeService")
             .withInputParamNames("device", "uuid")
             .implementedAs([this](const sdbus::ObjectPath& device, const std::string& uuid) {
+                // Enforce the current connection policy before authorizing this service UUID.
                 if (!should_allow_request("authorize_service", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Connection rejected");
@@ -57,6 +69,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
             .withInputParamNames("device")
             .withOutputParamNames("pincode")
             .implementedAs([this](const sdbus::ObjectPath& device) -> std::string {
+                // Enforce policy, remember the peer for Cancel, and answer the PIN request.
                 if (!should_allow_request("request_pin", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "PIN code request rejected");
@@ -71,6 +84,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
             .withInputParamNames("device")
             .withOutputParamNames("passkey")
             .implementedAs([this](const sdbus::ObjectPath& device) -> uint32_t {
+                // Enforce policy, remember the peer for Cancel, and answer the passkey request.
                 if (!should_allow_request("request_passkey", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Passkey request rejected");
@@ -85,6 +99,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
             .withInputParamNames("device", "passkey", "entered")
             .implementedAs([this](const sdbus::ObjectPath& device,
                                   uint32_t passkey, uint16_t entered) {
+                // Report that BlueZ is displaying a passkey for this peer.
                 emit("display_passkey", std::string(device));
                 (void)passkey; (void)entered;
             }),
@@ -92,12 +107,14 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
             .withInputParamNames("device", "pincode")
             .implementedAs([this](const sdbus::ObjectPath& device,
                                   const std::string& pincode) {
+                // Report that BlueZ is displaying a PIN for this peer.
                 emit("display_pin", std::string(device));
                 (void)pincode;
             }),
         sdbus::registerMethod("RequestConfirmation")
             .withInputParamNames("device", "passkey")
             .implementedAs([this](const sdbus::ObjectPath& device, uint32_t passkey) {
+                // Enforce policy before accepting the displayed passkey confirmation.
                 (void)passkey;
                 if (!should_allow_request("request_confirmation", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
@@ -111,6 +128,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
         sdbus::registerMethod("RequestAuthorization")
             .withInputParamNames("device")
             .implementedAs([this](const sdbus::ObjectPath& device) {
+                // Enforce policy before granting general access to this device.
                 if (!should_allow_request("request_authorization", std::string(device))) {
                     throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Rejected"},
                                        "Authorization rejected");
@@ -120,6 +138,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
             }),
         sdbus::registerMethod("Cancel")
             .implementedAs([this]() {
+                // Cancel only the recent pairing request that BlueZ is referring to.
                 if (pending_pairing_device_path_.empty()) {
                     return;
                 }
@@ -153,6 +172,7 @@ void BluezPairingAgent::register_agent(const std::string& capability) {
 }
 
 void BluezPairingAgent::unregister_agent() {
+    // Unregister agent.
     if (!registered_) return;
     try {
         auto am = sdbus::createProxy(dbus_.connection(),
@@ -169,14 +189,17 @@ void BluezPairingAgent::unregister_agent() {
 }
 
 void BluezPairingAgent::set_event_callback(AgentEventCallback cb) {
+    // Replace the observer that receives pairing prompts, decisions, and cancellation events.
     on_event_ = std::move(cb);
 }
 
 void BluezPairingAgent::set_request_policy_callback(AgentRequestPolicyCallback cb) {
+    // Replace the policy used to accept or reject each inbound pairing request.
     request_policy_ = std::move(cb);
 }
 
 void BluezPairingAgent::set_auto_pair(bool auto_pair) {
+    // Control whether unattended pairing requests are permitted by the default policy.
     auto_pair_ = auto_pair;
     if (!auto_pair_) {
         pending_pairing_device_path_.clear();
@@ -185,10 +208,12 @@ void BluezPairingAgent::set_auto_pair(bool auto_pair) {
 }
 
 void BluezPairingAgent::set_auto_trust(bool auto_trust) {
+    // Control whether an accepted peer is marked Trusted automatically.
     auto_trust_ = auto_trust;
 }
 
 void BluezPairingAgent::set_trusted(const std::string& device_path) {
+    // Set Device1.Trusted for the peer currently being authorized.
     try {
         auto proxy = sdbus::createProxy(dbus_.connection(),
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -206,6 +231,7 @@ void BluezPairingAgent::set_trusted(const std::string& device_path) {
 
 void BluezPairingAgent::emit(const std::string& event,
                               const std::string& device_path) {
+    // Clear pending state on daemon release, then isolate observer exceptions.
     if (event == "agent_release") {
         pending_pairing_device_path_.clear();
         pending_pairing_request_time_ = std::chrono::steady_clock::time_point{};
@@ -219,6 +245,7 @@ void BluezPairingAgent::emit(const std::string& event,
 
 bool BluezPairingAgent::should_allow_request(const std::string& event,
                                              const std::string& device_path) const {
+    // Defer to the configured admission policy, denying exceptions safely.
     if (!request_policy_) {
         return auto_pair_ || !request_requires_pairing_flow(event);
     }

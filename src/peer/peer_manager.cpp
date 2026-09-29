@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/peer/peer_manager.cpp
+/// \brief Implements the peer manager component of the peer lifecycle layer.
+
 #include "mrs_uav_bluetooth/peer/peer_manager.hpp"
 
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
@@ -18,8 +21,13 @@ constexpr double kPairCooldownMin = 10.0;
 constexpr double kPairAfterConnectGraceMin = 5.0;
 constexpr double kTrustCooldownMin = 0.5;
 
+/// \brief Test a peer session phase against a small accepted-state set.
+/// \param session Peer session whose current phase is compared.
+/// \param values Accepted peer phase names.
+/// \return True if the session phase matches one of the accepted names; otherwise false.
 bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
               std::initializer_list<const char*> values) {
+    // Stop at the first exact phase match.
     for (const char* value : values) {
         if (session.phase == value) {
             return true;
@@ -28,7 +36,11 @@ bool is_phase(const mrs_uav_bluetooth::peer::PeerConnectionSession& session,
     return false;
 }
 
+/// \brief Return text without surrounding ASCII whitespace.
+/// \param value Text to normalize.
+/// \return Input text without surrounding ASCII whitespace.
 std::string trim_copy(std::string value) {
+    // Locate both boundaries before returning the middle substring.
     const auto start = value.find_first_not_of(" \t\r\n");
     if (start == std::string::npos) {
         return {};
@@ -37,14 +49,22 @@ std::string trim_copy(std::string value) {
     return value.substr(start, end - start + 1);
 }
 
+/// \brief Lowercase peer names before matching hostname-based admission rules.
+/// \param value Text to normalize.
+/// \return Lowercase copy of the input text.
 std::string lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        // Lowercase peer names before matching hostname-based admission rules.
         return static_cast<char>(std::tolower(ch));
     });
     return value;
 }
 
+/// \brief Validate the six-octet colon-separated Bluetooth address form.
+/// \param value Peer identifier to test for Bluetooth-address syntax.
+/// \return True if the full text contains six hexadecimal address octets; otherwise false.
 bool looks_like_mac_address(std::string_view value) {
+    // Require exactly six hexadecimal octets separated by five colons.
     if (value.size() != 17) {
         return false;
     }
@@ -63,15 +83,23 @@ bool looks_like_mac_address(std::string_view value) {
     return true;
 }
 
+/// \brief Validate and uppercase a Bluetooth address for stable map keys.
+/// \param value Bluetooth address to trim validate and uppercase.
+/// \return Normalized mac.
 std::string normalize_mac(std::string value) {
     value = trim_copy(std::move(value));
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        // Uppercase address hex digits while preserving colon separators.
         return static_cast<char>(std::toupper(ch));
     });
     return value;
 }
 
+/// \brief Canonicalize a configured hostname or Bluetooth address for policy matching.
+/// \param value Hostname or Bluetooth address from the peer allow-list.
+/// \return Normalized whitelist token.
 std::string normalize_whitelist_token(std::string value) {
+    // Preserve MAC separators while hostnames use lowercase policy matching.
     value = trim_copy(std::move(value));
     if (looks_like_mac_address(value)) {
         return normalize_mac(std::move(value));
@@ -79,9 +107,15 @@ std::string normalize_whitelist_token(std::string value) {
     return lower_copy(std::move(value));
 }
 
+/// \brief Match a normalized peer name or address against the configured admission list.
+/// \param whitelist configured peer names or addresses allowed to connect.
+/// \param mac peer Bluetooth MAC address.
+/// \param peer_name Resolved peer hostname checked alongside its Bluetooth address.
+/// \return True when whitelist contains; otherwise false.
 bool whitelist_contains(const std::vector<std::string>& whitelist,
                         const std::string& mac,
                         const std::string& peer_name) {
+    // Match a normalized peer name or address against the configured admission list.
     const auto normalized_mac = normalize_mac(mac);
     const auto normalized_peer_name = lower_copy(trim_copy(peer_name));
     for (const auto& entry : whitelist) {
@@ -99,33 +133,63 @@ bool whitelist_contains(const std::vector<std::string>& whitelist,
     return false;
 }
 
+/// \brief Detect cached pairing, bonding, or trust state that may need cleanup.
+/// \param device Peer whose paired bonded or trusted flags are inspected.
+/// \return True when device has local security; otherwise false.
 bool device_has_local_security(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    // Detect cached pairing, bonding, or trust state that may need cleanup.
     return device.paired || device.bonded || device.trusted;
 }
 
+/// \brief Decide whether this peer must complete pairing before bridge setup.
+/// \param config Security policy from which the required protection level is derived.
+/// \return True if policy requires pairing before peer use; otherwise false.
 bool pairing_required(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Decide whether this peer must complete pairing before bridge setup.
     return config.auto_pair;
 }
 
+/// \brief Derive whether the active security policy requires BlueZ trust.
+/// \param config Security policy from which the required protection level is derived.
+/// \return True if policy requires the peer's Trusted flag; otherwise false.
 bool trust_required(const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Trust required.
     return config.auto_trust;
 }
 
+/// \brief Require pairing only when the active configuration or cached peer state needs it.
+/// \param device Peer whose pairing state is checked against policy.
+/// \param config Security policy against which the peer flags are checked.
+/// \return True when device has required pairing; otherwise false.
 bool device_has_required_pairing(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
                                  const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Require pairing only when the active configuration or cached peer state needs it.
     return !pairing_required(config) || device.paired || device.bonded;
 }
 
+/// \brief Require Trusted only when the active policy enables automatic trust.
+/// \param device Peer whose trusted state is checked against policy.
+/// \param config Security policy against which the peer flags are checked.
+/// \return True when device has required trust; otherwise false.
 bool device_has_required_trust(const mrs_uav_bluetooth::bluez::DeviceInfo& device,
                                const mrs_uav_bluetooth::config::NodeConfig& config) {
+    // Require Trusted only when the active policy enables automatic trust.
     return !trust_required(config) || device.trusted;
 }
 
+/// \brief Detect stale local security state that must be removed before retrying pairing.
+/// \param device Peer checked for stale local security material requiring removal.
+/// \return True when device needs forget; otherwise false.
 bool device_needs_forget(const mrs_uav_bluetooth::bluez::DeviceInfo& device) {
+    // Detect stale local security state that must be removed before retrying pairing.
     return device.connected || device.services_resolved || device_has_local_security(device);
 }
 
+/// \brief Block normal peer work until stale-bond removal is issued and observed.
+/// \param session Peer session checked for an active repair or reset workflow.
+/// \return True when repair blocks regular actions; otherwise false.
 bool repair_blocks_regular_actions(const mrs_uav_bluetooth::peer::PeerConnectionSession& session) {
+    // Block normal peer work until stale-bond removal is issued and observed.
     return session.repair_requested &&
            (!session.repair_remove_issued || session.repair_awaiting_cache_removal);
 }
@@ -135,15 +199,19 @@ bool repair_blocks_regular_actions(const mrs_uav_bluetooth::peer::PeerConnection
 namespace mrs_uav_bluetooth::peer {
 
 PeerManager::PeerManager(rclcpp::Node& node, rclcpp::Logger logger)
-    : node_(node), logger_(logger) {}
+    : node_(node), logger_(logger) {
+        // Retain the ROS clock and logger used by peer retry and phase tracking.
+    }
 
 double PeerManager::now_monotonic() const {
+    // Read steady-clock seconds for retry and lease calculations.
     return std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 PeerConnectionSession& PeerManager::get_or_create_session(const std::string& mac,
                                                           const std::string& peer_name) {
+    // Create first-seen state or refresh the last-seen time and discovered peer name.
     auto it = sessions_.find(mac);
     if (it == sessions_.end()) {
         PeerConnectionSession session;
@@ -168,6 +236,7 @@ PeerConnectionSession& PeerManager::get_or_create_session(const std::string& mac
 bool PeerManager::matches_auto_connect_policy(const bluez::DeviceInfo& device,
                                               const config::NodeConfig& config,
                                               const std::string& peer_name) const {
+    // Accept a peer only when its normalized name matches the configured UAV pattern.
     (void)device;
     const auto normalized_peer_name = lower_copy(trim_copy(peer_name));
     return !normalized_peer_name.empty() &&
@@ -177,12 +246,14 @@ bool PeerManager::matches_auto_connect_policy(const bluez::DeviceInfo& device,
 void PeerManager::set_session_phase(PeerConnectionSession& session,
                                     const std::string& phase,
                                     const std::string& detail) const {
+    // Update the externally reported phase and its diagnostic detail together.
     session.phase = phase;
     session.detail = detail;
 }
 
 void PeerManager::note_local_connect_attempt(PeerConnectionSession& session,
                                              double now_mono) const {
+    // Mark the session as locally initiated and start its connection grace window.
     session.peer_initiated = false;
     session.last_connect_attempt_monotonic = now_mono;
     session.connect_started_monotonic = now_mono;
@@ -191,6 +262,7 @@ void PeerManager::note_local_connect_attempt(PeerConnectionSession& session,
 void PeerManager::request_device_reset(PeerConnectionSession& session,
                                        const std::string& reason,
                                        bool reset_pairing_state) {
+    // Request device reset.
     if (session.repair_requested) {
         if (session.repair_reason.empty() && !reason.empty()) {
             session.repair_reason = reason;
@@ -231,6 +303,7 @@ void PeerManager::request_device_reset(PeerConnectionSession& session,
 
 void PeerManager::clear_device_reset(PeerConnectionSession& session,
                                      bool clear_pairing_reset_pending) {
+    // Release repair flags after removal completes or the repair is abandoned.
     session.repair_requested = false;
     session.repair_in_progress = false;
     session.repair_remove_issued = false;
@@ -258,6 +331,17 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
                               const std::string& peer_name,
                               bool preserve_ready_runtime,
                               bool preserve_active_bridge_runtime) {
+    const bool has_connection_state =
+        device.connected || device.services_resolved || device_has_local_security(device);
+    if (!sessions_.contains(device.mac) && !has_connection_state &&
+        (!config.auto_connect_enable || peer_name.empty())) {
+        // Advertisement reception uses ObjectManagerCache directly and does
+        // not need a GATT connection session. In broadcast mode, rotating
+        // private addresses can otherwise create hundreds of permanently
+        // irrelevant sessions. Still track an existing session so a mode
+        // change can clear it, and always track connected or bonded devices.
+        return;
+    }
     auto& session = get_or_create_session(device.mac, peer_name);
     const auto now = now_monotonic();
     const bool was_desired = session.desired;
@@ -480,6 +564,7 @@ void PeerManager::sync_device(const bluez::DeviceInfo& device,
 }
 
 void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
+    // Start the absence timer once without extending it on later cache snapshots.
     auto it = sessions_.find(mac);
     if (it == sessions_.end()) {
         return;
@@ -519,6 +604,7 @@ void PeerManager::note_missing_device(const std::string& mac, double now_mono) {
 void PeerManager::note_pairing_event(const std::string& device_path,
                                      const std::string& event,
                                      const bluez::ObjectManagerCache& cache) {
+    // Resolve the agent path to a session and advance its pairing flags and phase.
     auto device = cache.device(device_path);
     if (!device) {
         return;
@@ -573,6 +659,7 @@ bool PeerManager::should_attempt_trust(const PeerConnectionSession& session,
                                        const config::NodeConfig& config,
                                        double now_mono,
                                        double retry_period_s) const {
+    // Trust only stable, connected, security-ready peers after the retry cooldown.
     if (!config.auto_trust) {
         return false;
     }
@@ -608,6 +695,7 @@ bool PeerManager::should_attempt_trust(const PeerConnectionSession& session,
 bool PeerManager::should_attempt_connect(const PeerConnectionSession& session,
                                          double now_mono,
                                          double retry_period_s) const {
+    // Retry only desired visible peers that are outside active or blocked phases.
     if (!session.desired) {
         return false;
     }
@@ -637,6 +725,7 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
                                       const config::NodeConfig& config,
                                       double now_mono,
                                       double retry_period_s) const {
+    // Pair connected desired peers only after discovery grace and failure backoff.
     if (!config.auto_pair) {
         return false;
     }
@@ -680,6 +769,7 @@ bool PeerManager::should_attempt_pair(const PeerConnectionSession& session,
 bool PeerManager::should_repair_authentication_disconnect(
     const PeerConnectionSession& session, const bluez::DeviceInfo& device,
     const config::NodeConfig& config, const std::string& reason) const {
+    // Repair stored credentials only for an admitted automatically managed GATT peer.
     return reason == "org.bluez.Reason.Authentication" &&
         config.auto_pair && config.auto_connect_enable && !config.enable_mesh &&
         config.advertise_mode != "broadcast" && session.desired &&
@@ -690,6 +780,7 @@ bool PeerManager::should_repair_authentication_disconnect(
 void PeerManager::prune_sessions(const std::set<std::string>& current_macs,
                                  double now_mono,
                                  double ttl_s) {
+    // Remove only unseen, inactive sessions whose absence exceeds the configured TTL.
     for (auto it = sessions_.begin(); it != sessions_.end();) {
         if (current_macs.find(it->first) != current_macs.end() ||
             time_bridges_.find(it->first) != time_bridges_.end() ||
@@ -702,6 +793,7 @@ void PeerManager::prune_sessions(const std::set<std::string>& current_macs,
 }
 
 void PeerManager::remove_time_bridge(const std::string& mac) {
+    // Release the peer’s status publisher before erasing its clock state.
     auto it = time_bridges_.find(mac);
     if (it == time_bridges_.end()) {
         return;

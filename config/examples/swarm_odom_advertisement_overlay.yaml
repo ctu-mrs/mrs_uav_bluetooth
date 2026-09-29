@@ -1,17 +1,21 @@
-# Node: user_node (overlay applied to the background service_node)
-# Purpose: share timestamped odometry through connectionless BLE advertisements.
-# Usage: ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=<absolute-path-to-this-file>
-# Run the optional random_odometry_publisher launch if no estimator is available.
+# Advertisement example: broadcasts position and orientation without connecting.
+# Copy this file, list all UAVs below, and deploy the same copy everywhere.
+# Start user_node with config_path:=<absolute path to the copy>.
+# Updates may be missed. Received data appears below /<this-uav>/bluetooth/le/peers.
 
+# -----------------------------------------------------------------------------
+# Advertisement settings
 node_topics_prefix: "/{hostname}/bluetooth"
 
-# Advertisement topic sharing is a connectionless mode. Broadcast advertising
-# and disabled GATT/pairing settings prevent a connection from stopping the
-# controller's advertisement data stream.
+# Keep these values together.
 advertise_mode: broadcast
 advertise_size: legacy
-# The 26-byte bare value occupies the full primary legacy packet after BLE
-# overhead. BlueZ places this local name in the scan response on both test UAVs.
+# Tested update method.
+advertise_update_strategy: reregister
+# Repeat interval in milliseconds.
+advertise_min_interval: 100
+advertise_max_interval: 100
+# Include this UAV's name.
 advertise_local_name: "{hostname}"
 advertise_discoverable: false
 enable_server: true
@@ -22,19 +26,14 @@ enable_serial_port_profile: false
 auto_connect_enable: false
 auto_pair: false
 auto_trust: false
-# Global admission list for this example. Empty would accept every nearby peer.
+# Accept only these UAVs. Empty accepts all.
 peer_whitelist:
   - uav42
   - uav99
 
-# A legacy advertisement holds 31 bytes. BLE flags use 3 bytes and the
-# advertisement Data field header uses 2. The bare codec fills the remaining
-# 26 bytes with an 8-byte Unix nanosecond timestamp, 6 bytes for
-# quaternion-derived roll/pitch/yaw, and three float32 XYZ coordinates (12 B).
-# Types below describe the final wire representation. The general encode and
-# decode expressions perform every conversion, with no odometry-specific codec.
-# Received samples appear below:
-# /{hostname}/bluetooth/le/peers/<peer>/mavros/local_position/odom
+# -----------------------------------------------------------------------------
+# Data to send
+# Keep this section identical on all UAVs.
 shared_topics:
   - name: swarm_odometry_advertisement
     transport: advertisement
@@ -44,17 +43,14 @@ shared_topics:
     export_topic: /{hostname}/mavros/local_position/odom
     import_topic_suffix: mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
-    rate_hz: 1.0
+    rate_hz: 10.0
     members_encode:
-      # Integer-only arithmetic preserves the full Unix nanosecond value.
+      # Store the time in one value.
       - target: timestamp_ns
         type: uint64
         expression: header.stamp.sec * 1000000000 + header.stamp.nanosec
 
-      # The source quaternion is expected to be normalized, as ROS odometry
-      # quaternions normally are. Each signed 16-bit integer stores an angle
-      # in units of pi / 32767. The four reconstruction relations below turn
-      # the decoded integers back into a unit quaternion in members_decode.
+      # Store orientation as three short angles.
       - target: roll
         type: int16
         expression: >-
@@ -75,7 +71,7 @@ shared_topics:
           1.0 - 2.0 * (pose.pose.orientation.y * pose.pose.orientation.y +
           pose.pose.orientation.z * pose.pose.orientation.z))
 
-      # The three position members are copied directly as float32 metres.
+      # Store XYZ position in metres.
       - target: pose.pose.position.x
         type: float32
       - target: pose.pose.position.y
@@ -83,7 +79,7 @@ shared_topics:
       - target: pose.pose.position.z
         type: float32
 
-    # These relations rebuild ROS fields from the named wire values above.
+    # Rebuild the usual ROS fields.
     members_decode:
       - target: header.stamp.sec
         expression: timestamp_ns / 1000000000

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/user_overlay_node.cpp
+/// \brief Implements the user overlay node component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/user_overlay_node.hpp"
 
 #include "mrs_uav_bluetooth/config/config_loader.hpp"
@@ -25,25 +28,46 @@ namespace {
 
 constexpr size_t kBridgeFrameHeaderBytes = 5;
 
+/// \brief Treat export and bidirectional bridges as producers for status reporting.
+/// \param bridge Topic bridge direction flags to test.
+/// \return Configured outgoing bridge map.
 bool exports(const config::SharedTopicConfig& bridge) {
+    // Treat export and bidirectional bridges as producers for status reporting.
     return bridge.mode == "export" || bridge.mode == "both";
 }
 
+/// \brief Treat import and bidirectional bridges as consumers for status reporting.
+/// \param bridge Topic bridge direction flags to test.
+/// \return Configured incoming bridge map.
 bool imports(const config::SharedTopicConfig& bridge) {
+    // Treat import and bidirectional bridges as consumers for status reporting.
     return bridge.mode == "import" || bridge.mode == "both";
 }
 
+/// \brief Render a boolean as the short yes/no text used in reports.
+/// \param value Boolean to render.
+/// \return Literal yes when true; otherwise no.
 std::string yes_no(bool value) {
+    // Render a boolean as the short yes/no text used in reports.
     return value ? "yes" : "no";
 }
 
+/// \brief Format a 16-bit Mesh identifier as zero-padded hexadecimal.
+/// \param value Mesh identifier to render as four hexadecimal digits.
+/// \return Zero-padded four-digit hexadecimal value.
 std::string hex16(uint16_t value) {
+    // Format a 16-bit Mesh identifier as zero-padded hexadecimal.
     std::ostringstream stream;
     stream << "0x" << std::hex << std::setw(4) << std::setfill('0') << value;
     return stream.str();
 }
 
+/// \brief Format a bounded hexadecimal prefix of a payload for diagnostics.
+/// \param bytes Payload bytes rendered as a bounded hexadecimal preview.
+/// \param limit maximum payload bytes shown in the diagnostic preview.
+/// \return Bounded hexadecimal payload preview.
 std::string byte_preview(const std::vector<uint8_t>& bytes, size_t limit = 12) {
+    // Format a bounded hexadecimal prefix of a payload for diagnostics.
     if (bytes.empty()) return "(empty)";
     std::ostringstream stream;
     stream << std::hex << std::setfill('0');
@@ -56,8 +80,12 @@ std::string byte_preview(const std::vector<uint8_t>& bytes, size_t limit = 12) {
     return stream.str();
 }
 
+/// \brief Validate the bridge frame header and extract its nonzero channel identifier.
+/// \param payload Advertisement bridge frame whose channel header is inspected.
+/// \return Nonzero bridge channel from a valid frame; otherwise std::nullopt.
 std::optional<uint16_t> advertisement_channel(
     const std::vector<uint8_t>& payload) {
+    // Validate the bridge frame header and extract its nonzero channel identifier.
     if (payload.size() < kBridgeFrameHeaderBytes || payload[0] != 'M' ||
         payload[1] != 'B' || payload[2] != 1) {
         return std::nullopt;
@@ -67,8 +95,13 @@ std::optional<uint16_t> advertisement_channel(
     return channel == 0 ? std::nullopt : std::optional<uint16_t>{channel};
 }
 
+/// \brief Calculate monotonic sample age, reserving a negative value for no sample.
+/// \param received_at steady-clock time when the sample was observed.
+/// \param now current monotonic time.
+/// \return Monotonic sample age in seconds, or a negative value when unset.
 double age_seconds(std::chrono::steady_clock::time_point received_at,
                    std::chrono::steady_clock::time_point now) {
+    // Calculate monotonic sample age, reserving a negative value for no sample.
     if (received_at == std::chrono::steady_clock::time_point{}) return -1.0;
     return std::chrono::duration<double>(now - received_at).count();
 }
@@ -85,13 +118,17 @@ UserOverlayNode::UserOverlayNode()
         print_sub_ = create_subscription<std_msgs::msg::String>(
             print_topic_, 200,
             [this](const std_msgs::msg::String::SharedPtr message) {
+                // Mirror human-readable service status received on the overlay print topic.
                 handle_print(message);
             });
     }
     configure_transport_reporting();
     keepalive_timer_ = create_wall_timer(
         std::chrono::duration<double>(keepalive_publish_period_sec_),
-        [this]() { publish_keepalive(); });
+        [this]() {
+            // Refresh the overlay lease before the service node can expire it.
+            publish_keepalive();
+        });
     set_active_config_client_ = create_client<mrs_uav_bluetooth::srv::SetActiveConfig>(set_active_config_service_);
 
     activate_overlay();
@@ -101,15 +138,20 @@ UserOverlayNode::UserOverlayNode()
         // confirms that the overlay is active.
         transport_report_timer_ = create_wall_timer(
             std::chrono::duration<double>(transport_report_period_sec_),
-            [this]() { print_transport_status(); });
+            [this]() {
+                // Print the latest advertisement or Mesh measurements at the configured report period.
+                print_transport_status();
+            });
     }
 }
 
 UserOverlayNode::~UserOverlayNode() {
+    // Release this overlay lease so the service node can restore its default configuration.
     revert_overlay();
 }
 
 void UserOverlayNode::configure_parameters() {
+    // Reject missing overlay paths and invalid timeouts before creating service clients or timers.
     declare_parameter<std::string>("config_path", "");
     declare_parameter<std::string>("print_source", "log");
     declare_parameter<double>("service_wait_timeout_sec", 30.0);
@@ -139,7 +181,10 @@ void UserOverlayNode::configure_parameters() {
     }
 
     std::transform(print_source_.begin(), print_source_.end(), print_source_.begin(),
-                   [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+                   [](unsigned char value) {
+                       // Normalize the print destination before validating the status/log choice.
+                       return static_cast<char>(std::tolower(value));
+                   });
     if (print_source_ != "status" && print_source_ != "log") {
         throw std::runtime_error("print_source must be 'status' or 'log'");
     }
@@ -200,6 +245,7 @@ void UserOverlayNode::load_overlay_context() {
 }
 
 void UserOverlayNode::configure_transport_reporting() {
+    // Subscribe only to the mode-specific status streams requested by this example.
     const auto topic_root = util::normalize_ros_topic(
         effective_config_.node_topics_prefix);
 
@@ -211,6 +257,7 @@ void UserOverlayNode::configure_transport_reporting() {
                 topic, 10,
                 [this](
                     const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message) {
+                    // Format the latest scan results for this overlay output.
                     handle_advertisements(message);
                 });
     }
@@ -221,6 +268,7 @@ void UserOverlayNode::configure_transport_reporting() {
                 util::normalize_ros_topic(topic_root + "/mesh/status"), 10,
                 [this](
                     const mrs_uav_bluetooth::msg::MeshStatus::SharedPtr message) {
+                    // Report changes in daemon attachment and mesh configuration state.
                     handle_mesh_status(message);
                 });
         mesh_event_sub_ =
@@ -228,6 +276,7 @@ void UserOverlayNode::configure_transport_reporting() {
                 util::normalize_ros_topic(topic_root + "/mesh/events"), 50,
                 [this](
                     const mrs_uav_bluetooth::msg::MeshEvent::SharedPtr message) {
+                    // Report provisioning and mesh-management events to the user.
                     handle_mesh_event(message);
                 });
         mesh_message_sub_ =
@@ -235,6 +284,7 @@ void UserOverlayNode::configure_transport_reporting() {
                 util::normalize_ros_topic(topic_root + "/mesh/rx"), 100,
                 [this](
                     const mrs_uav_bluetooth::msg::MeshMessage::SharedPtr message) {
+                    // Report received mesh model payloads when message reporting is enabled.
                     handle_mesh_message(message);
                 });
     }
@@ -242,6 +292,7 @@ void UserOverlayNode::configure_transport_reporting() {
 }
 
 void UserOverlayNode::activate_overlay() {
+    // Acquire the service-side lease before starting keepalives and status subscriptions.
     if (!set_active_config_client_->wait_for_service(std::chrono::duration<double>(service_wait_timeout_sec_))) {
         throw std::runtime_error(set_active_config_service_ + " service is not available");
     }
@@ -292,12 +343,14 @@ void UserOverlayNode::revert_overlay() {
 }
 
 void UserOverlayNode::publish_keepalive() {
+    // Renew the service-side overlay lease with an empty heartbeat message.
     std_msgs::msg::Empty msg;
     keepalive_pub_->publish(msg);
 }
 
 mrs_uav_bluetooth::srv::SetActiveConfig::Response::SharedPtr
 UserOverlayNode::call_config_service(const std::string& config_path) {
+    // Submit the overlay path and bound the synchronous wait for its response.
     if (!rclcpp::ok()) {
         return nullptr;
     }
@@ -317,6 +370,7 @@ UserOverlayNode::call_config_service(const std::string& config_path) {
 }
 
 void UserOverlayNode::handle_print(const std_msgs::msg::String::SharedPtr message) {
+    // Print status only when changed; preserve individual log-line severity formatting.
     if (print_source_ == "status") {
         std::lock_guard<std::mutex> lock(print_mutex_);
         if (message->data == last_print_payload_) {
@@ -360,6 +414,7 @@ void UserOverlayNode::handle_advertisements(
 
 void UserOverlayNode::handle_mesh_status(
     const mrs_uav_bluetooth::msg::MeshStatus::SharedPtr message) {
+    // Cache the newest attachment snapshot and its local receipt time.
     std::lock_guard<std::mutex> lock(transport_status_mutex_);
     latest_mesh_status_ = *message;
     mesh_status_received_at_ = std::chrono::steady_clock::now();
@@ -367,6 +422,7 @@ void UserOverlayNode::handle_mesh_status(
 
 void UserOverlayNode::handle_mesh_event(
     const mrs_uav_bluetooth::msg::MeshEvent::SharedPtr message) {
+    // Cache the newest lifecycle event and increment the observed event count.
     std::lock_guard<std::mutex> lock(transport_status_mutex_);
     latest_mesh_event_ = *message;
     mesh_event_received_at_ = std::chrono::steady_clock::now();
@@ -375,6 +431,7 @@ void UserOverlayNode::handle_mesh_event(
 
 void UserOverlayNode::handle_mesh_message(
     const mrs_uav_bluetooth::msg::MeshMessage::SharedPtr message) {
+    // Cache the newest access message and increment the observed message count.
     std::lock_guard<std::mutex> lock(transport_status_mutex_);
     latest_mesh_message_ = *message;
     mesh_message_received_at_ = std::chrono::steady_clock::now();
@@ -437,6 +494,7 @@ void UserOverlayNode::print_transport_status() {
     }
 
     const auto append_bridges = [this, &report](const std::string& transport) {
+        // Append a compact per-bridge summary for the selected transport mode.
         size_t count = 0;
         for (const auto& bridge : effective_config_.shared_topics) {
             if (bridge.transport == transport) ++count;
@@ -458,8 +516,10 @@ void UserOverlayNode::print_transport_status() {
                 report << " rate=" << bridge.rate_hz << "Hz";
             }
             if (transport == "mesh") {
-                report << " destination=" << hex16(bridge.mesh_destination)
-                       << " app_key=" << bridge.mesh_app_key_index;
+                report << " destination=";
+                if (bridge.mesh_swarm_reliable) report << "adaptive group and unicast delivery";
+                else report << hex16(bridge.mesh_destination);
+                report << " app_key=" << bridge.mesh_app_key_index;
             }
             report << '\n';
             if (exports(bridge)) {
@@ -515,6 +575,7 @@ void UserOverlayNode::print_transport_status() {
                     effective_config_.shared_topics.begin(),
                     effective_config_.shared_topics.end(),
                     [](const auto& bridge) {
+                        // Detect whether any advertisement bridge consumes bare, unframed payloads.
                         return bridge.transport == "advertisement" &&
                             bridge.advertisement_bare;
                     });

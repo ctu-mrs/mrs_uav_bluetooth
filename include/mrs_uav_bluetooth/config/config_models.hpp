@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file include/mrs_uav_bluetooth/config/config_models.hpp
+/// \brief Declares the config models component of the YAML configuration layer.
+
 #pragma once
 
 #include <cstdint>
@@ -14,7 +17,11 @@ struct BridgeAssignmentSpec {
     std::string target;
     std::string expression;
 
+    /// \brief Compare both values field by field.
+    /// \param o Other bridge assignment compared field by field.
+    /// \return True when the compared configurations are equal; otherwise false.
     bool operator==(const BridgeAssignmentSpec& o) const {
+        // Equality includes both the destination field and its reconstruction expression.
         return target == o.target && expression == o.expression;
     }
 };
@@ -26,7 +33,11 @@ struct BridgeMemberSpec {
     std::string value_type;  // final scalar wire type
     std::string expression;
 
+    /// \brief Compare both values field by field.
+    /// \param o Other bridge member compared field by field.
+    /// \return True when the compared configurations are equal; otherwise false.
     bool operator==(const BridgeMemberSpec& o) const {
+        // Equality covers the field path wire type and optional encoding expression.
         return target == o.target && value_type == o.value_type &&
                expression == o.expression;
     }
@@ -57,6 +68,8 @@ struct SharedTopicConfig {
     // Mesh access-message metadata. These values are ignored by GATT and
     // advertisement bridges and intentionally mirror the MeshSend service.
     uint16_t mesh_destination{0xc000};
+    /// Automatic swarms combine group delivery, per-peer repair, and unicast probes.
+    bool mesh_swarm_reliable{false};
     uint16_t mesh_app_key_index{0};
     uint8_t mesh_element_index{0};
     bool mesh_force_segmented{true};
@@ -88,6 +101,8 @@ struct NodeConfig {
     uint8_t mesh_default_ttl{127};
     uint8_t mesh_relay_retransmit_count{1};
     uint8_t mesh_relay_retransmit_interval_steps{2};
+    uint8_t mesh_network_retransmit_count{1};
+    uint8_t mesh_network_retransmit_interval_steps{19};
     bool mesh_swarm_auto_provisioning{false};
     /// Logical application swarm; zero is reserved for "not participating".
     uint16_t mesh_swarm_id{1};
@@ -142,6 +157,8 @@ struct NodeConfig {
     // Static / rarely changing.
     std::string advertise_mode = "peripheral";
     std::string advertise_size = "legacy";
+    /// How dynamic Data changes reach BlueZ: "property" or "reregister".
+    std::string advertise_update_strategy = "reregister";
     // Empty explicitly omits LocalName. The default is the local hostname.
     std::string advertise_local_name{"{hostname}"};
     std::optional<bool> advertise_discoverable;

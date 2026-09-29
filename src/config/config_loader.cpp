@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/config/config_loader.cpp
+/// \brief Implements the config loader component of the YAML configuration layer.
+
 #include "mrs_uav_bluetooth/config/config_loader.hpp"
 #include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 #include "mrs_uav_bluetooth/util/string_utils.hpp"
@@ -20,7 +23,11 @@ namespace mrs_uav_bluetooth::config {
 namespace {
 
 /// Replace all occurrences of {hostname} in a string.
+/// \param value Configuration text in which placeholders are replaced.
+/// \param hostname UAV hostname used to identify the node.
+/// \return Input text with every hostname placeholder replaced.
 std::string expand_hostname(const std::string& value, const std::string& hostname) {
+    // Expand hostname.
     std::string result = value;
     const std::string placeholder = "{hostname}";
     std::string sanitized = util::sanitize_topic_suffix(hostname);
@@ -32,7 +39,11 @@ std::string expand_hostname(const std::string& value, const std::string& hostnam
     return result;
 }
 
+/// \brief Build the normalized ROS topic for a configured bridge and optional peer suffix.
+/// \param canonical_topic normalized ROS topic matched against an export pattern.
+/// \return Normalized ROS topic formed from the configured prefix and suffix.
 std::string bridge_topic_path(const std::string& canonical_topic) {
+    // Build the normalized ROS topic for a configured bridge and optional peer suffix.
     const auto normalized_canonical = util::normalize_ros_topic(canonical_topic);
     if (normalized_canonical == "/") {
         return std::string{"/"};
@@ -41,6 +52,9 @@ std::string bridge_topic_path(const std::string& canonical_topic) {
 }
 
 /// Strip UAV hostname prefix from a canonical topic.
+/// \param export_topic configured ROS topic checked against the automatic export pattern.
+/// \param pattern Topic pattern in which the export topic placeholder is expanded.
+/// \return Canonical topic after expanding the export-topic placeholder.
 std::string canonical_shared_topic(const std::string& export_topic,
                                    const std::string& pattern) {
     std::string normalized = util::normalize_ros_topic(export_topic);
@@ -65,7 +79,9 @@ std::string canonical_shared_topic(const std::string& export_topic,
 }
 
 /// Map of supported compact value types to their struct sizes.
+/// \return Immutable mapping from canonical scalar names to byte widths.
 const std::map<std::string, size_t>& struct_format_sizes() {
+    // Return the supported scalar format codes and their fixed byte widths.
     static const std::map<std::string, size_t> sizes = {
         {"bool", 1}, {"int8", 1}, {"uint8", 1},
         {"int16", 2}, {"uint16", 2},
@@ -77,7 +93,9 @@ const std::map<std::string, size_t>& struct_format_sizes() {
 }
 
 /// ROS type name aliases.
+/// \return Accepted aliases mapped to canonical ROS scalar types.
 const std::map<std::string, std::string>& ros_type_aliases() {
+    // Return accepted shorthand names for ROS scalar field types.
     static const std::map<std::string, std::string> aliases = {
         {"boolean", "bool"},
         {"byte", "int8"},
@@ -89,7 +107,11 @@ const std::map<std::string, std::string>& ros_type_aliases() {
     return aliases;
 }
 
+/// \brief Map supported scalar aliases to the one canonical codec name.
+/// \param vt configured scalar type name or alias to normalize.
+/// \return Canonical scalar type name.
 std::string normalize_value_type(const std::string& vt) {
+    // Expand ROS scalar aliases first, then reject types unsupported by the packed codec.
     auto it = ros_type_aliases().find(vt);
     std::string candidate = (it != ros_type_aliases().end()) ? it->second : vt;
     if (struct_format_sizes().count(candidate) == 0) {
@@ -98,13 +120,20 @@ std::string normalize_value_type(const std::string& vt) {
     return candidate;
 }
 
+/// \brief Decode one YAML bridge-member mapping including type scale and expression.
+/// \param item YAML mapping describing one encoded ROS member.
+/// \return Validated member spec.
 BridgeMemberSpec parse_member_spec(const YAML::Node& item) {
+    // Accept only target, type, and expression keys before normalizing the wire type.
     BridgeMemberSpec spec;
     if (item.IsMap()) {
         spec.target = item["target"].as<std::string>("");
         std::string raw_type = item["type"].as<std::string>("");
         std::transform(raw_type.begin(), raw_type.end(), raw_type.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) {
+                           // Normalize the declared scalar type before validating supported wire formats.
+                           return std::tolower(c);
+                       });
         spec.value_type = normalize_value_type(raw_type);
         spec.expression = item["expression"]
             ? item["expression"].as<std::string>("") : "";
@@ -123,7 +152,11 @@ BridgeMemberSpec parse_member_spec(const YAML::Node& item) {
     return spec;
 }
 
+/// \brief Return text without surrounding ASCII whitespace.
+/// \param raw Configuration text to trim before parsing.
+/// \return Input text without surrounding ASCII whitespace.
 std::string trim_copy(const std::string& raw) {
+    // Strip only ASCII configuration whitespace so YAML values remain otherwise unchanged.
     const auto begin = raw.find_first_not_of(" \t\r\n");
     if (begin == std::string::npos) {
         return {};
@@ -132,9 +165,15 @@ std::string trim_copy(const std::string& raw) {
     return raw.substr(begin, end - begin + 1);
 }
 
+/// \brief Parse an unsigned YAML scalar exactly and enforce its upper bound.
+/// \param node YAML scalar containing the unsigned integer.
+/// \param max_value largest accepted numeric value before conversion.
+/// \param context Configuration field name included in unsigned-integer errors.
+/// \return Validated integer value.
 uint64_t parse_integer_value(const YAML::Node& node,
                              uint64_t max_value,
                              const std::string& context) {
+    // Accept YAML numeric or decimal/hex text only within the caller’s unsigned bound.
     if (!node || node.IsNull()) {
         throw std::runtime_error(context + " must not be null");
     }
@@ -169,10 +208,17 @@ uint64_t parse_integer_value(const YAML::Node& node,
     throw std::runtime_error(context + " must be a scalar integer");
 }
 
+/// \brief Parse a signed YAML scalar exactly and enforce both bounds.
+/// \param node YAML scalar containing the signed integer.
+/// \param min_value smallest accepted numeric value before conversion.
+/// \param max_value largest accepted numeric value before conversion.
+/// \param context Configuration field name included in signed-integer errors.
+/// \return Validated signed integer value.
 int64_t parse_signed_integer_value(const YAML::Node& node,
                                    int64_t min_value,
                                    int64_t max_value,
                                    const std::string& context) {
+    // Accept YAML numeric or decimal/hex text only within both signed bounds.
     if (!node || node.IsNull()) {
         throw std::runtime_error(context + " must not be null");
     }
@@ -207,7 +253,11 @@ int64_t parse_signed_integer_value(const YAML::Node& node,
     throw std::runtime_error(context + " must be a scalar integer");
 }
 
+/// \brief Tokenize a scalar member list while respecting bracketed selectors.
+/// \param raw Comma-separated member specification to tokenize.
+/// \return Top-level comma-separated tokens with bracketed selectors kept intact.
 std::vector<std::string> split_scalar_tokens(const std::string& raw) {
+    // Tokenize a scalar member list while respecting bracketed selectors.
     std::string normalized = raw;
     std::replace(normalized.begin(), normalized.end(), ',', ' ');
     std::istringstream stream(normalized);
@@ -219,8 +269,13 @@ std::vector<std::string> split_scalar_tokens(const std::string& raw) {
     return tokens;
 }
 
+/// \brief Decode a YAML byte list or compact scalar form with range checks.
+/// \param node YAML scalar or sequence containing byte values.
+/// \param context Configuration field path included in byte-decoding errors.
+/// \return Validated byte sequence.
 std::vector<uint8_t> parse_byte_sequence(const YAML::Node& node,
                                          const std::string& context) {
+    // Decode either a YAML list or compact scalar and range-check every byte.
     std::vector<uint8_t> bytes;
     if (!node || node.IsNull()) {
         return bytes;
@@ -257,9 +312,15 @@ std::vector<uint8_t> parse_byte_sequence(const YAML::Node& node,
 }
 
 template<typename KeyT, typename KeyParserT>
+/// \brief Decode an identifier-to-byte-sequence YAML mapping with contextual errors.
+/// \param node YAML mapping from parsed identifiers to byte sequences.
+/// \param parse_key callback converting a textual YAML map key to its target type.
+/// \param context Configuration field path included in byte-decoding errors.
+/// \return Validated byte map.
 std::map<KeyT, std::vector<uint8_t>> parse_byte_map(const YAML::Node& node,
                                                     KeyParserT&& parse_key,
                                                     const std::string& context) {
+    // Decode each textual key and attach the field path to any byte error.
     std::map<KeyT, std::vector<uint8_t>> out;
     if (!node || node.IsNull()) {
         return out;
@@ -279,17 +340,29 @@ std::map<KeyT, std::vector<uint8_t>> parse_byte_map(const YAML::Node& node,
     return out;
 }
 
+/// \brief Read an optional YAML boolean without treating missing as false.
+/// \param parent YAML mapping that may contain the optional field.
+/// \param key YAML mapping key to read when present.
+/// \return Parsed boolean or std::nullopt when the YAML key is absent.
 std::optional<bool> parse_optional_bool(const YAML::Node& parent, const std::string& key) {
+    // Preserve absence as nullopt instead of conflating it with false.
     if (!parent[key] || parent[key].IsNull()) {
         return std::nullopt;
     }
     return parent[key].as<bool>();
 }
 
+/// \brief Parse an optional nonnegative YAML integer with a caller-defined upper bound.
+/// \tparam IntegerT Unsigned destination integer type.
+/// \param parent YAML mapping containing the optional value.
+/// \param key Field name to read.
+/// \param max_value Largest accepted value before conversion.
+/// \return Parsed value, or std::nullopt when the field is absent or null.
 template<typename IntegerT>
 std::optional<IntegerT> parse_optional_integer(const YAML::Node& parent,
                                                const std::string& key,
                                                uint64_t max_value) {
+    // Preserve absence, otherwise reuse the bounded unsigned parser.
     if (!parent[key] || parent[key].IsNull()) {
         return std::nullopt;
     }
@@ -297,10 +370,17 @@ std::optional<IntegerT> parse_optional_integer(const YAML::Node& parent,
 }
 
 template<typename IntegerT>
+/// \brief Parse an optional signed YAML integer within caller-defined bounds.
+/// \param parent YAML mapping that may contain the optional field.
+/// \param key YAML mapping key to read when present.
+/// \param min_value smallest accepted numeric value before conversion.
+/// \param max_value largest accepted numeric value before conversion.
+/// \return Parsed value, or std::nullopt when the field is absent or null.
 std::optional<IntegerT> parse_optional_signed_integer(const YAML::Node& parent,
                                                       const std::string& key,
                                                       int64_t min_value,
                                                       int64_t max_value) {
+    // Preserve absence, otherwise reuse the bounded signed parser.
     if (!parent[key] || parent[key].IsNull()) {
         return std::nullopt;
     }
@@ -309,6 +389,9 @@ std::optional<IntegerT> parse_optional_signed_integer(const YAML::Node& parent,
 
 }  // namespace
 
+/// \brief Read one YAML file and report syntax and I/O failures with its path.
+/// \param path YAML configuration file to read.
+/// \return Parsed YAML document.
 YAML::Node load_yaml_file(const std::string& path) {
     std::ifstream ifs(path);
     if (!ifs.is_open()) {
@@ -327,6 +410,10 @@ YAML::Node load_yaml_file(const std::string& path) {
     return doc;
 }
 
+/// \brief Merge an overlay recursively while replacing scalars and sequences.
+/// \param base default YAML node onto which overlay values are merged.
+/// \param override_node overlay YAML values merged over the base configuration.
+/// \return Merged YAML tree with overlay values taking precedence.
 YAML::Node deep_merge(const YAML::Node& base, const YAML::Node& override_node) {
     if (!base.IsDefined() || base.IsNull()) return YAML::Clone(override_node);
     if (!override_node.IsDefined() || override_node.IsNull()) return YAML::Clone(base);
@@ -346,6 +433,11 @@ YAML::Node deep_merge(const YAML::Node& base, const YAML::Node& override_node) {
     return YAML::Clone(override_node);
 }
 
+/// \brief Convert merged YAML into a validated runtime NodeConfig.
+/// \param doc YAML document from which the effective configuration is loaded.
+/// \param hostname UAV hostname used to identify the node.
+/// \param auto_connect_pattern hostname pattern used to recognize peer UAVs.
+/// \return Validated node configuration.
 NodeConfig parse_node_config(const YAML::Node& doc,
                              const std::string& hostname,
                              const std::string& auto_connect_pattern) {
@@ -374,6 +466,8 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         "mesh_provisioner_preference",
         "mesh_relay_retransmit_count",
         "mesh_relay_retransmit_interval_steps",
+        "mesh_network_retransmit_count",
+        "mesh_network_retransmit_interval_steps",
         "mesh_swarm_app_key_index",
         "mesh_swarm_auto_provisioning",
         "mesh_swarm_group_address",
@@ -396,18 +490,23 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     }
 
     auto str = [&](const std::string& key, const std::string& def) -> std::string {
+        // Read an optional string while preserving the caller's default when the key is absent.
         return doc[key] ? doc[key].as<std::string>() : def;
     };
     auto dbl = [&](const std::string& key, double def) -> double {
+        // Read an optional floating-point value while preserving the caller's default.
         return doc[key] ? doc[key].as<double>() : def;
     };
     auto b = [&](const std::string& key, bool def) -> bool {
+        // Read an optional boolean while preserving the caller's default.
         return doc[key] ? doc[key].as<bool>() : def;
     };
     auto u32 = [&](const std::string& key, uint32_t def) -> uint32_t {
+        // Read an optional unsigned integer while preserving the caller's default.
         return doc[key] ? doc[key].as<uint32_t>() : def;
     };
     auto str_list = [&](const std::string& key) -> std::vector<std::string> {
+        // Decode a YAML string sequence and ignore empty placeholder entries.
         std::vector<std::string> result;
         if (doc[key] && doc[key].IsSequence()) {
             for (const auto& item : doc[key]) {
@@ -467,6 +566,17 @@ NodeConfig parse_node_config(const YAML::Node& doc,
             ? doc["mesh_relay_retransmit_interval_steps"]
             : YAML::Node(cfg.mesh_relay_retransmit_interval_steps),
         31, "mesh_relay_retransmit_interval_steps"));
+    cfg.mesh_network_retransmit_count = static_cast<uint8_t>(parse_integer_value(
+        doc["mesh_network_retransmit_count"]
+            ? doc["mesh_network_retransmit_count"]
+            : YAML::Node(cfg.mesh_network_retransmit_count),
+        7, "mesh_network_retransmit_count"));
+    cfg.mesh_network_retransmit_interval_steps = static_cast<uint8_t>(
+        parse_integer_value(
+            doc["mesh_network_retransmit_interval_steps"]
+                ? doc["mesh_network_retransmit_interval_steps"]
+                : YAML::Node(cfg.mesh_network_retransmit_interval_steps),
+            31, "mesh_network_retransmit_interval_steps"));
     cfg.peer_whitelist = str_list("peer_whitelist");
     {
         std::set<std::string> unique_peers;
@@ -553,6 +663,7 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         std::set<uint64_t> unique_numbers;
         const auto number_for = [](const std::string& member,
                                    const std::string& context) -> uint64_t {
+            // Parse the trailing UAV number used for deterministic unicast assignment and ordering.
             const auto non_digit = member.find_last_not_of("0123456789");
             const auto digits = non_digit == std::string::npos
                 ? member : member.substr(non_digit + 1);
@@ -594,6 +705,7 @@ NodeConfig parse_node_config(const YAML::Node& doc,
             }
         }
         const auto positive_finite = [](double value) {
+            // Mesh timing periods must be finite and strictly positive to keep lease arithmetic valid.
             return std::isfinite(value) && value > 0.0;
         };
         if (!positive_finite(cfg.mesh_swarm_startup_grace) ||
@@ -713,6 +825,13 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     if (cfg.advertise_size != "legacy" && cfg.advertise_size != "extended") {
         throw std::runtime_error("advertise_size must be 'legacy' or 'extended'");
     }
+    cfg.advertise_update_strategy = util::lower_trim_copy(
+        str("advertise_update_strategy", cfg.advertise_update_strategy));
+    if (cfg.advertise_update_strategy != "property" &&
+        cfg.advertise_update_strategy != "reregister") {
+        throw std::runtime_error(
+            "advertise_update_strategy must be 'property' or 'reregister'");
+    }
     cfg.advertise_local_name = expand_hostname(str("advertise_local_name", cfg.advertise_local_name), hostname);
     cfg.advertise_discoverable = parse_optional_bool(doc, "advertise_discoverable");
     cfg.advertise_includes = str_list("advertise_includes");
@@ -721,6 +840,7 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.advertise_manufacturer_data = parse_byte_map<uint16_t>(
         doc["advertise_manufacturer_data"],
         [](const std::string& raw_key, const std::string& context) {
+            // Parse manufacturer identifiers exactly within the 16-bit Bluetooth company-ID range.
             return static_cast<uint16_t>(parse_integer_value(
                 YAML::Node(raw_key), std::numeric_limits<uint16_t>::max(),
                 context + ".key=" + raw_key));
@@ -728,11 +848,15 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         "advertise_manufacturer_data");
     cfg.advertise_service_data = parse_byte_map<std::string>(
         doc["advertise_service_data"],
-        [](const std::string& raw_key, const std::string&) { return raw_key; },
+        [](const std::string& raw_key, const std::string&) {
+            // Preserve a service UUID key exactly as written while parsing its byte payload.
+            return raw_key;
+        },
         "advertise_service_data");
     cfg.advertise_data = parse_byte_map<uint8_t>(
         doc["advertise_data"],
         [](const std::string& raw_key, const std::string& context) {
+            // Parse a raw advertising field type into the required one-byte identifier.
             return static_cast<uint8_t>(parse_integer_value(
                 YAML::Node(raw_key), std::numeric_limits<uint8_t>::max(),
                 context + ".key=" + raw_key));
@@ -742,6 +866,7 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.advertise_scan_response_manufacturer_data = parse_byte_map<uint16_t>(
         doc["advertise_scan_response_manufacturer_data"],
         [](const std::string& raw_key, const std::string& context) {
+            // Parse scan-response manufacturer identifiers within the 16-bit company-ID range.
             return static_cast<uint16_t>(parse_integer_value(
                 YAML::Node(raw_key), std::numeric_limits<uint16_t>::max(),
                 context + ".key=" + raw_key));
@@ -750,11 +875,15 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.advertise_scan_response_solicit_uuids = str_list("advertise_scan_response_solicit_uuids");
     cfg.advertise_scan_response_service_data = parse_byte_map<std::string>(
         doc["advertise_scan_response_service_data"],
-        [](const std::string& raw_key, const std::string&) { return raw_key; },
+        [](const std::string& raw_key, const std::string&) {
+            // Preserve service UUID map keys verbatim for later UUID normalization.
+            return raw_key;
+        },
         "advertise_scan_response_service_data");
     cfg.advertise_scan_response_data = parse_byte_map<uint8_t>(
         doc["advertise_scan_response_data"],
         [](const std::string& raw_key, const std::string& context) {
+            // Parse raw scan-response field identifiers within the one-byte advertising type range.
             return static_cast<uint8_t>(parse_integer_value(
                 YAML::Node(raw_key), std::numeric_limits<uint8_t>::max(),
                 context + ".key=" + raw_key));
@@ -801,7 +930,7 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     std::string pattern = cfg.auto_connect_pattern.empty()
                           ? auto_connect_pattern : cfg.auto_connect_pattern;
 
-    // Parse shared_topics.
+    // Decode each bridge entry while enforcing unique registry keys and transport channels.
     if (doc["shared_topics"] && doc["shared_topics"].IsSequence()) {
         int index = 0;
         std::map<std::string, bool> seen_keys;
@@ -826,7 +955,10 @@ NodeConfig parse_node_config(const YAML::Node& doc,
             }
             std::string mode = raw["mode"] ? raw["mode"].as<std::string>("both") : "both";
             std::transform(mode.begin(), mode.end(), mode.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
+                           [](unsigned char c) {
+                               // Normalize bridge direction before accepting export, import, or both.
+                               return std::tolower(c);
+                           });
             if (mode.empty()) mode = "both";
             if (mode != "export" && mode != "import" && mode != "both") {
                 throw std::runtime_error("shared_topics[" + std::to_string(index) + "].mode must be export, import, or both");
@@ -973,6 +1105,8 @@ NodeConfig parse_node_config(const YAML::Node& doc,
             }
 
             if (stc.transport == "mesh") {
+                // Omitted destination means reliable automatic swarm delivery.
+                stc.mesh_swarm_reliable = cfg.mesh_swarm_auto_provisioning && !raw["destination"];
                 stc.mesh_destination = static_cast<uint16_t>(parse_integer_value(
                     raw["destination"] ? raw["destination"] : YAML::Node(cfg.mesh_swarm_group_address),
                     std::numeric_limits<uint16_t>::max(), "shared_topics.mesh.destination"));
@@ -1095,9 +1229,15 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     return cfg;
 }
 
+/// \brief Load defaults merge the selected overlay expand hostname placeholders and validate.
+/// \param default_path Base YAML configuration loaded before the overlay.
+/// \param overlay_path Optional YAML overlay merged over the default file.
+/// \param hostname UAV hostname used to identify the node.
+/// \return Validated default configuration with the selected overlay applied.
 NodeConfig load_effective_config(const std::string& default_path,
                                  const std::string& overlay_path,
                                  const std::string& hostname) {
+    // Overlay the selected YAML on defaults before hostname expansion and validation.
     YAML::Node base = load_yaml_file(default_path);
     if (!overlay_path.empty()) {
         YAML::Node overlay = load_yaml_file(overlay_path);

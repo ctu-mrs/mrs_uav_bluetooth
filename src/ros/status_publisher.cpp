@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/ros/status_publisher.cpp
+/// \brief Implements the status publisher component of the ROS 2 interface layer.
+
 #include "mrs_uav_bluetooth/ros/status_publisher.hpp"
 
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
@@ -11,7 +14,11 @@ namespace mrs_uav_bluetooth::ros {
 namespace {
 
 template<typename MapT>
+/// \brief Flatten configured YAML byte groups into one validated payload.
+/// \param values Ordered advertisement field map whose byte vectors are concatenated.
+/// \return All mapped byte vectors concatenated in key order.
 std::vector<uint8_t> concatenate_byte_values(const MapT& values) {
+    // Flatten configured YAML byte groups into one validated payload.
     std::vector<uint8_t> bytes;
     for (const auto& [key, value] : values) {
         (void)key;
@@ -20,8 +27,13 @@ std::vector<uint8_t> concatenate_byte_values(const MapT& values) {
     return bytes;
 }
 
+/// \brief Extract the configured raw advertising field from a cached device record.
+/// \param device Discovered peer containing the configured raw advertisement field.
+/// \param data_type Raw advertisement field type from which application bytes are read.
+/// \return Selected raw advertising field bytes, or an empty vector.
 std::vector<uint8_t> advertisement_user_payload(const bluez::DeviceInfo& device,
                                                 uint8_t data_type) {
+    // Extract the configured raw advertising field from a cached device record.
     const auto it = device.advertising_data.find(data_type);
     if (it == device.advertising_data.end()) {
         return {};
@@ -29,9 +41,15 @@ std::vector<uint8_t> advertisement_user_payload(const bluez::DeviceInfo& device,
     return it->second;
 }
 
+/// \brief Copy a cached BlueZ device record into the public ROS message shape.
+/// \param node ROS node that owns the interfaces.
+/// \param device Cached BlueZ device converted to the public ROS representation.
+/// \param advertisement_user_data_type raw advertising field selected for application payload extraction.
+/// \return Converted device msg.
 mrs_uav_bluetooth::msg::BleDevice to_device_msg(rclcpp::Node& node,
                                                 const bluez::DeviceInfo& device,
                                                 uint8_t advertisement_user_data_type) {
+    // Copy a cached BlueZ device record into the public ROS message shape.
     mrs_uav_bluetooth::msg::BleDevice item;
     item.mac = device.mac;
     item.path = device.object_path;
@@ -60,8 +78,13 @@ mrs_uav_bluetooth::msg::BleDevice to_device_msg(rclcpp::Node& node,
     return item;
 }
 
+/// \brief Test whether the configured advertisement field contains application data.
+/// \param device Discovered peer checked for nonempty application advertisement data.
+/// \param advertisement_user_data_type raw advertising field selected for application payload extraction.
+/// \return True if the selected raw advertisement field exists and is nonempty; otherwise false.
 bool has_advertisement_user_data(const bluez::DeviceInfo& device,
                                  uint8_t advertisement_user_data_type) {
+    // Empty fields do not belong in the advertisement-only device stream.
     return !advertisement_user_payload(device, advertisement_user_data_type).empty();
 }
 
@@ -70,14 +93,17 @@ bool has_advertisement_user_data(const bluez::DeviceInfo& device,
 StatusPublisher::StatusPublisher(rclcpp::Node& node)
     : node_(node),
       advertisement_user_data_type_(bluez::kDefaultAdvertisementExtraDataType) {
+    // Start with the standard raw-advertisement field and create publishers under the default root.
     configure_topics("/bluetooth");
 }
 
 void StatusPublisher::set_advertisement_user_data_type(uint8_t data_type) {
+    // Select which raw advertising field is decoded into the published user payload.
     advertisement_user_data_type_ = data_type;
 }
 
 void StatusPublisher::configure_topics(const std::string& node_topics_prefix) {
+    // Normalize the root once and recreate every status publisher below it.
     node_topics_prefix_ = util::normalize_ros_topic(node_topics_prefix);
     auto status_topic = util::normalize_ros_topic(node_topics_prefix_ + "/system/status");
     auto log_topic = util::normalize_ros_topic(node_topics_prefix_ + "/system/log");
@@ -92,18 +118,21 @@ void StatusPublisher::configure_topics(const std::string& node_topics_prefix) {
 }
 
 void StatusPublisher::publish_report(const std::string& report) {
+    // Wrap the rendered system report in the configured text topic.
     std_msgs::msg::String msg;
     msg.data = report;
     status_pub_->publish(msg);
 }
 
 void StatusPublisher::publish_log(const std::string& report) {
+    // Forward one diagnostic line to the ROS log stream.
     std_msgs::msg::String msg;
     msg.data = report;
     log_pub_->publish(msg);
 }
 
 void StatusPublisher::publish_devices(const std::map<std::string, bluez::DeviceInfo>& devices) {
+    // Publish the full device list and a filtered application-data list together.
     mrs_uav_bluetooth::msg::BleDeviceArray msg;
     mrs_uav_bluetooth::msg::BleDeviceArray advertisement_msg;
     msg.header.stamp = node_.get_clock()->now();
@@ -125,6 +154,7 @@ void StatusPublisher::publish_notification(const std::string& mac,
                                            const std::string& uuid,
                                            const std::vector<uint8_t>& value,
                                            const std::string& frame_id) {
+    // Preserve peer, object path, UUID, and raw bytes in the notification message.
     mrs_uav_bluetooth::msg::BleNotification msg;
     msg.header.stamp = node_.get_clock()->now();
     msg.header.frame_id = util::sanitize_topic_suffix(frame_id);

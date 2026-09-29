@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bridge/math_expression.cpp
+/// \brief Implements the math expression component of the transport-independent ROS message bridge.
+
 #include "mrs_uav_bluetooth/bridge/math_expression.hpp"
 
 #include <algorithm>
@@ -18,11 +21,19 @@ namespace {
 /// relations needed to map ROS fields to fixed-width wire scalars are legal.
 class Parser {
 public:
+    /// \brief Bind the expression text to the resolver used for each identifier.
+    /// \param input Floating-point expression text to parse.
+    /// \param resolver Callback that resolves each field name to a numeric value.
     Parser(const std::string& input,
            const std::function<double(const std::string&)>& resolver)
-        : input_(input), resolver_(resolver) {}
+        : input_(input), resolver_(resolver) {
+            // Bind the expression text to the resolver used for each identifier.
+        }
 
+    /// \brief Evaluate the complete floating-point expression and reject trailing text.
+    /// \return Fully evaluated expression value after requiring complete input consumption.
     double evaluate() {
+        // A successful result must consume every token and remain finite.
         const double result = expression();
         whitespace();
         if (position_ != input_.size()) fail("Unexpected trailing text");
@@ -31,14 +42,20 @@ public:
     }
 
 private:
+    /// \brief Advance the parser cursor past ASCII whitespace.
     void whitespace() {
+        // Advance the parser cursor past ASCII whitespace.
         while (position_ < input_.size() &&
                std::isspace(static_cast<unsigned char>(input_[position_]))) {
             ++position_;
         }
     }
 
+    /// \brief Consume the requested token only when it begins at the current parser position.
+    /// \param token Expected operator consumed only when present at the parser cursor.
+    /// \return True when consume; otherwise false.
     bool consume(char token) {
+        // Consume the requested token only when it begins at the current parser position.
         whitespace();
         if (position_ < input_.size() && input_[position_] == token) {
             ++position_;
@@ -47,12 +64,18 @@ private:
         return false;
     }
 
+    /// \brief Raise a parse error annotated with the current expression offset.
+    /// \param reason Parser error appended with the current expression position.
     [[noreturn]] void fail(const std::string& reason) const {
+        // Raise a parse error annotated with the current expression offset.
         throw std::runtime_error(reason + " at column " +
             std::to_string(position_ + 1) + " in expression: " + input_);
     }
 
+    /// \brief Evaluate addition and subtraction over the parsed product terms.
+    /// \return Sum or difference parsed at the current cursor.
     double expression() {
+        // Evaluate addition and subtraction over the parsed product terms.
         double result = product();
         for (;;) {
             if (consume('+')) result += product();
@@ -61,7 +84,10 @@ private:
         }
     }
 
+    /// \brief Evaluate multiplication and division with higher precedence than addition.
+    /// \return Product or quotient parsed at the current cursor.
     double product() {
+        // Evaluate multiplication and division with higher precedence than addition.
         double result = unary();
         for (;;) {
             if (consume('*')) result *= unary();
@@ -73,14 +99,23 @@ private:
         }
     }
 
+    /// \brief Parse leading plus or minus operators before the next primary expression.
+    /// \return Signed operand parsed at the current cursor.
     double unary() {
+        // Parse leading plus or minus operators before the next primary expression.
         if (consume('+')) return unary();
         if (consume('-')) return -unary();
         return primary();
     }
 
+    /// \brief Evaluate one supported mathematical function after arity validation.
+    /// \param name Supported expression function name.
+    /// \param args function arguments parsed or validated by the expression evaluator.
+    /// \return Result of the validated built-in function call.
     double call(const std::string& name, const std::vector<double>& args) {
+        // Enforce each built-in function’s fixed argument count before indexing.
         const auto require = [&](size_t count) {
+            // Reject a function call whose argument count differs from its mathematical signature.
             if (args.size() != count) fail(name + " expects " + std::to_string(count) + " arguments");
         };
         if (name == "sin") { require(1); return std::sin(args[0]); }
@@ -97,7 +132,10 @@ private:
         fail("Unknown function " + name);
     }
 
+    /// \brief Parse a number, identifier, function call, or parenthesized expression.
+    /// \return Literal parenthesized expression or variable parsed at the current cursor.
     double primary() {
+        // Parse a number, identifier, function call, or parenthesized expression.
         whitespace();
         if (consume('(')) {
             const double result = expression();
@@ -146,11 +184,19 @@ struct FloatingExpression {};
 /// This matters for current Unix nanoseconds, which already exceed that range.
 class IntegerParser {
 public:
+    /// \brief Bind the integer expression to a resolver that can decline nonintegral identifiers.
+    /// \param input Exact-integer expression text to parse.
+    /// \param resolver Callback that resolves integral fields without rounding.
     IntegerParser(const std::string& input,
                   const std::function<std::optional<ExactInteger>(const std::string&)>& resolver)
-        : input_(input), resolver_(resolver) {}
+        : input_(input), resolver_(resolver) {
+            // Bind the integer expression to a resolver that can decline nonintegral identifiers.
+        }
 
+    /// \brief Evaluate the complete exact-integer expression and reject trailing text.
+    /// \return Fully evaluated expression value after requiring complete input consumption.
     ExactInteger evaluate() {
+        // Exact evaluation succeeds only when every input token is consumed.
         const auto result = expression();
         whitespace();
         if (position_ != input_.size()) fail("Unexpected trailing text");
@@ -158,16 +204,23 @@ public:
     }
 
 private:
+    /// Largest magnitude representable by the signed exact-integer accumulator.
     static constexpr auto kMaximum = static_cast<ExactInteger>(
         static_cast<unsigned __int128>(-1) >> 1);
     static constexpr auto kMinimum = -kMaximum - 1;
 
+    /// \brief Advance the parser cursor past ASCII whitespace.
     void whitespace() {
+        // Advance the parser cursor past ASCII whitespace.
         while (position_ < input_.size() &&
                std::isspace(static_cast<unsigned char>(input_[position_]))) ++position_;
     }
 
+    /// \brief Consume the requested token only when it begins at the current parser position.
+    /// \param token Expected operator consumed only when present at the parser cursor.
+    /// \return True when consume; otherwise false.
     bool consume(char token) {
+        // Consume the requested token only when it begins at the current parser position.
         whitespace();
         if (position_ < input_.size() && input_[position_] == token) {
             ++position_;
@@ -176,12 +229,18 @@ private:
         return false;
     }
 
+    /// \brief Raise a parse error annotated with the current expression offset.
+    /// \param reason Parser error appended with the current expression position.
     [[noreturn]] void fail(const std::string& reason) const {
+        // Raise a parse error annotated with the current expression offset.
         throw std::runtime_error(reason + " at column " +
             std::to_string(position_ + 1) + " in expression: " + input_);
     }
 
+    /// \brief Evaluate addition and subtraction over the parsed product terms.
+    /// \return Sum or difference parsed at the current cursor.
     ExactInteger expression() {
+        // Evaluate addition and subtraction over the parsed product terms.
         auto result = product();
         for (;;) {
             if (consume('+')) {
@@ -194,7 +253,10 @@ private:
         }
     }
 
+    /// \brief Evaluate multiplication and division with higher precedence than addition.
+    /// \return Product or quotient parsed at the current cursor.
     ExactInteger product() {
+        // Evaluate multiplication and division with higher precedence than addition.
         auto result = unary();
         for (;;) {
             if (consume('*')) {
@@ -210,7 +272,10 @@ private:
         }
     }
 
+    /// \brief Parse leading plus or minus operators before the next primary expression.
+    /// \return Signed operand parsed at the current cursor.
     ExactInteger unary() {
+        // Parse leading plus or minus operators before the next primary expression.
         if (consume('+')) return unary();
         if (consume('-')) {
             const auto value = unary();
@@ -220,7 +285,10 @@ private:
         return primary();
     }
 
+    /// \brief Parse a number, identifier, function call, or parenthesized expression.
+    /// \return Literal parenthesized expression or variable parsed at the current cursor.
     ExactInteger primary() {
+        // Parse a number, identifier, function call, or parenthesized expression.
         whitespace();
         if (consume('(')) {
             const auto result = expression();
@@ -270,15 +338,25 @@ private:
 
 }  // namespace
 
+/// \brief Parse and evaluate a finite arithmetic expression with named ROS fields.
+/// \param expression arithmetic expression evaluated for a bridge member.
+/// \param resolve_identifier callback that supplies a value for each expression identifier.
+/// \return Finite numeric expression result.
 double evaluate_math_expression(
     const std::string& expression,
     const std::function<double(const std::string&)>& resolve_identifier) {
+    // Use the finite floating parser for expressions that may include trigonometry.
     return Parser(expression, resolve_identifier).evaluate();
 }
 
+/// \brief Evaluate an expression exactly only when every operand and operation stays integral.
+/// \param expression arithmetic expression evaluated for a bridge member.
+/// \param resolve_identifier callback that supplies a value for each expression identifier.
+/// \return Exact integer result when no floating operation was required; otherwise std::nullopt.
 std::optional<ExactInteger> try_evaluate_integer_expression(
     const std::string& expression,
     const std::function<std::optional<ExactInteger>(const std::string&)>& resolve_identifier) {
+    // Evaluate an expression exactly only when every operand and operation stays integral.
     try {
         return IntegerParser(expression, resolve_identifier).evaluate();
     } catch (const FloatingExpression&) {

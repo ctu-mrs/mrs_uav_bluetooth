@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/app/tui_node.cpp
+/// \brief Implements the tui node component of the ROS 2 application and operator-tool layer.
+
 #include "mrs_uav_bluetooth/app/tui_node.hpp"
 
 #include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
@@ -24,17 +27,29 @@ namespace mrs_uav_bluetooth::app {
 
 namespace {
 
+/// \brief Render a boolean as the short yes/no text used in reports.
+/// \param value Boolean to render.
+/// \return Literal yes when true; otherwise no.
 std::string yes_no(bool value) {
+    // Render a boolean as the short yes/no text used in reports.
     return value ? "yes" : "no";
 }
 
+/// \brief Convert the ROS clock wall time to an unsigned nanosecond count.
+/// \return Current ROS wall-clock time in nanoseconds.
 uint64_t wall_time_ns() {
+    // Convert the ROS clock wall time to an unsigned nanosecond count.
     const auto now = std::chrono::time_point_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now());
     return static_cast<uint64_t>(now.time_since_epoch().count());
 }
 
+/// \brief Clip text to a terminal column width.
+/// \param value Display text to crop or pad.
+/// \param width Maximum displayed characters including an ellipsis.
+/// \return Text clipped to the requested width.
 std::string shorten(std::string value, size_t width) {
+    // Preserve short values and mark clipped ones with a trailing tilde.
     if (value.size() <= width) {
         return value;
     }
@@ -44,27 +59,48 @@ std::string shorten(std::string value, size_t width) {
     return value.substr(0, width - 1) + "~";
 }
 
+/// \brief Pad text on the right to fill a terminal table column.
+/// \param value Display text to pad.
+/// \param width Minimum display width after padding.
+/// \return Original text followed by enough spaces to reach the width.
 std::string pad_right(std::string value, size_t width) {
+    // Add spaces only when the value is narrower than its table column.
     if (value.size() < width) {
         value.append(width - value.size(), ' ');
     }
     return value;
 }
 
+/// \brief Produce one clipped, padded, newline-terminated terminal row.
+/// \param value Display text for the row.
+/// \param width Exact row width before the newline.
+/// \return Fixed-width terminal row ending in a newline.
 std::string frame_line(std::string value, size_t width) {
+    // Clip, pad, and terminate one fixed-width terminal row.
     return pad_right(shorten(std::move(value), width), width) + "\n";
 }
 
+/// \brief Pad text on the left for right-aligned terminal values.
+/// \param value Display text to pad.
+/// \param width Minimum display width after padding.
+/// \return Enough leading spaces followed by the original text.
 std::string pad_left(std::string value, size_t width) {
+    // Prepend spaces for right-aligned counters and status values.
     if (value.size() < width) {
         value.insert(value.begin(), width - value.size(), ' ');
     }
     return value;
 }
 
+/// \brief Select the visible row window around the current terminal focus.
+/// \param lines Complete rendered dashboard rows.
+/// \param rows Maximum rows available in the terminal.
+/// \param focus_row Selected row to keep near the middle of the window.
+/// \return At most `rows` entries containing the focused portion of the dashboard.
 std::vector<std::string> window_lines(const std::vector<std::string>& lines,
                                       size_t rows,
                                       size_t focus_row) {
+    // Shift the slice only when the full dashboard exceeds terminal height.
     if (lines.size() <= rows) {
         return lines;
     }
@@ -82,7 +118,11 @@ std::vector<std::string> window_lines(const std::vector<std::string>& lines,
                                     lines.begin() + static_cast<std::ptrdiff_t>(start + rows));
 }
 
+/// \brief Render a nanosecond epoch timestamp with millisecond precision.
+/// \param remote_time_ns peer timestamp decoded from the time-writeback payload.
+/// \return Formatted remote nanosecond timestamp.
 std::string format_remote_time(uint64_t remote_time_ns) {
+    // Split epoch nanoseconds so only the millisecond remainder is appended.
     if (remote_time_ns == 0) {
         return "-";
     }
@@ -96,7 +136,11 @@ std::string format_remote_time(uint64_t remote_time_ns) {
     return out.str();
 }
 
+/// \brief Render characteristic bytes as two-digit space-separated hexadecimal.
+/// \param data Bytes to render for the terminal.
+/// \return Space-separated hexadecimal bytes.
 std::string format_hex_bytes(const std::vector<uint8_t>& data) {
+    // Emit a separator before every byte except the first.
     if (data.empty()) {
         return "-";
     }
@@ -112,10 +156,16 @@ std::string format_hex_bytes(const std::vector<uint8_t>& data) {
     return out.str();
 }
 
+/// \brief Append a heading and width-bounded indented text rows to the dashboard.
+/// \param lines Output rows receiving the label and wrapped text.
+/// \param label Heading shown before the wrapped value.
+/// \param value Text to wrap below the supplied label.
+/// \param width Maximum terminal width available to the label and wrapped text.
 void append_wrapped_block(std::vector<std::string>& lines,
                           const std::string& label,
                           const std::string& value,
                           size_t width) {
+    // Keep the heading intact, then wrap its value with a two-space indent.
     lines.push_back(label);
 
     const std::string prefix = "  ";
@@ -130,17 +180,28 @@ void append_wrapped_block(std::vector<std::string>& lines,
     }
 }
 
+/// \brief Decode a cached byte property as trimmed display text.
+/// \param characteristic Optional cached characteristic whose bytes are rendered as text.
+/// \return Trimmed text decoded from cached GATT bytes.
 std::string cached_ascii_value(const std::optional<bluez::GattCharacteristicInfo>& characteristic) {
+    // Decode a cached byte property as trimmed display text.
     if (!characteristic.has_value()) {
         return {};
     }
     return util::trim_ascii_copy(std::string(characteristic->value.begin(), characteristic->value.end()));
 }
 
+/// \brief Wait until peer service discovery produces a usable cached GATT tree.
+/// \param client BlueZ client used for remote discovery and GATT operations.
+/// \param mac peer Bluetooth MAC address.
+/// \param timeout Maximum time for service discovery and cache refresh.
+/// \return True if services resolve and cached GATT objects become usable before timeout; otherwise false.
 bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
                                 const std::string& mac,
                                 std::chrono::milliseconds timeout) {
+    // Wait for service discovery and at least one cached remote GATT object.
     const auto has_remote_gatt = [&client, &mac]() {
+        // Treat either a discovered service or characteristic as proof that the cache is ready.
         return !client.list_services(mac).empty() || !client.list_characteristics(mac).empty();
     };
 
@@ -166,9 +227,15 @@ bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
     return has_remote_gatt();
 }
 
+/// \brief Retry transient BlueZ profile errors until RFCOMM connects or the deadline expires.
+/// \param client BlueZ client used for remote discovery and GATT operations.
+/// \param mac peer Bluetooth MAC address.
+/// \param timeout Overall retry deadline for the serial profile connection.
+/// \return True if RFCOMM connects before timeout despite transient BlueZ failures; otherwise false.
 bool connect_serial_profile_with_retry(bluez::BluezClient& client,
                                        const std::string& mac,
                                        std::chrono::milliseconds timeout) {
+    // Connect serial profile with retry.
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     do {
         if (client.connect_profile(mac, std::string{bluez::kSerialPortProfileUuid})) {
@@ -183,6 +250,7 @@ bool connect_serial_profile_with_retry(bluez::BluezClient& client,
 
 TuiNode::TuiNode()
     : rclcpp::Node("mrs_uav_bluetooth_tui") {
+    // Load UI parameters, create the shared client runtime, and attach event handlers.
     configure_parameters();
 
     CentralClientRuntimeOptions options;
@@ -195,6 +263,7 @@ TuiNode::TuiNode()
         [this](const std::vector<uint8_t>& data,
                const std::string& uuid,
                const std::string& characteristic_path) {
+            // Route each remote Value notification into the matching TUI device row.
             on_notification(data, uuid, characteristic_path);
         });
     status_message_ = "ready";
@@ -221,6 +290,7 @@ TuiNode::TuiNode()
                 [this](const std::string& device_path,
                        int socket_fd,
                        const std::map<std::string, sdbus::Variant>&) {
+                    // Transfer an accepted RFCOMM descriptor into the terminal link manager exactly once.
                     bool handed_off = false;
                     try {
                         if (!serial_links_) {
@@ -244,11 +314,13 @@ TuiNode::TuiNode()
                 });
             serial_profile_->set_disconnection_handler(
                 [this](const std::string& device_path) {
+                    // Detach the terminal associated with the device BlueZ disconnected.
                     if (serial_links_) {
                         serial_links_->detach(device_path);
                     }
                 });
             serial_profile_->set_release_handler([this]() {
+                // Detach every terminal because BlueZ released the serial profile.
                 if (serial_links_) {
                     serial_links_->detach_all();
                 }
@@ -263,10 +335,14 @@ TuiNode::TuiNode()
 
     ui_timer_ = create_wall_timer(
         std::chrono::duration<double>(render_period_sec_),
-        [this]() { ui_tick(); });
+        [this]() {
+            // Advance connection tasks and redraw the terminal dashboard on each UI tick.
+            ui_tick();
+        });
 }
 
 TuiNode::~TuiNode() {
+    // Remove callbacks and terminal state before the shared client runtime is destroyed.
     if (notification_token_ != 0 && runtime_) {
         runtime_->client().remove_notification_handler(notification_token_);
     }
@@ -293,6 +369,7 @@ TuiNode::~TuiNode() {
 }
 
 void TuiNode::configure_parameters() {
+    // Validate scan terminal refresh and peer-name settings before starting asynchronous dashboard work.
     declare_parameter<std::string>("adapter_alias", "");
     declare_parameter<std::string>("scan_mode", "auto");
     declare_parameter<std::string>("uav_name_pattern", "^uav[0-9]{1,5}$");
@@ -326,6 +403,7 @@ void TuiNode::configure_parameters() {
 }
 
 void TuiNode::ui_tick() {
+    // Advance pending UI tasks, refresh snapshots, and render the next dashboard frame.
     handle_input();
     collect_action_result();
     refresh_device_cache();
@@ -347,6 +425,7 @@ void TuiNode::ui_tick() {
 }
 
 void TuiNode::handle_input() {
+    // Drain every complete key sequence currently available without blocking.
     while (true) {
         const auto event = terminal_.read_key();
         if (!event.has_value()) {
@@ -357,6 +436,7 @@ void TuiNode::handle_input() {
 }
 
 void TuiNode::handle_key_event(const TerminalKeyEvent& event) {
+    // Give active text prompts priority before dashboard navigation shortcuts.
     if (prompt_mode_ != PromptMode::None) {
         if (event.kind == TerminalKeyKind::Escape) {
             prompt_mode_ = PromptMode::None;
@@ -460,6 +540,7 @@ void TuiNode::handle_key_event(const TerminalKeyEvent& event) {
 }
 
 void TuiNode::move_selection(int delta) {
+    // Move selection.
     const auto devices = visible_devices();
     if (devices.empty()) {
         selected_mac_.clear();
@@ -485,11 +566,13 @@ void TuiNode::move_selection(int delta) {
 }
 
 void TuiNode::select_first_visible_device() {
+    // Clear selection for an empty filter or select the first displayed address.
     const auto devices = visible_devices();
     selected_mac_ = devices.empty() ? std::string{} : devices.front()->mac;
 }
 
 void TuiNode::refresh_device_cache(bool force) {
+    // Throttle cache snapshots, preserve selection, and schedule details for visible peers.
     const auto now = std::chrono::steady_clock::now();
     if (!force && last_device_refresh_ != std::chrono::steady_clock::time_point{} &&
         (now - last_device_refresh_) < std::chrono::duration<double>(refresh_period_sec_)) {
@@ -521,6 +604,7 @@ void TuiNode::refresh_device_cache(bool force) {
     }
 
     std::sort(current_devices_.begin(), current_devices_.end(), [this](const auto& lhs, const auto& rhs) {
+        // Sort recognized UAVs ahead of other devices, then use name and address as stable ties.
         const bool lhs_is_uav = !util::device_hostname_guess(lhs, uav_name_pattern_).empty();
         const bool rhs_is_uav = !util::device_hostname_guess(rhs, uav_name_pattern_).empty();
         if (lhs_is_uav != rhs_is_uav) {
@@ -545,6 +629,7 @@ void TuiNode::refresh_device_cache(bool force) {
     });
 
     const auto it = std::find_if(current_devices_.begin(), current_devices_.end(), [&](const auto& device) {
+        // Restore selection by matching the previously selected Bluetooth address.
         return device.mac == selected_mac_;
     });
     if (it == current_devices_.end()) {
@@ -567,6 +652,7 @@ void TuiNode::refresh_device_cache(bool force) {
 }
 
 void TuiNode::apply_pending_notifications() {
+    // Apply pending notifications.
     std::vector<PendingNotification> pending;
     {
         std::lock_guard<std::mutex> lock(pending_notification_mutex_);
@@ -600,6 +686,7 @@ void TuiNode::apply_pending_notifications() {
 }
 
 void TuiNode::collect_topic_count_results() {
+    // Consume ready discovery futures and timestamp each peer’s bridge count.
     for (auto& [_, entry] : topic_counts_) {
         if (!entry.pending || !entry.future.valid()) {
             continue;
@@ -616,6 +703,7 @@ void TuiNode::collect_topic_count_results() {
 }
 
 void TuiNode::collect_time_sample_results() {
+    // Consume ready clock reads and store their remote time, delay, and offset.
     for (auto& [_, entry] : time_samples_) {
         if (!entry.pending || !entry.future.valid()) {
             continue;
@@ -635,6 +723,7 @@ void TuiNode::collect_time_sample_results() {
 }
 
 void TuiNode::collect_wifi_results() {
+    // Consume ready Wi-Fi reads and update each peer’s SSID, password, and status.
     for (auto& [_, entry] : wifi_state_) {
         if (!entry.pending || !entry.future.valid()) {
             continue;
@@ -654,6 +743,7 @@ void TuiNode::collect_wifi_results() {
 }
 
 void TuiNode::collect_action_result() {
+    // Move a completed operator action’s diagnostic into the dashboard status line.
     if (!action_future_.valid()) {
         return;
     }
@@ -669,6 +759,7 @@ void TuiNode::collect_action_result() {
 }
 
 void TuiNode::request_topic_count_refresh(const bluez::DeviceInfo& device) {
+    // Request topic count refresh.
     auto& entry = topic_counts_[device.mac];
     if (!device.connected || !effective_services_resolved(device)) {
         entry.pending = false;
@@ -685,11 +776,13 @@ void TuiNode::request_topic_count_refresh(const bluez::DeviceInfo& device) {
     const auto mac = device.mac;
     entry.pending = true;
     entry.future = std::async(std::launch::async, [this, mac]() {
+        // Count only characteristics with a complete remotely advertised bridge descriptor set.
         return inspector_->count_exported_topics(mac);
     }).share();
 }
 
 void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
+    // Request time sample.
     auto& entry = time_samples_[device.mac];
     if (!device.connected || !effective_services_resolved(device)) {
         entry.available = false;
@@ -704,6 +797,7 @@ void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
     const auto mac = device.mac;
     entry.pending = true;
     entry.future = std::async(std::launch::async, [this, mac]() {
+        // Read the peer clock and retain request timing so the UI can display offset and round-trip delay.
         try {
             const auto paths = inspector_->resolve_builtin_paths(mac);
             if (paths.time_characteristic_path.empty()) {
@@ -731,6 +825,7 @@ void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
 }
 
 void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) {
+    // Request Wi-Fi refresh.
     auto& entry = wifi_state_[device.mac];
     if (!device.connected || !effective_services_resolved(device)) {
         entry.available = false;
@@ -751,6 +846,7 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
     entry.last_attempt = now;
     entry.error.clear();
     entry.future = std::async(std::launch::async, [this, mac]() {
+        // Refresh the peer GATT tree and read its Wi-Fi fields without blocking the UI thread.
         try {
             (void)runtime_->client().refresh_gatt_snapshot(mac);
 
@@ -761,6 +857,7 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
             }
 
             const auto read_ascii = [this](const std::string& path) {
+                // Read one Wi-Fi characteristic and trim its byte payload for display.
                 const auto payload = runtime_->client().read_characteristic(path);
                 if (!payload.empty()) {
                     return util::trim_ascii_copy(std::string(payload.begin(), payload.end()));
@@ -872,6 +969,7 @@ void TuiNode::trigger_connect_toggle() {
 }
 
 void TuiNode::trigger_serial_connect() {
+    // Trigger serial connect.
     const auto* device = selected_device();
     if (device == nullptr || action_future_.valid()) {
         return;
@@ -889,6 +987,7 @@ void TuiNode::trigger_serial_connect() {
     action_future_ = std::async(
         std::launch::async,
         [this, mac, device_path, already_open]() {
+            // Toggle the RFCOMM profile while keeping all blocking BlueZ calls off the ROS executor.
             auto& client = runtime_->client();
             if (already_open) {
                 const bool ok = client.disconnect_profile(
@@ -916,6 +1015,7 @@ void TuiNode::trigger_serial_connect() {
 }
 
 std::string TuiNode::ssh_wrapper_path() const {
+    // Resolve the installed helper used to attach an interactive shell to a peer.
     std::vector<char> executable(4096, '\0');
     const auto size = ::readlink("/proc/self/exe", executable.data(), executable.size() - 1);
     if (size < 0) {
@@ -927,6 +1027,7 @@ std::string TuiNode::ssh_wrapper_path() const {
 }
 
 void TuiNode::trigger_ssh() {
+    // Trigger SSH.
     const auto* device = selected_device();
     if (device == nullptr || !serial_links_) {
         status_message_ = "no UAV serial link is available";
@@ -980,11 +1081,13 @@ void TuiNode::trigger_ssh() {
 }
 
 void TuiNode::trigger_scan_toggle() {
+    // Trigger scan toggle.
     runtime_->set_scan_enabled(!runtime_->is_scanning(), scan_mode_);
     status_message_ = runtime_->is_scanning() ? "scan enabled" : "scan stopped";
 }
 
 void TuiNode::trigger_wifi_write(PromptMode mode, std::string value) {
+    // Trigger Wi-Fi write.
     const auto* device = selected_device();
     if (device == nullptr || action_future_.valid()) {
         return;
@@ -1000,6 +1103,7 @@ void TuiNode::trigger_wifi_write(PromptMode mode, std::string value) {
     wifi_state_[mac].error.clear();
 
     action_future_ = std::async(std::launch::async, [this, mac, mode, value = std::move(value)]() {
+        // Resolve the peer's Wi-Fi characteristics and perform the operator-selected read or write.
         try {
             const auto paths = inspector_->resolve_builtin_paths(mac);
             if (!paths.has_wifi()) {
@@ -1023,13 +1127,16 @@ void TuiNode::trigger_wifi_write(PromptMode mode, std::string value) {
 }
 
 const bluez::DeviceInfo* TuiNode::selected_device() const {
+    // Resolve the current selection by address because sorting can move its row index.
     const auto it = std::find_if(current_devices_.begin(), current_devices_.end(), [&](const auto& device) {
+        // Resolve the selected row by its stable Bluetooth address.
         return device.mac == selected_mac_;
     });
     return it == current_devices_.end() ? nullptr : &(*it);
 }
 
 std::vector<const bluez::DeviceInfo*> TuiNode::visible_devices() const {
+    // Concatenate the filtered UAV and non-UAV sections in display order.
     std::vector<const bluez::DeviceInfo*> result;
     const auto uavs = visible_uav_devices();
     result.insert(result.end(), uavs.begin(), uavs.end());
@@ -1039,6 +1146,7 @@ std::vector<const bluez::DeviceInfo*> TuiNode::visible_devices() const {
 }
 
 std::vector<const bluez::DeviceInfo*> TuiNode::visible_uav_devices() const {
+    // Filter visible cache rows to devices recognized by the UAV hostname policy.
     std::vector<const bluez::DeviceInfo*> result;
     for (const auto& device : current_devices_) {
         const auto guessed = util::device_hostname_guess(device, uav_name_pattern_);
@@ -1051,6 +1159,7 @@ std::vector<const bluez::DeviceInfo*> TuiNode::visible_uav_devices() const {
 }
 
 std::vector<const bluez::DeviceInfo*> TuiNode::visible_other_devices() const {
+    // Filter visible cache rows to devices not recognized as UAV peers.
     std::vector<const bluez::DeviceInfo*> result;
     if (hide_non_uav_) {
         return result;
@@ -1065,6 +1174,7 @@ std::vector<const bluez::DeviceInfo*> TuiNode::visible_other_devices() const {
 }
 
 bool TuiNode::effective_services_resolved(const bluez::DeviceInfo& device) const {
+    // Treat an already populated GATT cache as resolved during brief property lag.
     if (!device.connected) {
         return false;
     }
@@ -1075,6 +1185,7 @@ bool TuiNode::effective_services_resolved(const bluez::DeviceInfo& device) const
 }
 
 void TuiNode::ensure_builtin_subscriptions() {
+    // Ensure builtin subscriptions.
     std::vector<std::string> active_macs;
     active_macs.reserve(current_devices_.size());
 
@@ -1106,6 +1217,7 @@ void TuiNode::ensure_builtin_subscriptions() {
 }
 
 void TuiNode::ensure_builtin_subscription(const bluez::DeviceInfo& device) {
+    // Ensure builtin subscription.
     gatt::RemoteBuiltinPaths resolved_paths;
     try {
         resolved_paths = inspector_->resolve_builtin_paths(device.mac);
@@ -1141,6 +1253,7 @@ void TuiNode::ensure_builtin_subscription(const bluez::DeviceInfo& device) {
 void TuiNode::on_notification(const std::vector<uint8_t>& data,
                               const std::string& uuid,
                               const std::string& characteristic_path) {
+    // Resolve the characteristic owner, then update the displayed value for that peer.
     std::string mac;
     if (const auto characteristic = runtime_->cache().characteristic(characteristic_path)) {
         if (const auto service = runtime_->cache().service(characteristic->service_path)) {
@@ -1173,6 +1286,7 @@ void TuiNode::on_notification(const std::vector<uint8_t>& data,
 }
 
 std::string TuiNode::adapter_local_mac() {
+    // Read and normalize the selected adapter public address.
     const auto adapter = runtime_->cache().adapter(runtime_->adapter_path());
     if (!adapter || adapter->address.empty()) {
         return "-";
@@ -1190,6 +1304,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     constexpr size_t uav_id_preferred_width = 10;
     constexpr size_t other_id_preferred_width = 17;
     const auto table_width = [min_name_width](size_t id_width) {
+        // Sum fixed columns with the minimum name column to determine required width.
         return size_t{3} + id_width + size_t{1} + min_name_width + size_t{1} +
             size_t{4} + size_t{1} + size_t{4} + size_t{1} + size_t{3} + size_t{1} + size_t{4};
     };
@@ -1206,6 +1321,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     }
 
     const auto format_left_header = [&](std::string id_label, size_t id_width, size_t name_width) {
+        // Build the aligned heading row for the device table.
         return std::string{"sel "} + pad_right(shorten(std::move(id_label), id_width), id_width) + " " +
             pad_right("name", name_width) + " " + pad_left("rssi", 4) + " " +
             pad_right("conn", 4) + " " + pad_right("srv", 3) + " " + pad_left("exp", 4);
@@ -1219,6 +1335,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
                                      std::string exports_value,
                                      size_t id_width,
                                      size_t name_width) {
+        // Format one device row using the same widths as the table heading.
         return pad_right(shorten(std::move(marker), 3), 3) +
             pad_right(shorten(std::move(id_value), id_width), id_width) + " " +
             pad_right(shorten(std::move(name_value), name_width), name_width) + " " +
@@ -1229,6 +1346,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     };
 
     const auto compute_name_width = [&](size_t id_width) {
+        // Give remaining terminal columns to the name field after fixed columns are reserved.
         const size_t reserved = table_width(id_width) - min_name_width;
         if (left_width <= reserved) {
             return size_t{0};

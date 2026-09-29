@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bridge/payload_codec.cpp
+/// \brief Implements the payload codec component of the transport-independent ROS message bridge.
+
 #include "mrs_uav_bluetooth/bridge/payload_codec.hpp"
 
 #include <cmath>
@@ -30,6 +33,11 @@ const std::unordered_map<std::string, TypeInfo> kTypeInfo = {
     {"float64", {8}},
 };
 
+/// \brief Round and range-check a numeric value for a fixed-width wire integer.
+/// \tparam T Destination signed or unsigned integer type.
+/// \param value Finite numeric value to round before encoding.
+/// \param type Wire type name included in validation errors.
+/// \return Value narrowed safely to T.
 template<typename T>
 T checked_fixed(double value, const std::string& type) {
     if (!std::isfinite(value)) {
@@ -46,8 +54,14 @@ T checked_fixed(double value, const std::string& type) {
     return static_cast<T>(scaled);
 }
 
+/// \brief Range-check an exact integer for a fixed-width wire type.
+/// \tparam T Destination signed or unsigned integer type.
+/// \param value Exact decoded integer to narrow.
+/// \param type Wire type name included in validation errors.
+/// \return Value narrowed safely to T.
 template<typename T>
 T checked_exact(ExactInteger value, const std::string& type) {
+    // Range-check an exact decoded integer before narrowing it to the target wire type.
     if (value < static_cast<ExactInteger>(std::numeric_limits<T>::min()) ||
         value > static_cast<ExactInteger>(std::numeric_limits<T>::max())) {
         throw std::runtime_error(type + " value is outside its integer range");
@@ -56,6 +70,10 @@ T checked_exact(ExactInteger value, const std::string& type) {
 }
 
 // Pack a single ScalarValue into the buffer at the given offset.
+/// \brief Encode one checked scalar in the configured little-endian wire type.
+/// \param buf Output byte vector receiving the encoded scalar.
+/// \param val new cached byte value.
+/// \param spec member encoding specification that controls conversion and width.
 void pack_value(std::vector<uint8_t>& buf, const ScalarValue& val,
                 const config::BridgeMemberSpec& spec) {
     const auto& value_type = spec.value_type;
@@ -83,8 +101,14 @@ void pack_value(std::vector<uint8_t>& buf, const ScalarValue& val,
 }
 
 // Unpack a single value from the buffer at the given offset.
+/// \brief Decode one configured little-endian scalar after validating payload bounds.
+/// \param buf Input payload containing the scalar at the supplied offset.
+/// \param off byte offset at which the field or digest block begins.
+/// \param spec member encoding specification that controls conversion and width.
+/// \return Checked scalar decoded from the configured payload offset.
 ScalarValue unpack_value(const std::vector<uint8_t>& buf, size_t off,
                          const config::BridgeMemberSpec& spec) {
+    // Check the configured width before reading any bytes from the payload.
     const auto& value_type = spec.value_type;
     size_t sz = wire_size(spec);
     if (!sz) throw std::runtime_error("Unknown value type: " + value_type);
@@ -150,7 +174,11 @@ ScalarValue unpack_value(const std::vector<uint8_t>& buf, size_t off,
     throw std::runtime_error("Unhandled value type: " + value_type);
 }
 
+/// \brief Return text without surrounding ASCII whitespace.
+/// \param raw Configuration text to trim before parsing.
+/// \return Input text without surrounding ASCII whitespace.
 std::string trim_copy(const std::string& raw) {
+    // Remove ASCII whitespace around one member-path fragment without changing its contents.
     const auto begin = raw.find_first_not_of(" \t\r\n");
     if (begin == std::string::npos) {
         return {};
@@ -159,7 +187,12 @@ std::string trim_copy(const std::string& raw) {
     return raw.substr(begin, end - begin + 1);
 }
 
+/// \brief Parse an array selector index without signs trailing text or overflow.
+/// \param raw Array index or bound text to parse.
+/// \param context Member-path fragment included in index parsing errors.
+/// \return Validated non negative int.
 int parse_non_negative_int(const std::string& raw, const std::string& context) {
+    // Require a complete decimal token that fits a nonnegative int.
     const auto token = trim_copy(raw);
     if (token.empty()) {
         throw std::invalid_argument("Missing integer in member path segment: " + context);
@@ -174,7 +207,11 @@ int parse_non_negative_int(const std::string& raw, const std::string& context) {
 
 }  // namespace
 
+/// \brief Parse and validate dotted ROS fields array indices and slices.
+/// \param path Dotted ROS member selector to parse.
+/// \return Validated segments of the nested ROS member path.
 std::vector<PathSegment> parse_member_path(const std::string& path) {
+    // Split dotted fields while validating every index and slice selector.
     if (path.empty()) {
         throw std::invalid_argument("Member path must not be empty");
     }
@@ -240,9 +277,14 @@ std::vector<PathSegment> parse_member_path(const std::string& path) {
     return segments;
 }
 
+/// \brief Encode ordered scalar values into the configured packed-field payload.
+/// \param values Scalar values encoded in the same order as the member specifications.
+/// \param specs ordered member specifications defining the payload layout.
+/// \return Packed scalar payload in configured member order.
 std::vector<uint8_t> encode_struct_payload(
     const std::vector<ScalarValue>& values,
     const std::vector<config::BridgeMemberSpec>& specs) {
+    // Require one specification per value, then append each checked little-endian scalar.
     if (values.size() != specs.size()) {
         throw std::runtime_error("Value count does not match member spec count");
     }
@@ -254,9 +296,15 @@ std::vector<uint8_t> encode_struct_payload(
     return buf;
 }
 
+/// \brief Decode a packed-field payload and reject trailing or missing bytes.
+/// \brief Decode a compact payload into its configured scalar sequence.
+/// \param payload Compact little-endian field payload to decode.
+/// \param specs ordered member specifications defining the payload layout.
+/// \return Decoded scalar values in configured member order.
 std::vector<ScalarValue> decode_struct_payload(
     const std::vector<uint8_t>& payload,
     const std::vector<config::BridgeMemberSpec>& specs) {
+    // Advance by each configured wire width so malformed short data fails in unpacking.
     std::vector<ScalarValue> values;
     values.reserve(specs.size());
     size_t off = 0;
@@ -267,7 +315,12 @@ std::vector<ScalarValue> decode_struct_payload(
     return values;
 }
 
+/// \brief Convert a floating ROS value to the configured wire scalar type.
+/// \param value ROS floating-point value to encode.
+/// \param spec member encoding specification that controls conversion and width.
+/// \return Wire scalar after range and type conversion.
 ScalarValue coerce_outgoing(double value, const config::BridgeMemberSpec& spec) {
+    // Range-check every integer target before narrowing the source value.
     const auto& value_type = spec.value_type;
     if (value_type == "bool") return static_cast<bool>(value != 0.0);
     if (value_type == "int8") return checked_fixed<int8_t>(value, value_type);
@@ -283,8 +336,13 @@ ScalarValue coerce_outgoing(double value, const config::BridgeMemberSpec& spec) 
     throw std::runtime_error("Unknown value type for coercion: " + value_type);
 }
 
+/// \brief Convert an exact ROS integer to the configured wire scalar type.
+/// \param value Exact ROS integer value to encode.
+/// \param spec member encoding specification that controls conversion and width.
+/// \return Wire scalar preserving the exact integer value.
 ScalarValue coerce_outgoing_integer(ExactInteger value,
                                     const config::BridgeMemberSpec& spec) {
+    // Preserve full integer precision while checking the selected wire range.
     const auto& type = spec.value_type;
     if (type == "bool") return value != 0;
     if (type == "int8") return checked_exact<int8_t>(value, type);
@@ -300,16 +358,27 @@ ScalarValue coerce_outgoing_integer(ExactInteger value,
     throw std::runtime_error("Unknown value type for integer coercion: " + type);
 }
 
+/// \brief Convert any decoded wire scalar to the floating expression domain.
+/// \param value Decoded wire scalar to convert to a ROS numeric value.
+/// \param spec member encoding specification that controls conversion and width.
+/// \return Decoded scalar represented for numeric expression evaluation.
 double coerce_incoming(const ScalarValue& value, const config::BridgeMemberSpec& spec) {
+    // The member specification is retained for API symmetry; the variant owns its type.
     static_cast<void>(spec);
     const double encoded = std::visit([](auto&& v) -> double {
+        // Convert any decoded scalar variant to the floating representation used by expressions.
         return static_cast<double>(v);
     }, value);
     return encoded;
 }
 
+/// \brief Recover an exact integer only from integral wire scalar variants.
+/// \param value Decoded wire scalar to recover as an exact integer.
+/// \return Exact decoded integer when the wire scalar is integral; otherwise std::nullopt.
 std::optional<ExactInteger> coerce_incoming_integer(const ScalarValue& value) {
+    // Decline float variants so large integers are never silently rounded.
     return std::visit([](auto raw) -> std::optional<ExactInteger> {
+        // Preserve integral variants exactly and decline floating-point alternatives.
         using T = std::decay_t<decltype(raw)>;
         if constexpr (std::is_floating_point_v<T>) {
             return std::nullopt;
@@ -319,16 +388,28 @@ std::optional<ExactInteger> coerce_incoming_integer(const ScalarValue& value) {
     }, value);
 }
 
+/// \brief Look up the fixed byte width of one supported wire scalar type.
+/// \param value_type Canonical scalar type whose encoded byte width is requested.
+/// \return Fixed encoded size in bytes, or zero for an unknown type.
 size_t wire_size(const std::string& value_type) {
+    // Look up the fixed byte width of one supported wire scalar type.
     auto it = kTypeInfo.find(value_type);
     return it != kTypeInfo.end() ? it->second.size : 0;
 }
 
+/// \brief Derive this member width from its normalized wire scalar type.
+/// \param spec member encoding specification that controls conversion and width.
+/// \return Fixed encoded size in bytes, or zero for an unknown type.
 size_t wire_size(const config::BridgeMemberSpec& spec) {
+    // Derive this member width from its normalized wire scalar type.
     return wire_size(spec.value_type);
 }
 
+/// \brief Sum every member width to determine the exact unframed payload size.
+/// \param specs ordered member specifications defining the payload layout.
+/// \return Sum of all encoded member widths in bytes.
 size_t total_wire_size(const std::vector<config::BridgeMemberSpec>& specs) {
+    // Sum every member width to determine the exact unframed payload size.
     size_t total = 0;
     for (const auto& s : specs) {
         total += wire_size(s);

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bluez/dbus_connection.cpp
+/// \brief Implements the dbus connection component of the BlueZ system-D-Bus integration layer.
+
 #include "mrs_uav_bluetooth/bluez/dbus_connection.hpp"
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
 
@@ -40,6 +43,7 @@ DbusConnection::DbusConnection(rclcpp::Logger logger,
 }
 
 DbusConnection::~DbusConnection() {
+    // Stop the background event loop before destroying its system-bus connection.
     if (connection_) {
         RCLCPP_INFO(logger_, "Leaving D-Bus event loop (%s)", role_.c_str());
         connection_->leaveEventLoop();

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
+/// \file src/bluez/bluez_client_gatt.cpp
+/// \brief Implements the bluez client gatt component of the BlueZ system-D-Bus integration layer.
+
 #include "mrs_uav_bluetooth/bluez/bluez_client.hpp"
 #include "mrs_uav_bluetooth/bluez/bluez_constants.hpp"
 
@@ -10,8 +13,13 @@ namespace {
 
 constexpr auto kGattReadTimeout = std::chrono::seconds(2);
 
+/// \brief Match known BlueZ error fragments without depending on exact daemon wording.
+/// \param message BlueZ error text to inspect.
+/// \param needles accepted message fragments tested against a BlueZ error.
+/// \return True when message contains; otherwise false.
 bool message_contains(const std::string& message,
                       std::initializer_list<const char*> needles) {
+    // Match known BlueZ error fragments without depending on exact daemon wording.
     for (const char* needle : needles) {
         if (message.find(needle) != std::string::npos) {
             return true;
@@ -20,8 +28,13 @@ bool message_contains(const std::string& message,
     return false;
 }
 
+/// \brief Bind a proxy to this GATT object on the shared event connection.
+/// \param connection System-bus connection used to query BlueZ.
+/// \param object_path BlueZ D-Bus object path targeted by the proxy.
+/// \return New bluez proxy.
 std::unique_ptr<sdbus::IProxy> create_bluez_proxy(sdbus::IConnection& connection,
                                                   const std::string& object_path) {
+    // Bind a proxy to this GATT object on the shared event connection.
     return sdbus::createProxy(connection,
                               sdbus::ServiceName{std::string(kBluezServiceName)},
                               sdbus::ObjectPath{object_path});
@@ -31,6 +44,7 @@ std::unique_ptr<sdbus::IProxy> create_bluez_proxy(sdbus::IConnection& connection
 
 std::string BluezClient::find_characteristic(const std::string& mac,
                                              const std::string& uuid) const {
+    // Resolve a characteristic by UUID below the requested peer service tree.
     const auto dev = cache_.device_by_mac(mac);
     if (!dev) {
         return {};
@@ -42,6 +56,7 @@ std::string BluezClient::find_characteristic(const std::string& mac,
 std::string BluezClient::find_descriptor(const std::string& mac,
                                          const std::string& uuid,
                                          const std::string& chrc_path) const {
+    // Resolve a descriptor by UUID below the requested characteristic path.
     if (!chrc_path.empty()) {
         auto result = cache_.find_descriptor_by_uuid(chrc_path, uuid);
         return result ? result->object_path : std::string{};
@@ -56,6 +71,7 @@ std::string BluezClient::find_descriptor(const std::string& mac,
 }
 
 std::vector<uint8_t> BluezClient::read_characteristic(const std::string& chrc_path) {
+    // Issue ReadValue with a bounded timeout and publish the operation result.
     try {
         auto proxy = create_bluez_proxy(dbus_.connection(), chrc_path);
         std::map<std::string, sdbus::Variant> options;
@@ -76,6 +92,7 @@ std::vector<uint8_t> BluezClient::read_characteristic(const std::string& chrc_pa
 bool BluezClient::write_characteristic(const std::string& chrc_path,
                                        const std::vector<uint8_t>& data,
                                        bool with_response) {
+    // Issue WriteValue as a request or command and publish the synchronous result.
     try {
         auto proxy = create_bluez_proxy(dbus_.connection(), chrc_path);
         std::map<std::string, sdbus::Variant> options;
@@ -94,6 +111,7 @@ bool BluezClient::write_characteristic(const std::string& chrc_path,
 bool BluezClient::write_characteristic_async(const std::string& chrc_path,
                                              const std::vector<uint8_t>& data,
                                              bool with_response) {
+    // Start a nonblocking WriteValue while retaining its proxy through reply delivery.
     try {
         auto proxy = std::shared_ptr<sdbus::IProxy>(
             create_bluez_proxy(dbus_.connection(), chrc_path).release());
@@ -104,6 +122,7 @@ bool BluezClient::write_characteristic_async(const std::string& chrc_path,
             .onInterface(std::string(kGattCharacteristicIface))
             .withArguments(data, options)
             .uponReplyInvoke([this, path_copy, proxy](std::optional<sdbus::Error> err) {
+                // Keep the proxy alive through completion and publish the characteristic write result.
                 (void)proxy;
                 if (err) {
                     emit_gatt("client_write_failed", path_copy, err->getMessage());
@@ -119,6 +138,7 @@ bool BluezClient::write_characteristic_async(const std::string& chrc_path,
 }
 
 std::vector<uint8_t> BluezClient::read_descriptor(const std::string& desc_path) {
+    // Issue Descriptor1.ReadValue with a bounded timeout and publish the result.
     try {
         auto proxy = create_bluez_proxy(dbus_.connection(), desc_path);
         std::map<std::string, sdbus::Variant> options;
@@ -138,6 +158,7 @@ std::vector<uint8_t> BluezClient::read_descriptor(const std::string& desc_path) 
 
 bool BluezClient::write_descriptor(const std::string& desc_path,
                                    const std::vector<uint8_t>& data) {
+    // Write descriptor bytes synchronously and publish success or failure.
     try {
         auto proxy = create_bluez_proxy(dbus_.connection(), desc_path);
         std::map<std::string, sdbus::Variant> options;
@@ -154,6 +175,7 @@ bool BluezClient::write_descriptor(const std::string& desc_path,
 
 bool BluezClient::write_descriptor_async(const std::string& desc_path,
                                          const std::vector<uint8_t>& data) {
+    // Start a nonblocking descriptor write while retaining its proxy through completion.
     try {
         auto proxy = std::shared_ptr<sdbus::IProxy>(
             create_bluez_proxy(dbus_.connection(), desc_path).release());
@@ -163,6 +185,7 @@ bool BluezClient::write_descriptor_async(const std::string& desc_path,
             .onInterface(std::string(kGattDescriptorIface))
             .withArguments(data, options)
             .uponReplyInvoke([this, path_copy, proxy](std::optional<sdbus::Error> err) {
+                // Keep the proxy alive through completion and publish the descriptor write result.
                 (void)proxy;
                 if (err) {
                     emit_gatt("client_descriptor_write_failed", path_copy, err->getMessage());
@@ -178,6 +201,7 @@ bool BluezClient::write_descriptor_async(const std::string& desc_path,
 }
 
 bool BluezClient::start_notify(const std::string& chrc_path) {
+    // Establish notify.
     RCLCPP_DEBUG(logger_, "[client] start_notify path=%s", chrc_path.c_str());
     try {
         auto proxy = create_bluez_proxy(dbus_.connection(), chrc_path);
@@ -201,6 +225,7 @@ bool BluezClient::start_notify(const std::string& chrc_path) {
 }
 
 bool BluezClient::stop_notify(const std::string& chrc_path) {
+    // Tear down notify.
     RCLCPP_DEBUG(logger_, "[client] stop_notify path=%s", chrc_path.c_str());
     if (!is_notify_active(chrc_path)) {
         return true;

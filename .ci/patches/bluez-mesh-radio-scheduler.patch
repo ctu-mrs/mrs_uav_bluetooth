@@ -1,0 +1,906 @@
+diff --git a/mesh/mesh-io-generic.c b/mesh/mesh-io-generic.c
+index df1450e..a0db464 100644
+--- a/mesh/mesh-io-generic.c
++++ b/mesh/mesh-io-generic.c
+@@ -31,15 +31,27 @@
+ #include "mesh/mesh-io-api.h"
+ #include "mesh/mesh-io-generic.h"
+ 
++/* Bluetooth 5 supports 20 ms legacy advertising. Probe that interval and
++ * fall back only when the controller rejects it, without chipset assumptions.
++ */
++#define MESH_FAST_ADV_INTERVAL 0x0020
++#define MESH_COMPAT_ADV_INTERVAL 0x00a0
++
+ struct mesh_io_private {
+ 	struct mesh_io *io;
+ 	struct bt_hci *hci;
+ 	struct l_timeout *tx_timeout;
++	struct l_idle *tx_idle;
+ 	struct l_queue *tx_pkts;
+ 	struct tx_pkt *tx;
+ 	uint16_t interval;
+ 	bool sending;
+ 	bool active;
++	bool programming;
++	bool scan_programming;
++	bool scan_enabled;
++	struct l_idle *init_idle;
++	uint16_t adv_interval;
+ };
+ 
+ struct process_data {
+@@ -51,6 +63,7 @@ struct process_data {
+ 
+ struct tx_pkt {
+ 	struct mesh_io_send_info	info;
++	uint64_t			next_send;
+ 	bool				delete;
+ 	uint8_t				len;
+ 	uint8_t				pkt[MESH_AD_MAX_LEN];
+@@ -84,7 +97,8 @@ static void process_rx_callbacks(void *v_reg, void *v_rx)
+ 	struct mesh_io_reg *rx_reg = v_reg;
+ 	struct process_data *rx = v_rx;
+ 
+-	if (!memcmp(rx->data, rx_reg->filter, rx_reg->len))
++	if (rx->len >= rx_reg->len &&
++			!memcmp(rx->data, rx_reg->filter, rx_reg->len))
+ 		rx_reg->cb(rx_reg->user_data, &rx->info, rx->data, rx->len);
+ }
+ 
+@@ -107,48 +121,56 @@ static void process_rx(struct mesh_io_private *pvt, int8_t rssi,
+ 
+ static void event_adv_report(struct mesh_io *io, const void *buf, uint8_t size)
+ {
+-	const struct bt_hci_evt_le_adv_report *evt = buf;
+-	const uint8_t *adv;
+-	const uint8_t *addr;
+-	uint32_t instant;
+-	uint8_t adv_len;
+-	uint16_t len = 0;
+-	int8_t rssi;
++	const uint8_t *report = buf;
++	uint8_t count;
++	uint32_t instant = get_instant();
+ 
+-	if (evt->event_type != 0x03)
++	if (!size)
+ 		return;
+ 
+-	instant = get_instant();
+-	adv = evt->data;
+-	adv_len = evt->data_len;
+-	addr = evt->addr;
+-
+-	/* rssi is just beyond last byte of data */
+-	rssi = (int8_t) adv[adv_len];
+-
+-	while (len < adv_len - 1) {
+-		uint8_t field_len = adv[0];
+-
+-		/* Check for the end of advertising data */
+-		if (field_len == 0)
+-			break;
+-
+-		len += field_len + 1;
+-
+-		/* Do not continue data parsing if got incorrect length */
+-		if (len > adv_len)
+-			break;
++	count = *report++;
++	size--;
++	while (count--) {
++		uint8_t data_len, remaining;
++		const uint8_t *adv;
+ 
+-		/* TODO: Create an Instant to use */
+-		process_rx(io->pvt, rssi, instant, addr, adv + 1, adv[0]);
+-
+-		adv += field_len + 1;
++		/* Each report has an event type, address type, six address
++		 * bytes, a data length, the data and a trailing RSSI byte.
++		 * A controller may batch several reports in one HCI event.
++		 */
++		if (size < 10)
++			return;
++		data_len = report[8];
++		if (data_len > size - 10)
++			return;
++
++		if (report[0] == 0x03) {
++			adv = report + 9;
++			remaining = data_len;
++			while (remaining) {
++				uint8_t field_len = adv[0];
++
++				if (!field_len || field_len >= remaining)
++					break;
++				process_rx(io->pvt, (int8_t) report[9 + data_len],
++						instant, report + 2, adv + 1,
++						field_len);
++				adv += field_len + 1;
++				remaining -= field_len + 1;
++			}
++		}
++		report += data_len + 10;
++		size -= data_len + 10;
+ 	}
+ }
+ 
+ static void event_callback(const void *buf, uint8_t size, void *user_data)
+ {
+-	uint8_t event = l_get_u8(buf);
++	uint8_t event;
++
++	if (!size)
++		return;
++	event = l_get_u8(buf);
+ 	struct mesh_io *io = user_data;
+ 
+ 	switch (event) {
+@@ -197,8 +219,11 @@ static void configure_hci(struct mesh_io_private *io)
+ 
+ 	/* Set scan parameters */
+ 	cmd.type = 0x00; /* Passive Scanning. No scanning PDUs shall be sent */
+-	cmd.interval = 0x0030; /* Scan Interval = N * 0.625ms */
+-	cmd.window = 0x0030; /* Scan Window = N * 0.625ms */
++	/* Mesh reception stays enabled between advertising events. The
++	 * controller schedules its own transmit/receive conflicts.
++	 */
++	cmd.interval = L_CPU_TO_LE16(0x0010); /* 10 ms */
++	cmd.window = L_CPU_TO_LE16(0x0010); /* 10 ms */
+ 	cmd.own_addr_type = 0x00; /* Public Device Address */
+ 	/* Accept all advertising packets except directed advertising packets
+ 	 * not addressed to this device (default).
+@@ -280,46 +305,74 @@ static void configure_hci(struct mesh_io_private *io)
+ 				sizeof(cmd), hci_generic_callback, NULL, NULL);
+ }
+ 
+-static void scan_enable_rsp(const void *buf, uint8_t size,
+-							void *user_data)
++static void restart_scan(struct mesh_io_private *pvt);
++
++static bool scan_command_ok(struct mesh_io_private *pvt,
++				const void *buf, uint8_t size, const char *stage)
+ {
+-	uint8_t status = *((uint8_t *) buf);
++	if (size && !l_get_u8(buf))
++		return true;
+ 
+-	if (status)
+-		l_error("LE Scan enable failed (0x%02x)", status);
++	pvt->scan_programming = false;
++	l_error("Mesh scan %s failed (0x%02x)", stage,
++					size ? l_get_u8(buf) : 0xff);
++	return false;
+ }
+ 
+-static void set_recv_scan_enable(const void *buf, uint8_t size,
+-							void *user_data)
++static void scan_enable_rsp(const void *buf, uint8_t size, void *user_data)
+ {
+ 	struct mesh_io_private *pvt = user_data;
+-	struct bt_hci_cmd_le_set_scan_enable cmd;
+ 
+-	cmd.enable = 0x01;	/* Enable scanning */
+-	cmd.filter_dup = 0x00;	/* Report duplicates */
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_ENABLE,
+-			&cmd, sizeof(cmd), scan_enable_rsp, pvt, NULL);
++	if (!scan_command_ok(pvt, buf, size, "enable"))
++		return;
++
++	pvt->scan_enabled = true;
++	pvt->scan_programming = false;
++	restart_scan(pvt);
+ }
+ 
+-static void scan_disable_rsp(const void *buf, uint8_t size,
+-							void *user_data)
++static void set_recv_scan_enable(const void *buf, uint8_t size, void *user_data)
+ {
+-	struct bt_hci_cmd_le_set_scan_parameters cmd;
+ 	struct mesh_io_private *pvt = user_data;
+-	uint8_t status = *((uint8_t *) buf);
++	struct bt_hci_cmd_le_set_scan_enable cmd = { 0x01, 0x00 };
+ 
+-	if (status)
+-		l_error("LE Scan disable failed (0x%02x)", status);
++	if (!scan_command_ok(pvt, buf, size, "parameters"))
++		return;
++	if (l_queue_isempty(pvt->io->rx_regs)) {
++		pvt->scan_programming = false;
++		return;
++	}
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_ENABLE,
++			&cmd, sizeof(cmd), scan_enable_rsp, pvt, NULL))
++		scan_command_ok(pvt, NULL, 0, "enable submission");
++}
+ 
+-	cmd.type = pvt->active ? 0x01 : 0x00;	/* Passive/Active scanning */
+-	cmd.interval = L_CPU_TO_LE16(0x0010);	/* 10 ms */
+-	cmd.window = L_CPU_TO_LE16(0x0010);	/* 10 ms */
+-	cmd.own_addr_type = 0x01;		/* ADDR_TYPE_RANDOM */
+-	cmd.filter_policy = 0x00;		/* Accept all */
++static void configure_scan(struct mesh_io_private *pvt)
++{
++	struct bt_hci_cmd_le_set_scan_parameters cmd;
++
++	if (l_queue_isempty(pvt->io->rx_regs)) {
++		pvt->scan_programming = false;
++		return;
++	}
++	cmd.type = pvt->active ? 0x01 : 0x00;
++	cmd.interval = L_CPU_TO_LE16(0x0010); /* 10 ms */
++	cmd.window = L_CPU_TO_LE16(0x0010); /* 10 ms */
++	cmd.own_addr_type = 0x01;
++	cmd.filter_policy = 0x00;
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_PARAMETERS,
++			&cmd, sizeof(cmd), set_recv_scan_enable, pvt, NULL))
++		scan_command_ok(pvt, NULL, 0, "parameters submission");
++}
++
++static void scan_disable_rsp(const void *buf, uint8_t size, void *user_data)
++{
++	struct mesh_io_private *pvt = user_data;
+ 
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_PARAMETERS,
+-			&cmd, sizeof(cmd),
+-			set_recv_scan_enable, pvt, NULL);
++	if (!scan_command_ok(pvt, buf, size, "disable"))
++		return;
++	pvt->scan_enabled = false;
++	configure_scan(pvt);
+ }
+ 
+ static bool simple_match(const void *a, const void *b)
+@@ -362,23 +415,38 @@ static bool find_active(const void *a, const void *b)
+ 
+ static void restart_scan(struct mesh_io_private *pvt)
+ {
+-	struct bt_hci_cmd_le_set_scan_enable cmd;
++	struct bt_hci_cmd_le_set_scan_enable cmd = { 0x00, 0x00 };
++	bool enabled = !l_queue_isempty(pvt->io->rx_regs);
++	bool active = l_queue_find(pvt->io->rx_regs, find_active, NULL) != NULL;
+ 
+-	if (l_queue_isempty(pvt->io->rx_regs))
++	/* One disable/parameters/enable transaction owns scanning. Registration
++	 * changes during that transaction are reconciled after its completion,
++	 * so an older enable can never precede a newer parameter command.
++	 */
++	if (!pvt->hci || pvt->scan_programming)
++		return;
++	if (enabled == pvt->scan_enabled && (!enabled || active == pvt->active))
+ 		return;
+ 
+-	pvt->active = l_queue_find(pvt->io->rx_regs, find_active, NULL);
+-	cmd.enable = 0x00;	/* Disable scanning */
+-	cmd.filter_dup = 0x00;	/* Report duplicates */
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_ENABLE,
+-				&cmd, sizeof(cmd), scan_disable_rsp, pvt, NULL);
++	pvt->active = active;
++	pvt->scan_programming = true;
++	if (!pvt->scan_enabled) {
++		configure_scan(pvt);
++		return;
++	}
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_ENABLE,
++			&cmd, sizeof(cmd), scan_disable_rsp, pvt, NULL))
++		scan_command_ok(pvt, NULL, 0, "disable submission");
+ }
+ 
+-static void hci_init(void *user_data)
++static void hci_init(struct l_idle *idle, void *user_data)
+ {
+ 	struct mesh_io *io = user_data;
+ 	bool result = true;
+ 
++	l_idle_remove(idle);
++	io->pvt->init_idle = NULL;
++
+ 	if (io->pvt->hci)
+ 		bt_hci_unref(io->pvt->hci);
+ 
+@@ -417,8 +485,9 @@ static bool dev_init(struct mesh_io *io, void *opts, void *user_data)
+ 	io->pvt->tx_pkts = l_queue_new();
+ 
+ 	io->pvt->io = io;
++	io->pvt->adv_interval = MESH_FAST_ADV_INTERVAL;
+ 
+-	l_idle_oneshot(hci_init, io, NULL);
++	io->pvt->init_idle = l_idle_create(hci_init, io, NULL);
+ 
+ 	return true;
+ }
+@@ -430,6 +499,8 @@ static bool dev_destroy(struct mesh_io *io)
+ 	if (!pvt)
+ 		return true;
+ 
++	l_idle_remove(pvt->init_idle);
++	l_idle_remove(pvt->tx_idle);
+ 	bt_hci_unref(pvt->hci);
+ 	l_timeout_remove(pvt->tx_timeout);
+ 	l_queue_remove_if(pvt->tx_pkts, simple_match, pvt->tx);
+@@ -454,22 +525,31 @@ static bool dev_caps(struct mesh_io *io, struct mesh_io_caps *caps)
+ 	return true;
+ }
+ 
++static void tx_to(struct l_timeout *timeout, void *user_data);
++static void schedule_tx(struct mesh_io_private *pvt, uint32_t delay);
++
+ static void send_cancel_done(const void *buf, uint8_t size,
+ 							void *user_data)
+ {
+ 	struct mesh_io_private *pvt = user_data;
+-	struct bt_hci_cmd_le_set_random_address cmd;
+ 
+ 	if (!pvt)
+ 		return;
+ 
+-	pvt->sending = false;
+-
+-	/* At end of any burst of ADVs, change random address */
+-	l_getrandom(cmd.addr, 6);
+-	cmd.addr[5] |= 0xc0;
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_RANDOM_ADDRESS,
+-				&cmd, sizeof(cmd), NULL, NULL, NULL);
++	pvt->programming = false;
++	if (size && l_get_u8(buf))
++		l_error("Mesh advertising disable failed (0x%02x)", l_get_u8(buf));
++	else
++		pvt->sending = false;
++	if (!l_queue_isempty(pvt->tx_pkts))
++		schedule_tx(pvt, 1);
++
++	/* configure_hci assigns a fresh static random address before scanning
++	 * starts. Keep that address for this bearer session. Changing it here
++	 * while scanning is enabled is forbidden by HCI and produces Command
++	 * Disallowed on legacy controllers. Mesh identity and encryption are
++	 * independent of this bearer address.
++	 */
+ }
+ 
+ static void send_cancel(struct mesh_io_private *pvt)
+@@ -485,9 +565,59 @@ static void send_cancel(struct mesh_io_private *pvt)
+ 	}
+ 
+ 	cmd.enable = 0x00;	/* Disable advertising */
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_ENABLE,
++	pvt->programming = true;
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_ENABLE,
+ 				&cmd, sizeof(cmd),
+-				send_cancel_done, pvt, NULL);
++				send_cancel_done, pvt, NULL)) {
++		pvt->programming = false;
++		l_error("Could not queue Mesh advertising disable");
++		schedule_tx(pvt, 1);
++	}
++}
++
++static void tx_to(struct l_timeout *timeout, void *user_data);
++
++/* Start packet dwell after the controller accepted advertising, not before
++ * its asynchronous disable/parameters/data/enable command chain completed.
++ */
++static void schedule_tx(struct mesh_io_private *pvt, uint32_t delay)
++{
++	if (pvt->tx_timeout)
++		l_timeout_modify_ms(pvt->tx_timeout, delay);
++	else
++		pvt->tx_timeout = l_timeout_create_ms(delay, tx_to, pvt, NULL);
++}
++
++/* A rejected command must end this transaction. In particular, never
++ * enable advertising after Set Advertising Data failed, which would send
++ * the previous packet while the upper layers account for the new packet.
++ */
++static void programming_failed(struct mesh_io_private *pvt,
++                                        const char *stage, uint8_t status)
++{
++    l_error("Mesh advertising %s failed (0x%02x)", stage, status);
++    if (pvt->tx && pvt->tx->delete) {
++        l_queue_remove(pvt->tx_pkts, pvt->tx);
++        l_free(pvt->tx);
++    }
++    pvt->tx = NULL;
++    pvt->programming = false;
++    schedule_tx(pvt, 1);
++}
++
++static void send_adv_enabled(const void *buf, uint8_t size, void *user_data)
++{
++	struct mesh_io_private *pvt = user_data;
++	uint8_t status = size ? l_get_u8(buf) : 0xff;
++
++	pvt->programming = false;
++	pvt->sending = !status;
++	if (status)
++		l_error("Mesh advertising enable failed (0x%02x)", status);
++	/* One interval plus the maximum 10 ms advertising-event delay.
++	 * Use the interval actually accepted by the controller.
++	 */
++	schedule_tx(pvt, (pvt->adv_interval * 625 + 999) / 1000 + 10);
+ }
+ 
+ static void set_send_adv_enable(const void *buf, uint8_t size,
+@@ -499,12 +629,23 @@ static void set_send_adv_enable(const void *buf, uint8_t size,
+ 	if (!pvt)
+ 		return;
+ 
+-	pvt->sending = true;
++	if (!pvt->tx) {
++		pvt->programming = false;
++		schedule_tx(pvt, 1);
++		return;
++	}
++	if (!size || l_get_u8(buf)) {
++		programming_failed(pvt, "data", size ? l_get_u8(buf) : 0xff);
++		return;
++	}
+ 	cmd.enable = 0x01;	/* Enable advertising */
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_ENABLE,
+-				&cmd, sizeof(cmd), NULL, NULL, NULL);
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_ENABLE,
++				&cmd, sizeof(cmd), send_adv_enabled, pvt, NULL))
++		programming_failed(pvt, "enable submission", 0xff);
+ }
+ 
++static void set_send_adv_params(const void *buf, uint8_t size, void *user_data);
++
+ static void set_send_adv_data(const void *buf, uint8_t size,
+ 							void *user_data)
+ {
+@@ -512,12 +653,31 @@ static void set_send_adv_data(const void *buf, uint8_t size,
+ 	struct tx_pkt *tx;
+ 	struct bt_hci_cmd_le_set_adv_data cmd;
+ 
+-	if (!pvt || !pvt->tx)
++	if (!pvt)
++		return;
++	if (!pvt->tx) {
++		pvt->programming = false;
++		schedule_tx(pvt, 1);
+ 		return;
++	}
+ 
+ 	tx = pvt->tx;
+-	if (tx->len >= sizeof(cmd.data))
+-		goto done;
++	if (size && l_get_u8(buf)) {
++		if (l_get_u8(buf) == 0x12 &&
++				pvt->adv_interval == MESH_FAST_ADV_INTERVAL) {
++			pvt->adv_interval = MESH_COMPAT_ADV_INTERVAL;
++			set_send_adv_params(NULL, 0, pvt);
++			return;
++		}
++		programming_failed(pvt, "parameters", l_get_u8(buf));
++		return;
++	}
++
++	tx = pvt->tx;
++	if (tx->len >= sizeof(cmd.data)) {
++		programming_failed(pvt, "payload length", 0x12);
++		return;
++	}
+ 
+ 	memset(&cmd, 0, sizeof(cmd));
+ 
+@@ -525,16 +685,16 @@ static void set_send_adv_data(const void *buf, uint8_t size,
+ 	cmd.data[0] = tx->len;
+ 	memcpy(cmd.data + 1, tx->pkt, tx->len);
+ 
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_DATA,
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_DATA,
+ 					&cmd, sizeof(cmd),
+-					set_send_adv_enable, pvt, NULL);
+-done:
+-	if (tx->delete) {
+-		l_queue_remove_if(pvt->tx_pkts, simple_match, tx);
+-		l_free(tx);
++					set_send_adv_enable, pvt, NULL)) {
++		programming_failed(pvt, "data submission", 0xff);
++		return;
+ 	}
+-
+-	pvt->tx = NULL;
++	/* The current packet remains owned until its radio dwell completes.
++	 * Queue cancellation must not confuse an empty repeat queue with an
++	 * idle transmitter.
++	 */
+ }
+ 
+ static void set_send_adv_params(const void *buf, uint8_t size,
+@@ -547,7 +707,12 @@ static void set_send_adv_params(const void *buf, uint8_t size,
+ 	if (!pvt)
+ 		return;
+ 
+-	hci_interval = (pvt->interval * 16) / 10;
++	if (size && l_get_u8(buf)) {
++		programming_failed(pvt, "disable", l_get_u8(buf));
++		return;
++	}
++	pvt->sending = false;
++	hci_interval = pvt->adv_interval;
+ 	cmd.min_interval = L_CPU_TO_LE16(hci_interval);
+ 	cmd.max_interval = L_CPU_TO_LE16(hci_interval);
+ 	cmd.type = 0x03; /* ADV_NONCONN_IND */
+@@ -557,9 +722,10 @@ static void set_send_adv_params(const void *buf, uint8_t size,
+ 	cmd.channel_map = 0x07;
+ 	cmd.filter_policy = 0x03;
+ 
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_PARAMETERS,
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_PARAMETERS,
+ 				&cmd, sizeof(cmd),
+-				set_send_adv_data, pvt, NULL);
++				set_send_adv_data, pvt, NULL))
++		programming_failed(pvt, "parameters submission", 0xff);
+ }
+ 
+ static void send_pkt(struct mesh_io_private *pvt, struct tx_pkt *tx,
+@@ -567,14 +733,9 @@ static void send_pkt(struct mesh_io_private *pvt, struct tx_pkt *tx,
+ {
+ 	struct bt_hci_cmd_le_set_adv_enable cmd;
+ 
+-	/* Delete superseded packet in favor of new packet */
+-	if (pvt->tx && pvt->tx != tx && pvt->tx->delete) {
+-		l_queue_remove_if(pvt->tx_pkts, simple_match, pvt->tx);
+-		l_free(pvt->tx);
+-	}
+-
+ 	pvt->tx = tx;
+ 	pvt->interval = interval;
++	pvt->programming = true;
+ 
+ 	if (!pvt->sending) {
+ 		set_send_adv_params(NULL, 0, pvt);
+@@ -582,112 +743,138 @@ static void send_pkt(struct mesh_io_private *pvt, struct tx_pkt *tx,
+ 	}
+ 
+ 	cmd.enable = 0x00;	/* Disable advertising */
+-	bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_ENABLE,
++	if (!bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_ADV_ENABLE,
+ 				&cmd, sizeof(cmd),
+-				set_send_adv_params, pvt, NULL);
++				set_send_adv_params, pvt, NULL))
++		programming_failed(pvt, "disable submission", 0xff);
+ }
+ 
+ static void tx_to(struct l_timeout *timeout, void *user_data)
+ {
+ 	struct mesh_io_private *pvt = user_data;
+-	struct tx_pkt *tx;
+-	uint16_t ms;
++	const struct l_queue_entry *entry;
++	struct tx_pkt *tx = NULL;
++	uint64_t now = l_time_now();
++	uint16_t interval;
+ 	uint8_t count;
+ 
+-	if (!pvt)
++	if (pvt->programming) {
++		schedule_tx(pvt, 5);
+ 		return;
++	}
++
++	/* The previous packet's acknowledged radio dwell has now finished.
++	 * Repeated packets still belong to the queue, final copies belong here.
++	 */
++	if (pvt->tx) {
++		if (pvt->tx->delete)
++			l_free(pvt->tx);
++		pvt->tx = NULL;
++	}
++
++	/* Repetition spacing belongs to each packet, not to the whole queue.
++	 * While one packet waits for its repeat, other segments, acknowledgements
++	 * and relay traffic can use the radio. Preserve FIFO order among due
++	 * packets so a stream cannot starve another stream.
++	 */
++	for (entry = l_queue_get_entries(pvt->tx_pkts); entry;
++						entry = entry->next) {
++		struct tx_pkt *candidate = entry->data;
++
++		if (candidate->next_send <= now) {
++			tx = candidate;
++			break;
++		}
++	}
+ 
+-	tx = l_queue_pop_head(pvt->tx_pkts);
+ 	if (!tx) {
+-		l_timeout_remove(timeout);
+-		pvt->tx_timeout = NULL;
+ 		send_cancel(pvt);
++		if (l_queue_isempty(pvt->tx_pkts)) {
++			l_timeout_remove(timeout);
++			pvt->tx_timeout = NULL;
++		} else {
++			/* Bound wake latency for a newly queued packet while all
++			 * existing packets wait for their own retry deadlines.
++			 */
++			schedule_tx(pvt, 10);
++		}
+ 		return;
+ 	}
++	l_queue_remove(pvt->tx_pkts, tx);
+ 
+ 	if (tx->info.type == MESH_IO_TIMING_TYPE_GENERAL) {
+-		ms = tx->info.u.gen.interval;
++		interval = tx->info.u.gen.interval;
+ 		count = tx->info.u.gen.cnt;
+ 		if (count != MESH_IO_TX_COUNT_UNLIMITED)
+ 			tx->info.u.gen.cnt--;
+ 	} else {
+-		ms = 25;
++		interval = 25;
+ 		count = 1;
+ 	}
+ 
+-	tx->delete = !!(count == 1);
+-
+-	send_pkt(pvt, tx, ms);
+-
+-	if (count == 1) {
+-		/* Recalculate wakeup if we are responding to POLL */
+-		tx = l_queue_peek_head(pvt->tx_pkts);
+-
+-		if (tx && tx->info.type == MESH_IO_TIMING_TYPE_POLL_RSP) {
+-			ms = instant_remaining_ms(tx->info.u.poll_rsp.instant +
+-						tx->info.u.poll_rsp.delay);
+-		}
+-	} else
++	tx->delete = count == 1;
++	if (!tx->delete) {
++		tx->next_send = now + (uint64_t) interval * 1000;
+ 		l_queue_push_tail(pvt->tx_pkts, tx);
++	}
+ 
+-	if (timeout) {
+-		pvt->tx_timeout = timeout;
+-		l_timeout_modify_ms(timeout, ms);
+-	} else
+-		pvt->tx_timeout = l_timeout_create_ms(ms, tx_to, pvt, NULL);
++	/* A new advertising event starts when enabled. The HCI interval is
++	 * still standards-compliant, but waiting an entire repeat interval
++	 * here would stall unrelated queued traffic. The completion callback
++	 * grants this event its dwell before another command chain starts.
++	 */
++	send_pkt(pvt, tx, interval);
+ }
+ 
+-static void tx_worker(void *user_data)
++static uint32_t initial_tx_delay(const struct mesh_io_send_info *info)
+ {
+-	struct mesh_io_private *pvt = user_data;
+-	struct tx_pkt *tx;
+ 	uint32_t delay;
+ 
+-	tx = l_queue_peek_head(pvt->tx_pkts);
+-	if (!tx)
+-		return;
+-
+-	switch (tx->info.type) {
++	switch (info->type) {
+ 	case MESH_IO_TIMING_TYPE_GENERAL:
+-		if (tx->info.u.gen.min_delay == tx->info.u.gen.max_delay)
+-			delay = tx->info.u.gen.min_delay;
++		if (info->u.gen.min_delay == info->u.gen.max_delay)
++			delay = info->u.gen.min_delay;
+ 		else {
+ 			l_getrandom(&delay, sizeof(delay));
+-			delay %= tx->info.u.gen.max_delay -
+-						tx->info.u.gen.min_delay;
+-			delay += tx->info.u.gen.min_delay;
++			delay %= info->u.gen.max_delay -
++						info->u.gen.min_delay;
++			delay += info->u.gen.min_delay;
+ 		}
+ 		break;
+ 
+ 	case MESH_IO_TIMING_TYPE_POLL:
+-		if (tx->info.u.poll.min_delay == tx->info.u.poll.max_delay)
+-			delay = tx->info.u.poll.min_delay;
++		if (info->u.poll.min_delay == info->u.poll.max_delay)
++			delay = info->u.poll.min_delay;
+ 		else {
+ 			l_getrandom(&delay, sizeof(delay));
+-			delay %= tx->info.u.poll.max_delay -
+-						tx->info.u.poll.min_delay;
+-			delay += tx->info.u.poll.min_delay;
++			delay %= info->u.poll.max_delay -
++						info->u.poll.min_delay;
++			delay += info->u.poll.min_delay;
+ 		}
+ 		break;
+ 
+ 	case MESH_IO_TIMING_TYPE_POLL_RSP:
+ 		/* Delay until Instant + Delay */
+-		delay = instant_remaining_ms(tx->info.u.poll_rsp.instant +
+-						tx->info.u.poll_rsp.delay);
++		delay = instant_remaining_ms(info->u.poll_rsp.instant +
++						info->u.poll_rsp.delay);
+ 		if (delay > 255)
+ 			delay = 0;
+ 		break;
+ 
+ 	default:
+-		return;
++		return 0;
+ 	}
+ 
+-	if (!delay)
+-		tx_to(pvt->tx_timeout, pvt);
+-	else if (pvt->tx_timeout)
+-		l_timeout_modify_ms(pvt->tx_timeout, delay);
+-	else
+-		pvt->tx_timeout = l_timeout_create_ms(delay, tx_to, pvt, NULL);
++	return delay;
++}
++
++static void tx_worker(struct l_idle *idle, void *user_data)
++{
++	struct mesh_io_private *pvt = user_data;
++
++	l_idle_remove(idle);
++	pvt->tx_idle = NULL;
++	tx_to(pvt->tx_timeout, pvt);
+ }
+ 
+ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+@@ -695,6 +882,7 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+ {
+ 	struct mesh_io_private *pvt = io->pvt;
+ 	struct tx_pkt *tx;
++	bool idle;
+ 
+ 	if (!info || !data || !len || len > sizeof(tx->pkt))
+ 		return false;
+@@ -704,33 +892,42 @@ static bool send_tx(struct mesh_io *io, struct mesh_io_send_info *info,
+ 	memcpy(&tx->info, info, sizeof(tx->info));
+ 	memcpy(&tx->pkt, data, len);
+ 	tx->len = len;
++	tx->next_send = l_time_now() + (uint64_t) initial_tx_delay(info) * 1000;
++
++	/* A queued packet already owns the worker, even before its idle callback
++	 * runs or after the current HCI command completes. Scheduling another
++	 * worker here replaces pvt->tx during segmented/group bursts.
++	 */
++	idle = !pvt->programming && !pvt->tx && !pvt->tx_idle && !pvt->tx_timeout &&
++						l_queue_isempty(pvt->tx_pkts);
+ 
+ 	if (info->type == MESH_IO_TIMING_TYPE_POLL_RSP)
+ 		l_queue_push_head(pvt->tx_pkts, tx);
+-	else {
+-		/*
+-		 * If transmitter is idle, send packets at least twice to
+-		 * guard against in-line cancellation of HCI command chain.
+-		 */
+-		if (info->type == MESH_IO_TIMING_TYPE_GENERAL &&
+-					!pvt->tx &&
+-					l_queue_isempty(pvt->tx_pkts) &&
+-					tx->info.u.gen.cnt == 1)
+-			tx->info.u.gen.cnt++;
+-
++	else
+ 		l_queue_push_tail(pvt->tx_pkts, tx);
+-	}
+ 
+ 	/* If not already sending, schedule the tx worker */
+-	if (!pvt->tx) {
++	if (idle) {
+ 		l_timeout_remove(pvt->tx_timeout);
+ 		pvt->tx_timeout = NULL;
+-		l_idle_oneshot(tx_worker, pvt, NULL);
++		pvt->tx_idle = l_idle_create(tx_worker, pvt, NULL);
+ 	}
+ 
+ 	return true;
+ }
+ 
++static bool tx_pending(struct mesh_io *io, const uint8_t *data, uint8_t len)
++{
++	struct mesh_io_private *pvt = io->pvt;
++	struct tx_pattern pattern = { .data = data, .len = len };
++
++	if (!pvt)
++		return false;
++	if (pvt->tx && find_by_pattern(pvt->tx, &pattern))
++		return true;
++	return l_queue_find(pvt->tx_pkts, find_by_pattern, &pattern) != NULL;
++}
++
+ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
+ {
+ 	struct mesh_io_private *pvt = io->pvt;
+@@ -739,6 +936,24 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
+ 	if (!data)
+ 		return false;
+ 
++	/* A final transmission has no queued repetition, but still owns its
++	 * dwell. Only cancel it when this request matches the actual packet.
++	 */
++	if (pvt->tx && pvt->tx->delete) {
++		bool matches;
++
++		if (len == 1)
++			matches = find_by_ad_type(pvt->tx, L_UINT_TO_PTR(data[0]));
++		else {
++			struct tx_pattern pattern = { .data = data, .len = len };
++			matches = find_by_pattern(pvt->tx, &pattern);
++		}
++		if (matches) {
++			l_free(pvt->tx);
++			pvt->tx = NULL;
++		}
++	}
++
+ 	if (len == 1) {
+ 		do {
+ 			tx = l_queue_remove_if(pvt->tx_pkts, find_by_ad_type,
+@@ -766,7 +981,7 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
+ 		} while (tx);
+ 	}
+ 
+-	if (l_queue_isempty(pvt->tx_pkts)) {
++	if (l_queue_isempty(pvt->tx_pkts) && !pvt->programming && !pvt->tx) {
+ 		send_cancel(pvt);
+ 		l_timeout_remove(pvt->tx_timeout);
+ 		pvt->tx_timeout = NULL;
+@@ -778,50 +993,14 @@ static bool tx_cancel(struct mesh_io *io, const uint8_t *data, uint8_t len)
+ static bool recv_register(struct mesh_io *io, const uint8_t *filter,
+ 			uint8_t len, mesh_io_recv_func_t cb, void *user_data)
+ {
+-	struct bt_hci_cmd_le_set_scan_enable cmd;
+-	struct mesh_io_private *pvt = io->pvt;
+-	bool already_scanning;
+-	bool active = false;
+-
+-	already_scanning = l_queue_length(io->rx_regs) > 1;
+-
+-	/* Look for any AD types requiring Active Scanning */
+-	if (l_queue_find(io->rx_regs, find_active, NULL))
+-		active = true;
+-
+-	if (!already_scanning || pvt->active != active) {
+-		pvt->active = active;
+-		cmd.enable = 0x00;	/* Disable scanning */
+-		cmd.filter_dup = 0x00;	/* Report duplicates */
+-		bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_ENABLE,
+-				&cmd, sizeof(cmd), scan_disable_rsp, pvt, NULL);
+-
+-	}
+-
++	restart_scan(io->pvt);
+ 	return true;
+ }
+ 
+ static bool recv_deregister(struct mesh_io *io, const uint8_t *filter,
+ 								uint8_t len)
+ {
+-	struct bt_hci_cmd_le_set_scan_enable cmd = {0, 0};
+-	struct mesh_io_private *pvt = io->pvt;
+-	bool active = false;
+-
+-	/* Look for any AD types requiring Active Scanning */
+-	if (l_queue_find(io->rx_regs, find_active, NULL))
+-		active = true;
+-
+-	if (l_queue_isempty(io->rx_regs)) {
+-		bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_ENABLE,
+-					&cmd, sizeof(cmd), NULL, NULL, NULL);
+-
+-	} else if (active != pvt->active) {
+-		pvt->active = active;
+-		bt_hci_send(pvt->hci, BT_HCI_CMD_LE_SET_SCAN_ENABLE,
+-				&cmd, sizeof(cmd), scan_disable_rsp, pvt, NULL);
+-	}
+-
++	restart_scan(io->pvt);
+ 	return true;
+ }
+ 
+@@ -833,4 +1012,5 @@ const struct mesh_io_api mesh_io_generic = {
+ 	.reg = recv_register,
+ 	.dereg = recv_deregister,
+ 	.cancel = tx_cancel,
++	.pending = tx_pending,
+ };
