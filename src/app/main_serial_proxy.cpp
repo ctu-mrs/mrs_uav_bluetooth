@@ -4,7 +4,7 @@
 
 // Serial forwarding behavior inspired by b1f6c1c4/ttyssh (MIT).
 #include <fcntl.h>
-#include <sys/ioctl.h>
+#include <sys/file.h>
 #include <sys/poll.h>
 #include <termios.h>
 #include <unistd.h>
@@ -57,7 +57,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot open %s: %s\n", argv[1], std::strerror(errno));
         return 66;
     }
-    (void)::ioctl(tty_fd, TIOCEXCL);
+    if (::flock(tty_fd, LOCK_EX | LOCK_NB) != 0) {
+        std::fprintf(stderr, "serial link %s is already in use\n", argv[1]);
+        ::close(tty_fd);
+        return 75;
+    }
 
     termios original{};
     const bool have_original = ::tcgetattr(tty_fd, &original) == 0;
@@ -106,7 +110,7 @@ int main(int argc, char** argv) {
     if (have_original) {
         (void)::tcsetattr(tty_fd, TCSANOW, &original);
     }
-    (void)::ioctl(tty_fd, TIOCNXCL);
+    (void)::flock(tty_fd, LOCK_UN);
     ::close(tty_fd);
     return 0;
 }

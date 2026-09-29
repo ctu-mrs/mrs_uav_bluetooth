@@ -296,7 +296,7 @@ public:
     /// \param destination Unicast address of the node being configured.
     /// \param subnet_index Mesh subnet containing the network key.
     /// \param network_index Existing subnet used to deliver the new network key.
-    /// \param update whether an existing Mesh key is updated instead of newly added.
+    /// \param update True updates an existing Mesh key; false adds a new key.
     void add_net_key(uint8_t element_index, uint16_t destination,
                      uint16_t subnet_index, uint16_t network_index, bool update);
     /// \brief Send a Config AppKey Add or Update message to a node.
@@ -304,7 +304,7 @@ public:
     /// \param destination Unicast address of the node being configured.
     /// \param application_index Application key index added to the remote node.
     /// \param network_index Subnet to which the application key belongs.
-    /// \param update whether an existing Mesh key is updated instead of newly added.
+    /// \param update True updates an existing Mesh key; false adds a new key.
     void add_app_key(uint8_t element_index, uint16_t destination,
                      uint16_t application_index, uint16_t network_index, bool update);
     /// \brief Publish an access message using one local model’s configured publication.
@@ -397,8 +397,8 @@ private:
     void export_attention();
     /// \brief Expose provisioning data allocation and completion callbacks.
     void export_provisioner();
-    /// Ask the system D-Bus daemon to activate bluetooth-meshd, rate-limited
-    /// so a missing host prerequisite cannot create a one-hertz restart storm.
+    /// Ask the system D-Bus daemon to activate bluetooth-meshd with a bounded
+    /// retry rate for unavailable host prerequisites.
     /// \return True if the Mesh daemon became reachable after D-Bus activation; otherwise false.
     bool request_daemon_activation();
     /// \brief Store the current attachment token and notify persistence observers only on change.
@@ -436,8 +436,8 @@ private:
     rclcpp::Logger logger_;
     /// ObjectManager root supplied to BlueZ lifecycle methods.
     std::string root_path_{"/cz/cvut/mrs/uav/bluetooth/mesh"};
-    /// Application1 must be a managed child: sdbus-c++ ObjectManager does not
-    /// include interfaces placed directly on its own root object.
+    /// Application1 is a managed child because sdbus-c++ ObjectManager
+    /// enumerates interfaces below its root object.
     std::string application_path_{root_path_ + "/application"};
     std::string agent_path_{root_path_ + "/agent"};
     std::string element_path_{root_path_ + "/ele00"};
@@ -477,10 +477,9 @@ std::vector<uint8_t> mesh_uuid_from_string(const std::string& value);
 
 /// Derive a deterministic RFC 4122 version-3 UUID for a named Mesh device.
 ///
-/// The repository's generic name UUID helper intentionally preserves its
-/// historical output because those values are also used by existing GATT
-/// profiles. Mesh uses this dedicated wrapper because BlueZ rejects UUID byte
-/// arrays whose RFC version and variant bits are not set.
+/// The repository's generic name UUID helper preserves the values used by
+/// existing GATT profiles. Mesh uses this dedicated wrapper to set the RFC
+/// version and variant bits required by BlueZ.
 /// \param value Stable name from which to derive a Mesh UUID.
 /// \return Deterministic name-based 16-byte Mesh UUID.
 std::vector<uint8_t> mesh_uuid_from_name(const std::string& value);

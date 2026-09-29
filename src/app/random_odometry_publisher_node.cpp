@@ -64,6 +64,8 @@ RandomOdometryPublisherNode::RandomOdometryPublisherNode()
 }
 
 void RandomOdometryPublisherNode::configure_parameters() {
+    // Declare every output and bound parameter, expand the local hostname, and
+    // validate all numeric ranges before creating publishers or timers.
     declare_parameter<std::string>(
         "odometry_topic", "/{hostname}/mavros/local_position/odom");
     declare_parameter<std::string>("frame_id", frame_id_);
@@ -143,8 +145,8 @@ void RandomOdometryPublisherNode::publish_odometry() {
     message.pose.pose.orientation.z = cr * cp * sy - sr * sp * cy;
     message.pose.pose.orientation.w = cr * cp * cy + sr * sp * sy;
 
-    // Independent components intentionally favor broad transport coverage over
-    // physically continuous motion; this node is a data-path source, not a simulator.
+    // Independent components create broad synthetic coverage of every odometry
+    // field exercised by the transport data path.
     message.twist.twist.linear.x = sample(-linear_xy_limit_, linear_xy_limit_);
     message.twist.twist.linear.y = sample(-linear_xy_limit_, linear_xy_limit_);
     message.twist.twist.linear.z = sample(-linear_z_limit_, linear_z_limit_);
@@ -155,7 +157,7 @@ void RandomOdometryPublisherNode::publish_odometry() {
 }
 
 double RandomOdometryPublisherNode::sample(double minimum, double maximum) {
-    // Sample random odometry publisher node.
+    // Draw one bounded component from the node's persistent random engine.
     return std::uniform_real_distribution<double>(minimum, maximum)(random_engine_);
 }
 

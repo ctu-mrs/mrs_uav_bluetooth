@@ -25,8 +25,8 @@ double evaluate_math_expression(
 using ExactInteger = __int128_t;
 
 /// Evaluate a relation exactly when all literals and resolved fields are
-/// integers. Decimal literals, floating-point fields, pi, and functions
-/// select the floating-point evaluator instead. Integer division truncates
+/// integers. The floating-point evaluator handles decimal literals,
+/// floating-point fields, pi, and functions. Integer division truncates
 /// toward zero and % gives the remainder. Overflow and division by zero fail.
 /// \param expression arithmetic expression evaluated for a bridge member.
 /// \param resolve_identifier callback that supplies a value for each expression identifier.

@@ -261,8 +261,8 @@ void MeshApplication::export_objects() {
 
     // Keep ObjectManager at app_root and every advertised Mesh interface on a
     // managed child. BlueZ discovers Application1 by scanning the dictionary
-    // returned by app_root.GetManagedObjects(); sdbus-c++ correctly reports
-    // descendants but does not include interfaces attached to app_root itself.
+    // returned by app_root.GetManagedObjects(); sdbus-c++ reports the
+    // descendant objects through that manager.
     root_object_ = sdbus::createObject(
         dbus_.connection(), sdbus::ObjectPath{root_path_});
     application_object_ = sdbus::createObject(
@@ -645,6 +645,8 @@ void MeshApplication::export_provisioner() {
 }
 
 bool MeshApplication::daemon_available() const {
+    // Require both the well-known bus owner and its initialized Network1 object
+    // before lifecycle calls use the Mesh daemon.
     try {
         auto proxy = sdbus::createProxy(
             dbus_.connection(),
@@ -678,6 +680,8 @@ bool MeshApplication::daemon_available() const {
 }
 
 bool MeshApplication::request_daemon_activation() {
+    // Rate-limit StartServiceByName requests while lifecycle maintenance waits
+    // for bluetooth-meshd to publish its initialized object tree.
     const auto now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -698,9 +702,9 @@ bool MeshApplication::request_daemon_activation() {
             .onInterface("org.freedesktop.DBus")
             .withArguments(std::string{kMeshService}, uint32_t{0})
             .storeResultsTo(result);
-        // D-Bus returns 1 when it started the service and 2 when another
-        // caller already did. Treat both as success and verify ownership in
-        // refresh_status() instead of relying on implementation-specific text.
+        // D-Bus returns 1 for a new activation and 2 for an existing service.
+        // Both are successful requests; refresh_status() verifies the resulting
+        // well-known-name ownership.
         RCLCPP_INFO(logger_, "Requested bluetooth-meshd D-Bus activation (result=%u)",
                     result);
         return true;
@@ -819,8 +823,8 @@ bool MeshApplication::vendor_model_ready() const {
 
 std::vector<uint8_t> MeshApplication::local_device_key() {
     const auto path = config_.mesh_token_path + ".device-key";
-    // Never generate replacement identity material for an already enrolled
-    // node: an absent backup requires recovery, not resetting replay state.
+    // Preserve the enrolled identity and replay state. A missing backup enters
+    // the explicit credential-recovery path.
     if (!std::filesystem::exists(path) && token() != 0)
         throw std::runtime_error("Mesh Device Key backup missing; restore it before configuring this identity");
     const auto parent = std::filesystem::path(path).parent_path();
@@ -855,8 +859,8 @@ std::vector<uint8_t> MeshApplication::local_device_key() {
 namespace {
 
 /// Return the once-generated private NetKey and AppKey for a creator node.
-/// A short or exposed file fails closed instead of silently changing a live
-/// Mesh identity. Joined nodes never create this file.
+/// Accept exactly sized credentials from an owner-private file to preserve the
+/// live Mesh identity. Joined nodes receive their keys through provisioning.
 /// \param path Persistent file holding automatically generated Mesh credentials.
 /// \param create whether missing automatic Mesh credentials may be created and persisted.
 /// \return Validated credential bytes loaded from disk or generated and persisted.
@@ -929,8 +933,8 @@ bool MeshApplication::prepare_auto_keys() {
     std::vector<uint8_t> creator_keys;
     if (creator) {
         creator_keys = auto_credentials(credentials_path, false);
-        // Network1.Import installs the operational NetKey but does not create
-        // Management1's keyring directory. ExportKeys fails outright until
+        // Network1.Import installs the operational NetKey. Seed Management1's
+        // keyring directory before ExportKeys reads the snapshot.
         // that directory exists, so seed it before checking the snapshot.
         try {
             import_subnet(config_.mesh_swarm_network_index,
@@ -956,7 +960,7 @@ bool MeshApplication::prepare_auto_keys() {
                     creator_keys.begin(), creator_keys.begin() + 16)) {
                 // A UAV may have created a temporary network while isolated,
                 // then joined another provisioner's network. The attached
-                // network is authoritative. Never import the old AppKey into it.
+                // network is authoritative, so discard the earlier private AppKey.
                 creator = false;
                 RCLCPP_WARN(logger_,
                             "Ignoring private creator keys from an earlier Mesh network");
@@ -985,8 +989,8 @@ bool MeshApplication::prepare_auto_keys() {
         }
         return true;
     }
-    // The provisioning Configuration Client installs the AppKey remotely.
-    // The joining UAV must never invent a different key to appear ready.
+    // Readiness follows the AppKey installed by the provisioning
+    // Configuration Client.
     return found_network && found_application;
 }
 
@@ -1118,6 +1122,8 @@ void MeshApplication::cancel_join() {
 }
 
 void MeshApplication::attach(uint64_t selected_token) {
+    // Attach Application1 to the persisted node, import its model state, and
+    // assign a new generation to all transfer handles created afterward.
     if (selected_token == 0) selected_token = token();
     if (selected_token == 0) throw std::invalid_argument("Mesh token is not set");
 
@@ -1144,8 +1150,8 @@ void MeshApplication::attach(uint64_t selected_token) {
     set_token(selected_token);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        // Shared across application instances so a queued cleanup cannot
-        // target a replacement object after an overlay or network change.
+        // A process-wide generation lets queued cleanup recognize replacement
+        // objects created after an overlay or network change.
         static std::atomic<uint64_t> next_attachment{0};
         attachment_id_ = next_attachment.fetch_add(1) + 1;
         status_.node_path = static_cast<std::string>(node);
@@ -1179,6 +1185,8 @@ void MeshApplication::leave(uint64_t selected_token) {
 }
 
 void MeshApplication::create_network(const std::vector<uint8_t>& uuid) {
+    // Validate the provisioner identity and submit one asynchronous
+    // CreateNetwork transaction whose completion callback stores the token.
     if (!config_.mesh_provisioner) {
         throw std::runtime_error("mesh_provisioner must be enabled to create a network");
     }
@@ -1247,7 +1255,7 @@ void MeshApplication::import_node(const std::vector<uint8_t>& uuid,
         status_.error.clear();
     }
     // Like CreateNetwork, Import introspects our D-Bus objects and completes
-    // through JoinComplete. Never block the ROS overlay lease timer on it.
+    // asynchronously through JoinComplete, leaving the overlay lease timer responsive.
     auto proxy = std::shared_ptr<sdbus::IProxy>(network_proxy().release());
     create_call_slot_.emplace(
         proxy->callMethodAsync("Import")

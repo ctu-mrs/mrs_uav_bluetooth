@@ -376,7 +376,7 @@ double coerce_incoming(const ScalarValue& value, const config::BridgeMemberSpec&
 /// \param value Decoded wire scalar to recover as an exact integer.
 /// \return Exact decoded integer when the wire scalar is integral; otherwise std::nullopt.
 std::optional<ExactInteger> coerce_incoming_integer(const ScalarValue& value) {
-    // Decline float variants so large integers are never silently rounded.
+    // Accept integral variants directly and preserve their full wire precision.
     return std::visit([](auto raw) -> std::optional<ExactInteger> {
         // Preserve integral variants exactly and decline floating-point alternatives.
         using T = std::decay_t<decltype(raw)>;

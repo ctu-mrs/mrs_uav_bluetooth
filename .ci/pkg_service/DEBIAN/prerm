@@ -8,5 +8,12 @@ fi
 if [ -f /etc/systemd/system/mrs-uav-bluetooth.service ]; then
   rm /etc/systemd/system/mrs-uav-bluetooth.service
 fi
+if [ -f /etc/systemd/system/mrs-uav-bluetooth-le-radio.service ]; then
+  rm /etc/systemd/system/mrs-uav-bluetooth-le-radio.service
+fi
+if [ -f /etc/systemd/system/bluetooth-mesh.service.d/20-mrs-uav-bluetooth-aead.conf ]; then
+  rm /etc/systemd/system/bluetooth-mesh.service.d/20-mrs-uav-bluetooth-aead.conf
+fi
+rmdir /etc/systemd/system/bluetooth-mesh.service.d 2>/dev/null || true
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true

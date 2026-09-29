@@ -82,11 +82,11 @@ std::string tty_path_from_mac(const std::string& mac) {
     return "/dev/ttyBLE_" + normalized;
 }
 
-/// \brief Quote one argument so the remote shell cannot reinterpret its bytes.
+/// \brief Quote one argument while preserving its bytes through the remote shell.
 /// \param value Single command-line argument to quote.
 /// \return Single-quoted shell word that preserves every argument byte.
 std::string shell_quote(const std::string& value) {
-    // Quote one argument so the remote shell cannot reinterpret its bytes.
+    // Preserve every argument byte with POSIX single-quote escaping.
     std::string quoted{"'"};
     for (const char ch : value) {
         if (ch == '\'') {
@@ -195,7 +195,8 @@ int main(int argc, char** argv) {
     arguments.emplace_back("-o");
     arguments.push_back(proxy_command);
     arguments.emplace_back("-o");
-    arguments.emplace_back("HostKeyAlias=" + hostname_from_destination(host));
+    arguments.emplace_back(
+        "HostKeyAlias=bluetooth-" + hostname_from_destination(host));
     arguments.insert(arguments.end(), ssh_options.begin(), ssh_options.end());
     arguments.push_back(destination);
 

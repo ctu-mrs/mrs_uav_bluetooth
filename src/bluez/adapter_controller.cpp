@@ -66,6 +66,8 @@ void AdapterController::set_alias(const std::string& alias) {
 }
 
 void AdapterController::start_discovery(const std::string& transport) {
+    // Install the requested transport filter before acquiring this process's
+    // share of the adapter-wide discovery session.
     try {
         std::map<std::string, sdbus::Variant> filter;
         filter["Transport"] = sdbus::Variant{transport};
@@ -81,13 +83,13 @@ void AdapterController::start_discovery(const std::string& transport) {
               .onInterface(std::string(kAdapterIface));
         RCLCPP_INFO(logger_, "Discovery started (transport=%s)", transport.c_str());
     } catch (const sdbus::Error& e) {
-        // "Already discovering" is not fatal.
+        // Treat BlueZ's idempotent "Already discovering" reply as a warning.
         RCLCPP_WARN(logger_, "StartDiscovery: %s", e.what());
     }
 }
 
 void AdapterController::stop_discovery() {
-    // Tear down discovery.
+    // Ask Adapter1 to release this process's discovery request.
     try {
         proxy_->callMethod("StopDiscovery")
               .onInterface(std::string(kAdapterIface));
@@ -114,8 +116,8 @@ void AdapterController::set_adapter_property(const std::string& name,
     // BlueZ returns Busy while a management command for this property is
     // pending, including commands issued internally when discovery stops.
     // Retry that transient state within a bounded deadline. A successful Set
-    // confirms the requested value, while other errors reach the caller so
-    // the configuration transaction cannot report a setting it did not apply.
+    // confirms the requested value; other errors reach the caller and abort
+    // the surrounding configuration transaction.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     for (;;) {
         try {

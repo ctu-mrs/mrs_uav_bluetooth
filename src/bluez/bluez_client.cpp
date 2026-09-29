@@ -16,8 +16,8 @@ namespace {
 using ManagedObjectMap = std::map<sdbus::ObjectPath,
                                   std::map<std::string, std::map<std::string, sdbus::Variant>>>;
 
-// Discovery is best-effort during radio handoff. Bound each D-Bus call so a
-// powered-down/raw-HCI controller cannot stall overlay activation for 25 seconds.
+// Discovery is best-effort during radio handoff. Short D-Bus deadlines keep
+// overlay activation responsive while the controller changes ownership.
 constexpr auto kDiscoveryTimeout = std::chrono::seconds(2);
 constexpr auto kConnectPollInterval = std::chrono::milliseconds(300);
 constexpr auto kPairPollInterval = std::chrono::milliseconds(500);
@@ -150,13 +150,13 @@ std::optional<std::map<std::string, sdbus::Variant>> read_interface_properties(
     return properties;
 }
 
-/// \brief Require usable cached characteristics rather than only ServicesResolved=true.
+/// \brief Require ServicesResolved plus usable characteristics in the shared cache.
 /// \param connection System-bus connection used to query BlueZ.
 /// \param device_path BlueZ device path whose Device1 or GATT descendants are inspected.
 /// \return True when device has resolved characteristics; otherwise false.
 bool device_has_resolved_characteristics(sdbus::IConnection& connection,
                                          const std::string& device_path) {
-    // Require usable cached characteristics rather than only ServicesResolved=true.
+    // Confirm both BlueZ resolution state and a populated characteristic cache.
     auto proxy = create_bluez_proxy(connection, "/");
     ManagedObjectMap objects;
     proxy->callMethod("GetManagedObjects")
@@ -206,9 +206,8 @@ BluezClient::BluezClient(DbusConnection& dbus,
       cache_(cache),
       adapter_path_(adapter_path),
       logger_(logger) {
-    // A cached Paired=true does not prove the other endpoint still has its
-    // key. Forward BlueZ's explicit authentication reason, without guessing
-    // from connection duration or treating ordinary timeouts as stale bonds.
+    // Forward BlueZ's explicit authentication reason as the endpoint evidence
+    // that authorizes bond repair.
     disconnect_match_ = dbus_.connection().addMatch(
         "type='signal',sender='org.bluez',interface='org.bluez.Device1',"
         "member='Disconnected',path_namespace='" + adapter_path_ + "'",
@@ -392,6 +391,8 @@ std::vector<DeviceInfo> BluezClient::get_connected_devices() const {
 // ---------------------------------------------------------------------------
 
 bool BluezClient::connect(const std::string& mac, double timeout_s, bool prefer_le) {
+    // Resolve the latest Device1 path, request a connection on the selected
+    // bearer, and wait on fresh cache or property state until the deadline.
     if (!connections_allowed_.load()) return false;
     auto dev = cache_.device_by_mac(mac);
     if (!dev) return false;
@@ -527,9 +528,9 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
     }
 
     if (!connections_allowed_.load()) return false;
-    // Older BlueZ versions do not expose Bearer.LE1. Device1.Connect selects
-    // the disconnected bearer when BR/EDR is already up; PreferredBearer keeps
-    // the initial connection on LE when no bearer is active.
+    // Device1.Connect selects the disconnected bearer when BR/EDR is already
+    // active. PreferredBearer selects LE for the initial connection on BlueZ
+    // versions whose Device1 properties omit Bearer.LE1.
     (void)set_preferred_bearer(mac, "le");
     try {
         auto proxy = create_bluez_proxy(*connection, path);
@@ -686,6 +687,8 @@ bool BluezClient::disconnect_profile(const std::string& mac, const std::string& 
 // ---------------------------------------------------------------------------
 
 bool BluezClient::pair(const std::string& mac, double timeout_s, std::string* error_detail) {
+    // Start one bounded Pair transaction, retain BlueZ's authentication detail,
+    // and explicitly cancel a daemon operation that outlives the local timeout.
     if (!connections_allowed_.load()) return false;
     if (error_detail != nullptr) {
         error_detail->clear();
@@ -709,8 +712,8 @@ bool BluezClient::pair(const std::string& mac, double timeout_s, std::string* er
     } catch (const sdbus::Error& error) {
         const auto message = error.getMessage();
         if (std::chrono::steady_clock::now() >= deadline) {
-            // A D-Bus timeout does not cancel BlueZ's pending Pair operation.
-            // Cancel that operation explicitly, without deleting bond storage.
+            // Explicitly cancel BlueZ's pending Pair operation after the D-Bus
+            // deadline while retaining any established bond storage.
             try {
                 auto proxy = create_bluez_proxy(*connection, path);
                 proxy->callMethod("CancelPairing")
@@ -998,6 +1001,8 @@ bool BluezClient::refresh_device_gatt_cache(const std::string& device_path) cons
 }
 
 void BluezClient::on_cache_event(CacheEvent event, const std::string& object_path) {
+    // Clear per-device refresh backoff and reconcile discovery and notification
+    // ownership after BlueZ changes cached adapter or GATT objects.
     if (const auto device_path = device_root_path(object_path); !device_path.empty()) {
         std::lock_guard<std::mutex> lock(mutex_);
         gatt_refresh_backoff_until_.erase(device_path);

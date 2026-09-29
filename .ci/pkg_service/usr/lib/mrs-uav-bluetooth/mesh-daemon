@@ -1,7 +1,7 @@
 #!/bin/sh
 # Node: bluetooth-meshd, started on demand by service_node's Mesh overlay.
 # Raw HCI avoids the MGMT receive/transmit failure reproduced on the test UAVs.
-# No kernel-version assumptions: administrators may explicitly select auto.
+# Administrators may explicitly select automatic bearer choice after validation.
 set -eu
 radio_config=/etc/ctu-mrs/mrs-uav-bluetooth/mesh_radio
 if [ -r "$radio_config" ]; then . "$radio_config"; fi
@@ -12,7 +12,7 @@ if [ "$mesh_io" = generic ] || [ "${1:-}" = --release ]; then
     if [ -z "$mesh_adapter" ]; then
         for controller in /sys/class/bluetooth/hci*; do
             [ -e "$controller" ] || continue
-            # sysfs also exposes live links as hci0:123. They are not adapters.
+            # Accept controller entries such as hci0 and skip live-link entries such as hci0:123.
             controller_name=${controller##*/}
             case "${controller_name#hci}" in
                 ''|*[!0-9]*) continue ;;
@@ -33,7 +33,7 @@ if [ "$mesh_io" = generic ] || [ "${1:-}" = --release ]; then
     esac
     [ -d "/sys/class/bluetooth/$mesh_adapter" ] || exit 1
     if [ "${1:-}" = --release ]; then
-        # Refuse to interfere with a Mesh process not stopped by our caller.
+        # Continue after the caller has released the Mesh D-Bus name.
         if busctl --system call org.freedesktop.DBus /org/freedesktop/DBus \
             org.freedesktop.DBus NameHasOwner s org.bluez.mesh | grep -q 'true'; then
             echo "Mesh still owns the radio; stop it before starting LE" >&2
@@ -42,7 +42,7 @@ if [ "$mesh_io" = generic ] || [ "${1:-}" = --release ]; then
         # The management transaction requires an up controller on some
         # kernels. Raw HCI releases it powered off; wait briefly for Adapter1
         # and power it on before disabling the persistent Mesh receive bit.
-        # This does not reset or replace any stored security identity.
+        # This preserves every stored security identity.
         power_attempt=0
         until busctl set-property org.bluez "/org/bluez/$mesh_adapter" \
             org.bluez.Adapter1 Powered b true; do

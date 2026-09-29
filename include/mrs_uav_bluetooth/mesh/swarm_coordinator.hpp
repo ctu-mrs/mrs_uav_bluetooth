@@ -25,9 +25,9 @@ namespace mrs_uav_bluetooth::mesh {
 ///
 /// Every UAV imports the common Mesh credentials at a stable unique address.
 /// Availability heartbeats travel over encrypted Mesh, including relay hops.
-/// The first reachable allowed peer is coordinator; loss of that peer never
-/// resets identities or prevents another swarm member from starting alone.
-/// Logical swarm changes are application admission, not security isolation.
+/// The first reachable allowed peer is coordinator; another reachable member
+/// takes the role while every node retains its identity and standalone startup.
+/// Logical swarm changes control application admission; Mesh keys secure traffic.
 class MeshSwarmCoordinator {
 public:
     /// \brief Coordinate N-peer membership, provisioner election, and radio turns.
@@ -45,8 +45,8 @@ public:
     /// \param message Decoded Mesh control message to validate and apply.
     /// \return True if the packet is a valid private coordination frame and was consumed; otherwise false.
     bool handle_message(const ReceivedMessage& message);
-    /// Queue BlueZ scan/provisioning callbacks for the timer thread. Never
-    /// make a provisioning D-Bus call inside a D-Bus callback.
+    /// Queue BlueZ scan/provisioning callbacks so the timer thread performs
+    /// provisioning D-Bus calls after the originating callback returns.
     /// \param event Mesh lifecycle event used to update coordinator state.
     void handle_event(const Event& event);
 
@@ -67,9 +67,9 @@ public:
     /// \return True when the Mesh application is attached and configured; otherwise false.
     bool application_ready() const;
 
-    /// Change only this UAV's logical application swarm, never its Mesh keys.
-    /// The state is persisted before publication so reboot does not silently
-    /// restore a previously left swarm.
+    /// Change this UAV's logical application swarm while preserving Mesh keys.
+    /// Persist the state before publication so reboot restores the chosen
+    /// participation state.
     /// \param swarm_id Nonzero logical Mesh group to join.
     void join_swarm(uint16_t swarm_id);
     /// \brief Persist a nonparticipating state and announce departure without changing Mesh keys.
@@ -86,8 +86,8 @@ public:
     /// Fresh peer unicast addresses for acknowledged automatic topic delivery.
     /// \return Unicast addresses of currently present Mesh members.
     std::vector<uint16_t> swarm_member_addresses() const;
-    /// Configured peers with no fresh same-swarm presence. The sender probes
-    /// these sparingly so heartbeat loss cannot permanently disable repairs.
+    /// Configured peers awaiting fresh same-swarm presence. Bounded probes
+    /// restore repair delivery after heartbeat loss.
     /// \return Member addresses that still require direct probing.
     std::vector<uint16_t> swarm_probe_addresses() const;
 
@@ -95,8 +95,8 @@ public:
     /// \param source Mesh unicast address claimed by the sender.
     /// \return True when the requested value is accepted; otherwise false.
     bool accepts_swarm_payload(uint16_t source) const;
-    /// Reliable bridge frames carry their own swarm ID, so a lost heartbeat
-    /// cannot reject valid topic data from an admitted Mesh peer.
+    /// Reliable bridge frames carry their own swarm ID for admission decisions
+    /// during heartbeat gaps.
     /// \param source Mesh unicast address claimed by the sender.
     /// \param sender_swarm_id identifier of the sender swarm.
     /// \return True when the requested value is accepted; otherwise false.

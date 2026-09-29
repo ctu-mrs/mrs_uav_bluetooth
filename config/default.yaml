@@ -31,7 +31,7 @@ auto_trust: true
 enable_time_service: true
 enable_wifi_service: true
 
-# Allow remote shell access through GATT.
+# Allow an SSH shell over Bluetooth.
 enable_serial_port_profile: true
 serial_port_channel: 22
 serial_sshd_path: /usr/sbin/sshd

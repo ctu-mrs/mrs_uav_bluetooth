@@ -40,7 +40,7 @@ std::string characteristic_name_for_bridge(const std::string& bridge_name) {
 /// \param member_specs Ordered field paths and scalar types exposed in the descriptor.
 /// \return Newline-delimited field path and scalar-type metadata bytes.
 std::vector<uint8_t> serialize_member_specs(const std::vector<config::BridgeMemberSpec>& member_specs) {
-    // Serialize member specs.
+    // Encode ordered field mappings as compact YAML for remote bridge discovery.
     YAML::Emitter out;
     out << YAML::Flow << YAML::BeginSeq;
     for (const auto& spec : member_specs) {

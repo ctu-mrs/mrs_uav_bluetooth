@@ -194,6 +194,8 @@ std::pair<bool, std::string> OverlayConfigManager::reload() {
 }
 
 void OverlayConfigManager::check_lease() {
+    // Observe the active overlay's keepalive publisher and perform one guarded
+    // return-to-default transaction after its lease and retry hold expire.
     std::string keepalive_topic;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -237,10 +239,18 @@ void OverlayConfigManager::check_lease() {
     keepalive_miss_count_ = 0;
 
     // Radio callbacks must not execute under the metadata mutex. A failed
-    // transition retains the lease so the next expiry check can retry it.
+    // transition retains the lease for a later, rate-limited retry.
     lock.unlock();
     const auto [success, message] = revert_to_default();
     if (!success) {
+        {
+            std::lock_guard<std::mutex> retry_lock(mutex_);
+            // A failed radio handoff leaves the previous overlay running. Hold
+            // that stable state through the retry interval, then attempt one
+            // new transition.
+            lease_hold_until_ = std::chrono::steady_clock::now() +
+                kRevertRetryDelay;
+        }
         RCLCPP_ERROR(logger_, "Failed to revert after keepalive expiry: %s", message.c_str());
     }
 }
@@ -351,7 +361,7 @@ void OverlayConfigManager::apply_config(const std::string& overlay,
                 RCLCPP_ERROR(logger_, "Overlay rollback also failed: %s", error.what());
             }
         }
-        throw;  // Never claim that a failed radio transition was applied.
+        throw;  // Propagate the transition failure after restoring the previous state.
     }
     RCLCPP_INFO(logger_, "Config applied (%s): source=%s",
                 source_label.c_str(), active_source_.c_str());

@@ -95,9 +95,9 @@ void GattDescriptor::export_object() {
         sdbus::createObject(dbus_.connection(), sdbus::ObjectPath{path_}));
 
     // Register BlueZ-expected properties + methods on the GattDescriptor1 interface.
-    // sdbus-c++ automatically provides org.freedesktop.DBus.Properties (GetAll,
-    // Get, Set, PropertiesChanged) for registered properties — do NOT register
-    // that interface manually, or BlueZ will reject the vtable.
+    // sdbus-c++ provides org.freedesktop.DBus.Properties (GetAll, Get, Set,
+    // PropertiesChanged) for registered properties. Register only
+    // GattDescriptor1 here to keep the vtable valid for BlueZ.
     object->addVTable(
         sdbus::registerProperty("UUID")
             .withGetter([this]() -> std::string {
@@ -437,7 +437,7 @@ void GattService::export_object() {
             }),
         sdbus::registerProperty("Includes")
             .withGetter([]() -> std::vector<sdbus::ObjectPath> {
-                // Report that this service does not include any other local services.
+                // Return the empty list of local services included by this service.
                 return {};
             })
     ).forInterface(std::string(kGattServiceIface));
@@ -450,6 +450,8 @@ void GattService::export_object() {
 }
 
 void GattService::unexport() {
+    // Unexport every characteristic first, then release its parent service
+    // object to preserve the D-Bus hierarchy throughout removal.
     for (auto& chrc : characteristics_) {
         chrc->unexport();
     }

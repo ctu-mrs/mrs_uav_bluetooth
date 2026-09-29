@@ -57,7 +57,7 @@ bool device_has_recorded_bond(const mrs_uav_bluetooth::bluez::DeviceInfo& device
 /// \param event_type Pairing-agent request name checked for user interaction.
 /// \return True if the event asks the operator for pairing input or confirmation; otherwise false.
 bool is_interactive_pairing_request_event(const std::string& event_type) {
-    // PIN, passkey, and numeric confirmation cannot be accepted silently.
+    // Route PIN, passkey, and numeric-confirmation requests to the operator.
     return event_type == "request_confirmation" ||
            event_type == "request_passkey" ||
            event_type == "request_pin";
@@ -148,9 +148,9 @@ void ServiceNode::note_pair_attempt_result(const std::string& mac,
     const bool authentication_failed = normalized_error.find("authentication") != std::string::npos;
     const bool bridge_ready = has_ready_peer_time_bridge(mac);
 
-    // Pair errors do not prove that a stored bond is stale. BlueZ owns key
-    // replacement through its pairing protocol. Preserve working links and
-    // report the actual error instead of deleting the peer and trying again.
+    // BlueZ's authentication result identifies stale stored credentials. Keep
+    // working links and surface other pairing errors; explicit authentication
+    // failures enter the bounded key-repair path below.
     session.repair_in_progress = false;
     if (bridge_ready || session.phase == "ready") {
         session.detail = error_detail.empty() ? "pair failed" : "pair failed: " + error_detail;
@@ -712,16 +712,15 @@ void ServiceNode::reconcile_peers() {
     const auto now = peers_->now_monotonic();
     const auto retry_period_s = std::max(0.5, active_config_.auto_connect_period);
 
-    // Do not observe half-applied role changes, and never run GATT bond
-    // recovery while the Mesh daemon owns this controller.
+    // Wait for complete role changes and keep GATT bond recovery within
+    // periods when BlueZ owns the controller.
     if (config_apply_in_progress_.load() || active_config_.enable_mesh) return;
 
-    // Broadcast overlays are deliberately connectionless. Do not run normal
-    // pairing/bond recovery here: that machinery may repair or remove a bond,
-    // while this mode only needs to close a transient link and keep scanning.
+    // Broadcast overlays use the connectionless scan path. Close transient
+    // links and prune scan sessions while leaving stored bonds unchanged.
     if (active_config_.advertise_mode == "broadcast") {
         // Broadcast peers may rotate their private advertisement address at
-        // every data update. Do not retain a session for each expired address.
+        // every data update. Retain sessions only for current addresses.
         std::set<std::string> current_macs;
         const auto cache_now = std::chrono::steady_clock::now();
         for (const auto& device : client_->get_devices()) {
@@ -743,29 +742,70 @@ void ServiceNode::reconcile_peers() {
                     (void)client_->disconnect(mac, retry_period_s);
                 });
         }
-        if (active_config_.enable_scan && !client_->is_scanning()) {
+        const bool transmit_window = advertisement_transmit_window_.load();
+        if (active_config_.enable_scan && !transmit_window &&
+            !client_->is_scanning()) {
             client_->start_scan(active_config_.scan_mode, false);
-        } else if (!active_config_.enable_scan && client_->is_scanning()) {
+        } else if ((!active_config_.enable_scan || transmit_window) &&
+                   client_->is_scanning()) {
             client_->stop_scan();
         }
         return;
     }
 
     bool should_suspend_scan = false;
-    const auto report_incomplete_time_bridge =
-        [this](const std::string& mac,
-                               const std::string& device_label,
-                               peer::PeerConnectionSession& session,
-                               const std::string& reason) {
-            // A missing optional clock acknowledgement must not tear down a
-            // connected data bearer. Leave StartNotify retry and the GATT
-            // cache repair path running while topic imports stay active.
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-                        "[reconcile] %s: %s; keeping GATT data link active",
-                        device_label.c_str(), reason.c_str());
-            session.bridge_wait_started_monotonic = peers_->now_monotonic();
-            session.phase = "connected_unready";
-            session.detail = reason;
+    const auto recover_incomplete_time_bridge =
+        [this, retry_period_s](const std::string& mac,
+                              const std::string& device_label,
+                              peer::PeerConnectionSession& session,
+                              const std::string& reason,
+                              bool missing_writeback) {
+            // The clock exchange is also an end-to-end direction check: a
+            // A missing writeback identifies the peer whose client side still
+            // needs recovery even when payloads flow in the other direction.
+            const bool missing_direction_is_required = std::any_of(
+                active_config_.shared_topics.begin(),
+                active_config_.shared_topics.end(),
+                [missing_writeback](const auto& topic) {
+                    // A writeback proves the remote client can subscribe to
+                    // local exports; notifications prove local imports work.
+                    if (topic.transport != "gatt") return false;
+                    return missing_writeback
+                        ? (topic.mode == "export" || topic.mode == "both")
+                        : (topic.mode == "import" || topic.mode == "both");
+                });
+            if (!missing_direction_is_required) {
+                RCLCPP_WARN_THROTTLE(
+                    get_logger(), *get_clock(), 10000,
+                    "[reconcile] %s: %s; no configured GATT data direction requires recovery",
+                    device_label.c_str(), reason.c_str());
+                session.bridge_wait_started_monotonic = peers_->now_monotonic();
+                session.phase = "connected_unready";
+                session.detail = reason;
+                return false;
+            }
+
+            const auto recovery_reason = reason + "; recycling one-way GATT link";
+            const bool started = run_peer_task_once(
+                mac, "recycle incomplete GATT link",
+                [this, mac, retry_period_s]() {
+                    // Drop only the ACL link. Keep the bond and cached identity
+                    // so pairwise arbitration can reconnect without re-pairing.
+                    (void)client_->disconnect(mac, retry_period_s);
+                });
+            if (!started) {
+                // Another peer operation owns the worker. Keep the original
+                // deadline expired so the next reconciliation retries promptly.
+                schedule_peer_reconcile(kPeerWaitReconcileDelay);
+                return false;
+            }
+
+            RCLCPP_WARN(get_logger(),
+                        "[reconcile] %s: %s",
+                        device_label.c_str(), recovery_reason.c_str());
+            expected_disconnect_reasons_[mac] = recovery_reason;
+            session.phase = "disconnecting";
+            session.detail = recovery_reason;
             return true;
         };
     std::set<std::string> current_macs;
@@ -841,8 +881,8 @@ void ServiceNode::reconcile_peers() {
         }
 
         // An authenticated inbound serial session owns the Bluetooth link until
-        // sshd exits. In particular, do not let GATT/time-bridge recovery tear
-        // down a TUI connection whose peer does not host the UAV GATT services.
+        // sshd exits. Suspend GATT/time-bridge recovery while the TUI connection
+        // holds that link.
         if (device && serial_ssh_server_ &&
             serial_ssh_server_->active(device->object_path)) {
             peers_->clear_device_reset(session);
@@ -862,9 +902,9 @@ void ServiceNode::reconcile_peers() {
             continue;
         }
 
-        // Automatic connection selection is not an inbound connection ACL. Leave
-        // peer-initiated and manually managed connections alone, but let an explicit
-        // stale-bond repair finish before returning to passive management.
+        // Automatic connection selection controls outbound attempts. Preserve
+        // peer-initiated and manually managed connections, and finish explicit
+        // stale-bond repair before returning to passive management.
         if (!session.desired && !session.repair_requested && !session.repair_in_progress) {
             session.forget_pending = false;
             session.phase = device && device->connected ? "passive" : "idle";
@@ -1041,9 +1081,9 @@ void ServiceNode::reconcile_peers() {
 
         if (!is_connected) {
             // Broadcast overlays create a new unbonded random address for
-            // each payload. BlueZ can retain those Device1 objects after the
-            // peer switches back to GATT. Prefer its bonded identity instead
-            // of spending a full connection timeout on every stale advert.
+            // each payload. After the peer returns to GATT, select its bonded
+            // identity ahead of retained Device1 objects for expired broadcast
+            // addresses.
             if (device && device->address_type == "random" &&
                 !device_has_recorded_bond(*device) && !session.peer_name.empty()) {
                 const bool bonded_identity_available = std::any_of(
@@ -1063,10 +1103,9 @@ void ServiceNode::reconcile_peers() {
                     continue;
                 }
             }
-            // Both UAVs host a GATT server and could issue Connect at the same
-            // time. Pick one initiator for each pair so BlueZ never has two
-            // competing outgoing LE connections. The other side still accepts
-            // the incoming link and runs its own client bridge on that link.
+            // Both UAVs host a GATT server. Choose one deterministic initiator
+            // per pair for a single outgoing LE attempt; the other side accepts
+            // that link and runs its client bridge over it.
             const auto local_name = util::lower_trim_copy(hostname_);
             const auto remote_name = util::lower_trim_copy(session.peer_name);
             const bool named_pair =
@@ -1144,13 +1183,14 @@ void ServiceNode::reconcile_peers() {
                     bridge_it != peers_->time_bridges().end() &&
                     bridge_it->second.time_notification_received &&
                     !bridge_it->second.time_writeback_received;
-                (void)report_incomplete_time_bridge(
+                (void)recover_incomplete_time_bridge(
                     mac,
                     device_label,
                     session,
                     missing_writeback
                         ? "peer time writeback missing after GATT rediscovery"
-                        : "peer time notifications missing after GATT rediscovery");
+                        : "peer time notifications missing after GATT rediscovery",
+                    missing_writeback);
                 continue;
             }
 
@@ -1164,8 +1204,8 @@ void ServiceNode::reconcile_peers() {
                 (now - services_wait_started_monotonic) >= services_wait_grace_s;
 
             if (services_wait_expired) {
-                // Service discovery belongs to BlueZ. A slow or missing
-                // service is not evidence of a broken ACL link or stale keys.
+                // Service discovery belongs to BlueZ. Keep the established ACL
+                // link and bond while reporting its resolution delay.
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
                     "[reconcile] %s: BlueZ has not resolved remote services after %.1fs",
                     device_label.c_str(), now - services_wait_started_monotonic);
@@ -1213,13 +1253,14 @@ void ServiceNode::reconcile_peers() {
                     bridge_it != peers_->time_bridges().end() &&
                     bridge_it->second.time_notification_received &&
                     !bridge_it->second.time_writeback_received;
-                (void)report_incomplete_time_bridge(
+                (void)recover_incomplete_time_bridge(
                     mac,
                     device_label,
                     session,
                     missing_writeback
                         ? "peer time writeback missing after GATT rediscovery"
-                        : "peer time notifications missing after GATT rediscovery");
+                        : "peer time notifications missing after GATT rediscovery",
+                    missing_writeback);
                 continue;
             }
 

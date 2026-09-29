@@ -34,7 +34,7 @@ public:
     /// \brief Create the owner of RFCOMM-to-PTY forwarding links.
     /// \param logger ROS logger used for diagnostics.
     /// \param preferred_directory directory in which stable PTY symlinks should first be created.
-    /// \param fallback_directory private directory used when stable PTY links cannot be created in the preferred location.
+    /// \param fallback_directory private directory used after preferred PTY-link creation fails.
     SerialLinkManager(rclcpp::Logger logger,
                       std::string preferred_directory = "/dev",
                       std::string fallback_directory = {});

@@ -61,7 +61,7 @@ struct TopicImportBridgeState {
 };
 
 /// Thread-safe registry shared by discovery, GATT, and transport managers.
-/// Registry entries own bridge runtimes so callbacks cannot outlive their codec.
+/// Registry entries keep bridge runtimes and their callback codecs in one lifetime.
 class BridgeRegistry {
 public:
     /// \brief Return the configured outgoing bridges.

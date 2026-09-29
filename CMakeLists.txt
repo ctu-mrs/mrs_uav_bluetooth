@@ -3,6 +3,14 @@ project(mrs_uav_bluetooth)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Keep developer workspace paths out of shipped binaries and debug metadata.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(
+    "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=/usr/src/${PROJECT_NAME}"
+  )
+endif()
+# Use relative paths for libraries built beside an executable.
+set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 
 include(GNUInstallDirs)
 

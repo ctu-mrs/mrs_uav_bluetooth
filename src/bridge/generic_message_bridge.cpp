@@ -302,7 +302,7 @@ std::vector<size_t> select_indices_mutable(const MessageMember& member,
                                            const std::optional<size_t>& dynamic_count) {
     // Grow dynamic destinations only as far as the requested index or slice requires.
     auto ensure_size = [&](size_t required_size) {
-        // Resize dynamic arrays once and reject fixed arrays that cannot hold the selected index.
+        // Resize dynamic arrays once and report a range error for short fixed arrays.
         const size_t current_size = array_size_mutable(member, field);
         if (required_size <= current_size) {
             return;

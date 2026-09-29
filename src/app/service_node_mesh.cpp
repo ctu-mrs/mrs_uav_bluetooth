@@ -27,7 +27,7 @@ constexpr uint8_t kReliableAck = 0xd2;
 constexpr uint8_t kReliableReceiptQuery = 0xd3;
 constexpr auto kReceiptQueryPeriod = std::chrono::seconds(2);
 constexpr auto kMeshQueueRetryDelay = std::chrono::milliseconds(250);
-// This is a lost-token failsafe, not a normal scheduling quantum. A segmented
+// This lost-token failsafe sits outside the normal scheduling quantum. A segmented
 // unicast can still be draining native SAR and queued access acknowledgements
 // several seconds after its receiver handed the turn onward. Reclaiming inside
 // that interval creates two token holders and makes the lowest address starve
@@ -146,15 +146,49 @@ rclcpp::TimerBase::SharedPtr create_mesh_wall_timer(
         node.get_node_timers_interface().get());
 }
 
-/// Release an on-demand Mesh bearer before conventional LE starts. The package
-/// grants the mrs account narrowly scoped StopUnit permission for this unit.
+/// \brief Start the packaged Mesh daemon and wait for its system-bus name.
+///
+/// systemd owns the privileged controller handoff performed by the service wrapper.
+/// \param connection D-Bus connection used to request and observe daemon startup.
+void start_mesh_bearer(bluez::DbusConnection& connection) {
+    auto bus = sdbus::createProxy(connection.connection(),
+        sdbus::ServiceName{"org.freedesktop.DBus"},
+        sdbus::ObjectPath{"/org/freedesktop/DBus"});
+    const auto running = [&]() {
+        // The well-known name appears only after bluetooth-meshd reaches D-Bus startup.
+        bool present = false;
+        bus->callMethod("NameHasOwner").onInterface("org.freedesktop.DBus")
+            .withArguments(std::string{"org.bluez.mesh"}).storeResultsTo(present);
+        return present;
+    };
+    if (running()) return;
+
+    auto manager = sdbus::createProxy(connection.connection(),
+        sdbus::ServiceName{"org.freedesktop.systemd1"},
+        sdbus::ObjectPath{"/org/freedesktop/systemd1"});
+    sdbus::ObjectPath job;
+    manager->callMethod("StartUnit").onInterface("org.freedesktop.systemd1.Manager")
+        .withArguments(std::string{"bluetooth-mesh.service"}, std::string{"replace"})
+        .storeResultsTo(job);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (!running()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw std::runtime_error(
+                "Timed out waiting for bluetooth-meshd after systemd accepted StartUnit");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+/// Release the Mesh bearer before conventional LE starts. The packaged system
+/// service owns this radio lifecycle and runs with the required privileges.
 /// \param connection D-Bus connection used to stop the local Mesh daemon bearer.
 void stop_mesh_bearer(bluez::DbusConnection& connection) {
     auto bus = sdbus::createProxy(connection.connection(),
         sdbus::ServiceName{"org.freedesktop.DBus"},
         sdbus::ObjectPath{"/org/freedesktop/DBus"});
     const auto running = [&]() {
-        // Query D-Bus ownership directly so shutdown waits for bluetooth-meshd rather than stale cache state.
+        // Query live D-Bus ownership until bluetooth-meshd releases its well-known name.
         bool present = false;
         bus->callMethod("NameHasOwner").onInterface("org.freedesktop.DBus")
             .withArguments(std::string{"org.bluez.mesh"}).storeResultsTo(present);
@@ -189,8 +223,8 @@ void stop_mesh_bearer(bluez::DbusConnection& connection) {
     // A MGMT receiver can outlive both the daemon and controller power cycles.
     // Run the narrowly privileged cleanup even on cold LE startup, to recover
     // state left by an earlier daemon version or a crash. Its unit is ordered
-    // after Mesh shutdown, including ExecStopPost. Await its job, not merely
-    // its bus-name disappearance, before any discovery/advertising operation.
+    // after Mesh shutdown, including ExecStopPost. Await the completed job
+    // before any discovery or advertising operation.
     const std::string cleanup_unit{"mrs-uav-bluetooth-le-radio.service"};
     manager->callMethod("StartUnit").onInterface("org.freedesktop.systemd1.Manager")
         .withArguments(cleanup_unit, std::string{"replace"}).storeResultsTo(job);
@@ -290,7 +324,7 @@ template<typename ResponseT>
 /// \param status Current Mesh lifecycle and addressing state copied into the service response.
 /// \param response service response to populate.
 void populate_network_status(const mesh::Status& status, ResponseT& response) {
-    // Populate network status.
+    // Copy the daemon attachment identity and assigned address range into the ROS reply.
     response.state = status.state;
     response.token = status.token;
     response.node_path = status.node_path;
@@ -300,6 +334,8 @@ void populate_network_status(const mesh::Status& status, ResponseT& response) {
 }  // namespace
 
 void ServiceNode::configure_mesh(const config::NodeConfig& config) {
+    // Reset model confirmations and reliable-transfer state, then reconcile the
+    // D-Bus application, coordinator, publishers, services, and maintenance timer.
     mesh_local_network_transmit_expected_.store(static_cast<uint8_t>(
         config.mesh_network_retransmit_count |
         (config.mesh_network_retransmit_interval_steps << 3)));
@@ -331,6 +367,8 @@ void ServiceNode::configure_mesh(const config::NodeConfig& config) {
         mesh_topic_prefix_ = config.node_topics_prefix;
         return;
     }
+    start_mesh_bearer(*server_dbus_);
+
 
     if (topic_changed || !mesh_status_pub_) {
         mesh_status_pub_ = create_publisher<mrs_uav_bluetooth::msg::MeshStatus>(
@@ -586,7 +624,7 @@ void ServiceNode::flush_mesh_transfer_cancellations() {
             cancellations.pop_front();
         } catch (const std::exception& error) {
             // Keep ownership on a transient D-Bus failure. Retry the remaining
-            // batch on a later tick rather than blocking once per transfer.
+            // batch on a later tick to keep this executor pass bounded.
             // Reattachment invalidates old handles before new work starts.
             std::lock_guard<std::mutex> lock(mesh_reliable_mutex_);
             mesh_transfer_cancellations_.insert(mesh_transfer_cancellations_.end(),
@@ -622,6 +660,8 @@ void ServiceNode::clear_mesh_reliable_state(bool preserve_latest) {
 }
 
 void ServiceNode::maintain_mesh_reliable() {
+    // Advance native transfer checks, application receipts, membership probes,
+    // handoff recovery, retries, and queued sends for every active channel.
     if (mesh_reliable_reset_requested_.exchange(false))
         clear_mesh_reliable_state(true);
     struct Outbound {
@@ -685,8 +725,8 @@ void ServiceNode::maintain_mesh_reliable() {
             }
             const auto latest = mesh_reliable_latest_.find(pending.channel_key);
             if (latest != mesh_reliable_latest_.end()) {
-                // Topic bridges promise the newest state, not a historical
-                // stream. If a receiver was offline, repair the outstanding
+                // Topic bridges promise the newest state. If a receiver was
+                // offline, repair the outstanding
                 // receipt identity with the newest encoded value. A receiver
                 // that already published this sequence discards the repair;
                 // a restarted receiver avoids publishing the obsolete sample.
@@ -704,10 +744,9 @@ void ServiceNode::maintain_mesh_reliable() {
                         std::chrono::milliseconds(100);
                 }
                 if (target.receipt_query_at <= now && target.retry_at > now) {
-                    // A lost application receipt does not require sending the
-                    // complete segmented sample again. The receiver answers
-                    // this unsegmented query only after its ROS bridge has
-                    // decoded and published the original sample.
+                    // Query a missing application receipt with one unsegmented
+                    // control frame. The receiver answers after its ROS bridge
+                    // decodes and publishes the original sample.
                     std::vector<uint8_t> query(pending.data.begin(),
                         pending.data.begin() + kReliableAckHeaderBytes);
                     query[3] = kReliableReceiptQuery;
@@ -788,8 +827,8 @@ void ServiceNode::maintain_mesh_reliable() {
                 remember_mesh_transfer(mesh_reliable_sequence(item.data),
                     item.destination, *handle);
             if (!handle) {
-                // Native SAR still owns this destination. No duplicate was
-                // queued, so this does not consume an application retry.
+                // Native SAR still owns this destination. Defer the sample and
+                // preserve its application retry budget.
                 std::lock_guard<std::mutex> lock(mesh_reliable_mutex_);
                 const auto retry_at = std::chrono::steady_clock::now() +
                     kMeshQueueRetryDelay;
@@ -888,9 +927,8 @@ void ServiceNode::publish_mesh_message(const mesh::ReceivedMessage& received) {
         // Logical swarm admission applies only to automatic Mesh overlays.
         // Manual controllers continue to receive the raw /mesh/rx topic and
         // retain their own bridge policy.
-        // BlueZ does not provide the subnet index in MessageReceived. The
-        // authenticated AppKey, coordination frame and live source mapping
-        // provide the available admission checks for automatic overlays.
+        // MessageReceived supplies the authenticated AppKey, coordination
+        // frame, and live source mapping used for automatic-overlay admission.
         const bool swarm_allowed = !mesh_swarm_coordinator_ ||
             mesh_swarm_coordinator_->accepts_swarm_payload(received.source);
         if (!local_source && is_mesh_reliable_frame(received.data)) {
@@ -902,8 +940,8 @@ void ServiceNode::publish_mesh_message(const mesh::ReceivedMessage& received) {
             const bool frame_allowed = !mesh_swarm_coordinator_ ||
                 mesh_swarm_coordinator_->accepts_swarm_payload(
                     received.source, mesh_reliable_swarm_id(received.data));
-            // Receipts and queries have exactly the compact header. They
-            // never pass through the topic codec as application data.
+            // Receipts and queries use exactly the compact header and stay in
+            // the reliability-control path.
             const bool receipt_query = received.data[3] == kReliableReceiptQuery &&
                 received.data.size() == kReliableAckHeaderBytes;
             if (received.data[3] == kReliableAck && frame_allowed &&
@@ -1008,8 +1046,8 @@ void ServiceNode::publish_mesh_message(const mesh::ReceivedMessage& received) {
                                 turn.initialized = true;
                                 // The sender marks exactly one unicast copy as
                                 // the handoff. All other recipients explicitly
-                                // clear permission, so temporarily different
-                                // heartbeat views cannot create two successors.
+                                // clear permission. The transmitted successor
+                                // remains unique across temporary heartbeat views.
                                 turn.permitted =
                                     received.data[3] == kReliableData;
                                 turn.reclaim_at = std::chrono::steady_clock::now() +
@@ -1062,8 +1100,8 @@ void ServiceNode::send_mesh_bridge_payload_impl(
         (static_cast<uint64_t>(bridge.mesh_element_index) << 32U) |
         (static_cast<uint64_t>(bridge.mesh_app_key_index) << 16U) |
         bridge.channel_id;
-    // A resumed value may race a newer source callback. Preserve the newer
-    // value instead of putting an older sample back at the head of the queue.
+    // A resumed value may race a newer source callback. Keep the newest queued
+    // value at the head of the channel.
     const auto store_latest_locked = [&]() {
         // Coalesce unsent samples by channel, preserving resumed traffic ahead of new data.
         if (resumed)
@@ -1126,9 +1164,9 @@ void ServiceNode::send_mesh_bridge_payload_impl(
             std::lock_guard<std::mutex> lock(mesh_reliable_mutex_);
             const auto now = std::chrono::steady_clock::now();
             if (!probe_candidates.empty() && now >= mesh_reliable_next_probe_at_) {
-                // A missed heartbeat is not proof that a peer left the
-                // network. Probe one configured, unheard address at a time so
-                // many offline UAVs cannot flood the radio with repairs.
+                // Probe one configured, unheard address at a time after a
+                // missed heartbeat, bounding repair airtime as the configured
+                // peer set grows.
                 for (size_t offset = 0; offset < probe_candidates.size(); ++offset) {
                     const auto index = (mesh_reliable_probe_cursor_ + offset) %
                         probe_candidates.size();
@@ -1144,10 +1182,10 @@ void ServiceNode::send_mesh_bridge_payload_impl(
             std::sort(targets.begin(), targets.end());
             targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
             if (targets.empty()) {
-                // Coordination discovers members independently. With no
-                // recipient or due probe, retain one sample instead of
-                // filling the daemon's multicast queue with undeliverable
-                // data during startup, peer loss, or a swarm change.
+                // Coordination discovers members independently. Retain one
+                // sample until a recipient or discovery probe becomes due,
+                // keeping undeliverable startup and membership traffic out of
+                // the daemon's multicast queue.
                 store_latest_locked();
                 return;
             }
@@ -1157,8 +1195,8 @@ void ServiceNode::send_mesh_bridge_payload_impl(
             // A token holder fans the latest value out once to every live
             // member. Per-destination unicast SAR supplies selective segment
             // repair; application receipts cover end-to-end publication.
-            // Offline probes join this fan-out but never join the turn ring,
-            // so an unheard address cannot stall N live participants.
+            // Offline probes join this fan-out while the authenticated live
+            // members alone form the turn ring.
             if (!turn_peers.empty() && !status.addresses.empty()) {
                 const auto members = mesh_turn_members(
                     status.addresses.front(), turn_peers);

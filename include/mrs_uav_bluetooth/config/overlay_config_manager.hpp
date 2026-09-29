@@ -10,6 +10,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <set>
@@ -127,6 +128,8 @@ private:
     /// Minimum initial hold requested through SetActiveConfig; zero disables it.
     std::chrono::steady_clock::time_point lease_hold_until_{};
     static constexpr int kRequiredMisses = 3;
+    /// Delay before retrying a failed automatic return to the default config.
+    static constexpr auto kRevertRetryDelay = std::chrono::seconds(30);
 
     std::set<std::string> overlay_connected_baseline_;
 

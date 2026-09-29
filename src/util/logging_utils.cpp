@@ -35,6 +35,8 @@ void VerboseLogger::open_file(const std::string& path) {
 }
 
 void VerboseLogger::log(const std::string& message) {
+    // Mirror the diagnostic to ROS immediately and append the same event to the
+    // optional file under its serialization lock.
     RCLCPP_INFO(ros_logger_, "[VERBOSE] %s", message.c_str());
 
     std::lock_guard<std::mutex> lock(mutex_);

@@ -68,9 +68,9 @@ void Advertisement::export_object() {
             }),
         sdbus::registerMethod("Release")
             .implementedAs([this]() {
-                // BlueZ has already removed the registration. Do not call
-                // UnregisterAdvertisement from this callback or destroy the
-                // object while its method is being dispatched.
+                // BlueZ has already removed the registration. Mark the local
+                // object released and let its owner destroy it after this
+                // method dispatch returns.
                 released_ = true;
                 registration_ = Registration::Unregistered;
                 RCLCPP_WARN(rclcpp::get_logger("mrs_uav_bluetooth"),
@@ -167,7 +167,7 @@ void Advertisement::export_object() {
         exported_->addVTable(
             sdbus::registerProperty("ScanResponseServiceUUIDs")
                 .withGetter([this]() -> std::vector<std::string> {
-                    // Put these service identifiers in the scan response instead of the first packet.
+                    // Move overflow service identifiers into the scan response packet.
                     return scan_response_service_uuids_;
                 })
         ).forInterface(interface_name);
@@ -297,7 +297,10 @@ void Advertisement::register_advertisement(const std::string& adapter_path) {
 
     const auto status = future.wait_for(std::chrono::seconds(30));
     if (status == std::future_status::timeout) {
-        registration_ = Registration::Unregistered;
+        // BlueZ lists the client before programming the controller. Cancel
+        // that pending client now; otherwise later cleanup can skip it and an
+        // old packet may remain on air after this process has exited.
+        unregister_advertisement(adapter_path);
         throw sdbus::Error(sdbus::Error::Name{"org.freedesktop.DBus.Error.Timeout"},
                            "RegisterAdvertisement timed out");
     }
@@ -305,7 +308,7 @@ void Advertisement::register_advertisement(const std::string& adapter_path) {
     try {
         future.get();
     } catch (...) {
-        registration_ = Registration::Unregistered;
+        unregister_advertisement(adapter_path);
         throw;
     }
     auto expected = Registration::Registering;
@@ -364,7 +367,10 @@ void Advertisement::emit_property_changed(const std::string& property_name) {
 }
 
 void Advertisement::unregister_advertisement(const std::string& adapter_path) {
-    if (registration_.exchange(Registration::Unregistered) != Registration::Registered) {
+    // Atomically leave the registered lifecycle, release the manager entry once,
+    // and remove the exported advertisement object.
+    const auto previous = registration_.exchange(Registration::Unregistered);
+    if (previous == Registration::Unregistered) {
         unexport();
         return;
     }
@@ -375,8 +381,16 @@ void Advertisement::unregister_advertisement(const std::string& adapter_path) {
         proxy->callMethod("UnregisterAdvertisement")
             .onInterface(std::string(kLeAdvManagerIface))
             .withArguments(sdbus::ObjectPath{path_});
-    } catch (const sdbus::Error&) {
-        // Best effort.
+    } catch (const sdbus::Error& error) {
+        // A released or failed registration is already absent. Report other
+        // failures because silently losing cleanup can leave stale data on air.
+        if (error.getName() != "org.bluez.Error.DoesNotExist") {
+            registration_ = previous;
+            RCLCPP_WARN(rclcpp::get_logger("mrs_uav_bluetooth"),
+                        "Could not unregister advertisement %s: %s",
+                        path_.c_str(), error.what());
+            throw;
+        }
     }
     unexport();
     registration_ = Registration::Unregistered;

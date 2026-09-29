@@ -33,7 +33,7 @@ public:
     /// \brief Disable copy assignment of the D-Bus connection.
     DbusConnection& operator=(const DbusConnection&) = delete;
 
-    /// The shared system-bus connection.  Never null after construction.
+    /// The shared system-bus connection, valid for this wrapper's lifetime.
     /// \return Live system-bus connection owned by this wrapper.
     sdbus::IConnection& connection() {
         // Expose the live system-bus connection and its background event loop.

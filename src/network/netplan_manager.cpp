@@ -292,7 +292,7 @@ NetplanManager::NetplanManager(std::string netplan_config_file,
                                std::vector<std::string> allowed_networks)
     : netplan_config_file_(std::move(netplan_config_file)),
       allowed_networks_(std::move(allowed_networks)) {
-    // Construction records policy only; it never changes the host network.
+    // Construction records policy; apply() performs the host-network change.
 }
 
 bool NetplanManager::busy() {

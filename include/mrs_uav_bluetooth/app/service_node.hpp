@@ -218,7 +218,9 @@ private:
                                const std::string& device_path,
                                uint64_t received_time_ns);
     /// \brief Register the current advertisement or update its exported properties safely.
-    void refresh_advertisement_registration();
+    /// \param resume_scan_after_registration True resumes discovery immediately;
+    /// false reserves a transmit-only radio window after registration.
+    void refresh_advertisement_registration(bool resume_scan_after_registration = true);
     /// \brief Pause broadcast transmission long enough for a half-duplex controller to scan.
     ///
     /// The active BlueZ discovery request resumes after the advertisement is
@@ -230,9 +232,9 @@ private:
     /// \brief Apply a raw ROS byte array as the next application advertisement value.
     /// \param message ROS byte-array containing the next raw advertisement payload.
     void handle_advertisement_payload(const std_msgs::msg::UInt8MultiArray::SharedPtr message);
-    /// Apply an advertisement payload from either the raw ROS topic or a
-    /// declarative bridge. Configured bridge frames are rejected rather than
-    /// truncated because truncation would silently corrupt their codec.
+    /// Apply an advertisement payload from the raw ROS topic or a declarative
+    /// bridge. Declarative frames require an exact fit and report overflow to
+    /// preserve their codec layout.
     /// \param payload Application bytes to place in advertisement service data.
     /// \param allow_truncate whether an oversized raw payload may be shortened.
     void set_advertisement_payload(std::vector<uint8_t> payload,
@@ -343,7 +345,7 @@ private:
     /// \brief Publish the newest clock offset latency and sample age for one peer.
     /// \param bridge Per-peer time bridge supplying the latest offset sample.
     void publish_peer_time_status(peer::PeerTimeBridge& bridge) const;
-    /// \brief Claim one named peer task so duplicate callbacks cannot run it concurrently.
+    /// \brief Claim one named peer task with per-peer duplicate exclusion.
     /// \param mac peer Bluetooth MAC address.
     /// \param label Operation name used for per-peer exclusion and diagnostics.
     /// \param task asynchronous peer operation whose completion is tracked.
@@ -487,7 +489,7 @@ private:
     /// \param response Management result diagnostic and exported key data when requested.
     void handle_mesh_management(const std::shared_ptr<mrs_uav_bluetooth::srv::MeshManagement::Request> request,
                                 std::shared_ptr<mrs_uav_bluetooth::srv::MeshManagement::Response> response);
-    /// Runtime logical-swarm control never changes Mesh provisioning credentials.
+    /// Runtime logical-swarm control preserves the installed Mesh provisioning credentials.
     /// \param request Logical Mesh group status join or leave action and group identifier.
     /// \param response Result diagnostic current group participation and member list.
     void handle_mesh_swarm(const std::shared_ptr<mrs_uav_bluetooth::srv::MeshSwarm::Request> request,
@@ -528,6 +530,8 @@ private:
 
     std::unique_ptr<gatt::GattApplication> gatt_app_;
     std::unique_ptr<gatt::Advertisement> advertisement_;
+    /// True while a broadcast-only payload owns a half-duplex controller for transmission.
+    std::atomic_bool advertisement_transmit_window_{false};
     std::unique_ptr<gatt::services::WifiService> wifi_service_;
     std::unique_ptr<gatt::services::TimeService> time_service_;
 
@@ -559,14 +563,14 @@ private:
     std::atomic_bool shutting_down_{false};
     // BlueZ emits Adapter1 PropertiesChanged while the service is applying a
     // group of adapter properties. Guard the group and defer reconciliation to
-    // the lease timer so asynchronous property events can never recursively
-    // write back to BlueZ from its D-Bus callback thread.
+    // the lease timer, keeping corrective BlueZ writes on the ROS executor
+    // outside the originating D-Bus callback.
     std::atomic_bool adapter_state_apply_in_progress_{false};
     std::atomic_bool adapter_state_reconcile_requested_{false};
     std::atomic_bool bluez_daemon_recovery_requested_{false};
     // Some controllers reject policy writes while Mesh owns an advertising
-    // operation. Keep the correction request pending, but do not retry it on
-    // every one-second lease tick and flood BlueZ/the journal.
+    // operation. Keep the correction request pending and rate-limit retries to
+    // protect BlueZ and the journal from one-second retry bursts.
     std::chrono::steady_clock::time_point next_adapter_state_reconcile_{};
     // Overlay activation runs in a reentrant service callback while timers and
     // D-Bus events remain live. Serialize full config transitions and expose a
@@ -602,7 +606,7 @@ private:
     std::map<uint64_t, std::pair<config::SharedTopicConfig, std::vector<uint8_t>>>
         mesh_reliable_latest_;
     // Receipt identity includes the source, AppKey, swarm, vendor opcode and
-    // sequence, so independent bridge protocols cannot acknowledge each other.
+    // sequence, giving each bridge protocol an independent receipt namespace.
     using MeshReliableSeenKey =
         std::tuple<uint16_t, uint16_t, uint16_t, uint32_t, uint16_t>;
     std::map<MeshReliableSeenKey, MeshReliableSeen> mesh_reliable_seen_;

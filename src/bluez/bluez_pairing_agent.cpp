@@ -10,11 +10,11 @@ namespace {
 
 constexpr auto kPendingPairingCancelTimeout = std::chrono::seconds(20);
 
-/// \brief Classify agent callbacks that require pairing policy rather than service authorization.
+/// \brief Classify credential and confirmation callbacks as pairing-policy events.
 /// \param event Pairing-agent event name to classify.
 /// \return True for agent events that require pairing policy; otherwise false.
 bool request_requires_pairing_flow(const std::string& event) {
-    // Request requires pairing flow.
+    // PIN, passkey, and numeric-confirmation requests all follow pairing admission policy.
     return event == "request_pin" ||
            event == "request_passkey" ||
            event == "request_confirmation";

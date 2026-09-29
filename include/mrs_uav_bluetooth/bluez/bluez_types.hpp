@@ -37,6 +37,8 @@ struct DeviceInfo {
     std::vector<uint8_t> advertising_flags;
     std::map<uint8_t, std::vector<uint8_t>> advertising_data;
     std::chrono::steady_clock::time_point last_seen;
+    /// Time of a live discovery signal carrying advertisement observations.
+    std::chrono::steady_clock::time_point last_advertisement_seen;
 };
 
 /// Runtime representation of a remote GATT service.

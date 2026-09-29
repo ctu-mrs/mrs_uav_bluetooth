@@ -18,14 +18,14 @@ ARCH=$(dpkg-architecture -qDEB_HOST_ARCH) ;
 # selection of BlueZ and ELL versions
 BLUEZ_VERSION=5.87 ;
 ELL_VERSION=0.83 ;
-# Keep the existing BlueZ package version. The Mesh fix is part of this build,
-# not a separate package revision that callers need to select explicitly.
+# Keep the BlueZ package version at 5.87 and include the audited Mesh changes
+# in that package selection.
 PACKAGE_VERSION="${BLUEZ_VERSION}" ;
 PATCH_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/patches" ;
 OUTPUT_DIR="$(pwd)" ;
 
-# custom package name; it replaces distro BlueZ when explicitly installed,
-# but it is not the same package so normal system updates do not require it.
+# This custom package explicitly replaces distribution BlueZ while retaining an
+# independent package name for ordinary distribution update resolution.
 PACKAGE_NAME="mrs-bluez" ; # better than bluez-mrs
 
 # the final package name
@@ -42,7 +42,7 @@ PACKAGE_REPLACES="bluez, bluez-obexd, bluez-hcidump, bluez-meshd, bluez-test-too
 ###  CONFIGURATION SECTION END  ###
 ###################################
 
-# Isolate each build; never glob-delete checkouts in the caller directory.
+# Isolate each build in its own disposable directory and preserve the caller tree.
 BUILD_DIR="$(mktemp -d /tmp/mrs-bluez-package.XXXXXX)" ;
 cd "$BUILD_DIR" ;
 
@@ -60,7 +60,7 @@ git clone https://github.com/bluez/bluez.git --branch $BLUEZ_VERSION --depth 1 ;
 git clone https://git.kernel.org/pub/scm/libs/ell/ell.git --branch $ELL_VERSION --depth 1 ;
 
 # Enter the BlueZ directory and apply the audited daemon fixes in order.
-# A changed upstream context fails the build, rather than silently omitting it.
+# A changed upstream context fails the build and preserves the complete audited set.
 cd bluez ;
 git apply --check "$PATCH_ROOT/bluez-adapter-mode-completion.patch" ;
 git apply "$PATCH_ROOT/bluez-adapter-mode-completion.patch" ;
@@ -211,8 +211,8 @@ case "$1" in
 	    invoke-rc.d bluetooth stop || true
 	fi
 
-        # Package removal must never erase bonds, Mesh keys or replay state.
-        # Administrators may archive/remove specific identities explicitly.
+        # Preserve bonds, Mesh keys, and replay state across package removal.
+        # Administrators manage individual stored identities explicitly.
     ;;
 esac
 
@@ -229,8 +229,8 @@ dpkg-deb --root-owner-group --build "$PACKAGE_ROOT" "$PACKAGE_FILENAME" ;
 mv "./$PACKAGE_FILENAME" "$OUTPUT_DIR/$PACKAGE_FILENAME" ;
 
 # Create a convenient apt-validation copy when the destination is writable.
-# A previous root build may own the same /var/tmp name, which must not turn a
-# completed unprivileged package build into a failure.
+# Treat an existing root-owned /var/tmp copy as an optional validation artifact
+# after the unprivileged package build has completed successfully.
 APT_VALIDATION_COPY="" ;
 if [ -d /var/tmp ] && cp "$OUTPUT_DIR/$PACKAGE_FILENAME" "/var/tmp/$PACKAGE_FILENAME" 2>/dev/null ; then
     chmod 644 "/var/tmp/$PACKAGE_FILENAME" || true ;

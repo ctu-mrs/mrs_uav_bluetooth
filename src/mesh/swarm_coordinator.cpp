@@ -25,8 +25,8 @@ constexpr auto kConfigurationStepDelay = std::chrono::seconds(1);
 constexpr auto kRetryDelay = std::chrono::seconds(5);
 // Starting a Mesh daemon, switching the controller away from GATT, and
 // configuring the first node can take tens of seconds on UAV hardware.
-// Keep later candidates unprovisioned long enough for the preferred peer's
-// PB-ADV initiator to finish instead of racing into a separate network.
+// This priority window gives the preferred peer's PB-ADV initiator time to
+// complete before a later candidate becomes eligible to create the network.
 constexpr double kPerPriorityJoinWindowSeconds = 90.0;
 constexpr uint8_t kControlOpcode = 0xc0;
 constexpr uint8_t kFrameVersion = 4;
@@ -291,14 +291,14 @@ std::vector<uint16_t> MeshSwarmCoordinator::swarm_probe_addresses() const {
     const auto now = Clock::now();
     std::vector<uint16_t> addresses;
     if (!swarm_participating_) return addresses;
-    // An open whitelist has no advance address list. Its newly heard members
-    // enter the ordinary fresh-member set instead.
+    // An open whitelist learns members from authenticated traffic and records
+    // them in the ordinary fresh-member set.
     for (const auto number : member_priority_) {
         if (number == local_number_ || number > 0x7fffU) continue;
         const auto it = peer_presence_.find(number);
         if (it != peer_presence_.end() && it->second.expires > now) {
-            // A peer that explicitly joined another logical swarm must not
-            // receive topic-data probes while that information is fresh.
+            // Reserve topic-data probes for peers in this logical swarm while
+            // their membership information is fresh.
             continue;
         }
         addresses.push_back(static_cast<uint16_t>(number));
@@ -374,8 +374,8 @@ void MeshSwarmCoordinator::accept_coordination_frame(
     }
 
     // Source is authenticated by Mesh and is the immutable numeric UAV address.
-    // Do not forward application-level leases: Mesh flooding already relays
-    // this unsegmented heartbeat to all reachable group members.
+    // Mesh flooding relays this unsegmented heartbeat to every reachable group
+    // member, so its authenticated source directly represents the sender lease.
     const uint32_t sender = source;
     const uint16_t sender_swarm_id = read_u16(frame, 6);
     if (sender == 0 || sender == local_number_ ||
@@ -445,8 +445,8 @@ void MeshSwarmCoordinator::update_selection(Clock::time_point now) {
 
 void MeshSwarmCoordinator::maintain(const Status& status) {
     const auto now = Clock::now();
-    // Lifecycle failures are reflected in Status; retries are bounded and
-    // never discard a token or reset BlueZ's replay-protection database.
+    // Lifecycle failures appear in Status. Bounded retries preserve the token
+    // and BlueZ replay-protection database.
     if (!status.attached) {
         application_ready_ = false;
         local_model_stage_ = 0;
@@ -512,6 +512,8 @@ void MeshSwarmCoordinator::maintain(const Status& status) {
 }
 
 void MeshSwarmCoordinator::publish_coordination_heartbeat(Clock::time_point now) {
+    // Rate-limit and encode this member's authenticated swarm identity before
+    // sending the group access message used for membership leases.
     if (!application_ready_.load()) return;
     const auto period = std::chrono::duration<double>(config_.mesh_swarm_heartbeat_period);
     std::vector<uint8_t> access{
@@ -570,9 +572,9 @@ void MeshSwarmCoordinator::maintain_local_model(
                         "Automatic Mesh application transport is ready on group 0x%04x",
                         config_.mesh_swarm_group_address);
         } else {
-            // A successful D-Bus send only queues a Config message. Retry until
-            // BlueZ reports the actual binding and subscription, never merely
-            // assume that enough seconds have elapsed.
+            // A successful D-Bus send queues a Config message. Retry until
+            // BlueZ reports the resulting binding and subscription through its
+            // status response.
             local_model_stage_ = 1;
         }
         next_local_model_action_ = now + kConfigurationStepDelay;
@@ -691,11 +693,11 @@ void MeshSwarmCoordinator::maintain_auto_enrollment(
         }
     }
     if (!pending_provision_uuid_.empty()) return;
-    // BlueZ's UnprovisionedScan method sends a Remote Provisioning Scan Start
-    // message to an RPR Server, even when Server is omitted. Our local vendor
-    // model is not an RPR Server. A common ordered peer list already gives us
-    // every Device UUID, so directly initiate PB-ADV for absent peers. Every
-    // attached UAV may provision a newcomer in its own radio range.
+    // BlueZ's UnprovisionedScan method targets a Remote Provisioning Server.
+    // Automatic enrollment derives every Device UUID from the common ordered
+    // peer list and initiates local PB-ADV for absent peers. Every attached UAV
+    // may provision a newcomer in its own radio range through that local
+    // bearer.
     for (const auto number : member_priority_) {
         if (number == local_number_) continue;
         {
@@ -707,10 +709,10 @@ void MeshSwarmCoordinator::maintain_auto_enrollment(
             now - previous < std::chrono::seconds(55)) continue;
         last_direct_attempt_[number] = now;
         try {
-            // A momentarily lost heartbeat does not make an attached node
-            // unprovisioned. BlueZ retains the remote Device Key for members
-            // already enrolled in this network. Reopening PB-ADV for such a
-            // member can only time out and steals radio time from Mesh data.
+            // BlueZ's retained remote Device Key identifies members already
+            // enrolled in this network across a momentary heartbeat loss.
+            // Reserve PB-ADV radio time for addresses absent from that keyring
+            // and keep application data flowing for enrolled members.
             const auto known_nodes = application_.export_device_keys();
             const bool enrolled = std::any_of(
                 known_nodes.begin(), known_nodes.end(),

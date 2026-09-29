@@ -136,6 +136,8 @@ std::optional<std::string> device_path_for_gatt_object(
 namespace mrs_uav_bluetooth::app {
 
 void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& object_path) {
+    // Serialize BlueZ object transitions with overlay state and collect the
+    // peer, bridge, and adapter work that can safely run after this callback.
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!peers_ || !cache_) {
         return;
@@ -391,10 +393,10 @@ void ServiceNode::on_cache_event(bluez::CacheEvent event, const std::string& obj
                     adapter->discoverable != should_be_discoverable ||
                     (should_be_discoverable && adapter->discoverable_timeout != active_config_.discoverable_timeout);
                 if (drifted) {
-                    // D-Bus property setters themselves generate this event.
-                    // Record the need for a later, coalesced check instead of
-                    // writing from BlueZ's callback thread and feeding back on
-                    // every intermediate property snapshot.
+                    // D-Bus property setters generate this event. Mark one
+                    // coalesced reconciliation for the ROS timer thread after
+                    // BlueZ has published the complete property transition.
+                    // This keeps writes outside the D-Bus callback.
                     adapter_state_reconcile_requested_.store(true);
                 }
               }
@@ -486,8 +488,8 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
     if (event_type == "bluez_daemon_restarted") {
         // The replacement daemon has no registrations, discovery ownership,
         // or notification subscriptions from the previous process. Rebuild
-        // them from the active config on the ROS timer thread, never inside
-        // this D-Bus callback.
+        // them from the active config on the ROS timer thread after this
+        // D-Bus callback returns.
         if (!config_apply_in_progress_.load() && !active_config_.enable_mesh) {
             bluez_daemon_recovery_requested_.store(true);
         }
@@ -500,8 +502,8 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
     if (event_type == "device_disconnected") {
         // BlueZ reports authentication failure even while Paired/Bonded
         // remain true locally. Recover that one stale GATT bond through the
-        // existing admission-controlled reset path. Never infer this from an
-        // RF timeout, and ignore late events during a radio-mode transaction.
+        // existing admission-controlled reset path. Require BlueZ's explicit
+        // authentication reason and ignore late radio-mode transaction events.
         if (!peers_ || config_apply_in_progress_.load()) return;
         if (const auto device = cache_->device(object_path)) {
             const auto it = peers_->sessions().find(device->mac);
@@ -602,7 +604,7 @@ void ServiceNode::on_gatt_event(const std::string& event_type,
                                 preserve_ready_runtime,
                                 preserve_active_bridge_runtime);
             // A failed time-characteristic subscription clears all per-peer paths.
-            // Rebuild topic imports because they do not depend on clock synchronization.
+            // Rebuild topic imports independently from clock synchronization.
             refresh_device = *device;
         }
     }

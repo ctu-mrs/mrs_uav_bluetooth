@@ -29,7 +29,7 @@ std::string system_hostname() {
 /// \param pattern Regular expression that valid UAV hostnames must match completely.
 /// \return True if the complete hostname matches the configured pattern; otherwise false.
 bool is_uav_hostname(std::string_view value, std::string_view pattern) {
-    // Whitespace is not part of the hostname used by admission policy.
+    // Trim surrounding whitespace before admission-policy matching.
     std::string trimmed;
     auto start = value.find_first_not_of(" \t\r\n");
     if (start == std::string_view::npos) return false;

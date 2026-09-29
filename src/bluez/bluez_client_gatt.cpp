@@ -201,7 +201,7 @@ bool BluezClient::write_descriptor_async(const std::string& desc_path,
 }
 
 bool BluezClient::start_notify(const std::string& chrc_path) {
-    // Establish notify.
+    // Start remote value updates and install the matching PropertiesChanged handler.
     RCLCPP_DEBUG(logger_, "[client] start_notify path=%s", chrc_path.c_str());
     try {
         auto proxy = create_bluez_proxy(dbus_.connection(), chrc_path);
@@ -225,7 +225,7 @@ bool BluezClient::start_notify(const std::string& chrc_path) {
 }
 
 bool BluezClient::stop_notify(const std::string& chrc_path) {
-    // Tear down notify.
+    // Stop remote value updates and release the local signal subscription.
     RCLCPP_DEBUG(logger_, "[client] stop_notify path=%s", chrc_path.c_str());
     if (!is_notify_active(chrc_path)) {
         return true;

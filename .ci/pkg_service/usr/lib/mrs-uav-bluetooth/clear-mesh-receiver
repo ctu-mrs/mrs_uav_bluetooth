@@ -25,8 +25,8 @@ COMMAND_STATUS = 0x0002
 def disable_receiver(sock, index):
     """Send one bounded transaction; ignore unrelated multicast MGMT events.
 
-    Some kernels validate scan timing even for Enable=0, so use valid equal
-    window/period values rather than zero. Unsupported Mesh is already off.
+    Some kernels validate scan timing for Enable=0. Valid equal window/period
+    values satisfy that check, and the command remains idempotent.
     All other errors are surfaced to systemd and then the ROS overlay caller.
     """
     payload = struct.pack("<BHHB", 0, 0x1000, 0x1000, 0)

@@ -37,8 +37,8 @@ void ExportBridgeManager::configure_export_bridge(const std::string& bridge_key,
                 }
                 auto& state = it->second;
                 auto payload = runtime->encode_payload(*message, state.member_specs, state.payload_format);
-                // publish_export_payload takes its own snapshot. Do not keep
-                // this outer recursive lock across a D-Bus signal emission.
+                // publish_export_payload takes its own snapshot. Release this
+                // outer recursive lock before its D-Bus signal emission.
                 if (state_lock.owns_lock()) state_lock.unlock();
                 publish_export_payload(bridge_key, payload);
             } catch (const std::exception& e) {

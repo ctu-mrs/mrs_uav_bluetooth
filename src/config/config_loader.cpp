@@ -340,12 +340,12 @@ std::map<KeyT, std::vector<uint8_t>> parse_byte_map(const YAML::Node& node,
     return out;
 }
 
-/// \brief Read an optional YAML boolean without treating missing as false.
+/// \brief Distinguish an absent YAML boolean from explicit false.
 /// \param parent YAML mapping that may contain the optional field.
 /// \param key YAML mapping key to read when present.
 /// \return Parsed boolean or std::nullopt when the YAML key is absent.
 std::optional<bool> parse_optional_bool(const YAML::Node& parent, const std::string& key) {
-    // Preserve absence as nullopt instead of conflating it with false.
+    // Represent an absent or null field as nullopt and explicit false as bool(false).
     if (!parent[key] || parent[key].IsNull()) {
         return std::nullopt;
     }
@@ -415,6 +415,8 @@ YAML::Node load_yaml_file(const std::string& path) {
 /// \param override_node overlay YAML values merged over the base configuration.
 /// \return Merged YAML tree with overlay values taking precedence.
 YAML::Node deep_merge(const YAML::Node& base, const YAML::Node& override_node) {
+    // Clone selected branches so recursive overlay replacement leaves both
+    // caller-owned input trees unchanged.
     if (!base.IsDefined() || base.IsNull()) return YAML::Clone(override_node);
     if (!override_node.IsDefined() || override_node.IsNull()) return YAML::Clone(base);
     if (base.IsMap() && override_node.IsMap()) {
@@ -913,8 +915,8 @@ NodeConfig parse_node_config(const YAML::Node& doc,
     cfg.scan_mode = str("scan_mode", cfg.scan_mode);
     if (cfg.mesh_swarm_auto_provisioning) {
         // bluetooth-meshd owns advertising and scanning for this overlay.
-        // Derive the mutually exclusive LE switches instead of requiring a
-        // long, fragile list of `false` values in every user's Mesh YAML.
+        // Automatic Mesh mode derives the complete mutually exclusive LE
+        // switch set from this single option.
         cfg.enable_server = false;
         cfg.enable_scan = false;
         cfg.enable_time_service = false;

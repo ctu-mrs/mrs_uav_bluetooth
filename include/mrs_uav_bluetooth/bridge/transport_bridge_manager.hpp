@@ -82,10 +82,21 @@ public:
                               const std::string& mac,
                               const std::vector<uint8_t>& payload);
 
+    /// Record a cached advertisement solely in replay history.
+    /// Call this before discovery starts so BlueZ data retained across a
+    /// process restart is treated as already delivered. A genuinely new
+    /// payload still passes through handle_advertisement normally.
+    /// \param hostname UAV hostname used to identify the node.
+    /// \param mac peer Bluetooth MAC address.
+    /// \param payload Cached advertisement service-data frame from the peer.
+    void remember_advertisement(const std::string& hostname,
+                                const std::string& mac,
+                                const std::vector<uint8_t>& payload);
+
     /// Decode a received Mesh application message.
     /// Both BlueZ variants (opcode retained or stripped) are accepted. Mesh
-    /// access messages contain a unicast address, not a Bluetooth MAC, so
-    /// an unresolved Mesh source can only have a unicast-based fallback.
+    /// access messages identify their source by unicast address, which also
+    /// supplies the fallback identity for unresolved sources.
     /// \param source Mesh unicast address that sent the bridge frame.
     /// \param key_index Application key index on which the bridge frame arrived.
     /// \param data Mesh access payload received from the source address.

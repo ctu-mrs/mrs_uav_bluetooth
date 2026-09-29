@@ -84,7 +84,7 @@ mrs_uav_bluetooth::msg::BleDevice to_device_msg(rclcpp::Node& node,
 /// \return True if the selected raw advertisement field exists and is nonempty; otherwise false.
 bool has_advertisement_user_data(const bluez::DeviceInfo& device,
                                  uint8_t advertisement_user_data_type) {
-    // Empty fields do not belong in the advertisement-only device stream.
+    // Include devices whose selected application field carries data.
     return !advertisement_user_payload(device, advertisement_user_data_type).empty();
 }
 

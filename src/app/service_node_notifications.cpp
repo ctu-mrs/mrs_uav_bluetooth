@@ -278,7 +278,7 @@ void ServiceNode::clear_peer_runtime(const std::string& mac,
 }
 
 void ServiceNode::refresh_import_bridges_for_device(const bluez::DeviceInfo& device) {
-    // Refresh import bridges for device.
+    // Rebuild this peer's importers from its currently discovered bridge metadata.
     std::unique_lock<std::recursive_mutex> state_lock(state_mutex_);
     if (!import_bridges_ || !client_ || !peers_) {
         return;

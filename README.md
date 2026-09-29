@@ -69,7 +69,7 @@ ros2 launch mrs_uav_bluetooth random_odometry_publisher.launch.py rate_hz:=5.0
 
 The advertisement sample packs the original nanosecond timestamp, three orientation angles, and XYZ position into 26 bytes. GATT and Mesh use the same 60-byte timestamp, pose, and velocity layout. All three samples are configured for 10 Hz. Add frame IDs or covariance fields to the declaration if your application needs them.
 
-Received GATT and advertisement topics appear below `/{hostname}/bluetooth/le/peers/<peer>/`. Mesh uses `/{hostname}/bluetooth/mesh/peers/<peer>/`. The peer segment is the hostname when it can be resolved. GATT and advertisements fall back to `mac_<address>`. Mesh packets contain a unicast address but no Bluetooth MAC, so a Mesh overlay without a peer list falls back to `unicast_<address>`. The `user_node` prints status for the active mode while it runs.
+Received GATT and advertisement topics appear below `/{hostname}/bluetooth/le/peers/<peer>/`. Mesh uses `/{hostname}/bluetooth/mesh/peers/<peer>/`. The peer segment is the hostname when it can be resolved. GATT and advertisements fall back to `mac_<address>`. Mesh peer identity uses a unicast address, so an empty Mesh peer list uses the fallback `unicast_<address>`. The `user_node` prints status for the active mode while it runs.
 
 #### First use of Mesh
 
@@ -79,7 +79,7 @@ The preferred active provisioner follows the peer list. If it disappears, the ne
 
 ### Use your own data or ROS node
 
-The `shared_topics` section tells the service what to send and how to rebuild it on the receiving UAV. You can copy a [sample overlay](config/examples/) and change the topic, message type, fields, and rate without writing a Bluetooth node. The [default configuration](config/default.yaml) documents every setting.
+The `shared_topics` section tells the service what to send and how to rebuild it on the receiving UAV. Copy a [sample overlay](config/examples/) and change the topic, message type, fields, and rate; configuration alone creates the Bluetooth bridge. The [default configuration](config/default.yaml) documents every setting.
 
 Each entry needs a `transport` of `gatt`, `advertisement`, or `mesh`, a `mode` of `export`, `import`, or `both`, and a ROS `message_type`. `export_topic` is the local source. `import_topic_suffix` names the received topic below the peer prefix. A positive `rate_hz` limits sending to the latest sample at that rate. Set it to zero to send each source sample.
 

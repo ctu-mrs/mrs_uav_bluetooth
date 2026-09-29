@@ -235,7 +235,7 @@ bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
 bool connect_serial_profile_with_retry(bluez::BluezClient& client,
                                        const std::string& mac,
                                        std::chrono::milliseconds timeout) {
-    // Connect serial profile with retry.
+    // Retry ConnectProfile while BlueZ finishes any preceding bearer transition.
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     do {
         if (client.connect_profile(mac, std::string{bluez::kSerialPortProfileUuid})) {
@@ -881,6 +881,8 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
 }
 
 void TuiNode::trigger_connect_toggle() {
+    // Launch one background action that changes the selected ACL state and
+    // prepares its serial and LE bearers for the dashboard.
     const auto* device = selected_device();
     if (device == nullptr || action_future_.valid()) {
         return;
@@ -969,7 +971,7 @@ void TuiNode::trigger_connect_toggle() {
 }
 
 void TuiNode::trigger_serial_connect() {
-    // Trigger serial connect.
+    // Open or close the selected peer's RFCOMM profile and wait for its stable PTY.
     const auto* device = selected_device();
     if (device == nullptr || action_future_.valid()) {
         return;
@@ -1027,7 +1029,7 @@ std::string TuiNode::ssh_wrapper_path() const {
 }
 
 void TuiNode::trigger_ssh() {
-    // Trigger SSH.
+    // Run OpenSSH through the selected peer's active Bluetooth PTY.
     const auto* device = selected_device();
     if (device == nullptr || !serial_links_) {
         status_message_ = "no UAV serial link is available";
@@ -1035,6 +1037,8 @@ void TuiNode::trigger_ssh() {
     }
     const auto link = serial_links_->link_for_device(device->object_path);
     const auto hostname = util::device_hostname_guess(*device, uav_name_pattern_);
+    const auto device_path = device->object_path;
+    const auto mac = device->mac;
     if (!link || hostname.empty()) {
         status_message_ = "open the selected UAV serial link before SSH";
         return;
@@ -1075,19 +1079,49 @@ void TuiNode::trigger_ssh() {
     }
     terminal_.resume();
     last_frame_.clear();
-    status_message_ = pid < 0
-        ? std::string{"failed to start SSH: "} + std::strerror(fork_error)
-        : std::string{"SSH session ended for "} + hostname;
+    if (pid < 0) {
+        status_message_ = std::string{"failed to start SSH: "} +
+            std::strerror(fork_error);
+        return;
+    }
+
+    // Each inetd-style sshd consumes one RFCOMM connection. Replace that
+    // profile connection now so the next SSH action receives a fresh server.
+    auto& client = runtime_->client();
+    (void)client.disconnect_profile(
+        mac, std::string{bluez::kSerialPortProfileUuid});
+    serial_links_->detach(device_path);
+
+    std::string recycle_status;
+    if (!connect_serial_profile_with_retry(
+            client, mac, std::chrono::seconds(8))) {
+        recycle_status = "; press l to reopen the serial link";
+    } else {
+        serial::SerialLinkInfo replacement;
+        if (!serial_links_->wait_for_link(
+                device_path, std::chrono::seconds(12), &replacement)) {
+            recycle_status = "; replacement serial PTY was not created";
+        } else if (!client.connect_le_bearer(mac, 15.0) ||
+                   !client.wait_services_resolved(mac, 15.0)) {
+            recycle_status = "; serial link renewed at " + replacement.tty_path +
+                ", LE services are still resolving";
+        } else {
+            (void)client.refresh_gatt_snapshot(mac);
+            recycle_status = "; serial link renewed at " + replacement.tty_path;
+        }
+    }
+    status_message_ = std::string{"SSH session ended for "} + hostname +
+        recycle_status;
 }
 
 void TuiNode::trigger_scan_toggle() {
-    // Trigger scan toggle.
+    // Converge BlueZ discovery to the opposite of its current state.
     runtime_->set_scan_enabled(!runtime_->is_scanning(), scan_mode_);
     status_message_ = runtime_->is_scanning() ? "scan enabled" : "scan stopped";
 }
 
 void TuiNode::trigger_wifi_write(PromptMode mode, std::string value) {
-    // Trigger Wi-Fi write.
+    // Write the edited network name or password through the selected GATT field.
     const auto* device = selected_device();
     if (device == nullptr || action_future_.valid()) {
         return;

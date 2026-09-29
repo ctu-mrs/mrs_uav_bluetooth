@@ -100,8 +100,8 @@ public:
                              const config::NodeConfig& config,
                              double now_mono,
                              double retry_period_s) const;
-    /// Recover only an admitted, automatically paired GATT peer whose stored
-    /// bond failed authentication; RF loss and exclusive modes never qualify.
+    /// Recover an admitted automatically paired GATT peer after explicit
+    /// stored-bond authentication failure.
     /// \param session Peer repair history and phase after an authentication disconnect.
     /// \param device Latest BlueZ security flags after the authentication failure.
     /// \param config Security policy controlling the peer action.

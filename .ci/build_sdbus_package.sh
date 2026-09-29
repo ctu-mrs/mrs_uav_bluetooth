@@ -18,8 +18,8 @@ DEB_HOST_MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH) ;
 # selection of sdbus-cpp version
 SDBUS_VERSION=2.3.1 ;
 
-# custom package name; it replaces distro package when explicitly installed,
-# but it is not the same package so normal system updates do not require it.
+# This custom package explicitly replaces the distribution package while using
+# an independent name for ordinary distribution update resolution.
 PACKAGE_NAME="mrs-libsdbus-c++" ; 
 
 # the final package name

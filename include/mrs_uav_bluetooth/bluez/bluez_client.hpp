@@ -199,7 +199,7 @@ public:
     /// \brief Write bytes to a remote characteristic and wait for the D-Bus result.
     /// \param chrc_path BlueZ path of the target GATT characteristic.
     /// \param data Bytes written to the remote GATT characteristic.
-    /// \param with_response whether WriteValue uses an acknowledged request rather than a command.
+    /// \param with_response True selects an acknowledged request; false selects a write command.
     /// \return True if BlueZ completed the characteristic write; otherwise false.
     bool write_characteristic(const std::string& chrc_path,
                               const std::vector<uint8_t>& data,
@@ -207,7 +207,7 @@ public:
     /// \brief Queue a characteristic write without blocking the caller thread.
     /// \param chrc_path BlueZ path of the target GATT characteristic.
     /// \param data Bytes written to the remote GATT characteristic.
-    /// \param with_response whether WriteValue uses an acknowledged request rather than a command.
+    /// \param with_response True selects an acknowledged request; false selects a write command.
     /// \return True if the asynchronous characteristic write was queued; otherwise false.
     bool write_characteristic_async(const std::string& chrc_path,
                                     const std::vector<uint8_t>& data,
@@ -299,8 +299,8 @@ private:
     bool scan_running_{false};
     std::atomic_bool connections_allowed_{true};
     mutable std::recursive_mutex discovery_operation_mutex_;
-    // Discovery is owned by this persistent blocking connection. Never use the
-    // cache/event connection while a caller may hold the service state lock.
+    // This persistent blocking connection owns discovery and remains separate
+    // from the cache/event connection used beside the service state lock.
     std::unique_ptr<sdbus::IConnection> discovery_connection_;
     std::string last_scan_transport_{"le"};
     bool last_scan_discoverable_{false};

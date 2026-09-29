@@ -12,7 +12,7 @@
 /// \param argv command-line argument vector.
 /// \return Zero on success, or a nonzero process status on failure.
 int main(int argc, char** argv) {
-    // Use a multithreaded executor so D-Bus waits cannot starve lease and reliability timers.
+    // Keep lease and reliability timers responsive while worker threads wait on D-Bus.
     rclcpp::init(argc, argv);
     auto node = std::make_shared<mrs_uav_bluetooth::app::ServiceNode>();
     rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions{}, 16);

@@ -298,10 +298,10 @@ void ServiceNode::publish_scan_snapshot() {
     const auto now = std::chrono::steady_clock::now();
     for (const auto& device : client_->get_devices()) {
         devices_map[device.mac] = device;
-        // Ignore cached random-address records after their radio updates stop.
+        // Ignore startup snapshots and random-address records whose live radio updates stopped.
         if (transport_bridges_ && active_config_.advertise_mode == "broadcast" &&
-            device.last_seen != std::chrono::steady_clock::time_point{} &&
-            now - device.last_seen < std::chrono::seconds(3)) {
+            device.last_advertisement_seen != std::chrono::steady_clock::time_point{} &&
+            now - device.last_advertisement_seen < std::chrono::seconds(3)) {
             const auto payload = advertisement_user_payload(
                 device, bluez::kDefaultAdvertisementExtraDataType);
             if (!payload.empty()) {

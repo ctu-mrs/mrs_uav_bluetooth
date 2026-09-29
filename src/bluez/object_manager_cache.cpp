@@ -32,7 +32,7 @@ void dispatch_notifications(const std::vector<std::pair<CacheEvent, std::string>
 /// \param candidate_path path of the candidate.
 /// \return True if the candidate equals the parent or lies in its D-Bus subtree; otherwise false.
 bool is_child_path(const std::string& parent_path, const std::string& candidate_path) {
-    // Check the slash boundary so similarly prefixed sibling names do not match.
+    // Require the slash boundary that distinguishes children from prefixed siblings.
     return candidate_path.size() > parent_path.size() &&
            candidate_path.compare(0, parent_path.size(), parent_path) == 0 &&
            candidate_path[parent_path.size()] == '/';
@@ -177,7 +177,7 @@ std::vector<AdapterInfo> ObjectManagerCache::adapters() const {
 }
 
 std::optional<DeviceInfo> ObjectManagerCache::device(const std::string& path) const {
-    // Copy one device record under lock so callers cannot observe an in-place update.
+    // Copy one device record under lock to give callers a stable snapshot.
     std::lock_guard lock(mutex_);
     auto it = devices_.find(path);
     return it != devices_.end() ? std::optional{it->second} : std::nullopt;
@@ -281,7 +281,7 @@ std::optional<GattCharacteristicInfo> ObjectManagerCache::find_characteristic_by
     std::string lower_uuid = uuid;
     std::transform(lower_uuid.begin(), lower_uuid.end(), lower_uuid.begin(),
                    [](unsigned char c) {
-                       // Fold each UUID byte so BlueZ's mixed-case spelling cannot break characteristic lookup.
+                       // Fold each UUID byte for case-independent characteristic lookup.
                        return std::tolower(c);
                    });
     for (const auto& [path, chrc] : gatt_characteristics_) {
@@ -304,7 +304,7 @@ std::optional<GattDescriptorInfo> ObjectManagerCache::find_descriptor_by_uuid(
     std::string lower_uuid = uuid;
     std::transform(lower_uuid.begin(), lower_uuid.end(), lower_uuid.begin(),
                    [](unsigned char c) {
-                       // Fold each UUID byte so BlueZ's mixed-case spelling cannot break descriptor lookup.
+                       // Fold each UUID byte for case-independent descriptor lookup.
                        return std::tolower(c);
                    });
     for (const auto& [path, desc] : gatt_descriptors_) {
@@ -322,6 +322,8 @@ std::optional<GattDescriptorInfo> ObjectManagerCache::find_descriptor_by_uuid(
 }
 
 bool ObjectManagerCache::refresh_device_subtree(const std::string& device_path) {
+    // Fetch one fresh ObjectManager snapshot and atomically replace the selected
+    // device's service, characteristic, and descriptor subtree in the cache.
     if (device_path.empty()) {
         return false;
     }
@@ -490,9 +492,9 @@ void ObjectManagerCache::on_bluez_owner_changed(
 void ObjectManagerCache::reload_managed_objects() {
     ManagedObjectMap objects;
     try {
-        // Never make a blocking call on the D-Bus event connection from its
-        // NameOwnerChanged callback. A short-lived connection also binds this
-        // snapshot to the replacement daemon rather than the vanished owner.
+        // Use a short-lived connection for this blocking call from the
+        // NameOwnerChanged path. Its destination resolves against the current
+        // replacement daemon owner.
         auto connection = sdbus::createSystemBusConnection();
         auto proxy = sdbus::createProxy(*connection,
                                         sdbus::ServiceName{std::string(kBluezServiceName)},
@@ -533,6 +535,14 @@ void ObjectManagerCache::on_interfaces_added(const sdbus::ObjectPath& path,
     {
         std::lock_guard lock(mutex_);
         process_object(std::string(path), ifaces, &notifications);
+        const auto device_interface = ifaces.find(std::string(kDeviceIface));
+        if (device_interface != ifaces.end()) {
+            // InterfacesAdded provides the live timestamp; the startup
+            // snapshot supplies the initial Device1 property values.
+            auto device = devices_.find(std::string(path));
+            if (device != devices_.end())
+                device->second.last_advertisement_seen = std::chrono::steady_clock::now();
+        }
     }
     dispatch_notifications(notifications, [this](CacheEvent event, const std::string& object_path) {
         // Announce newly exported interfaces after their records are complete.
@@ -603,6 +613,15 @@ void ObjectManagerCache::on_properties_changed(
                                 get_or<int16_t>(changed, "RSSI", 0));
                 }
                 update_device_props(it->second, changed);
+                const bool observed_advertisement =
+                    changed.count("ManufacturerData") != 0 ||
+                    changed.count("ServiceData") != 0 ||
+                    changed.count("AdvertisingFlags") != 0 ||
+                    changed.count("AdvertisingData") != 0;
+                if (observed_advertisement) {
+                    // Only live property signals prove that cached payload bytes were seen now.
+                    it->second.last_advertisement_seen = std::chrono::steady_clock::now();
+                }
 
                 for (const auto& key : invalidated) {
                     if (key == "ManufacturerData") {

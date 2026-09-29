@@ -39,7 +39,7 @@ public:
     void configure_import_bridge(const std::string& bridge_key,
                                  TopicImportBridgeState& state,
                                  bluez::BluezClient& client);
-    /// \brief Poll readable characteristics that cannot send notifications.
+    /// \brief Poll readable characteristics configured for read-based updates.
     /// \param bridge_key Stable key used to locate this import bridge after asynchronous work.
     /// \param state Import bridge receiving a timer for characteristics without notifications.
     /// \param client BlueZ client used for remote discovery and GATT operations.

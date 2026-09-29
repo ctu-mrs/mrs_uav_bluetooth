@@ -78,7 +78,7 @@ private:
 /// \param fd Open descriptor receiving the complete buffer.
 /// \param data First byte of the contiguous buffer to write.
 /// \param size Exact number of bytes that must be written.
-/// \param socket whether output uses send with SIGPIPE suppression instead of write.
+/// \param socket True selects send with SIGPIPE suppression; false selects write.
 /// \return True only after every requested byte was written; otherwise false.
 bool write_all(int fd, const uint8_t* data, size_t size, bool socket) {
     // Retry interruptions and short writes until the entire buffer reaches the socket or PTY.
@@ -99,10 +99,10 @@ bool write_all(int fd, const uint8_t* data, size_t size, bool socket) {
     return true;
 }
 
-/// \brief Choose a private runtime directory for PTY links when /dev is not writable.
+/// \brief Choose the private fallback directory for PTY links.
 /// \return Private runtime directory used when the preferred terminal-link directory is unavailable.
 std::string default_fallback_directory() {
-    // Choose a private runtime directory for PTY links when /dev is not writable.
+    // Place fallback links in the caller's private runtime directory.
     if (const char* runtime_dir = std::getenv("XDG_RUNTIME_DIR");
         runtime_dir != nullptr && runtime_dir[0] != '\0') {
         return std::string{runtime_dir} + "/mrs-uav-bluetooth";
@@ -608,7 +608,7 @@ SerialSshServer::~SerialSshServer() {
 }
 
 void SerialSshServer::start_session(const std::string& device_path, int socket_fd) {
-    // Establish session.
+    // Give one accepted RFCOMM socket to an inetd-style sshd child and track its PID.
     if (socket_fd < 0) {
         throw std::invalid_argument("invalid RFCOMM socket descriptor");
     }
@@ -689,7 +689,7 @@ void SerialSshServer::start_session(const std::string& device_path, int socket_f
 }
 
 void SerialSshServer::stop_session(const std::string& device_path) {
-    // Tear down session.
+    // Remove one device session, terminate a live child, and join its waiter thread.
     std::shared_ptr<Session> session;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -711,7 +711,7 @@ void SerialSshServer::stop_session(const std::string& device_path) {
 }
 
 void SerialSshServer::stop_all() {
-    // Tear down all.
+    // Snapshot device keys so every session can be stopped outside the map lock.
     std::vector<std::string> paths;
     {
         std::lock_guard<std::mutex> lock(mutex_);

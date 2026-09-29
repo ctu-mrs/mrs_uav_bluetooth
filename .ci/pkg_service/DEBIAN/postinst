@@ -11,6 +11,16 @@ fi
 if [ -f /etc/systemd/system/mrs-uav-bluetooth.service ]; then
   rm /etc/systemd/system/mrs-uav-bluetooth.service
 fi
+# Development versions installed these files directly in /etc. Remove them so
+# systemd loads the matching units and helpers from this package.
+if [ -f /etc/systemd/system/mrs-uav-bluetooth-le-radio.service ]; then
+  rm /etc/systemd/system/mrs-uav-bluetooth-le-radio.service
+fi
+if [ -f /etc/systemd/system/bluetooth-mesh.service.d/20-mrs-uav-bluetooth-aead.conf ]; then
+  rm /etc/systemd/system/bluetooth-mesh.service.d/20-mrs-uav-bluetooth-aead.conf
+fi
+rmdir /etc/systemd/system/bluetooth-mesh.service.d 2>/dev/null || true
+
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 
@@ -18,13 +28,8 @@ systemctl reset-failed 2>/dev/null || true
 chmod +x /etc/ctu-mrs/mrs-uav-bluetooth/service_exec.sh
 chmod +x /usr/lib/mrs-uav-bluetooth/mesh-daemon
 chmod +x /usr/lib/mrs-uav-bluetooth/clear-mesh-receiver
-# Tokens and collision-free unicast cursors must survive service restarts. The
-# account exists on UAV images; root remains able to use the directory too.
-if getent passwd mrs >/dev/null; then
-  install -d -m 0750 -o mrs -g mrs /var/lib/mrs_uav_bluetooth
-else
-  install -d -m 0750 /var/lib/mrs_uav_bluetooth
-fi
+# Tokens and collision-free unicast cursors must survive service restarts.
+install -d -m 0750 -o root -g root /var/lib/mrs_uav_bluetooth
 systemctl daemon-reload
 # The package ships only BlueZ's D-Bus alias, not the bluetooth.target Wants
 # link. This permits on-demand activation when a Mesh overlay is selected

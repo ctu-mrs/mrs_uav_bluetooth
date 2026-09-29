@@ -98,7 +98,7 @@ void SerialPortProfile::export_object() {
 }
 
 void SerialPortProfile::register_profile() {
-    // Register profile.
+    // Export Profile1 and give BlueZ the RFCOMM role, channel, and security policy.
     if (registered_) {
         return;
     }
@@ -142,7 +142,7 @@ void SerialPortProfile::register_profile() {
 }
 
 void SerialPortProfile::unregister_profile() {
-    // Unregister profile.
+    // Release the BlueZ registration before removing the exported Profile1 object.
     if (registered_) {
         try {
             auto manager = sdbus::createProxy(

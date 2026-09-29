@@ -116,7 +116,7 @@ bool RawTerminal::active() const {
 }
 
 void RawTerminal::suspend() {
-    // Suspend raw terminal.
+    // Restore the caller's terminal settings before an interactive child takes control.
     if (!active_ || tty_fd_ < 0) {
         return;
     }
@@ -131,7 +131,7 @@ void RawTerminal::suspend() {
 }
 
 void RawTerminal::resume() {
-    // Resume raw terminal.
+    // Reapply the saved raw flags and redraw state after the interactive child exits.
     if (active_ || tty_fd_ < 0 || !termios_saved_ || original_termios_ == nullptr) {
         return;
     }

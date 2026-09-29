@@ -13,7 +13,7 @@ namespace {
 
 /// \brief Detach process stdio from terminal.
 void detach_process_stdio_from_tty() {
-    // Detach process stdio from terminal.
+    // Release inherited streams so the dashboard can own /dev/tty directly.
     const int tty_fd = ::open("/dev/tty", O_RDWR | O_NOCTTY);
     if (tty_fd < 0) {
         return;

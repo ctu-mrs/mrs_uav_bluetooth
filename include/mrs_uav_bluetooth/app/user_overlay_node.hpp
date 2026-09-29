@@ -97,9 +97,9 @@ private:
     std::mutex print_mutex_;
     std::string last_print_payload_;
 
-    // Structured status callbacks only copy messages and timestamps. Formatting
-    // is centralized in the timer callback so high-rate Mesh RX cannot flood a
-    // user's terminal.
+    // Structured status callbacks copy messages and timestamps. The timer
+    // callback centralizes formatting and bounds terminal update frequency
+    // during high-rate Mesh reception.
     std::mutex transport_status_mutex_;
     std::optional<mrs_uav_bluetooth::msg::BleDeviceArray> latest_advertisements_;
     std::map<std::string, std::pair<

@@ -323,7 +323,7 @@ public:
     /// \param dbus shared D-Bus connection used for BlueZ calls.
     /// \param object_path D-Bus path where this service is exported.
     /// \param uuid Stable UUID exported for this service.
-    /// \param primary Whether BlueZ exposes this as a primary rather than secondary service.
+    /// \param primary True exports a primary service; false exports a secondary service.
     GattService(bluez::DbusConnection& dbus,
                 const std::string& object_path,
                 const std::string& uuid,

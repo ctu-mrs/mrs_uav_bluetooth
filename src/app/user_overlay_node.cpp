@@ -206,6 +206,8 @@ void UserOverlayNode::configure_parameters() {
 }
 
 void UserOverlayNode::load_overlay_context() {
+    // Resolve hostname placeholders, merge the selected overlay, and choose the
+    // transport-specific status streams shown while its lease is active.
     hostname_ = mrs_uav_bluetooth::util::sanitize_topic_suffix(
         mrs_uav_bluetooth::util::system_hostname().empty() ? "mrs-uav" : mrs_uav_bluetooth::util::system_hostname());
     const auto share_dir = ament_index_cpp::get_package_share_directory("mrs_uav_bluetooth");
@@ -221,14 +223,14 @@ void UserOverlayNode::load_overlay_context() {
         report_mesh_ = report_mesh_ || bridge.transport == "mesh";
     }
     report_mesh_ = report_mesh_ || effective_config_.enable_mesh;
-    // Preserve the original comprehensive service report for GATT and generic
-    // overlays. Connectionless modes use their structured status topics so the
-    // terminal shows transport-specific information instead of GATT internals.
+    // Use the comprehensive service report for GATT and generic overlays.
+    // Advertisement and Mesh overlays display their structured transport
+    // status topics.
     print_text_status_ = has_gatt_bridge ||
         (!report_advertisements_ && !report_mesh_);
     // The verbose log publisher is optional in service_node. Falling back to
-    // its always-present periodic status keeps a custom GATT overlay useful
-    // even when it did not explicitly enable log_topic_enable.
+    // its always-present periodic status keeps custom GATT overlays useful
+    // with the default logging setting.
     if (print_text_status_ && print_source_ == "log" &&
         !effective_config_.log_topic_enable) {
         print_source_ = "status";
@@ -396,8 +398,7 @@ void UserOverlayNode::handle_advertisements(
     const auto now = std::chrono::steady_clock::now();
     advertisements_received_at_ = now;
     // BlueZ may briefly remove a device while an advertisement is replaced.
-    // Preserve its last sample so the periodic report does not alternate
-    // between a real peer and an empty list on every scan cycle.
+    // Preserve its last sample across brief gaps for a stable periodic report.
     for (const auto& device : message->devices) {
         const auto key = !device.hostname.empty() ? device.hostname : device.mac;
         recent_advertisements_[key] = {device, now};
@@ -439,6 +440,8 @@ void UserOverlayNode::handle_mesh_message(
 }
 
 void UserOverlayNode::print_transport_status() {
+    // Snapshot callback-owned transport state under one lock, then format a
+    // coherent periodic report after releasing the shared state.
     std::optional<mrs_uav_bluetooth::msg::BleDeviceArray> advertisements;
     std::map<std::string, std::pair<
         mrs_uav_bluetooth::msg::BleDevice,

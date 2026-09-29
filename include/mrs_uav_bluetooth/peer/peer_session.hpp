@@ -26,11 +26,11 @@ struct PeerConnectionSession {
     double connect_started_monotonic{0.0};
     double connected_since_monotonic{0.0};
     double last_security_attempt_monotonic{0.0};
-    // Survives short reconnects while unpaired: an asymmetric bond must not
-    // restart the non-initiator's grace period on every failed encryption.
+    // Survives short reconnects while unpaired so an asymmetric bond keeps the
+    // non-initiator's original grace-period deadline across failed encryption.
     double pairing_wait_started_monotonic{0.0};
 
-    /// Prefer one pairing initiator initially, but never wait for it forever.
+    /// Prefer one pairing initiator until the bounded fallback deadline.
     /// \param now current monotonic time.
     /// \return True once the fallback deadline passes while pairing is still pending; otherwise false.
     bool pairing_fallback_due(double now) const {
@@ -39,7 +39,7 @@ struct PeerConnectionSession {
             now - pairing_wait_started_monotonic >= 10.0;
     }
 
-    /// Partial handshake traffic starts, but never postpones, the deadline.
+    /// Start the bridge deadline once and retain it across partial handshakes.
     /// \param now current monotonic time.
     void begin_bridge_wait(double now) {
         // Begin bridge wait.

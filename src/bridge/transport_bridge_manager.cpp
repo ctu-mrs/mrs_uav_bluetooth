@@ -92,9 +92,9 @@ std::optional<std::pair<uint16_t, std::vector<uint8_t>>> unframe_payload(
 
 /// \brief Convert a peer identity into a safe ROS topic path component.
 /// \param peer Resolved hostname, address, or Mesh fallback name.
-/// \return Nonempty topic-safe peer token that never begins with a digit.
+/// \return Nonempty topic-safe peer token with a ROS-valid leading character.
 std::string safe_peer_token(std::string peer) {
-    // Prefix numeric identities because ROS names cannot start with a digit.
+    // Prefix numeric identities with the ROS-compatible peer label.
     peer = util::sanitize_topic_suffix(peer);
     if (peer.empty()) peer = "unknown";
     if (std::isdigit(static_cast<unsigned char>(peer.front())) != 0) {
@@ -116,8 +116,8 @@ struct TransportBridgeManager::Impl {
         std::optional<std::vector<uint8_t>> pending_payload;
         std::map<std::string, rclcpp::PublisherBase::SharedPtr> publishers;
         // BlueZ can keep several random-address objects for one advertiser.
-        // Remember recent packets, not just the most recent packet, so an old
-        // cached object cannot republish data when scan snapshots alternate.
+        // Remember the recent packet window to filter replay from alternating
+        // cached scan snapshots.
         std::map<std::string, std::deque<std::pair<std::chrono::steady_clock::time_point,
                                                    std::vector<uint8_t>>>> recent_payloads;
     };
@@ -130,9 +130,9 @@ struct TransportBridgeManager::Impl {
         // Senders remain unset until ServiceNode has constructed each transport.
     }
 
-    // A transport callback can make a synchronous D-Bus call. Never invoke it
-    // while holding mutex: a Mesh receive callback runs on the D-Bus thread
-    // and needs this same mutex to publish an incoming bridge message.
+    // A transport callback can make a synchronous D-Bus call. Invoke it after
+    // releasing mutex so the D-Bus Mesh receive callback can acquire the same
+    // lock to publish an incoming bridge message.
     /// \brief Send one encoded bridge value through its configured transport.
     /// \param config Bridge routing and framing configuration.
     /// \param payload Encoded ROS value without transport framing.
@@ -238,7 +238,7 @@ struct TransportBridgeManager::Impl {
         std::lock_guard<std::recursive_mutex> lock(mutex);
         const auto found = entries.find(key);
         // A newer value supersedes this attempt, even if that value has
-        // already been sent. Old callbacks cannot restore an old overlay.
+        // already been sent. Generation and revision checks retain the newest overlay.
         if (found != entries.end() && found->second.generation == generation &&
             found->second.revision == revision && !found->second.pending_payload)
             found->second.pending_payload = std::move(payload);
@@ -254,14 +254,11 @@ struct TransportBridgeManager::Impl {
                  const std::string& peer,
                  const std::vector<uint8_t>& payload,
                  bool deduplicate) {
-        // Keep a short packet history because BlueZ may alternate cached addresses.
+        // Keep packet history for this overlay because BlueZ may alternate
+        // cached random-address records long after one stopped changing.
         const auto token = safe_peer_token(peer);
         if (deduplicate) {
             auto& recent = entry.recent_payloads[token];
-            const auto now = std::chrono::steady_clock::now();
-            while (!recent.empty() && now - recent.front().first > std::chrono::seconds(15)) {
-                recent.pop_front();
-            }
             if (std::any_of(recent.begin(), recent.end(), [&](const auto& seen) {
                     return seen.second == payload;
                 })) {
@@ -289,11 +286,7 @@ struct TransportBridgeManager::Impl {
                 payload, entry.config.member_specs, entry.config.payload_format,
                 entry.config.decode_assignments);
             publisher->publish(serialized);
-            if (deduplicate) {
-                auto& recent = entry.recent_payloads[token];
-                recent.emplace_back(std::chrono::steady_clock::now(), payload);
-                if (recent.size() > 128) recent.pop_front();
-            }
+            if (deduplicate) remember(entry, token, payload);
             return true;
         } catch (const std::exception& error) {
             RCLCPP_WARN(logger, "Could not decode %s bridge channel %u from %s: %s",
@@ -301,6 +294,25 @@ struct TransportBridgeManager::Impl {
                         token.c_str(), error.what());
             return false;
         }
+    }
+
+    /// \brief Add one payload to an advertisement peer's bounded replay history.
+    /// \param entry Configured advertisement import bridge that owns the history.
+    /// \param token Topic-safe peer identity shared with the publication path.
+    /// \param payload Decoded bridge bytes to suppress if BlueZ reports them again.
+    static void remember(Entry& entry,
+                         const std::string& token,
+                         const std::vector<uint8_t>& payload) {
+        auto& recent = entry.recent_payloads[token];
+        if (std::any_of(recent.begin(), recent.end(), [&](const auto& seen) {
+                return seen.second == payload;
+            })) {
+            return;
+        }
+        recent.emplace_back(std::chrono::steady_clock::now(), payload);
+        // More than six minutes at the example's 10 Hz rate covers address
+        // rotations without allowing retained process-lifetime state to grow.
+        if (recent.size() > 4096) recent.pop_front();
     }
 
     rclcpp::Node& node;
@@ -450,6 +462,36 @@ bool TransportBridgeManager::handle_advertisement(
     return impl_->publish(found->second, peer, frame->second, true);
 }
 
+
+void TransportBridgeManager::remember_advertisement(
+    const std::string& hostname,
+    const std::string& mac,
+    const std::vector<uint8_t>& payload) {
+    // Apply the same admission, peer naming, and frame selection used by live data.
+    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+    const auto normalized_peer = util::lower_trim_copy(hostname);
+    const auto normalized_mac = util::lower_trim_copy(mac);
+    if (!impl_->peer_whitelist.empty() &&
+        std::find(impl_->peer_whitelist.begin(), impl_->peer_whitelist.end(),
+                  normalized_peer) == impl_->peer_whitelist.end() &&
+        std::find(impl_->peer_whitelist.begin(), impl_->peer_whitelist.end(),
+                  normalized_mac) == impl_->peer_whitelist.end()) return;
+
+    const auto token = safe_peer_token(hostname.empty() ? "mac_" + mac : hostname);
+    const auto bare = impl_->entries.find(entry_key("advertisement", 0));
+    if (bare != impl_->entries.end() && bare->second.config.advertisement_bare) {
+        if (imports(bare->second.config)) {
+            Impl::remember(bare->second, token, payload);
+        }
+        return;
+    }
+
+    const auto frame = unframe_payload(payload, 0);
+    if (!frame) return;
+    const auto found = impl_->entries.find(entry_key("advertisement", frame->first));
+    if (found == impl_->entries.end() || !imports(found->second.config)) return;
+    Impl::remember(found->second, token, frame->second);
+}
 bool TransportBridgeManager::handle_mesh(
     uint16_t source,
     uint16_t key_index,
