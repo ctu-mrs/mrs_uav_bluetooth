@@ -67,7 +67,7 @@ void RandomOdometryPublisherNode::configure_parameters() {
     // Declare every output and bound parameter, expand the local hostname, and
     // validate all numeric ranges before creating publishers or timers.
     declare_parameter<std::string>(
-        "odometry_topic", "/{hostname}/mavros/local_position/odom");
+        "odometry_topic", "/{hostname}/mavros/global_position/local");
     declare_parameter<std::string>("frame_id", frame_id_);
     declare_parameter<std::string>("child_frame_id", child_frame_id_);
     declare_parameter<double>("rate_hz", rate_hz_);

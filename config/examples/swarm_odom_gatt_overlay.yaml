@@ -18,7 +18,7 @@ shared_topics:
   - transport: gatt
     mode: both
     payload_format: struct
-    export_topic: /{hostname}/mavros/local_position/odom
+    export_topic: /{hostname}/mavros/global_position/local
     message_type: nav_msgs/msg/Odometry
     rate_hz: 10.0
     members_encode:
