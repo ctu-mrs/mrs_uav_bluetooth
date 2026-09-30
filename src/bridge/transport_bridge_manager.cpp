@@ -114,6 +114,8 @@ struct TransportBridgeManager::Impl {
         rclcpp::SubscriptionBase::SharedPtr subscription;
         rclcpp::TimerBase::SharedPtr timer;
         std::optional<std::vector<uint8_t>> pending_payload;
+        // The source cap is based on successful transport handoffs, not timer ticks.
+        std::chrono::steady_clock::time_point next_dispatch_at{};
         std::map<std::string, rclcpp::PublisherBase::SharedPtr> publishers;
         // BlueZ can keep several random-address objects for one advertiser.
         // Remember the recent packet window to filter replay from alternating
@@ -218,6 +220,8 @@ struct TransportBridgeManager::Impl {
             if (found == entries.end() || found->second.generation != generation ||
                 !found->second.pending_payload) return;
             auto& entry = found->second;
+            if (entry.config.rate_hz > 0.0 &&
+                std::chrono::steady_clock::now() < entry.next_dispatch_at) return;
             config = entry.config;
             advertisement = advertisement_sender;
             mesh = mesh_sender;
@@ -234,7 +238,24 @@ struct TransportBridgeManager::Impl {
                 "Could not send %s bridge channel %u: %s",
                 config.transport.c_str(), config.channel_id, error.what());
         }
-        if (accepted) return;
+        if (accepted) {
+            std::lock_guard<std::recursive_mutex> lock(mutex);
+            const auto found = entries.find(key);
+            if (found != entries.end() && found->second.generation == generation &&
+                config.rate_hz > 0.0) {
+                const auto spacing = std::max(
+                    std::chrono::steady_clock::duration{1},
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::duration<double>(1.0 / config.rate_hz)));
+                auto& deadline = found->second.next_dispatch_at;
+                const auto now = std::chrono::steady_clock::now();
+                if (deadline == std::chrono::steady_clock::time_point{})
+                    deadline = now + spacing;
+                else
+                    do { deadline += spacing; } while (deadline <= now);
+            }
+            return;
+        }
         std::lock_guard<std::recursive_mutex> lock(mutex);
         const auto found = entries.find(key);
         // A newer value supersedes this attempt, even if that value has
@@ -310,8 +331,8 @@ struct TransportBridgeManager::Impl {
             return;
         }
         recent.emplace_back(std::chrono::steady_clock::now(), payload);
-        // More than six minutes at the example's 10 Hz rate covers address
-        // rotations without allowing retained process-lifetime state to grow.
+        // Keep enough distinct values to reject cached scans across address
+        // rotations while bounding memory for a long-running overlay.
         if (recent.size() > 4096) recent.pop_front();
     }
 
@@ -412,10 +433,11 @@ void TransportBridgeManager::configure(
                 impl_->handle_local_message(key, generation, message);
             },
             10);
-        // Unthrottled bridges dispatch immediately from the subscription.
-        // Their timer only retries a value whose transport was unavailable.
+        // A short timer retries brief configuration-lock contention promptly.
+        // flush() enforces the configured rate after each accepted value.
+        // Unthrottled bridges still dispatch immediately from the subscription.
         const double period = configured.rate_hz > 0.0
-            ? 1.0 / configured.rate_hz : 0.02;
+            ? std::min(0.1, 1.0 / configured.rate_hz) : 0.02;
         entry.timer = impl_->node.create_wall_timer(
             std::chrono::duration<double>(period),
             [this, key, generation]() {

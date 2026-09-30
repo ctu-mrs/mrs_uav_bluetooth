@@ -227,6 +227,8 @@ private:
     /// unregistered. A small hostname-phased receive window prevents equal-rate
     /// peers from remaining permanently synchronized as transmitters or receivers.
     void open_advertisement_scan_window();
+    /// \brief Alternate scan and transmit roles for legacy property-updated broadcasts.
+    void maintain_legacy_advertisement_radio();
     /// \brief Create or remove the raw advertisement payload subscription for the active mode.
     void refresh_advertisement_topic_subscription();
     /// \brief Apply a raw ROS byte array as the next application advertisement value.
@@ -533,6 +535,9 @@ private:
     /// True while a broadcast-only payload owns a half-duplex controller for transmission.
     std::atomic_bool advertisement_transmit_window_{false};
     std::unique_ptr<gatt::services::WifiService> wifi_service_;
+    /// The legacy controller must alternate physical scan and advertise roles.
+    bool legacy_advertisement_receiving_{false};
+    std::chrono::steady_clock::time_point legacy_advertisement_switch_at_{};
     std::unique_ptr<gatt::services::TimeService> time_service_;
 
     bridge::BridgeRegistry bridge_registry_;
@@ -553,6 +558,7 @@ private:
     rclcpp::TimerBase::SharedPtr peer_timer_;
     rclcpp::TimerBase::SharedPtr time_service_timer_;
     rclcpp::TimerBase::SharedPtr wifi_service_timer_;
+    rclcpp::TimerBase::SharedPtr advertisement_role_timer_;
     rclcpp::TimerBase::SharedPtr mesh_timer_;
     std::chrono::steady_clock::time_point mesh_next_maintenance_{};
     rclcpp::Publisher<mrs_uav_bluetooth::msg::MeshStatus>::SharedPtr mesh_status_pub_;

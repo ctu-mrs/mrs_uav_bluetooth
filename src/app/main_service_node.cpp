@@ -15,7 +15,9 @@ int main(int argc, char** argv) {
     // Keep lease and reliability timers responsive while worker threads wait on D-Bus.
     rclcpp::init(argc, argv);
     auto node = std::make_shared<mrs_uav_bluetooth::app::ServiceNode>();
-    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions{}, 16);
+    // Six workers cover concurrent lease, peer, transport, and status callbacks
+    // while limiting wakeups on small UAV CPUs.
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions{}, 6);
     executor.add_node(node);
     executor.spin();
     executor.remove_node(node);

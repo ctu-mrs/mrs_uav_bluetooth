@@ -1,5 +1,4 @@
 # Safe settings used when no example is running.
-# Start with config/README.md and copy one file from config/examples.
 
 # -----------------------------------------------------------------------------
 # General settings
@@ -148,8 +147,8 @@ advertise_mode: peripheral
 
 # "legacy" works with older radios; "extended" carries more data.
 advertise_size: legacy
-# Tested update method.
-advertise_update_strategy: reregister
+# Update method for changing broadcast data ("property" or "reregister").
+advertise_update_strategy: property
 # Repeat interval in milliseconds.
 advertise_min_interval: 100
 advertise_max_interval: 100

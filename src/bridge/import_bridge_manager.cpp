@@ -156,11 +156,9 @@ bool ImportBridgeManager::buffer_notification_payload(const std::string& mac,
         if (!state.mac.empty() && !mac.empty() && state.mac != mac) {
             continue;
         }
-        if (state.rate_hz > 0.0) {
-            state.pending_payload = payload;
-        } else {
-            publish_payload(state, payload);
-        }
+        // The exporter already limits notifications to its declared rate.
+        // A second receive timer discards fresh values near simultaneous expiries.
+        publish_payload(state, payload);
         updated = true;
     }
 

@@ -10,8 +10,8 @@ node_topics_prefix: "/{hostname}/bluetooth"
 # Keep these values together.
 advertise_mode: broadcast
 advertise_size: legacy
-# Tested update method.
-advertise_update_strategy: reregister
+# Update the broadcast as position changes.
+advertise_update_strategy: property
 # Repeat interval in milliseconds.
 advertise_min_interval: 100
 advertise_max_interval: 100
@@ -43,7 +43,7 @@ shared_topics:
     export_topic: /{hostname}/mavros/local_position/odom
     import_topic_suffix: mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
-    rate_hz: 10.0
+    rate_hz: 1.0
     members_encode:
       # Store the time in one value.
       - target: timestamp_ns

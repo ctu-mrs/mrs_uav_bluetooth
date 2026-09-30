@@ -1,4 +1,4 @@
-# Mesh example: shares complete odometry and relays it through other UAVs.
+# Mesh example: shares compact position and orientation through other UAVs.
 # Copy this file, list all UAVs below, and deploy the same copy everywhere.
 # Start user_node with config_path:=<absolute path to the copy>.
 # Received data appears below /<this-uav>/bluetooth/mesh/peers.
@@ -21,8 +21,10 @@ mesh_provisioner_preference: ordered
 mesh_swarm_heartbeat_period: 3.0
 # Seconds before a silent UAV is considered gone.
 mesh_swarm_provisioner_timeout: 20.0
-# Keep at zero; missing data is retried automatically.
-mesh_network_retransmit_count: 0
+# Send each radio packet three times to reduce lost segments.
+mesh_network_retransmit_count: 2
+# Space repeated radio packets by 50 ms.
+mesh_network_retransmit_interval_steps: 4
 
 # -----------------------------------------------------------------------------
 # Data to send
@@ -36,8 +38,8 @@ shared_topics:
     export_topic: /{hostname}/mavros/local_position/odom
     import_topic_suffix: mavros/local_position/odom
     message_type: nav_msgs/msg/Odometry
-    # Offer the newest value up to ten times per second.
-    rate_hz: 10.0
+    # Offer the newest value at the tested rate.
+    rate_hz: 0.5
     # Internal labels; keep them identical on every UAV.
     app_key_index: 0
     element_index: 0
@@ -45,41 +47,68 @@ shared_topics:
     vendor_opcode: 0xc1
     company_id: 0x05f1
     members_encode:
-      - target: seconds
-        type: uint32
-        expression: header.stamp.sec
-      - target: nanoseconds
-        type: uint32
-        expression: header.stamp.nanosec
-      - target: pose.pose.position.x
-        type: float32
-      - target: pose.pose.position.y
-        type: float32
-      - target: pose.pose.position.z
-        type: float32
-      - target: pose.pose.orientation.x
-        type: float32
-      - target: pose.pose.orientation.y
-        type: float32
-      - target: pose.pose.orientation.z
-        type: float32
-      - target: pose.pose.orientation.w
-        type: float32
-      - target: twist.twist.linear.x
-        type: float32
-      - target: twist.twist.linear.y
-        type: float32
-      - target: twist.twist.linear.z
-        type: float32
-      - target: twist.twist.angular.x
-        type: float32
-      - target: twist.twist.angular.y
-        type: float32
-      - target: twist.twist.angular.z
-        type: float32
-    # Rebuild the usual ROS time fields.
+      # Store the time in one value.
+      - target: timestamp_ns
+        type: uint64
+        expression: header.stamp.sec * 1000000000 + header.stamp.nanosec
+
+      # Store orientation as three short angles.
+      - target: roll
+        type: int16
+        expression: >-
+          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.x +
+          pose.pose.orientation.y * pose.pose.orientation.z),
+          1.0 - 2.0 * (pose.pose.orientation.x * pose.pose.orientation.x +
+          pose.pose.orientation.y * pose.pose.orientation.y))
+      - target: pitch
+        type: int16
+        expression: >-
+          (32767.0 / pi) * asin(clamp(2.0 * (pose.pose.orientation.w * pose.pose.orientation.y -
+          pose.pose.orientation.z * pose.pose.orientation.x), -1.0, 1.0))
+      - target: yaw
+        type: int16
+        expression: >-
+          (32767.0 / pi) * atan2(2.0 * (pose.pose.orientation.w * pose.pose.orientation.z +
+          pose.pose.orientation.x * pose.pose.orientation.y),
+          1.0 - 2.0 * (pose.pose.orientation.y * pose.pose.orientation.y +
+          pose.pose.orientation.z * pose.pose.orientation.z))
+
+      # Store XYZ in centimetres; each axis covers -327.68 to 327.67 m.
+      - target: x_cm
+        type: int16
+        expression: pose.pose.position.x * 100
+      - target: y_cm
+        type: int16
+        expression: pose.pose.position.y * 100
+      - target: z_cm
+        type: int16
+        expression: pose.pose.position.z * 100
+
+    # Rebuild the usual ROS fields.
     members_decode:
+      - target: pose.pose.position.x
+        expression: x_cm / 100.0
+      - target: pose.pose.position.y
+        expression: y_cm / 100.0
+      - target: pose.pose.position.z
+        expression: z_cm / 100.0
       - target: header.stamp.sec
-        expression: seconds
+        expression: timestamp_ns / 1000000000
       - target: header.stamp.nanosec
-        expression: nanoseconds
+        expression: timestamp_ns % 1000000000
+      - target: pose.pose.orientation.w
+        expression: >-
+          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
+          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.x
+        expression: >-
+          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) -
+          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.y
+        expression: >-
+          cos(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0) +
+          sin(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0)
+      - target: pose.pose.orientation.z
+        expression: >-
+          cos(roll * pi / 65534.0) * cos(pitch * pi / 65534.0) * sin(yaw * pi / 65534.0) -
+          sin(roll * pi / 65534.0) * sin(pitch * pi / 65534.0) * cos(yaw * pi / 65534.0)

@@ -856,6 +856,11 @@ void ServiceNode::build_runtime() {
         }
 
     }, timer_callback_group_);
+    advertisement_role_timer_ = create_grouped_wall_timer(
+        *this, std::chrono::milliseconds(100), [this]() {
+            maintain_legacy_advertisement_radio();
+        }, timer_callback_group_);
+
 
     overlay_config_->load_initial();
 }
@@ -1306,6 +1311,82 @@ void ServiceNode::open_advertisement_scan_window() {
     std::this_thread::sleep_for(std::chrono::milliseconds(dwell_ms));
 }
 
+void ServiceNode::maintain_legacy_advertisement_radio() {
+    // BlueZ reports both discovery and advertising as active on some legacy
+    // controllers even while the physical radio only scans. Alternate the
+    // two D-Bus-owned roles while keeping the advertisement registered, so
+    // property changes remain cheap and the latest sample stays on air.
+    std::unique_lock<std::mutex> config_lock(config_apply_mutex_, std::try_to_lock);
+    if (!config_lock.owns_lock() || !can_run_callbacks()) return;
+    std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+    const auto adapter = cache_ && !adapter_path_.empty()
+        ? cache_->adapter(adapter_path_)
+        : std::optional<bluez::AdapterInfo>{};
+    const bool legacy_broadcast = client_ && advertisement_ &&
+        advertisement_->is_registered() && advertisement_extra_payload_ &&
+        active_config_.enable_server && active_config_.enable_scan &&
+        !active_config_.enable_mesh &&
+        active_config_.advertise_mode == "broadcast" &&
+        active_config_.advertise_update_strategy == "property" &&
+        adapter && adapter->max_advertisement_length > 0 &&
+        adapter->max_advertisement_length <= kPrimaryAdvertisementMaxBytes;
+    if (!legacy_broadcast) {
+        if (legacy_advertisement_switch_at_ !=
+            std::chrono::steady_clock::time_point{}) {
+            legacy_advertisement_switch_at_ = {};
+            advertisement_transmit_window_.store(false);
+        }
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (legacy_advertisement_switch_at_ == std::chrono::steady_clock::time_point{}) {
+        legacy_advertisement_receiving_ = client_->is_scanning();
+        advertisement_transmit_window_.store(!legacy_advertisement_receiving_);
+        legacy_advertisement_switch_at_ = now + std::chrono::milliseconds(500);
+        return;
+    }
+    if (now < legacy_advertisement_switch_at_) return;
+
+    // Vary each dwell by the local hostname and cycle so any number of
+    // legacy peers eventually see one another even if their clocks align.
+    uint64_t phase = 1469598103934665603ULL;
+    for (const unsigned char character : hostname_) {
+        phase = (phase ^ character) * 1099511628211ULL;
+    }
+    phase += ++advertisement_scan_sequence_ * 0x9e3779b97f4a7c15ULL;
+    phase ^= phase >> 30U;
+    phase *= 0xbf58476d1ce4e5b9ULL;
+    phase ^= phase >> 27U;
+    // At least three advertising intervals per role give several receive
+    // chances while a complete cycle stays below one second at 100 ms.
+    const auto role_dwell = std::chrono::milliseconds(std::max(
+        350U, active_config_.advertise_max_interval.value_or(100U) * 3U));
+    const auto variation = std::chrono::milliseconds(phase % 151U);
+
+    if (legacy_advertisement_receiving_) {
+        advertisement_transmit_window_.store(true);
+        if (!client_->stop_scan()) {
+            advertisement_transmit_window_.store(false);
+            legacy_advertisement_switch_at_ = now + std::chrono::milliseconds(250);
+            return;
+        }
+        legacy_advertisement_receiving_ = false;
+        // A scan-window update was retained in the D-Bus property getter.
+        advertisement_->emit_property_changed("Data");
+        legacy_advertisement_switch_at_ = now + role_dwell + variation;
+    } else {
+        advertisement_transmit_window_.store(false);
+        if (!client_->start_scan(active_config_.scan_mode, false)) {
+            advertisement_transmit_window_.store(true);
+            legacy_advertisement_switch_at_ = now + std::chrono::milliseconds(250);
+            return;
+        }
+        legacy_advertisement_receiving_ = true;
+        legacy_advertisement_switch_at_ = now + role_dwell + variation;
+    }
+}
+
 void ServiceNode::refresh_advertisement_topic_subscription() {
     if (!can_run_callbacks()) {
         return;
@@ -1461,7 +1542,8 @@ void ServiceNode::set_advertisement_payload(std::vector<uint8_t> payload,
         return;
     }
 
-    const bool data_property_exported = advertisement_extra_payload_.has_value() ||
+    const bool data_property_exported = active_config_.advertise_mode == "broadcast" ||
+        advertisement_extra_payload_.has_value() ||
         !active_config_.advertise_data.empty();
     // Property mode changes Data on the registered D-Bus object. Reregister
     // mode performs a complete LEAdvertisingManager1 unregister/register for
@@ -1479,7 +1561,11 @@ void ServiceNode::set_advertisement_payload(std::vector<uint8_t> payload,
             advertise_data[bluez::kDefaultAdvertisementExtraDataType] = *advertisement_extra_payload_;
         }
         advertisement_->set_data(advertise_data);
-        advertisement_->emit_property_changed("Data");
+        // Keep only the newest value while a legacy radio is receiving.
+        // The role timer emits that value when transmission resumes.
+        if (legacy_advertisement_switch_at_ ==
+                std::chrono::steady_clock::time_point{} ||
+            !legacy_advertisement_receiving_) advertisement_->emit_property_changed("Data");
         RCLCPP_DEBUG(get_logger(),
                     "Submitted BLE advertisement data update (%zu bytes)",
                     advertisement_extra_payload_->size());

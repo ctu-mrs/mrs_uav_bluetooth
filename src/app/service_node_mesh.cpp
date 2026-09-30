@@ -823,7 +823,8 @@ void ServiceNode::maintain_mesh_reliable() {
                 mesh_app_->send_pending(*item.transfer)) continue;
             const auto handle = mesh_app_->try_send(item.element_index,
                 item.destination, item.app_key_index, item.segmented, item.data);
-            if (handle && item.data[3] == kReliableData)
+            if (handle && (item.data[3] == kReliableData ||
+                           item.data[3] == kReliableDataNoTurn))
                 remember_mesh_transfer(mesh_reliable_sequence(item.data),
                     item.destination, *handle);
             if (!handle) {

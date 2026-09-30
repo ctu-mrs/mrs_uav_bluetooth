@@ -105,7 +105,7 @@ void Advertisement::export_object() {
                 })
         ).forInterface(interface_name);
     }
-    if (!data_.empty()) {
+    if (!data_.empty() || ad_type_ == "broadcast") {
         exported_->addVTable(
             sdbus::registerProperty("Data")
                 .withGetter([this]() -> std::map<uint8_t, sdbus::Variant> {

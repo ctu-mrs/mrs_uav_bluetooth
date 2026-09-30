@@ -51,23 +51,23 @@ Choose the same topic-sharing mode on the participating UAVs. The service switch
 
 | Mode | What it does | User payload limit | Sample configuration |
 | --- | --- | --- | --- |
-| Advertisement | Sends small messages to nearby UAVs without connecting. | 26 B (legacy) / 246 B | [Odometry advertisement](config/examples/swarm_odom_advertisement_overlay.yaml) |
-| GATT | Connects to nearby UAVs and sends larger messages. | 512 B | [Odometry GATT](config/examples/swarm_odom_gatt_overlay.yaml) |
-| Mesh | Passes messages through other UAVs to reach farther away (multi-hop). | 370 B | [Odometry Mesh](config/examples/swarm_odom_mesh_overlay.yaml) |
+| Advertisement | Sends small messages to nearby UAVs without connecting at small rates. | 26 B (legacy) / 246 B | [Odometry advertisement](config/examples/swarm_odom_advertisement_overlay.yaml) |
+| GATT | Connects to nearby UAVs and sends larger messages at higher rates. | 512 B | [Odometry GATT](config/examples/swarm_odom_gatt_overlay.yaml) |
+| Mesh | Passes small messages through other UAVs to reach farther away (multi-hop) at small rates. | 370 B | [Odometry Mesh](config/examples/swarm_odom_mesh_overlay.yaml) |
 
-Copy the sample for your mode and edit the UAV names in `peer_whitelist` and the source topic in `shared_topics`. The samples use `/uavXX/mavros/local_position/odom`. Start the overlay on each participating UAV with an absolute path to your edited file:
+Copy the sample for your mode and edit the UAV names in `peer_whitelist` and the source topic in `shared_topics`. The samples are typically installed in `/opt/ros/jazzy/share/mrs_uav_bluetooth/config/examples` and they use `/uavXX/mavros/local_position/odom`. Start the overlay on each participating UAV with an absolute path to your edited file:
 
 ```bash
 ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/absolute/path/to/your-overlay.yaml
 ```
 
-For generated odometry, start a test source on each UAV:
+When no real odometry source is available, start a test source on each UAV:
 
 ```bash
-ros2 launch mrs_uav_bluetooth random_odometry_publisher.launch.py rate_hz:=5.0
+ros2 launch mrs_uav_bluetooth random_odometry_publisher.launch.py rate_hz:=10.0
 ```
 
-The advertisement sample packs the original nanosecond timestamp, three orientation angles, and XYZ position into 26 bytes. GATT and Mesh use the same 60-byte timestamp, pose, and velocity layout. All three samples are configured for 10 Hz. Add frame IDs or covariance fields to the declaration if your application needs them.
+The advertisement sample packs timestamp, orientation, and XYZ position into 26 bytes. Mesh uses 20 bytes by storing XYZ to the nearest centimetre within -327.68 to 327.67 m on each axis. GATT sends timestamp, pose, and velocity in 60 bytes. The sample message rates are 1 Hz for advertisement, 0.5 Hz for Mesh, and 10 Hz for GATT. All YAML options are listed in the [configuration table](config/README.md).
 
 Received GATT and advertisement topics appear below `/{hostname}/bluetooth/le/peers/<peer>/`. Mesh uses `/{hostname}/bluetooth/mesh/peers/<peer>/`. The peer segment is the hostname when it can be resolved. GATT and advertisements fall back to `mac_<address>`. Mesh peer identity uses a unicast address, so an empty Mesh peer list uses the fallback `unicast_<address>`. The `user_node` prints status for the active mode while it runs.
 
