@@ -5,6 +5,7 @@
 // Command-line UX and reconnectable serial transport inspired by ttyssh (MIT).
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <filesystem>
@@ -33,6 +34,18 @@ std::string hostname_from_destination(const std::string& destination) {
     // Extract the host part from a user-at-host SSH destination.
     const auto separator = destination.rfind('@');
     return separator == std::string::npos ? destination : destination.substr(separator + 1);
+}
+
+/// \brief Validate an explicitly supplied OpenSSH account name.
+/// \param username Candidate remote account name.
+/// \return True when the account is nonempty and safe to pass as part of a destination.
+bool valid_ssh_username(const std::string& username) {
+    if (username.empty() || username.front() == '-') {
+        return false;
+    }
+    return std::all_of(username.begin(), username.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.';
+    });
 }
 
 /// \brief Build the stable tty symlink path for a validated peer hostname.
@@ -157,6 +170,19 @@ int main(int argc, char** argv) {
 
     if (host.empty()) {
         usage(argv[0]);
+        return 64;
+    }
+    if (user.empty() && host.find('@') == std::string::npos) {
+        std::fprintf(stderr,
+                     "SSH username is required; pass --user USER or USER@PEER_HOST\n");
+        return 64;
+    }
+    const auto separator = host.rfind('@');
+    const auto destination_user = separator == std::string::npos
+        ? user
+        : host.substr(0, separator);
+    if (!valid_ssh_username(destination_user)) {
+        std::fprintf(stderr, "invalid SSH username\n");
         return 64;
     }
     if (!device.empty() && !mac.empty()) {

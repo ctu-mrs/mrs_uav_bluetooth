@@ -82,6 +82,7 @@ private:
 
     enum class PromptMode {
         None,
+        SshUsername,
         WifiSsid,
         WifiPassword,
     };
@@ -129,7 +130,8 @@ private:
     /// \brief Open the selected peer's RFCOMM terminal without blocking the dashboard.
     void trigger_serial_connect();
     /// \brief Launch the Bluetooth SSH helper for the selected peer.
-    void trigger_ssh();
+    /// \param username Explicit remote account entered by the operator.
+    void trigger_ssh(const std::string& username);
     /// \brief Start or stop discovery and update the requested scan state.
     void trigger_scan_toggle();
     /// \brief Apply an operator-entered SSID or password to the selected peer.
@@ -151,8 +153,8 @@ private:
     void on_notification(const std::vector<uint8_t>& data,
                          const std::string& uuid,
                          const std::string& characteristic_path);
-    /// \brief Accept BlueZ resolution or an already populated remote GATT cache.
-    /// \param device Peer whose BlueZ discovery state is combined with the local readiness cache.
+    /// \brief Accept BlueZ resolution or an actually populated remote GATT cache.
+    /// \param device Peer whose BlueZ discovery state is combined with cached GATT objects.
     /// \return True when effective services resolved; otherwise false.
     bool effective_services_resolved(const bluez::DeviceInfo& device) const;
     /// \brief Read the normalized address of the selected adapter.
@@ -185,13 +187,11 @@ private:
     std::map<std::string, TimeSampleCacheEntry> time_samples_;
     std::map<std::string, WifiCacheEntry> wifi_state_;
     std::map<std::string, BuiltinSubscriptionState> builtin_subscriptions_;
-    std::map<std::string, bool> resolved_service_latch_;
     std::string adapter_alias_;
     std::string scan_mode_;
     std::string uav_name_pattern_;
     std::string serial_device_directory_;
     std::string serial_fallback_directory_;
-    std::string ssh_user_;
     std::string selected_mac_;
     std::string status_message_;
     std::string last_frame_;

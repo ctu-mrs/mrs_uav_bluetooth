@@ -9,6 +9,7 @@
 #include "mrs_uav_bluetooth/util/string_utils.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <ctime>
@@ -33,6 +34,19 @@ namespace {
 std::string yes_no(bool value) {
     // Render a boolean as the short yes/no text used in reports.
     return value ? "yes" : "no";
+}
+
+/// \brief Validate an explicitly entered OpenSSH account name.
+/// \param username Candidate remote account name.
+/// \return True when the value is nonempty and contains only username-safe characters.
+bool valid_ssh_username(const std::string& username) {
+    // Keep the username separate from the host and from OpenSSH options.
+    if (username.empty() || username.front() == '-') {
+        return false;
+    }
+    return std::all_of(username.begin(), username.end(), [](unsigned char ch) {
+        return std::isalnum(ch) || ch == '_' || ch == '-' || ch == '.';
+    });
 }
 
 /// \brief Convert the ROS clock wall time to an unsigned nanosecond count.
@@ -217,7 +231,7 @@ bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
         }
 
         const auto device = client.get_device(mac);
-        if (!device || !device->connected || !device->services_resolved) {
+        if (!device || !device->connected) {
             return false;
         }
 
@@ -380,7 +394,6 @@ void TuiNode::configure_parameters() {
     declare_parameter<int>("serial_port_channel", 22);
     declare_parameter<std::string>("serial_device_directory", "/dev");
     declare_parameter<std::string>("serial_fallback_directory", "");
-    declare_parameter<std::string>("ssh_user", "");
     declare_parameter<bool>("hide_non_uav", false);
 
     adapter_alias_ = get_parameter("adapter_alias").as_string();
@@ -398,7 +411,6 @@ void TuiNode::configure_parameters() {
     serial_port_channel_ = static_cast<uint16_t>(serial_channel);
     serial_device_directory_ = get_parameter("serial_device_directory").as_string();
     serial_fallback_directory_ = get_parameter("serial_fallback_directory").as_string();
-    ssh_user_ = get_parameter("ssh_user").as_string();
     hide_non_uav_ = get_parameter("hide_non_uav").as_bool();
 }
 
@@ -451,9 +463,19 @@ void TuiNode::handle_key_event(const TerminalKeyEvent& event) {
             return;
         }
         if (event.kind == TerminalKeyKind::Enter) {
-            trigger_wifi_write(prompt_mode_, prompt_buffer_);
+            const auto completed_mode = prompt_mode_;
+            const auto completed_value = prompt_buffer_;
             prompt_mode_ = PromptMode::None;
             prompt_buffer_.clear();
+            if (completed_mode == PromptMode::SshUsername) {
+                if (!valid_ssh_username(completed_value)) {
+                    status_message_ = "invalid SSH username";
+                    return;
+                }
+                trigger_ssh(completed_value);
+                return;
+            }
+            trigger_wifi_write(completed_mode, completed_value);
             return;
         }
         if (event.kind == TerminalKeyKind::Character) {
@@ -487,7 +509,13 @@ void TuiNode::handle_key_event(const TerminalKeyEvent& event) {
             trigger_serial_connect();
             break;
         case 'h':
-            trigger_ssh();
+            if (selected_device() != nullptr) {
+                prompt_mode_ = PromptMode::SshUsername;
+                prompt_buffer_.clear();
+                status_message_ = "enter SSH username and press Enter";
+            } else {
+                status_message_ = "select a UAV before SSH";
+            }
             break;
         case 't':
             if (const auto* device = selected_device()) {
@@ -580,27 +608,13 @@ void TuiNode::refresh_device_cache(bool force) {
     }
 
     current_devices_ = runtime_->client().get_devices();
-    std::vector<std::string> current_macs;
-    current_macs.reserve(current_devices_.size());
     for (const auto& device : current_devices_) {
-        current_macs.push_back(device.mac);
         if (!device.connected) {
-            resolved_service_latch_.erase(device.mac);
             if (serial_links_) {
                 serial_links_->detach(device.object_path);
             }
             continue;
         }
-        if (device.services_resolved) {
-            resolved_service_latch_[device.mac] = true;
-        }
-    }
-    for (auto it = resolved_service_latch_.begin(); it != resolved_service_latch_.end();) {
-        if (std::find(current_macs.begin(), current_macs.end(), it->first) == current_macs.end()) {
-            it = resolved_service_latch_.erase(it);
-            continue;
-        }
-        ++it;
     }
 
     std::sort(current_devices_.begin(), current_devices_.end(), [this](const auto& lhs, const auto& rhs) {
@@ -787,7 +801,7 @@ void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
     if (!device.connected || !effective_services_resolved(device)) {
         entry.available = false;
         entry.pending = false;
-        entry.error = "device not connected";
+        entry.error = device.connected ? "services not resolved" : "device not connected";
         return;
     }
     if (entry.pending || (entry.available && !force)) {
@@ -799,6 +813,7 @@ void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
     entry.future = std::async(std::launch::async, [this, mac]() {
         // Read the peer clock and retain request timing so the UI can display offset and round-trip delay.
         try {
+            (void)runtime_->client().refresh_gatt_snapshot(mac);
             const auto paths = inspector_->resolve_builtin_paths(mac);
             if (paths.time_characteristic_path.empty()) {
                 return std::make_tuple(uint64_t{0}, 0.0, 0.0, std::string{"time service not found"});
@@ -830,7 +845,7 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
     if (!device.connected || !effective_services_resolved(device)) {
         entry.available = false;
         entry.config_known = false;
-        entry.error = "device not connected";
+        entry.error = device.connected ? "services not resolved" : "device not connected";
         return;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -881,21 +896,21 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
 }
 
 void TuiNode::trigger_connect_toggle() {
-    // Launch one background action that changes the selected ACL state and
-    // prepares its serial and LE bearers for the dashboard.
+    // Launch one background action that changes the selected LE/GATT state.
+    // RFCOMM is deliberately opened only by the explicit serial action: stock
+    // BlueZ may replace the LE bearer when ConnectProfile opens classic SPP.
     const auto* device = selected_device();
     if (device == nullptr || action_future_.valid()) {
         return;
     }
 
     const auto mac = device->mac;
-    const auto device_path = device->object_path;
     const bool connected = device->connected;
     action_label_ = connected ? "disconnect" : "connect";
     status_message_ = action_label_ + " requested for " + mac;
     action_future_ = std::async(
         std::launch::async,
-        [this, mac, device_path, connected]() {
+        [this, mac, connected]() {
             try {
                 auto& client = runtime_->client();
                 if (connected) {
@@ -917,53 +932,19 @@ void TuiNode::trigger_connect_toggle() {
                     return std::string{"connect failed for "} + mac;
                 }
 
-                std::string result;
                 const bool services_ok = client.wait_services_resolved(mac, 15.0);
                 if (services_ok &&
                     wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
-                    result = "connected over LE";
-                } else if (const auto current = client.get_device(mac);
-                           current && current->connected) {
-                    result = services_ok
+                    return std::string{"connected over LE with GATT services "} + mac;
+                }
+                if (const auto current = client.get_device(mac);
+                    current && current->connected) {
+                    return (services_ok
                         ? "connected; remote GATT cache still populating"
-                        : "connected; GATT services unresolved";
-                } else {
-                    // Pairing/profile negotiation can briefly replace the LE
-                    // bearer with BR/EDR. SPP ConnectProfile is authoritative
-                    // for this action and can restore its own transport.
-                    result = "LE bearer transitioned during security setup";
+                        : "connected; GATT services unresolved") +
+                        std::string{" "} + mac;
                 }
-
-                if (!serial_profile_ || !serial_links_) {
-                    return result + " (serial profile unavailable) " + mac;
-                }
-
-                const auto current = client.get_device(mac);
-                std::string pairing_error;
-                if (current && !current->paired && !current->bonded) {
-                    (void)client.pair(mac, 30.0, &pairing_error);
-                }
-
-                if (!connect_serial_profile_with_retry(
-                        client, mac, std::chrono::seconds(8))) {
-                    return result + "; serial profile connection failed" +
-                        (pairing_error.empty() ? std::string{} :
-                         std::string{" (pairing: "} + pairing_error + ")") +
-                        " " + mac;
-                }
-
-                serial::SerialLinkInfo link;
-                if (!serial_links_->wait_for_link(
-                        device_path, std::chrono::seconds(12), &link)) {
-                    return result + "; serial profile connected but no PTY arrived " + mac;
-                }
-                if (!client.connect_le_bearer(mac, 15.0) ||
-                    !client.wait_services_resolved(mac, 15.0)) {
-                    return result + "; serial=" + link.tty_path +
-                        "; failed to restore LE GATT bearer " + mac;
-                }
-                (void)client.refresh_gatt_snapshot(mac);
-                return result + "; serial=" + link.tty_path + " " + mac;
+                return std::string{"LE bearer disconnected during setup "} + mac;
             } catch (const std::exception& e) {
                 return std::string{"connect action failed: "} + e.what();
             }
@@ -994,8 +975,27 @@ void TuiNode::trigger_serial_connect() {
             if (already_open) {
                 const bool ok = client.disconnect_profile(
                     mac, std::string{bluez::kSerialPortProfileUuid});
-                return ok ? std::string{"serial link closed for "} + mac
-                          : std::string{"serial disconnect failed for "} + mac;
+                serial_links_->detach(device_path);
+                if (!ok) {
+                    return std::string{"serial disconnect failed for "} + mac;
+                }
+                if (!client.connect_le_bearer(mac, 15.0) ||
+                    !client.wait_services_resolved(mac, 15.0) ||
+                    !wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
+                    return std::string{"serial link closed; LE GATT restore failed for "} + mac;
+                }
+                (void)client.refresh_gatt_snapshot(mac);
+                return std::string{"serial link closed; LE GATT restored for "} + mac;
+            }
+
+            const auto current = client.get_device(mac);
+            if (current && !current->paired && !current->bonded) {
+                std::string pairing_error;
+                if (!client.pair(mac, 30.0, &pairing_error)) {
+                    return std::string{"pairing failed before serial connection for "} + mac +
+                        (pairing_error.empty() ? std::string{} :
+                         std::string{": "} + pairing_error);
+                }
             }
             if (!connect_serial_profile_with_retry(
                     client, mac, std::chrono::seconds(8))) {
@@ -1028,25 +1028,72 @@ std::string TuiNode::ssh_wrapper_path() const {
             "mrs-uav-bluetooth-ssh").string();
 }
 
-void TuiNode::trigger_ssh() {
-    // Run OpenSSH through the selected peer's active Bluetooth PTY.
+void TuiNode::trigger_ssh(const std::string& username) {
+    // Open the selected peer's serial profile on demand, then run OpenSSH
+    // using only the account name entered by the operator.
     const auto* device = selected_device();
-    if (device == nullptr || !serial_links_) {
-        status_message_ = "no UAV serial link is available";
+    if (device == nullptr || !serial_profile_ || !serial_links_) {
+        status_message_ = "no UAV serial profile is available";
         return;
     }
-    const auto link = serial_links_->link_for_device(device->object_path);
+    if (!device->connected) {
+        status_message_ = "connect the selected UAV before SSH";
+        return;
+    }
+
     const auto hostname = util::device_hostname_guess(*device, uav_name_pattern_);
     const auto device_path = device->object_path;
     const auto mac = device->mac;
-    if (!link || hostname.empty()) {
-        status_message_ = "open the selected UAV serial link before SSH";
+    if (hostname.empty()) {
+        status_message_ = "could not determine the selected UAV hostname";
         return;
+    }
+
+    auto& client = runtime_->client();
+    const auto close_serial_and_restore_gatt = [this, &client, &mac, &device_path]() {
+        (void)client.disconnect_profile(
+            mac, std::string{bluez::kSerialPortProfileUuid});
+        serial_links_->detach(device_path);
+        if (!client.connect_le_bearer(mac, 15.0) ||
+            !client.wait_services_resolved(mac, 15.0) ||
+            !wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
+            return false;
+        }
+        (void)client.refresh_gatt_snapshot(mac);
+        return true;
+    };
+    auto link = serial_links_->link_for_device(device_path);
+    if (!link) {
+        const auto current = client.get_device(mac);
+        if (current && !current->paired && !current->bonded) {
+            std::string pairing_error;
+            if (!client.pair(mac, 30.0, &pairing_error)) {
+                status_message_ = std::string{"pairing failed before SSH for "} + mac +
+                    (pairing_error.empty() ? std::string{} :
+                     std::string{": "} + pairing_error);
+                return;
+            }
+        }
+        if (!connect_serial_profile_with_retry(
+                client, mac, std::chrono::seconds(8))) {
+            const bool restored = close_serial_and_restore_gatt();
+            status_message_ = "serial connection failed before SSH for " + mac +
+                (restored ? "; LE GATT restored" : "; LE GATT restore failed");
+            return;
+        }
+        serial::SerialLinkInfo opened_link;
+        if (!serial_links_->wait_for_link(
+                device_path, std::chrono::seconds(12), &opened_link)) {
+            const bool restored = close_serial_and_restore_gatt();
+            status_message_ = "serial connected but no SSH PTY was created for " + mac +
+                (restored ? "; LE GATT restored" : "; LE GATT restore failed");
+            return;
+        }
+        link = std::move(opened_link);
     }
 
     const auto wrapper = ssh_wrapper_path();
     const auto tty_path = link->tty_path;
-    const auto user = ssh_user_;
     terminal_.suspend();
 
     const auto pid = ::fork();
@@ -1061,14 +1108,9 @@ void TuiNode::trigger_ssh() {
                 ::close(tty_fd);
             }
         }
-        if (user.empty()) {
-            ::execl(wrapper.c_str(), wrapper.c_str(),
-                    "--device", tty_path.c_str(), hostname.c_str(), nullptr);
-        } else {
-            ::execl(wrapper.c_str(), wrapper.c_str(),
-                    "--device", tty_path.c_str(),
-                    "--user", user.c_str(), hostname.c_str(), nullptr);
-        }
+        ::execl(wrapper.c_str(), wrapper.c_str(),
+                "--device", tty_path.c_str(),
+                "--user", username.c_str(), hostname.c_str(), nullptr);
         _exit(127);
     }
 
@@ -1079,36 +1121,17 @@ void TuiNode::trigger_ssh() {
     }
     terminal_.resume();
     last_frame_.clear();
+    // Each inetd-style sshd consumes one RFCOMM connection. Close classic SPP
+    // after the session and restore LE/GATT. Keeping SPP open here makes stock
+    // laptop BlueZ lose the Wi-Fi and time service tree.
+    const bool restored = close_serial_and_restore_gatt();
+    const std::string recycle_status = restored
+        ? "; serial link closed; LE GATT restored"
+        : "; serial link closed; LE GATT restore failed";
     if (pid < 0) {
         status_message_ = std::string{"failed to start SSH: "} +
-            std::strerror(fork_error);
+            std::strerror(fork_error) + recycle_status;
         return;
-    }
-
-    // Each inetd-style sshd consumes one RFCOMM connection. Replace that
-    // profile connection now so the next SSH action receives a fresh server.
-    auto& client = runtime_->client();
-    (void)client.disconnect_profile(
-        mac, std::string{bluez::kSerialPortProfileUuid});
-    serial_links_->detach(device_path);
-
-    std::string recycle_status;
-    if (!connect_serial_profile_with_retry(
-            client, mac, std::chrono::seconds(8))) {
-        recycle_status = "; press l to reopen the serial link";
-    } else {
-        serial::SerialLinkInfo replacement;
-        if (!serial_links_->wait_for_link(
-                device_path, std::chrono::seconds(12), &replacement)) {
-            recycle_status = "; replacement serial PTY was not created";
-        } else if (!client.connect_le_bearer(mac, 15.0) ||
-                   !client.wait_services_resolved(mac, 15.0)) {
-            recycle_status = "; serial link renewed at " + replacement.tty_path +
-                ", LE services are still resolving";
-        } else {
-            (void)client.refresh_gatt_snapshot(mac);
-            recycle_status = "; serial link renewed at " + replacement.tty_path;
-        }
     }
     status_message_ = std::string{"SSH session ended for "} + hostname +
         recycle_status;
@@ -1208,14 +1231,17 @@ std::vector<const bluez::DeviceInfo*> TuiNode::visible_other_devices() const {
 }
 
 bool TuiNode::effective_services_resolved(const bluez::DeviceInfo& device) const {
-    // Treat an already populated GATT cache as resolved during brief property lag.
+    // Treat an actually populated GATT cache as resolved during brief property
+    // lag. A sticky boolean latch is incorrect for dual-mode peers: opening
+    // RFCOMM can remove the LE GATT subtree while Device1 remains connected.
     if (!device.connected) {
         return false;
     }
     if (device.services_resolved) {
         return true;
     }
-    return resolved_service_latch_.find(device.mac) != resolved_service_latch_.end();
+    return !runtime_->client().list_services(device.mac).empty() ||
+           !runtime_->client().list_characteristics(device.mac).empty();
 }
 
 void TuiNode::ensure_builtin_subscriptions() {
@@ -1575,7 +1601,7 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
         right_lines.push_back("j/k or arrows: move");
         right_lines.push_back("c connect/disconnect");
         right_lines.push_back("l open/close serial");
-        right_lines.push_back("h SSH over serial");
+        right_lines.push_back("h SSH (asks username)");
         right_lines.push_back("s toggle scan");
         right_lines.push_back("t refresh time");
         right_lines.push_back("w refresh Wi-Fi");
@@ -1601,7 +1627,9 @@ void TuiNode::render_dashboard(std::vector<bluez::DeviceInfo> devices) {
     }
 
     if (prompt_mode_ != PromptMode::None) {
-        const auto label = prompt_mode_ == PromptMode::WifiSsid ? "ssid" : "password";
+        const auto label = prompt_mode_ == PromptMode::SshUsername
+            ? "SSH username"
+            : (prompt_mode_ == PromptMode::WifiSsid ? "ssid" : "password");
         const auto shown = prompt_mode_ == PromptMode::WifiPassword
             ? std::string(prompt_buffer_.size(), '*')
             : prompt_buffer_;
