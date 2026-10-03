@@ -731,6 +731,14 @@ void ServiceNode::reconcile_peers() {
         peers_->prune_sessions(current_macs, now, 5.0);
         std::vector<std::string> connected_macs;
         for (const auto& device : client_->get_connected_devices()) {
+            // An authenticated inbound serial session temporarily owns the
+            // link even when the active overlay otherwise forbids connected
+            // peers. Dropping it here makes laptop SSH last only until the
+            // next broadcast reconciliation tick.
+            if (serial_ssh_server_ &&
+                serial_ssh_server_->active(device.object_path)) {
+                continue;
+            }
             connected_macs.push_back(device.mac);
         }
         state_lock.unlock();
@@ -827,6 +835,20 @@ void ServiceNode::reconcile_peers() {
         const bool is_connected = device && device->connected;
         const bool functional_bridge_peer = device && device_can_host_peer_bridge(*device);
 
+        // An authenticated inbound serial session owns the Bluetooth link
+        // until sshd exits. Check this before whitelist enforcement and GATT
+        // recovery: a laptop is not normally part of the UAV peer whitelist,
+        // and the old ordering disconnected a working SSH session on the next
+        // reconciliation tick.
+        if (device && serial_ssh_server_ &&
+            serial_ssh_server_->active(device->object_path)) {
+            peers_->clear_device_reset(session);
+            session.pairing_in_progress = false;
+            session.phase = "serial_active";
+            session.detail = "peer-initiated serial SSH session active";
+            continue;
+        }
+
         if (!session.desired || !functional_bridge_peer) {
             state_lock.unlock();
             clear_peer_runtime(mac);
@@ -878,18 +900,6 @@ void ServiceNode::reconcile_peers() {
         if (session.peer_initiated && peer_service_available) {
             session.peer_initiated = false;
             session.detail = "peer-initiated UAV service connection";
-        }
-
-        // An authenticated inbound serial session owns the Bluetooth link until
-        // sshd exits. Suspend GATT/time-bridge recovery while the TUI connection
-        // holds that link.
-        if (device && serial_ssh_server_ &&
-            serial_ssh_server_->active(device->object_path)) {
-            peers_->clear_device_reset(session);
-            session.pairing_in_progress = false;
-            session.phase = "serial_active";
-            session.detail = "peer-initiated serial SSH session active";
-            continue;
         }
 
         if (session.peer_initiated) {

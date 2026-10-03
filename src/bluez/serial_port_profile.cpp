@@ -90,6 +90,8 @@ void SerialPortProfile::export_object() {
             .implementedAs([this](const sdbus::ObjectPath& device) {
                 // Ask the local link manager to close the RFCOMM connection for this device.
                 const auto device_path = static_cast<std::string>(device);
+                RCLCPP_INFO(logger_, "BlueZ requested serial disconnection for %s",
+                            device_path.c_str());
                 if (disconnection_handler_) {
                     disconnection_handler_(device_path);
                 }

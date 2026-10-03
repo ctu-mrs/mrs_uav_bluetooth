@@ -675,12 +675,31 @@ void SerialSshServer::start_session(const std::string& device_path, int socket_f
             throw std::runtime_error("SSH session already exists for device");
         }
         try {
-            session->waiter = std::thread([session]() {
-                // Reap the SSH child after exit and mark its session inactive.
+            session->waiter = std::thread([session, device_path, logger = logger_]() {
+                // Reap the SSH child, report why the endpoint stopped, and
+                // then let peer reconciliation resume normal GATT policy.
                 int status = 0;
-                while (::waitpid(session->pid, &status, 0) < 0 && errno == EINTR) {
-                }
+                pid_t result = -1;
+                do {
+                    result = ::waitpid(session->pid, &status, 0);
+                } while (result < 0 && errno == EINTR);
                 session->active.store(false);
+                if (result < 0) {
+                    RCLCPP_WARN(logger, "Could not reap Bluetooth sshd for %s: %s",
+                                device_path.c_str(), std::strerror(errno));
+                } else if (WIFEXITED(status)) {
+                    const int exit_code = WEXITSTATUS(status);
+                    if (exit_code == 0) {
+                        RCLCPP_INFO(logger, "Bluetooth sshd for %s exited with status 0",
+                                    device_path.c_str());
+                    } else {
+                        RCLCPP_WARN(logger, "Bluetooth sshd for %s exited with status %d",
+                                    device_path.c_str(), exit_code);
+                    }
+                } else if (WIFSIGNALED(status)) {
+                    RCLCPP_WARN(logger, "Bluetooth sshd for %s terminated by signal %d",
+                                device_path.c_str(), WTERMSIG(status));
+                }
             });
         } catch (...) {
             sessions_.erase(iterator);

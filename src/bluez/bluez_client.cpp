@@ -156,7 +156,16 @@ std::optional<std::map<std::string, sdbus::Variant>> read_interface_properties(
 /// \return True when device has resolved characteristics; otherwise false.
 bool device_has_resolved_characteristics(sdbus::IConnection& connection,
                                          const std::string& device_path) {
-    // Confirm both BlueZ resolution state and a populated characteristic cache.
+    // BlueZ deliberately keeps discovered GATT objects cached after a link
+    // closes. Require fresh Device1 connection/discovery state as well, or a
+    // disconnected peer can look GATT-ready indefinitely.
+    const auto device_properties = read_device_properties(connection, device_path);
+    if (!device_properties ||
+        !get_variant_or<bool>(*device_properties, "Connected", false) ||
+        !get_variant_or<bool>(*device_properties, "ServicesResolved", false)) {
+        return false;
+    }
+
     auto proxy = create_bluez_proxy(connection, "/");
     ManagedObjectMap objects;
     proxy->callMethod("GetManagedObjects")
@@ -479,6 +488,17 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
 
     const auto path = dev->object_path;
     auto connection = create_blocking_system_bus();
+    const auto gatt_ready = [&]() {
+        // Device1.Connected and ServicesResolved also become true for a
+        // classic-only link. A remote characteristic is the portable proof
+        // that the LE ATT bearer completed service discovery.
+        return device_has_resolved_characteristics(*connection, path);
+    };
+    if (gatt_ready()) {
+        (void)cache_.refresh_device_subtree(path);
+        return true;
+    }
+
     const auto le_connected = [&]() -> std::optional<bool> {
         // Query the LE bearer specifically; absence means this BlueZ version lacks bearer state.
         try {
@@ -486,8 +506,10 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
                 *connection, path, std::string{kLeBearerIface});
             return properties && get_variant_or<bool>(*properties, "Connected", false);
         } catch (const sdbus::Error& error) {
-            if (message_contains(error.getMessage(),
-                                 {"UnknownInterface", "UnknownProperty", "doesn't exist"})) {
+            if (error.getName() == "org.freedesktop.DBus.Error.UnknownInterface" ||
+                message_contains(error.getMessage(),
+                                 {"UnknownInterface", "Unknown interface", "No such interface",
+                                  "UnknownProperty", "doesn't exist"})) {
                 return std::nullopt;
             }
             throw;
@@ -497,7 +519,11 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
     try {
         const auto connected = le_connected();
         if (connected && *connected) {
-            return true;
+            const bool ready = poll_until(timeout_s, kConnectPollInterval, gatt_ready);
+            if (ready) {
+                (void)cache_.refresh_device_subtree(path);
+            }
+            return ready;
         }
         if (connected.has_value()) {
             RCLCPP_INFO(logger_, "[client] connect_le_bearer(%s) path=%s timeout=%.1fs",
@@ -515,11 +541,15 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
                     return false;
                 }
             }
-            return poll_until(timeout_s, kConnectPollInterval, [&]() {
-                // Wait until the LE bearer reports connected after ConnectLE returns.
+            const bool ready = poll_until(timeout_s, kConnectPollInterval, [&]() {
+                // Wait for both the LE link and the remote GATT database.
                 const auto state = le_connected();
-                return state && *state;
+                return state && *state && gatt_ready();
             });
+            if (ready) {
+                (void)cache_.refresh_device_subtree(path);
+            }
+            return ready;
         }
     } catch (const sdbus::Error& error) {
         RCLCPP_WARN(logger_, "connect_le_bearer(%s) state check failed: %s",
@@ -528,25 +558,42 @@ bool BluezClient::connect_le_bearer(const std::string& mac, double timeout_s) {
     }
 
     if (!connections_allowed_.load()) return false;
-    // Device1.Connect selects the disconnected bearer when BR/EDR is already
-    // active. PreferredBearer selects LE for the initial connection on BlueZ
-    // versions whose Device1 properties omit Bearer.LE1.
-    (void)set_preferred_bearer(mac, "le");
+
+    // Distribution BlueZ builds commonly omit the experimental Bearer.LE1
+    // interface and PreferredBearer property. Adapter1.ConnectDevice accepts
+    // an address type on those builds, making this an explicit LE connection
+    // instead of letting Device1.Connect select RFCOMM/BR-EDR for a dual-mode
+    // UAV. This method is used by the laptop TUI; UAV peer orchestration keeps
+    // using the normal Device1-based connect() path above.
     try {
-        auto proxy = create_bluez_proxy(*connection, path);
-        proxy->callMethod("Connect")
-            .onInterface(std::string(kDeviceIface));
-        return true;
+        auto proxy = create_bluez_proxy(*connection, adapter_path_);
+        std::map<std::string, sdbus::Variant> properties;
+        properties["Address"] = sdbus::Variant{dev->mac};
+        properties["AddressType"] = sdbus::Variant{dev->address_type};
+        sdbus::ObjectPath resolved_path;
+        proxy->callMethod("ConnectDevice")
+            .onInterface(std::string(kAdapterIface))
+            .withArguments(properties)
+            .storeResultsTo(resolved_path);
     } catch (const sdbus::Error& error) {
-        if (message_contains(error.getMessage(),
-                             {"AlreadyConnected", "Already connected", "InProgress",
-                              "In Progress", "Operation already in progress"})) {
-            return true;
+        const auto message = error.getMessage();
+        if (!message_contains(message,
+                              {"AlreadyConnected", "Already connected", "AlreadyExists",
+                               "InProgress", "In Progress", "Operation already in progress"}) &&
+            !gatt_ready()) {
+            RCLCPP_WARN(logger_, "connect_le_bearer(%s) Adapter1.ConnectDevice failed: %s",
+                        mac.c_str(), message.c_str());
+            return false;
         }
-        RCLCPP_WARN(logger_, "connect_le_bearer(%s) Device1 fallback failed: %s",
-                    mac.c_str(), error.getMessage().c_str());
-        return false;
     }
+
+    const bool ready = poll_until(timeout_s, kConnectPollInterval, gatt_ready);
+    if (ready) {
+        // Do not depend on signal ordering: seed the shared cache from the
+        // same authoritative ObjectManager tree that proved LE readiness.
+        (void)cache_.refresh_device_subtree(path);
+    }
+    return ready;
 }
 
 bool BluezClient::disconnect(const std::string& mac, double timeout_s) {
@@ -850,7 +897,8 @@ bool BluezClient::set_preferred_bearer(const std::string& mac, const std::string
         return true;
     } catch (const sdbus::Error& error) {
         const auto message = error.getMessage();
-        if (message_contains(message, {"UnknownProperty", "InvalidArguments", "NotSupported", "does not exist"})) {
+        if (message_contains(message, {"UnknownProperty", "Unknown property", "No such property",
+                                       "InvalidArguments", "NotSupported", "does not exist"})) {
             RCLCPP_DEBUG(logger_, "set_preferred_bearer(%s, %s) unavailable: %s",
                          mac.c_str(), bearer.c_str(), message.c_str());
             return false;

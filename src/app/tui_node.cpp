@@ -215,8 +215,10 @@ bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
                                 std::chrono::milliseconds timeout) {
     // Wait for service discovery and at least one cached remote GATT object.
     const auto has_remote_gatt = [&client, &mac]() {
-        // Treat either a discovered service or characteristic as proof that the cache is ready.
-        return !client.list_services(mac).empty() || !client.list_characteristics(mac).empty();
+        // A service object can precede its characteristics. Wait for a usable
+        // ATT tree so subsequent built-in path resolution cannot observe a
+        // transient services-only cache.
+        return !client.list_characteristics(mac).empty();
     };
 
     if (has_remote_gatt()) {
@@ -410,6 +412,12 @@ TuiNode::~TuiNode() {
     }
     if (action_future_.valid()) {
         action_future_.wait();
+    }
+    if (runtime_) {
+        // Stock BlueZ can keep discovery active after the owning D-Bus client
+        // disappears. Release it explicitly on the same connection that
+        // started it so an interrupted laptop TUI leaves hci0 idle.
+        runtime_->set_scan_enabled(false, scan_mode_);
     }
     serial_profile_.reset();
     serial_links_.reset();
@@ -714,7 +722,9 @@ void TuiNode::apply_pending_notifications() {
         if (notification.kind == NotificationKind::Time) {
             auto& entry = time_samples_[notification.mac];
             entry.available = true;
-            entry.pending = false;
+            // Keep an in-flight explicit read pending. StartNotify commonly
+            // emits the cached Value while that read is running; clearing the
+            // flag here would orphan its future and lose the RTT/offset data.
             entry.remote_time_ns = notification.remote_time_ns;
             entry.error.clear();
             if (!entry.metrics_available) {
@@ -726,7 +736,8 @@ void TuiNode::apply_pending_notifications() {
 
         auto& entry = wifi_state_[notification.mac];
         entry.available = true;
-        entry.pending = false;
+        // Likewise, a status notification must not orphan the concurrent
+        // SSID/password/status seed read used to populate the Wi-Fi panel.
         entry.status = notification.wifi_status;
         entry.error.clear();
     }
@@ -972,22 +983,17 @@ void TuiNode::trigger_connect_toggle() {
                     (void)client.stop_scan();
                 }
 
-                (void)client.set_preferred_bearer(mac, "le");
-                if (!client.connect(mac, 15.0, true)) {
-                    return std::string{"connect failed for "} + mac;
+                if (!client.connect_le_bearer(mac, 15.0)) {
+                    return std::string{"LE GATT connection failed for "} + mac;
                 }
 
-                const bool services_ok = client.wait_services_resolved(mac, 15.0);
-                if (services_ok &&
-                    wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
+                if (wait_for_remote_gatt_cache(
+                        client, mac, std::chrono::seconds(3))) {
                     return std::string{"connected over LE with GATT services "} + mac;
                 }
                 if (const auto current = client.get_device(mac);
                     current && current->connected) {
-                    return (services_ok
-                        ? "connected; remote GATT cache still populating"
-                        : "connected; GATT services unresolved") +
-                        std::string{" "} + mac;
+                    return std::string{"connected; remote GATT cache still populating "} + mac;
                 }
                 return std::string{"LE bearer disconnected during setup "} + mac;
             } catch (const std::exception& e) {
@@ -1025,7 +1031,6 @@ void TuiNode::trigger_serial_connect() {
                     return std::string{"serial disconnect failed for "} + mac;
                 }
                 if (!client.connect_le_bearer(mac, 15.0) ||
-                    !client.wait_services_resolved(mac, 15.0) ||
                     !wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
                     return std::string{"serial link closed; LE GATT restore failed for "} + mac;
                 }
@@ -1052,7 +1057,7 @@ void TuiNode::trigger_serial_connect() {
                 return std::string{"serial connected but PTY was not created for "} + mac;
             }
             if (!client.connect_le_bearer(mac, 15.0) ||
-                !client.wait_services_resolved(mac, 15.0)) {
+                !wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
                 return std::string{"serial link ready at "} + link.tty_path +
                     ", but the LE GATT bearer could not be restored for " + mac;
             }
@@ -1100,7 +1105,6 @@ void TuiNode::trigger_ssh(const std::string& username) {
             mac, std::string{bluez::kSerialPortProfileUuid});
         serial_links_->detach(device_path);
         if (!client.connect_le_bearer(mac, 15.0) ||
-            !client.wait_services_resolved(mac, 15.0) ||
             !wait_for_remote_gatt_cache(client, mac, std::chrono::seconds(3))) {
             return false;
         }
@@ -1160,8 +1164,14 @@ void TuiNode::trigger_ssh(const std::string& username) {
     }
 
     int wait_status = 0;
+    pid_t wait_result = -1;
+    int wait_error = 0;
     if (pid > 0) {
-        while (::waitpid(pid, &wait_status, 0) < 0 && errno == EINTR) {
+        do {
+            wait_result = ::waitpid(pid, &wait_status, 0);
+        } while (wait_result < 0 && errno == EINTR);
+        if (wait_result < 0) {
+            wait_error = errno;
         }
     }
     terminal_.resume();
@@ -1178,8 +1188,18 @@ void TuiNode::trigger_ssh(const std::string& username) {
             std::strerror(fork_error) + recycle_status;
         return;
     }
-    status_message_ = std::string{"SSH session ended for "} + hostname +
-        recycle_status;
+    if (wait_result < 0) {
+        status_message_ = std::string{"could not collect SSH status for "} + hostname +
+            ": " + std::strerror(wait_error) + recycle_status;
+    } else if (WIFEXITED(wait_status) && WEXITSTATUS(wait_status) != 0) {
+        status_message_ = std::string{"SSH exited with status "} +
+            std::to_string(WEXITSTATUS(wait_status)) + " for " + hostname + recycle_status;
+    } else if (WIFSIGNALED(wait_status)) {
+        status_message_ = std::string{"SSH terminated by signal "} +
+            std::to_string(WTERMSIG(wait_status)) + " for " + hostname + recycle_status;
+    } else {
+        status_message_ = std::string{"SSH session ended for "} + hostname + recycle_status;
+    }
 }
 
 void TuiNode::trigger_scan_toggle() {
@@ -1277,17 +1297,13 @@ std::vector<const bluez::DeviceInfo*> TuiNode::visible_other_devices() const {
 }
 
 bool TuiNode::effective_services_resolved(const bluez::DeviceInfo& device) const {
-    // Treat an actually populated GATT cache as resolved during brief property
-    // lag. A sticky boolean latch is incorrect for dual-mode peers: opening
-    // RFCOMM can remove the LE GATT subtree while Device1 remains connected.
-    if (!device.connected) {
+    // Device1.ServicesResolved also describes a classic-only SDP result on
+    // dual-mode peers. Only actual GATT objects prove that the laptop's LE
+    // service tree is available.
+    if (!device.connected || !device.services_resolved) {
         return false;
     }
-    if (device.services_resolved) {
-        return true;
-    }
-    return !runtime_->client().list_services(device.mac).empty() ||
-           !runtime_->client().list_characteristics(device.mac).empty();
+    return !runtime_->client().list_characteristics(device.mac).empty();
 }
 
 void TuiNode::ensure_builtin_subscriptions() {

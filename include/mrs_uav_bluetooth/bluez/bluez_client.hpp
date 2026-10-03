@@ -94,10 +94,10 @@ public:
     bool connect(const std::string& mac,
                  double timeout_s = 15.0,
                  bool prefer_le = false);
-    /// \brief Connect only the peer's low-energy bearer and wait for its state transition.
+    /// \brief Connect only the peer's low-energy bearer and wait for a usable GATT tree.
     /// \param mac peer Bluetooth MAC address.
     /// \param timeout_s Maximum seconds to wait for the low-energy bearer.
-    /// \return True if the peer's low-energy bearer connected before the deadline; otherwise false.
+    /// \return True if the peer's remote GATT characteristics resolved before the deadline; otherwise false.
     bool connect_le_bearer(const std::string& mac, double timeout_s = 15.0);
     /// Cancel pending connection work and wait for the link to close.
     /// Packaged BlueZ suppresses automatic reconnect after explicit Disconnect.
