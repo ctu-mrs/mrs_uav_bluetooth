@@ -349,8 +349,19 @@ bool BluezClient::stop_scan() {
             scan_running_ = false;
             return true;
         }
-        RCLCPP_WARN(logger_, "stop_scan failed: %s", msg.c_str());
-        return false;
+        // Discovery ownership is scoped to this dedicated D-Bus connection.
+        // A timed-out StopDiscovery can still be executing inside BlueZ; if we
+        // retain the connection, discovery may resume after a GATT connection
+        // has already been established. Closing the owner is the definitive
+        // cancellation path and prevents repeated OperationInProgress calls.
+        discovery_connection_.reset();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            scan_running_ = false;
+        }
+        RCLCPP_WARN(logger_, "stop_scan failed: %s; released discovery owner",
+                    msg.c_str());
+        return true;
     }
 }
 

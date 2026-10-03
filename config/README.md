@@ -55,7 +55,7 @@
 | mesh_agent_uri | External setup-information address for manual Mesh joining. | String; empty when unused. |
 | gatt_profile_uuids | Optional service identities used to find connectable UAVs. | List of 128-bit UUID strings; [] disables this filter. |
 | auto_connect_enable | Start GATT connections to permitted nearby UAVs. | true or false. |
-| peer_whitelist | UAVs allowed to exchange data. | List of unique, nonempty hostnames; [] accepts transport-approved peers. Automatic Mesh needs numbered UAV names, including this UAV, with unique numbers 1..32767. |
+| peer_whitelist | Optional peer admission filter. | List of unique, nonempty hostnames; [] applies no identity filter and never disconnects an inbound link based on identity. Outbound GATT automation still follows auto_connect_pattern. Automatic Mesh needs numbered UAV names, including this UAV, with unique numbers 1..32767. |
 | auto_connect_pattern | Pattern matching UAV names for automatic connections. | Regular-expression string. |
 | peer_connection_timeout | Idle time before closing an unused GATT connection. | Number of seconds; use > 0. |
 | wifi_netplan_config_path | System network file changed after an approved Wi-Fi choice. | File path string. |

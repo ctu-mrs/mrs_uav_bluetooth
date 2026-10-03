@@ -730,6 +730,7 @@ void ServiceNode::reconcile_peers() {
         }
         peers_->prune_sessions(current_macs, now, 5.0);
         std::vector<std::string> connected_macs;
+        bool serial_session_active = false;
         for (const auto& device : client_->get_connected_devices()) {
             // An authenticated inbound serial session temporarily owns the
             // link even when the active overlay otherwise forbids connected
@@ -737,6 +738,7 @@ void ServiceNode::reconcile_peers() {
             // next broadcast reconciliation tick.
             if (serial_ssh_server_ &&
                 serial_ssh_server_->active(device.object_path)) {
+                serial_session_active = true;
                 continue;
             }
             connected_macs.push_back(device.mac);
@@ -752,9 +754,11 @@ void ServiceNode::reconcile_peers() {
         }
         const bool transmit_window = advertisement_transmit_window_.load();
         if (active_config_.enable_scan && !transmit_window &&
+            !serial_session_active &&
             !client_->is_scanning()) {
             client_->start_scan(active_config_.scan_mode, false);
-        } else if ((!active_config_.enable_scan || transmit_window) &&
+        } else if ((!active_config_.enable_scan || transmit_window ||
+                    serial_session_active) &&
                    client_->is_scanning()) {
             client_->stop_scan();
         }
@@ -835,6 +839,16 @@ void ServiceNode::reconcile_peers() {
         const bool is_connected = device && device->connected;
         const bool functional_bridge_peer = device && device_can_host_peer_bridge(*device);
 
+        // A single inbound laptop link needs the same radio protection as an
+        // automatically managed UAV peer. On several controllers, restarting
+        // discovery while a passive GATT or RFCOMM client is connected clears
+        // ServicesResolved and then drops the link. Empty peer_whitelist means
+        // there is no admission filter, so these manual clients must remain
+        // connected and keep discovery suspended as well.
+        if (is_connected) {
+            should_suspend_scan = true;
+        }
+
         // An authenticated inbound serial session owns the Bluetooth link
         // until sshd exits. Check this before whitelist enforcement and GATT
         // recovery: a laptop is not normally part of the UAV peer whitelist,
@@ -878,10 +892,6 @@ void ServiceNode::reconcile_peers() {
             (now - session.last_connect_attempt_monotonic) < std::max(4.0, retry_period_s * 2.0);
         const bool waiting_for_bridge = session.services_wait_started_monotonic > 0.0 ||
             session.bridge_wait_started_monotonic > 0.0;
-
-        if (session.desired && is_connected) {
-            should_suspend_scan = true;
-        }
 
         if (functional_bridge_peer) {
             const auto device_copy = *device;

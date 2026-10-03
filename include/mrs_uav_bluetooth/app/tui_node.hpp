@@ -104,6 +104,10 @@ private:
     /// \brief Refresh peer GATT metadata without issuing duplicate in-flight reads.
     /// \param force Whether to refresh even inside the normal cache throttle interval.
     void refresh_device_cache(bool force = false);
+    /// \brief Return whether a recognized UAV currently owns a Bluetooth link.
+    bool has_connected_uav() const;
+    /// \brief Pause discovery for active UAV links and resume the requested scan afterward.
+    void reconcile_scan_with_connections();
     /// \brief Harvest completed descriptor reads and update each peer's bridge count.
     void collect_topic_count_results();
     /// \brief Harvest completed time reads and calculate peer clock offsets.
@@ -183,6 +187,7 @@ private:
     RawTerminal terminal_;
     rclcpp::TimerBase::SharedPtr ui_timer_;
     std::vector<bluez::DeviceInfo> current_devices_;
+    std::map<std::string, bluez::DeviceInfo> remembered_uavs_;
     std::map<std::string, TopicCountCacheEntry> topic_counts_;
     std::map<std::string, TimeSampleCacheEntry> time_samples_;
     std::map<std::string, WifiCacheEntry> wifi_state_;

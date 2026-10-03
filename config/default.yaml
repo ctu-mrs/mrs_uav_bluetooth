@@ -97,7 +97,7 @@ gatt_profile_uuids: []
 # Whether this UAV starts GATT connections.
 auto_connect_enable: true
 
-# Allowed UAV names. Empty accepts every matching UAV.
+# Optional admission filter. Empty accepts every inbound device.
 peer_whitelist: []
 
 # Names must match this pattern.

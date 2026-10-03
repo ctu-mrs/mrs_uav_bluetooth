@@ -327,7 +327,11 @@ TuiNode::TuiNode()
             profile_options.channel = serial_port_channel_;
             profile_options.require_authentication = true;
             profile_options.require_authorization = false;
-            profile_options.auto_connect = true;
+            // RFCOMM is an explicit operator action. BlueZ AutoConnect on a
+            // client profile opens classic SPP as soon as the remote UUID is
+            // discovered, which replaces the laptop's LE GATT bearer a few
+            // seconds after every otherwise successful connection.
+            profile_options.auto_connect = false;
             profile_options.name = "MRS UAV Serial Client";
 
             serial_profile_ = std::make_unique<bluez::SerialPortProfile>(
@@ -589,7 +593,9 @@ void TuiNode::handle_key_event(const TerminalKeyEvent& event) {
             break;
         case 'r':
             status_message_ = "refresh requested";
-            runtime_->refresh_scan(scan_mode_);
+            if (!has_connected_uav()) {
+                runtime_->refresh_scan(scan_mode_);
+            }
             refresh_device_cache(true);
             last_frame_.clear();
             break;
@@ -648,7 +654,34 @@ void TuiNode::refresh_device_cache(bool force) {
         return;
     }
 
-    current_devices_ = runtime_->client().get_devices();
+    auto live_devices = runtime_->client().get_devices();
+    for (const auto& device : live_devices) {
+        if (!util::device_hostname_guess(device, uav_name_pattern_).empty()) {
+            remembered_uavs_.insert_or_assign(device.mac, device);
+        }
+    }
+
+    // Stock BlueZ removes unpaired Device1 objects soon after discovery is
+    // paused. Keep UAV identities seen during this TUI session so the table and
+    // selection do not flicker while another UAV owns the radio. Live records
+    // always replace these snapshots on the next advertisement.
+    for (const auto& [mac, remembered] : remembered_uavs_) {
+        const bool still_live = std::any_of(
+            live_devices.begin(), live_devices.end(), [&mac](const auto& device) {
+                return device.mac == mac;
+            });
+        if (still_live) {
+            continue;
+        }
+        auto offline = remembered;
+        offline.connected = false;
+        offline.services_resolved = false;
+        if (serial_links_) {
+            serial_links_->detach(offline.object_path);
+        }
+        live_devices.push_back(std::move(offline));
+    }
+    current_devices_ = std::move(live_devices);
     for (const auto& device : current_devices_) {
         if (!device.connected) {
             if (serial_links_) {
@@ -704,6 +737,30 @@ void TuiNode::refresh_device_cache(bool force) {
         }
     }
     last_device_refresh_ = now;
+    reconcile_scan_with_connections();
+}
+
+bool TuiNode::has_connected_uav() const {
+    // Discovery is paused only for links managed by this UAV-oriented TUI;
+    // unrelated laptop audio/peripheral connections must not disable scanning.
+    return std::any_of(current_devices_.begin(), current_devices_.end(), [this](const auto& device) {
+        return device.connected &&
+            !util::device_hostname_guess(device, uav_name_pattern_).empty();
+    });
+}
+
+void TuiNode::reconcile_scan_with_connections() {
+    if (has_connected_uav()) {
+        // BlueZ can report Discovering=false while it temporarily suspends an
+        // owned discovery session for connection setup. Release ownership even
+        // in that state so the hidden session cannot resume under the link.
+        // Preserve scan_desired_: discovery resumes when the final link closes.
+        (void)runtime_->client().stop_scan();
+        return;
+    }
+    if (runtime_->scan_desired() && !runtime_->is_scanning()) {
+        (void)runtime_->client().start_scan(scan_mode_);
+    }
 }
 
 void TuiNode::apply_pending_notifications() {
@@ -811,7 +868,6 @@ void TuiNode::collect_action_result() {
     status_message_ = action_future_.get();
     action_future_ = {};
     action_label_.clear();
-    runtime_->refresh_scan(scan_mode_);
     refresh_device_cache(true);
     last_frame_.clear();
 }
@@ -962,6 +1018,10 @@ void TuiNode::trigger_connect_toggle() {
 
     const auto mac = device->mac;
     const bool connected = device->connected;
+    if (!connected && !runtime_->client().get_device(mac)) {
+        status_message_ = "selected UAV is not currently visible; leave scanning enabled and retry";
+        return;
+    }
     action_label_ = connected ? "disconnect" : "connect";
     status_message_ = action_label_ + " requested for " + mac;
     action_future_ = std::async(
@@ -979,9 +1039,9 @@ void TuiNode::trigger_connect_toggle() {
                               : std::string{"disconnect failed for "} + mac;
                 }
 
-                if (runtime_->is_scanning()) {
-                    (void)client.stop_scan();
-                }
+                // is_scanning() may be false while BlueZ temporarily suspends
+                // an owned session. Stop unconditionally to release ownership.
+                (void)client.stop_scan();
 
                 if (!client.connect_le_bearer(mac, 15.0)) {
                     return std::string{"LE GATT connection failed for "} + mac;
@@ -1023,6 +1083,9 @@ void TuiNode::trigger_serial_connect() {
         [this, mac, device_path, already_open]() {
             // Toggle the RFCOMM profile while keeping all blocking BlueZ calls off the ROS executor.
             auto& client = runtime_->client();
+            if (!already_open) {
+                (void)client.stop_scan();
+            }
             if (already_open) {
                 const bool ok = client.disconnect_profile(
                     mac, std::string{bluez::kSerialPortProfileUuid});
@@ -1100,6 +1163,10 @@ void TuiNode::trigger_ssh(const std::string& username) {
     }
 
     auto& client = runtime_->client();
+    // Some stock laptop controllers lose the active LE/RFCOMM bearer when
+    // discovery is restarted. Keep the operator's scan preference, but leave
+    // discovery physically paused for the whole SSH session.
+    (void)client.stop_scan();
     const auto close_serial_and_restore_gatt = [this, &client, &mac, &device_path]() {
         (void)client.disconnect_profile(
             mac, std::string{bluez::kSerialPortProfileUuid});
@@ -1203,9 +1270,19 @@ void TuiNode::trigger_ssh(const std::string& username) {
 }
 
 void TuiNode::trigger_scan_toggle() {
-    // Converge BlueZ discovery to the opposite of its current state.
-    runtime_->set_scan_enabled(!runtime_->is_scanning(), scan_mode_);
-    status_message_ = runtime_->is_scanning() ? "scan enabled" : "scan stopped";
+    // Toggle the operator's requested state, distinguishing an active scan
+    // from one intentionally paused to protect a connected UAV bearer.
+    if (runtime_->scan_desired()) {
+        runtime_->set_scan_enabled(false, scan_mode_);
+        status_message_ = "scan stopped";
+        return;
+    }
+    if (has_connected_uav()) {
+        status_message_ = "disconnect the active UAV before enabling scan";
+        return;
+    }
+    runtime_->set_scan_enabled(true, scan_mode_);
+    status_message_ = runtime_->is_scanning() ? "scan enabled" : "scan start failed";
 }
 
 void TuiNode::trigger_wifi_write(PromptMode mode, std::string value) {
@@ -1297,10 +1374,11 @@ std::vector<const bluez::DeviceInfo*> TuiNode::visible_other_devices() const {
 }
 
 bool TuiNode::effective_services_resolved(const bluez::DeviceInfo& device) const {
-    // Device1.ServicesResolved also describes a classic-only SDP result on
-    // dual-mode peers. Only actual GATT objects prove that the laptop's LE
-    // service tree is available.
-    if (!device.connected || !device.services_resolved) {
+    // On stock laptop BlueZ, ServicesResolved can regress to false while the
+    // LE link and its complete ObjectManager GATT subtree remain usable. The
+    // live characteristic tree is the stronger signal; it also avoids treating
+    // a classic-only SDP result as usable GATT.
+    if (!device.connected) {
         return false;
     }
     return !runtime_->client().list_characteristics(device.mac).empty();
