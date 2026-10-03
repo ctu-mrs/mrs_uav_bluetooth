@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <rclcpp/rclcpp.hpp>
 
+#include <exception>
+#include <string>
 #include <unistd.h>
 
 namespace {
@@ -32,6 +34,32 @@ void detach_process_stdio_from_tty() {
     }
 }
 
+/// \brief Show a startup failure even after dashboard stdio was detached.
+/// \param detail Concrete exception detail to show to the operator.
+void report_startup_failure(const std::string& detail) {
+    const std::string message = "mrs_uav_bluetooth TUI startup failed: " + detail + "\n";
+    int output_fd = ::open("/dev/tty", O_WRONLY | O_NOCTTY);
+    bool close_output = output_fd >= 0;
+    if (output_fd < 0) {
+        output_fd = STDERR_FILENO;
+    }
+
+    const char* data = message.data();
+    std::size_t remaining = message.size();
+    while (remaining > 0) {
+        const auto written = ::write(output_fd, data, remaining);
+        if (written <= 0) {
+            break;
+        }
+        data += written;
+        remaining -= static_cast<std::size_t>(written);
+    }
+
+    if (close_output) {
+        ::close(output_fd);
+    }
+}
+
 }  // namespace
 
 /// \brief Run the interactive Bluetooth dashboard until ROS shutdown.
@@ -41,9 +69,20 @@ void detach_process_stdio_from_tty() {
 int main(int argc, char** argv) {
     // Detach the dashboard from inherited terminal streams before starting the ROS event loop.
     detach_process_stdio_from_tty();
-    rclcpp::init(argc, argv);
-    auto node = std::make_shared<mrs_uav_bluetooth::app::TuiNode>();
-    rclcpp::spin(node);
-    rclcpp::shutdown();
-    return 0;
+    try {
+        rclcpp::init(argc, argv);
+        auto node = std::make_shared<mrs_uav_bluetooth::app::TuiNode>();
+        rclcpp::spin(node);
+        rclcpp::shutdown();
+        return 0;
+    } catch (const std::exception& error) {
+        report_startup_failure(error.what());
+    } catch (...) {
+        report_startup_failure("unknown error");
+    }
+
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
+    }
+    return 1;
 }

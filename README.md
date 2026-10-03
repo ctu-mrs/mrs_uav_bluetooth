@@ -9,12 +9,16 @@ On UAVs, `service_node` runs in the background and manages Bluetooth. You launch
 
 ## Install
 
-On a laptop used only for the TUI, install the ROS package and its library:
+On a laptop used only for the TUI, install just the ROS package:
 
 ```bash
 sudo apt update
-sudo apt install mrs-libsdbus-c++ ros-jazzy-mrs-uav-bluetooth
+sudo apt install ros-jazzy-mrs-uav-bluetooth
 ```
+
+The ROS package pulls in its runtime libraries automatically and works with
+the distribution's BlueZ daemon. Do not install `mrs-bluez` or
+`mrs-uav-bluetooth-service` on a TUI-only laptop.
 
 On UAVs, install the MRS BlueZ build and background service. This also installs
 the ROS package and its dependencies:
@@ -30,8 +34,12 @@ it with `service mrs-uav-bluetooth status`. For logs, run
 belong in [default.yaml](config/default.yaml) or a user overlay.
 
 
-If the laptop uses its distribution's BlueZ, enable its experimental
-features. Open `/etc/bluetooth/main.conf`, set `Experimental = true` in the `[General]` section, then run `sudo service bluetooth restart`. This is needed for the TUI's advanced Bluetooth controls. `mrs-bluez` on UAVs enables the setting by default.
+The distribution's default BlueZ configuration is sufficient for TUI
+discovery and GATT controls. For advanced simultaneous LE/RFCOMM bearer
+handling, enable BlueZ's optional experimental interfaces by setting
+`Experimental = true` in the `[General]` section of
+`/etc/bluetooth/main.conf`, then run `sudo service bluetooth restart`.
+`mrs-bluez` enables those interfaces on UAVs by default.
 
 ## Quick Start
 
