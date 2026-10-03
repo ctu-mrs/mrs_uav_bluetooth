@@ -276,8 +276,18 @@ std::vector<GattDescriptorInfo> ObjectManagerCache::descriptors_for_characterist
 
 std::optional<GattCharacteristicInfo> ObjectManagerCache::find_characteristic_by_uuid(
     const std::string& device_path, const std::string& uuid) const {
-    // Find a case-insensitive characteristic UUID within one device subtree.
+    // Find a case-insensitive characteristic UUID owned by one device. BlueZ
+    // normally nests GATT paths below Device1, but ownership is defined by
+    // GattService1.Device and GattCharacteristic1.Service; do not require a
+    // particular object-path layout from BlueZ or vendor patches.
     std::lock_guard lock(mutex_);
+    std::set<std::string> service_paths;
+    for (const auto& [path, service] : gatt_services_) {
+        if (service.device_path == device_path || is_child_path(device_path, path)) {
+            service_paths.insert(path);
+        }
+    }
+
     std::string lower_uuid = uuid;
     std::transform(lower_uuid.begin(), lower_uuid.end(), lower_uuid.begin(),
                    [](unsigned char c) {
@@ -285,7 +295,9 @@ std::optional<GattCharacteristicInfo> ObjectManagerCache::find_characteristic_by
                        return std::tolower(c);
                    });
     for (const auto& [path, chrc] : gatt_characteristics_) {
-        if (path.find(device_path + "/") != 0) continue;
+        const bool owned_by_device = service_paths.count(chrc.service_path) != 0 ||
+            is_child_path(device_path, path);
+        if (!owned_by_device) continue;
         std::string chrc_uuid = chrc.uuid;
         std::transform(chrc_uuid.begin(), chrc_uuid.end(), chrc_uuid.begin(),
                        [](unsigned char c) {

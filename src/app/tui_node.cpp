@@ -241,6 +241,39 @@ bool wait_for_remote_gatt_cache(bluez::BluezClient& client,
     return has_remote_gatt();
 }
 
+/// \brief Wait for the selected built-in characteristic group after BlueZ resolves services.
+/// \param client BlueZ client used to refresh the remote object tree.
+/// \param inspector Resolver for the package's built-in characteristic UUIDs.
+/// \param mac Peer Bluetooth MAC address.
+/// \param wifi True waits for the complete Wi-Fi group; false waits for time.
+/// \param timeout Maximum time allowed for BlueZ to publish characteristic objects.
+/// \return Most recently resolved built-in paths, complete or partial at timeout.
+gatt::RemoteBuiltinPaths wait_for_builtin_paths(
+    bluez::BluezClient& client,
+    gatt::RemoteGattInspector& inspector,
+    const std::string& mac,
+    bool wifi,
+    std::chrono::milliseconds timeout) {
+    // ServicesResolved can become true before every characteristic interface
+    // reaches ObjectManager clients. Reconcile and retry the exact built-ins
+    // instead of treating the first nonempty service list as sufficient.
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    gatt::RemoteBuiltinPaths paths;
+    do {
+        (void)client.refresh_gatt_snapshot(mac);
+        paths = inspector.resolve_builtin_paths(mac);
+        if (wifi ? paths.has_wifi() : paths.has_time()) {
+            return paths;
+        }
+        const auto device = client.get_device(mac);
+        if (!device || !device->connected) {
+            return paths;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    } while (std::chrono::steady_clock::now() < deadline);
+    return paths;
+}
+
 /// \brief Retry transient BlueZ profile errors until RFCOMM connects or the deadline expires.
 /// \param client BlueZ client used for remote discovery and GATT operations.
 /// \param mac peer Bluetooth MAC address.
@@ -813,10 +846,17 @@ void TuiNode::request_time_sample(const bluez::DeviceInfo& device, bool force) {
     entry.future = std::async(std::launch::async, [this, mac]() {
         // Read the peer clock and retain request timing so the UI can display offset and round-trip delay.
         try {
-            (void)runtime_->client().refresh_gatt_snapshot(mac);
-            const auto paths = inspector_->resolve_builtin_paths(mac);
+            const auto paths = wait_for_builtin_paths(
+                runtime_->client(), *inspector_, mac, false, std::chrono::seconds(3));
             if (paths.time_characteristic_path.empty()) {
-                return std::make_tuple(uint64_t{0}, 0.0, 0.0, std::string{"time service not found"});
+                const auto service_count = runtime_->client().list_services(mac).size();
+                const auto characteristic_count =
+                    runtime_->client().list_characteristics(mac).size();
+                return std::make_tuple(
+                    uint64_t{0}, 0.0, 0.0,
+                    std::string{"time characteristic not found in resolved GATT tree (services="} +
+                        std::to_string(service_count) + ", characteristics=" +
+                        std::to_string(characteristic_count) + ")");
             }
 
             const auto before_ns = wall_time_ns();
@@ -863,12 +903,17 @@ void TuiNode::request_wifi_refresh(const bluez::DeviceInfo& device, bool force) 
     entry.future = std::async(std::launch::async, [this, mac]() {
         // Refresh the peer GATT tree and read its Wi-Fi fields without blocking the UI thread.
         try {
-            (void)runtime_->client().refresh_gatt_snapshot(mac);
-
-            const auto paths = inspector_->resolve_builtin_paths(mac);
+            const auto paths = wait_for_builtin_paths(
+                runtime_->client(), *inspector_, mac, true, std::chrono::seconds(3));
             if (!paths.has_wifi()) {
-                return std::make_tuple(std::string{}, std::string{}, std::string{},
-                                       std::string{"wifi service not found"});
+                const auto service_count = runtime_->client().list_services(mac).size();
+                const auto characteristic_count =
+                    runtime_->client().list_characteristics(mac).size();
+                return std::make_tuple(
+                    std::string{}, std::string{}, std::string{},
+                    std::string{"Wi-Fi characteristics not found in resolved GATT tree (services="} +
+                        std::to_string(service_count) + ", characteristics=" +
+                        std::to_string(characteristic_count) + ")");
             }
 
             const auto read_ascii = [this](const std::string& path) {
@@ -1162,9 +1207,10 @@ void TuiNode::trigger_wifi_write(PromptMode mode, std::string value) {
     action_future_ = std::async(std::launch::async, [this, mac, mode, value = std::move(value)]() {
         // Resolve the peer's Wi-Fi characteristics and perform the operator-selected read or write.
         try {
-            const auto paths = inspector_->resolve_builtin_paths(mac);
+            const auto paths = wait_for_builtin_paths(
+                runtime_->client(), *inspector_, mac, true, std::chrono::seconds(3));
             if (!paths.has_wifi()) {
-                return std::string{"wifi service not found"};
+                return std::string{"Wi-Fi characteristics not found in resolved GATT tree"};
             }
 
             const std::vector<uint8_t> payload(value.begin(), value.end());

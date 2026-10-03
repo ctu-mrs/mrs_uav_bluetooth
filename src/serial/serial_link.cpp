@@ -481,6 +481,16 @@ void SerialLinkManager::run_bridge(const std::shared_ptr<Link>& link) {
         }
     }
 
+    // Closing the PTY master is what delivers POLLHUP/EIO to every process
+    // holding the slave. Merely marking this link inactive leaves the SSH
+    // ProxyCommand blocked forever after RFCOMM or the remote sshd exits.
+    if (link->socket_fd >= 0) {
+        (void)::shutdown(link->socket_fd, SHUT_RDWR);
+    }
+    if (link->pty_master_fd >= 0) {
+        ::close(link->pty_master_fd);
+        link->pty_master_fd = -1;
+    }
     link->active.store(false);
     remove_owned_link(link->tty_path, link->pty_path);
 }

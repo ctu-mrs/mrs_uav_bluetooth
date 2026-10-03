@@ -224,6 +224,13 @@ int main(int argc, char** argv) {
     arguments.emplace_back(
         "HostKeyAlias=bluetooth-" + hostname_from_destination(host));
     arguments.insert(arguments.end(), ssh_options.begin(), ssh_options.end());
+    // Bound an established session that loses its RFCOMM transport. These
+    // protocol probes also make a silent radio failure terminate OpenSSH even
+    // when the kernel has not yet reported the Bluetooth socket as closed.
+    arguments.emplace_back("-o");
+    arguments.emplace_back("ServerAliveInterval=10");
+    arguments.emplace_back("-o");
+    arguments.emplace_back("ServerAliveCountMax=3");
     arguments.push_back(destination);
 
     std::vector<char*> raw_arguments;
