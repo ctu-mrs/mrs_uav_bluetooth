@@ -17,7 +17,7 @@ def _argument(name, default, description):
 
 def generate_launch_description():
     arguments = [
-        _argument("odometry_topic", "/{hostname}/mavros/global_position/local", "Published nav_msgs/Odometry topic."),
+        _argument("odometry_topic", "/{hostname}/estimation_manager/odom_main", "Published nav_msgs/Odometry topic."),
         _argument("rate_hz", "10.0", "Publication frequency in hertz."),
         _argument("frame_id", "map", "Odometry header frame."),
         _argument("child_frame_id", "base_link", "Odometry child frame."),

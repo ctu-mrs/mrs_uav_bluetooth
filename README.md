@@ -63,7 +63,7 @@ Choose the same topic-sharing mode on the participating UAVs. The service switch
 | GATT | Connects to nearby UAVs and sends larger messages at higher rates. | 512 B | [Odometry GATT](config/examples/swarm_odom_gatt_overlay.yaml) |
 | Mesh | Passes small messages through other UAVs to reach farther away (multi-hop) at small rates. | 370 B | [Odometry Mesh](config/examples/swarm_odom_mesh_overlay.yaml) |
 
-Copy the sample for your mode and edit the UAV names in `peer_whitelist` and the source topic in `shared_topics`. The samples are typically installed in `/opt/ros/jazzy/share/mrs_uav_bluetooth/config/examples` and they use `/uavXX/mavros/global_position/local`. Start the overlay on each participating UAV with an absolute path to your edited file:
+Copy the sample for your mode and edit the UAV names in `peer_whitelist` if needed. The samples are typically installed in `/opt/ros/jazzy/share/mrs_uav_bluetooth/config/examples` and use `/{hostname}/estimation_manager/odom_main`, where `{hostname}` expands to the local UAV name (for example, `/uav17/estimation_manager/odom_main`). Start the overlay on each participating UAV with an absolute path to your edited file:
 
 ```bash
 ros2 launch mrs_uav_bluetooth user_node.launch.py config_path:=/absolute/path/to/your-overlay.yaml

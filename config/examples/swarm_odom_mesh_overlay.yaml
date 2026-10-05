@@ -35,8 +35,8 @@ shared_topics:
     channel_id: 1001
     mode: both
     payload_format: struct
-    export_topic: /{hostname}/mavros/global_position/local
-    import_topic_suffix: mavros/global_position/local
+    export_topic: /{hostname}/estimation_manager/odom_main
+    import_topic_suffix: estimation_manager/odom_main
     message_type: nav_msgs/msg/Odometry
     # Offer the newest value at the tested rate.
     rate_hz: 0.5
