@@ -1,11 +1,11 @@
 # Mesh example: shares compact position and orientation through other UAVs.
 # Copy this file, list all UAVs below, and deploy the same copy everywhere.
 # Start user_node with config_path:=<absolute path to the copy>.
-# Received data appears below /<this-uav>/bluetooth/mesh/peers.
+# Received data appears below /<this-uav>/bluetooth/peers.
 
 # -----------------------------------------------------------------------------
 # Mesh settings
-node_topics_prefix: "/{hostname}/bluetooth"
+peers_prefix: "~/peers"
 enable_mesh: true
 mesh_swarm_auto_provisioning: true
 # Start or join automatically and remember the setup.

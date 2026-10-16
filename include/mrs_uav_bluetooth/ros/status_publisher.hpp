@@ -25,9 +25,6 @@ public:
     /// \param node ROS node that owns the created interfaces.
     explicit StatusPublisher(rclcpp::Node& node);
 
-    /// \brief Create publishers for aggregate status devices notifications reports and logs.
-    /// \param node_topics_prefix normalized ROS namespace below which endpoints are created.
-    void configure_topics(const std::string& node_topics_prefix);
     /// \brief Select the raw advertisement field copied into each published device message.
     /// \param data_type Raw advertisement field type reserved for application data.
     void set_advertisement_user_data_type(uint8_t data_type);
@@ -62,9 +59,10 @@ public:
 
 private:
     rclcpp::Node& node_;
-    std::string node_topics_prefix_;
-    uint8_t advertisement_user_data_type_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+	/// Create diagnostics under the fixed /<hostname>/bluetooth namespace.
+	void create_topics();
+	uint8_t advertisement_user_data_type_;
+	rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr log_pub_;
     rclcpp::Publisher<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr devices_pub_;
     rclcpp::Publisher<mrs_uav_bluetooth::msg::BleDeviceArray>::SharedPtr advertisements_pub_;

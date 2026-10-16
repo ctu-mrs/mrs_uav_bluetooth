@@ -2,14 +2,15 @@
 /// \file src/app/service_node_mesh.cpp
 /// \brief Implements the service node mesh component of the ROS 2 application and operator-tool layer.
 
-#include "mrs_uav_bluetooth/app/service_node.hpp"
-
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+
+#include "mrs_uav_bluetooth/app/service_node.hpp"
+#include "mrs_uav_bluetooth/util/topic_utils.hpp"
 
 namespace mrs_uav_bluetooth::app {
 
@@ -349,7 +350,6 @@ void ServiceNode::configure_mesh(const config::NodeConfig& config) {
     clear_mesh_reliable_state();
     const auto signature = mesh_config_signature(config);
     const bool config_changed = signature != mesh_config_signature_;
-    const bool topic_changed = config.node_topics_prefix != mesh_topic_prefix_;
 
     if (!config.enable_mesh) {
         if (mesh_timer_) mesh_timer_->cancel();
@@ -364,24 +364,21 @@ void ServiceNode::configure_mesh(const config::NodeConfig& config) {
         mesh_bootstrap_attempted_ = false;
         mesh_local_radio_confirmed_.store(0);
         mesh_config_signature_ = signature;
-        mesh_topic_prefix_ = config.node_topics_prefix;
         return;
     }
     start_mesh_bearer(*server_dbus_);
 
+	if (!mesh_status_pub_) {
+		mesh_status_pub_ =
+			create_publisher<mrs_uav_bluetooth::msg::MeshStatus>(util::node_prefix(hostname_) + "/mesh/status", 10);
+		mesh_message_pub_ =
+			create_publisher<mrs_uav_bluetooth::msg::MeshMessage>(util::node_prefix(hostname_) + "/mesh/rx", 100);
+		mesh_event_pub_ =
+			create_publisher<mrs_uav_bluetooth::msg::MeshEvent>(util::node_prefix(hostname_) + "/mesh/events", 50);
+	}
 
-    if (topic_changed || !mesh_status_pub_) {
-        mesh_status_pub_ = create_publisher<mrs_uav_bluetooth::msg::MeshStatus>(
-            config.node_topics_prefix + "/mesh/status", 10);
-        mesh_message_pub_ = create_publisher<mrs_uav_bluetooth::msg::MeshMessage>(
-            config.node_topics_prefix + "/mesh/rx", 100);
-        mesh_event_pub_ = create_publisher<mrs_uav_bluetooth::msg::MeshEvent>(
-            config.node_topics_prefix + "/mesh/events", 50);
-        mesh_topic_prefix_ = config.node_topics_prefix;
-    }
-
-    if (config_changed || !mesh_app_) {
-        if (mesh_timer_) mesh_timer_->cancel();
+	if (config_changed || !mesh_app_) {
+		if (mesh_timer_) mesh_timer_->cancel();
         mesh_timer_.reset();
         mesh_swarm_coordinator_.reset();
         mesh_app_.reset();
@@ -462,9 +459,9 @@ void ServiceNode::configure_mesh(const config::NodeConfig& config) {
         mesh_bootstrap_attempted_ = false;
         mesh_local_radio_confirmed_.store(0);
         mesh_config_signature_ = signature;
-    }
+	}
 
-    if (!mesh_timer_) {
+	if (!mesh_timer_) {
         mesh_timer_ = create_mesh_wall_timer(
             *this, std::chrono::milliseconds(20),
             [this]() {

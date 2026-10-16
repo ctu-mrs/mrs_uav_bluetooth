@@ -440,52 +440,25 @@ YAML::Node deep_merge(const YAML::Node& base, const YAML::Node& override_node) {
 /// \param hostname UAV hostname used to identify the node.
 /// \param auto_connect_pattern hostname pattern used to recognize peer UAVs.
 /// \return Validated node configuration.
-NodeConfig parse_node_config(const YAML::Node& doc,
-                             const std::string& hostname,
-                             const std::string& auto_connect_pattern) {
-    NodeConfig cfg;
-    if (!doc.IsDefined() || doc.IsNull()) return cfg;
-    if (!doc.IsMap()) throw std::runtime_error("Node configuration must be a YAML map");
-    const std::set<std::string> mesh_options{
-        "mesh_agent_capabilities",
-        "mesh_agent_numeric_oob",
-        "mesh_agent_oob_info",
-        "mesh_agent_private_key",
-        "mesh_agent_public_key",
-        "mesh_agent_static_oob",
-        "mesh_agent_uri",
-        "mesh_auto_attach",
-        "mesh_auto_configure_relay",
-        "mesh_auto_create_network",
-        "mesh_auto_join",
-        "mesh_company_id",
-        "mesh_crpl",
-        "mesh_default_ttl",
-        "mesh_device_uuid",
-        "mesh_next_unicast",
-        "mesh_product_id",
-        "mesh_provisioner",
-        "mesh_provisioner_preference",
-        "mesh_relay_retransmit_count",
-        "mesh_relay_retransmit_interval_steps",
-        "mesh_network_retransmit_count",
-        "mesh_network_retransmit_interval_steps",
-        "mesh_swarm_app_key_index",
-        "mesh_swarm_auto_provisioning",
-        "mesh_swarm_group_address",
-        "mesh_swarm_heartbeat_period",
-        "mesh_swarm_id",
-        "mesh_swarm_network_index",
-        "mesh_swarm_participating",
-        "mesh_swarm_provisioner_timeout",
-        "mesh_swarm_startup_grace",
-        "mesh_swarm_state_path",
-        "mesh_token",
-        "mesh_token_path",
-        "mesh_unicast_cursor_path",
-        "mesh_vendor_model_id",
-        "mesh_version_id"};
-    for (const auto& field : doc) {
+NodeConfig parse_node_config(
+	const YAML::Node& doc, const std::string& hostname, const std::string& auto_connect_pattern) {
+	if (hostname.empty())
+		throw std::runtime_error("hostname must be provided by the launch file");
+	NodeConfig cfg;
+	if (!doc.IsMap())
+		throw std::runtime_error("Node configuration must be a YAML map");
+	const std::set<std::string> mesh_options{"mesh_agent_capabilities", "mesh_agent_numeric_oob", "mesh_agent_oob_info",
+		"mesh_agent_private_key", "mesh_agent_public_key", "mesh_agent_static_oob", "mesh_agent_uri",
+		"mesh_auto_attach", "mesh_auto_configure_relay", "mesh_auto_create_network", "mesh_auto_join",
+		"mesh_company_id", "mesh_crpl", "mesh_default_ttl", "mesh_device_uuid", "mesh_next_unicast", "mesh_product_id",
+		"mesh_provisioner", "mesh_provisioner_preference", "mesh_relay_retransmit_count",
+		"mesh_relay_retransmit_interval_steps", "mesh_network_retransmit_count",
+		"mesh_network_retransmit_interval_steps", "mesh_swarm_app_key_index", "mesh_swarm_auto_provisioning",
+		"mesh_swarm_group_address", "mesh_swarm_heartbeat_period", "mesh_swarm_id", "mesh_swarm_network_index",
+		"mesh_swarm_participating", "mesh_swarm_provisioner_timeout", "mesh_swarm_startup_grace",
+		"mesh_swarm_state_path", "mesh_token", "mesh_token_path", "mesh_unicast_cursor_path", "mesh_vendor_model_id",
+		"mesh_version_id"};
+	for (const auto& field : doc) {
         const auto key = field.first.as<std::string>();
         if (key.starts_with("mesh_") && !mesh_options.contains(key))
             throw std::runtime_error("Unknown Mesh configuration option: " + key);
@@ -518,27 +491,27 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         return result;
     };
 
-    cfg.node_topics_prefix = expand_hostname(str("node_topics_prefix", cfg.node_topics_prefix), hostname);
-    cfg.scan_publish_period = dbl("scan_publish_period", cfg.scan_publish_period);
-    cfg.time_update_period = dbl("time_update_period", cfg.time_update_period);
-    cfg.wifi_refresh_period = dbl("wifi_refresh_period", cfg.wifi_refresh_period);
-    cfg.auto_connect_period = dbl("auto_connect_period", cfg.auto_connect_period);
-    cfg.discoverable_timeout = u32("discoverable_timeout", cfg.discoverable_timeout);
-    if (doc["auto_pair"]) {
-        cfg.auto_pair = b("auto_pair", cfg.auto_pair);
-    } else if (doc["auto_accept_pairing"]) {
-        cfg.auto_pair = b("auto_accept_pairing", cfg.auto_pair);
-    }
-    cfg.auto_trust = b("auto_trust", cfg.auto_trust);
-    cfg.enable_time_service = b("enable_time_service", cfg.enable_time_service);
-    cfg.enable_wifi_service = b("enable_wifi_service", cfg.enable_wifi_service);
-    cfg.enable_serial_port_profile =
-        b("enable_serial_port_profile", cfg.enable_serial_port_profile);
-    const auto serial_port_channel = u32("serial_port_channel", cfg.serial_port_channel);
-    if (serial_port_channel == 0 || serial_port_channel > 30) {
-        throw std::runtime_error("serial_port_channel must be in the range 1..30");
-    }
-    cfg.serial_port_channel = static_cast<uint16_t>(serial_port_channel);
+	if (doc["peers_prefix"] && !doc["peers_prefix"].IsScalar()) {
+		throw std::runtime_error("peers_prefix must be a ROS topic path string");
+	}
+	cfg.peers_prefix = util::resolve_topic_path(str("peers_prefix", cfg.peers_prefix), hostname);
+	if (cfg.peers_prefix == "/")
+		cfg.peers_prefix.clear();
+	cfg.scan_publish_period = dbl("scan_publish_period", cfg.scan_publish_period);
+	cfg.time_update_period = dbl("time_update_period", cfg.time_update_period);
+	cfg.wifi_refresh_period = dbl("wifi_refresh_period", cfg.wifi_refresh_period);
+	cfg.auto_connect_period = dbl("auto_connect_period", cfg.auto_connect_period);
+	cfg.discoverable_timeout = u32("discoverable_timeout", cfg.discoverable_timeout);
+	cfg.auto_pair = b("auto_pair", cfg.auto_pair);
+	cfg.auto_trust = b("auto_trust", cfg.auto_trust);
+	cfg.enable_time_service = b("enable_time_service", cfg.enable_time_service);
+	cfg.enable_wifi_service = b("enable_wifi_service", cfg.enable_wifi_service);
+	cfg.enable_serial_port_profile = b("enable_serial_port_profile", cfg.enable_serial_port_profile);
+	const auto serial_port_channel = u32("serial_port_channel", cfg.serial_port_channel);
+	if (serial_port_channel == 0 || serial_port_channel > 30) {
+		throw std::runtime_error("serial_port_channel must be in the range 1..30");
+	}
+	cfg.serial_port_channel = static_cast<uint16_t>(serial_port_channel);
     cfg.serial_sshd_path = str("serial_sshd_path", cfg.serial_sshd_path);
     cfg.enable_mesh = b("enable_mesh", cfg.enable_mesh);
     cfg.mesh_auto_attach = b("mesh_auto_attach", cfg.mesh_auto_attach);
@@ -906,11 +879,11 @@ NodeConfig parse_node_config(const YAML::Node& doc,
         static_cast<int64_t>(std::numeric_limits<int16_t>::min()),
         static_cast<int64_t>(std::numeric_limits<int16_t>::max()));
     const auto advertise_extra_data_topic = str("advertise_extra_data_topic", cfg.advertise_extra_data_topic);
-    cfg.advertise_extra_data_topic = advertise_extra_data_topic.empty()
-        ? std::string{}
-        : util::normalize_ros_topic(expand_hostname(advertise_extra_data_topic, hostname));
-    cfg.pairing_agent = str("pairing_agent", cfg.pairing_agent);
-    cfg.enable_server = b("enable_server", cfg.enable_server);
+	cfg.advertise_extra_data_topic = advertise_extra_data_topic.empty()
+		? std::string{}
+		: util::resolve_topic_path(advertise_extra_data_topic, hostname);
+	cfg.pairing_agent = str("pairing_agent", cfg.pairing_agent);
+	cfg.enable_server = b("enable_server", cfg.enable_server);
     cfg.enable_scan = b("enable_scan", cfg.enable_scan);
     cfg.scan_mode = str("scan_mode", cfg.scan_mode);
     if (cfg.mesh_swarm_auto_provisioning) {
@@ -969,13 +942,12 @@ NodeConfig parse_node_config(const YAML::Node& doc,
 
             std::string export_topic_raw = raw["export_topic"]
                 ? raw["export_topic"].as<std::string>("") : "";
-            stc.export_topic = util::normalize_ros_topic(
-                expand_hostname(export_topic_raw, hostname));
-            if (stc.export_topic == "/") {
-                throw std::runtime_error("shared_topics[" + std::to_string(index) + "] requires export_topic");
-            }
+			stc.export_topic = util::resolve_topic_path(export_topic_raw, hostname);
+			if (stc.export_topic == "/") {
+				throw std::runtime_error("shared_topics[" + std::to_string(index) + "] requires export_topic");
+			}
 
-            std::string canonical = canonical_shared_topic(stc.export_topic, pattern);
+			std::string canonical = canonical_shared_topic(stc.export_topic, pattern);
             std::string key_source = raw["key"]
                 ? raw["key"].as<std::string>(canonical) : canonical;
             if (key_source.empty()) {

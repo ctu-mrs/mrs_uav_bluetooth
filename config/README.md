@@ -1,13 +1,12 @@
 | Parameter | What it controls | Allowed values or range |
 | --- | --- | --- |
-| node_topics_prefix | Root of this UAV's Bluetooth ROS topics. {hostname} inserts the local name. | ROS topic prefix string. |
+| peers_prefix | Parent path for imported topics and peer clock reports. Default: ~/peers; ~ means /<hostname>/bluetooth, using the name supplied by launch. | ROS topic prefix with optional {hostname}, ~ or ~/path; "" and "/" use /<peer>/<suffix>. |
 | scan_publish_period | How often nearby-device information is published. | Number of seconds; use > 0. |
 | time_update_period | How often connected clocks are updated. | Number of seconds; use > 0. |
 | wifi_refresh_period | How often available Wi-Fi networks are checked. | Number of seconds; use > 0. |
 | auto_connect_period | Delay between automatic connection checks. | Number of seconds; use > 0. |
 | discoverable_timeout | How long this UAV remains visible. | Integer 0..4294967295 seconds; 0 means indefinitely. |
 | auto_pair | Automatically approve permitted pairing requests. | true or false. |
-| auto_accept_pairing | Older name for auto_pair, used only when auto_pair is absent. | true or false. |
 | auto_trust | Remember a permitted paired UAV as trusted. | true or false. |
 | enable_time_service | Share clock information over a connection. | true or false. |
 | enable_wifi_service | Share Wi-Fi choices over a connection. | true or false. |
@@ -97,7 +96,7 @@
 | shared_topics[].transport | Radio mode used by this bridge. | gatt, advertisement, or mesh. |
 | shared_topics[].mode | Which direction this UAV shares the topic. | export, import, or both. |
 | shared_topics[].payload_format | How a ROS message becomes bytes. | struct for selected fields, raw for byte-array messages, or ros2 for a complete serialized message. |
-| shared_topics[].export_topic | Local ROS source topic. | Nonempty ROS topic path; {hostname} expands. |
+| shared_topics[].export_topic | Local ROS source topic. | Nonempty ROS topic path; {hostname} expands and ~ means the package namespace. |
 | shared_topics[].import_topic_suffix | Name below this UAV's peer-topic prefix for received data. | ROS topic suffix string; defaults to the source path without its UAV prefix. |
 | shared_topics[].message_type | ROS message type of this bridge. | Installed type string such as nav_msgs/msg/Odometry. |
 | shared_topics[].rate_hz | Maximum offered source update frequency. | Number >= 0 Hz; 0 offers every source update. Delivered rate also depends on the radio. |

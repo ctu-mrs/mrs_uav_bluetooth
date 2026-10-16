@@ -6,23 +6,8 @@
 
 #include <algorithm>
 #include <regex>
-#include <unistd.h>
 
 namespace mrs_uav_bluetooth::util {
-
-/// \brief Trim trailing whitespace/newlines.
-/// \return Local hostname without surrounding whitespace.
-std::string system_hostname() {
-    char buf[256]{};
-    if (gethostname(buf, sizeof(buf) - 1) == 0) {
-        // Trim trailing whitespace/newlines.
-        std::string name(buf);
-        auto end = name.find_last_not_of(" \t\r\n");
-        if (end == std::string::npos) return {};
-        return name.substr(0, end + 1);
-    }
-    return {};
-}
 
 /// \brief Validate a trimmed hostname against the configured UAV pattern.
 /// \param value Hostname to validate.

@@ -56,21 +56,20 @@ public:
     /// \param sender transport callback invoked for an outgoing bridge payload.
     void set_mesh_sender(MeshSender sender);
 
-    /// Atomically replace all configured advertisement and Mesh bridges.
-    /// GATT entries are ignored because they are managed by the existing GATT
-    /// export/import managers. At most one advertisement exporter is accepted:
-    /// a controller exposes one dynamic user-data field at a time.
-    /// \param topics Topic bridge definitions used to create import and export runtime state.
-    /// \param node_topics_prefix normalized ROS namespace below which endpoints are created.
-    /// \param peer_whitelist admitted peer names or addresses used for bridge routing.
-    void configure(const std::vector<config::SharedTopicConfig>& topics,
-                   const std::string& node_topics_prefix,
-                   const std::vector<std::string>& peer_whitelist);
+	/// Atomically replace all configured advertisement and Mesh bridges.
+	/// GATT entries are ignored because they are managed by the existing GATT
+	/// export/import managers. At most one advertisement exporter is accepted:
+	/// a controller exposes one dynamic user-data field at a time.
+	/// \param topics Topic bridge definitions used to create import and export runtime state.
+	/// \param peers_prefix Resolved parent namespace of imported peers; empty means root.
+	/// \param peer_whitelist admitted peer names or addresses used for bridge routing.
+	void configure(const std::vector<config::SharedTopicConfig>& topics, const std::string& peers_prefix,
+		const std::vector<std::string>& peer_whitelist);
 
-    /// Release subscriptions, timers, publishers, and buffered payloads.
-    void clear();
+	/// Release subscriptions, timers, publishers, and buffered payloads.
+	void clear();
 
-    /// Decode a nearby device's dynamic advertisement user-data field.
+	/// Decode a nearby device's dynamic advertisement user-data field.
     /// Use the resolved hostname for the peer topic. When BlueZ has not
     /// resolved one, use its MAC address as the stable fallback. Repeated
     /// BlueZ snapshots are deduplicated per peer and channel.

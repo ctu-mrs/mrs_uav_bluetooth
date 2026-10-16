@@ -107,10 +107,12 @@ private:
         std::chrono::steady_clock::time_point started_at{};
         std::chrono::steady_clock::time_point last_at{};
         uint64_t total{0};
-    };
+		/// Peer observers may be retired once their publisher leaves the graph.
+		bool peer{false};
+	};
 
-    // Status callbacks cache data quickly; the periodic timer formats one coherent view.
-    std::mutex transport_status_mutex_;
+	// Status callbacks cache data quickly; the periodic timer formats one coherent view.
+	std::mutex transport_status_mutex_;
     std::map<std::string, TopicObservation> observed_topics_;
     std::map<std::string, double> peer_rtt_seconds_;
     std::optional<mrs_uav_bluetooth::msg::BleDeviceArray> latest_devices_;

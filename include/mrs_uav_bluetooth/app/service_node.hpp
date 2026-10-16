@@ -523,7 +523,6 @@ private:
     std::atomic<uint8_t> mesh_local_ttl_expected_{0};
     std::atomic<uint8_t> mesh_local_relay_expected_{0};
     std::atomic<uint8_t> mesh_local_network_transmit_expected_{0};
-    std::string mesh_topic_prefix_;
 
     std::unique_ptr<config::OverlayConfigManager> overlay_config_;
     std::string mesh_config_signature_;

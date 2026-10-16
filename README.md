@@ -77,7 +77,7 @@ ros2 launch mrs_uav_bluetooth random_odometry_publisher.launch.py rate_hz:=10.0
 
 The advertisement sample packs timestamp, orientation, and XYZ position into 26 bytes. Mesh uses 20 bytes by storing XYZ to the nearest centimetre within -327.68 to 327.67 m on each axis. GATT sends timestamp, pose, and velocity in 60 bytes. The sample message rates are 1 Hz for advertisement, 0.5 Hz for Mesh, and 10 Hz for GATT. All YAML options are listed in the [configuration table](config/README.md).
 
-Received GATT and advertisement topics appear below `/{hostname}/bluetooth/le/peers/<peer>/`. Mesh uses `/{hostname}/bluetooth/mesh/peers/<peer>/`. The peer segment is the hostname when it can be resolved. GATT and advertisements fall back to `mac_<address>`. Mesh peer identity uses a unicast address, so an empty Mesh peer list uses the fallback `unicast_<address>`. The `user_node` prints status for the active mode while it runs.
+Received topics from GATT, advertisement, and Mesh appear under the default `peers_prefix: "~/peers"` which uses `~` for the package namespace. Peer clock reports use `<peers_prefix>/<peer>/time_status`. The peer segment is the hostname when available, otherwise `mac_<address>` is used for LE and `unicast_<address>` for Mesh. The `user_node` prints periodic status for the active mode while it runs.
 
 #### First use of Mesh
 
@@ -101,7 +101,7 @@ The service also exposes ROS topics and services under `/{hostname}/bluetooth/le
 
 ## ROS topic reference
 
-These names use the default prefix `/{hostname}/bluetooth`. `{hostname}` is replaced with the local machine name. An overlay can change `node_topics_prefix`.
+The launch files select `UAV_NAME` when set, or the PC hostname otherwise, and pass that name to the nodes. The package namespace is `/{hostname}/bluetooth`.
 
 | Topic suffix | Type | What it carries |
 | --- | --- | --- |
@@ -112,12 +112,11 @@ These names use the default prefix `/{hostname}/bluetooth`. `{hostname}` is repl
 | `/le/advertisements` | `mrs_uav_bluetooth/msg/BleDeviceArray` | Nearby advertisement data. |
 | `/le/notifications` | `mrs_uav_bluetooth/msg/BleNotification` | Raw GATT notifications. |
 | `/le/advertisement` | `std_msgs/msg/UInt8MultiArray` | Optional raw advertisement input in broadcast mode. |
-| `/le/peers/<peer>/time_status` | `mrs_uav_bluetooth/msg/BlePeerTimeStatus` | Peer clock and round-trip estimate. |
-| `/le/peers/<peer>/<suffix>` | Configured message type | Imported GATT or advertisement bridge. |
+| `/peers/<peer>/time_status` | `mrs_uav_bluetooth/msg/BlePeerTimeStatus` | Peer clock and round-trip estimate. |
+| `/peers/<peer>/<suffix>` | Configured message type | Imported GATT, advertisement, or Mesh bridge. |
 | `/mesh/status` | `mrs_uav_bluetooth/msg/MeshStatus` | Mesh attachment, relay, and swarm state. |
 | `/mesh/events` | `mrs_uav_bluetooth/msg/MeshEvent` | Provisioning and scan events. |
 | `/mesh/rx` | `mrs_uav_bluetooth/msg/MeshMessage` | Raw received Mesh messages for a custom controller. |
-| `/mesh/peers/<peer>/<suffix>` | Configured message type | Imported Mesh bridge, named by configured hostname or unicast fallback. |
 
 The raw advertisement topic is an input to the service. The keepalive topic is published by `user_node`. Other fixed topics in this table are service outputs. Imported bridge topics appear only when the matching `shared_topics` declaration is active.
 

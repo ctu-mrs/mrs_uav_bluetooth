@@ -321,21 +321,11 @@ void OverlayConfigManager::apply_config(const std::string& overlay,
         cfg = load_effective_config(default_config_path_, overlay, hostname_);
     }
 
-    auto prefix = util::normalize_ros_topic(cfg.node_topics_prefix);
-    auto suffix = util::sanitize_topic_suffix(cfg.overlay_keepalive_topic_suffix);
-    auto keepalive_topic = prefix;
-    if (keepalive_topic.empty()) {
-        keepalive_topic = "/";
-    }
-    if (keepalive_topic.back() != '/') {
-        keepalive_topic += '/';
-    }
-    keepalive_topic += "config/";
-    keepalive_topic += suffix;
-    keepalive_topic = util::normalize_ros_topic(keepalive_topic);
+	const auto suffix = util::sanitize_topic_suffix(cfg.overlay_keepalive_topic_suffix);
+	const auto keepalive_topic = util::node_prefix(hostname_) + "/config/" + suffix;
 
-    NodeConfig previous;
-    std::string previous_source;
+	NodeConfig previous;
+	std::string previous_source;
     std::string previous_topic;
     {
         std::lock_guard<std::mutex> lock(mutex_);

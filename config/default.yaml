@@ -2,8 +2,11 @@
 
 # -----------------------------------------------------------------------------
 # General settings
-# Root name for this UAV's ROS topics.
-node_topics_prefix: "/{hostname}/bluetooth"
+# Parent path for imported topics and clock reports: <prefix>/<peer>/<suffix>.
+# Default: ~/peers. ~ resolves to /<hostname>/bluetooth; launch supplies hostname.
+# Allowed: a ROS topic prefix with optional {hostname}, ~ or ~/path;
+# "" or "/" publishes directly at /<peer>/<suffix>.
+peers_prefix: "~/peers"
 
 # Seconds between device-list updates.
 scan_publish_period: 2.0
@@ -156,7 +159,7 @@ advertise_max_interval: 100
 advertise_local_name: "{hostname}"
 
 # ROS topic for raw Advertisements; empty disables it.
-advertise_extra_data_topic: "/{hostname}/bluetooth/le/advertisement"
+advertise_extra_data_topic: "~/le/advertisement"
 
 pairing_agent: NoInputNoOutput
 enable_server: true

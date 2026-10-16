@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <regex>
+#include <stdexcept>
 
 namespace mrs_uav_bluetooth::util {
 
@@ -77,6 +78,28 @@ std::string normalize_ros_topic(std::string_view value) {
     }
 
     return collapsed.empty() ? "/" : collapsed;
+}
+
+std::string node_prefix(std::string_view hostname) {
+	if (hostname.empty())
+		throw std::runtime_error("hostname must be provided by the launch file");
+	return "/" + sanitize_topic_suffix(hostname) + "/bluetooth";
+}
+
+std::string resolve_topic_path(std::string_view value, std::string_view hostname) {
+	std::string path(value);
+	const auto name = sanitize_topic_suffix(hostname);
+	const std::string placeholder = "{hostname}";
+	for (size_t pos = 0; (pos = path.find(placeholder, pos)) != std::string::npos; pos += name.size()) {
+		path.replace(pos, placeholder.size(), name);
+	}
+	if (!path.empty() && path.front() == '~') {
+		if (path.size() > 1 && path[1] != '/') {
+			throw std::runtime_error("ROS topic paths must use ~ or ~/ before the package-relative path");
+		}
+		path.replace(0, 1, node_prefix(hostname));
+	}
+	return normalize_ros_topic(path);
 }
 
 }  // namespace mrs_uav_bluetooth::util

@@ -1,7 +1,7 @@
 # GATT example: shares complete odometry over fast private connections.
 # Copy this file, list all UAVs below, and deploy the same copy everywhere.
 # Start user_node with config_path:=<absolute path to the copy>.
-# Received data appears below /<this-uav>/bluetooth/le/peers.
+# Received data appears below /<this-uav>/bluetooth/peers.
 
 # -----------------------------------------------------------------------------
 # Allowed UAVs. Empty accepts all.

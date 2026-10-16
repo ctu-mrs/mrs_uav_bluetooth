@@ -45,6 +45,23 @@ bool imports(const config::SharedTopicConfig& bridge) {
     return bridge.mode == "import" || bridge.mode == "both";
 }
 
+/// \brief Match one imported topic, including when peers are placed at the root.
+/// \param topic Absolute ROS topic reported by the graph.
+/// \param bridge Bridge definition supplying the suffix and transport.
+/// \param cfg Effective configuration supplying the receive namespace.
+/// \return Whether the topic consists of the prefix, one peer, and the suffix.
+bool matches_import(const std::string& topic, const config::SharedTopicConfig& bridge, const config::NodeConfig& cfg) {
+	auto prefix = util::normalize_ros_topic(cfg.peers_prefix);
+	if (prefix != "/")
+		prefix += '/';
+	const auto suffix = "/" + bridge.import_topic_suffix;
+	if (topic.rfind(prefix, 0) != 0 || topic.size() <= prefix.size() + suffix.size() ||
+		topic.compare(topic.size() - suffix.size(), suffix.size(), suffix) != 0)
+		return false;
+	const auto peer = topic.substr(prefix.size(), topic.size() - prefix.size() - suffix.size());
+	return peer.find('/') == std::string::npos;
+}
+
 /// \brief Resolve the ROS topic component used for a named or address-only peer.
 /// \param name Peer hostname, when resolved from BlueZ or Mesh membership.
 /// \param mac Bluetooth address used when the hostname is unavailable.
@@ -140,7 +157,8 @@ UserOverlayNode::~UserOverlayNode() {
 
 void UserOverlayNode::configure_parameters() {
     // Reject missing overlay paths and invalid timeouts before creating service clients or timers.
-    declare_parameter<std::string>("config_path", "");
+	declare_parameter<std::string>("hostname", "");
+	declare_parameter<std::string>("config_path", "");
     declare_parameter<double>("service_wait_timeout_sec", 30.0);
     declare_parameter<double>("service_call_timeout_sec", 45.0);
     declare_parameter<double>("deactivate_service_wait_timeout_sec", 2.0);
@@ -185,10 +203,11 @@ void UserOverlayNode::configure_parameters() {
 void UserOverlayNode::load_overlay_context() {
     // Resolve hostname placeholders, merge the selected overlay, and choose the
     // transport-specific status streams shown while its lease is active.
-    hostname_ = mrs_uav_bluetooth::util::sanitize_topic_suffix(
-        mrs_uav_bluetooth::util::system_hostname().empty() ? "mrs-uav" : mrs_uav_bluetooth::util::system_hostname());
-    const auto share_dir = ament_index_cpp::get_package_share_directory("mrs_uav_bluetooth");
-    default_config_path_ = share_dir + "/config/default.yaml";
+	hostname_ = get_parameter("hostname").as_string();
+	if (hostname_.empty())
+		throw std::runtime_error("hostname must be provided by the launch file");
+	const auto share_dir = ament_index_cpp::get_package_share_directory("mrs_uav_bluetooth");
+	default_config_path_ = share_dir + "/config/default.yaml";
     effective_config_ = config::load_effective_config(
         default_config_path_, config_path_, hostname_);
 
@@ -205,23 +224,23 @@ void UserOverlayNode::load_overlay_context() {
 
     // Service and heartbeat/topic paths deliberately share the hostname-rooted
     // hierarchy used by service_node; no ROS namespace remapping is required.
-    set_active_config_service_ = mrs_uav_bluetooth::util::normalize_ros_topic(
-        "/" + hostname_ + "/bluetooth/config/set_active");
-    keepalive_topic_ = mrs_uav_bluetooth::util::normalize_ros_topic(
-        "/" + hostname_ + "/bluetooth/config/" + sentinel_topic_suffix_);
+	set_active_config_service_ =
+		mrs_uav_bluetooth::util::normalize_ros_topic(util::node_prefix(hostname_) + "/config/set_active");
+	keepalive_topic_ = mrs_uav_bluetooth::util::normalize_ros_topic(
+		util::node_prefix(hostname_) + "/config/" + sentinel_topic_suffix_);
 }
 
 void UserOverlayNode::configure_transport_reporting() {
     // Observe the complete device cache for connection state and nearby UAV identity.
-    const auto topic_root = util::normalize_ros_topic(effective_config_.node_topics_prefix);
-    devices_sub_ = create_subscription<mrs_uav_bluetooth::msg::BleDeviceArray>(
-        util::normalize_ros_topic(topic_root + "/le/devices"), 10,
-        [this](const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message) {
+	const auto topic_root = util::node_prefix(hostname_);
+	devices_sub_ = create_subscription<mrs_uav_bluetooth::msg::BleDeviceArray>(
+		util::normalize_ros_topic(topic_root + "/le/devices"), 10,
+		[this](const mrs_uav_bluetooth::msg::BleDeviceArray::SharedPtr message) {
             // Cache the most recent BlueZ device snapshot for the next report.
             handle_devices(message);
-        });
+		});
 
-    for (const auto& bridge : effective_config_.shared_topics) {
+	for (const auto& bridge : effective_config_.shared_topics) {
         if (!exports(bridge) || bridge.export_topic.empty()) continue;
         const auto topic = util::normalize_ros_topic(bridge.export_topic);
         if (observed_topics_.contains(topic)) continue;
@@ -295,32 +314,33 @@ void UserOverlayNode::refresh_import_observers() {
             "Could not refresh peer topic graph: %s", error.what());
         return;
     }
-    const auto prefix = util::normalize_ros_topic(
-        effective_config_.node_topics_prefix) + "/";
-    for (const auto& [topic, types] : topics) {
-        if (types.empty() || topic.rfind(prefix, 0) != 0) continue;
-        if (topic.find("/peers/") == std::string::npos) continue;
-        bool matching_import = false;
-        bool time_status = report_gatt_ &&
-            topic.size() >= 12 && topic.compare(topic.size() - 12, 12, "/time_status") == 0;
-        for (const auto& bridge : effective_config_.shared_topics) {
-            if (!imports(bridge)) continue;
-            const auto segment = bridge.transport == "mesh" ? "/mesh/peers/" : "/le/peers/";
-            const auto suffix = "/" + bridge.import_topic_suffix;
-            if (topic.find(segment) != std::string::npos &&
-                topic.size() >= suffix.size() &&
-                topic.compare(topic.size() - suffix.size(), suffix.size(), suffix) == 0 &&
-                std::find(types.begin(), types.end(), bridge.message_type) != types.end()) {
-                matching_import = true;
-                break;
-            }
-        }
-        if (!matching_import && !time_status) continue;
-        {
-            std::lock_guard<std::mutex> lock(transport_status_mutex_);
+	auto time_prefix = util::normalize_ros_topic(effective_config_.peers_prefix);
+	if (time_prefix != "/")
+		time_prefix += '/';
+	for (const auto& [topic, types] : topics) {
+		if (types.empty())
+			continue;
+		bool matching_import = false;
+		bool time_status = report_gatt_ &&
+			std::find(types.begin(), types.end(), "mrs_uav_bluetooth/msg/BlePeerTimeStatus") != types.end() &&
+			topic.rfind(time_prefix, 0) == 0 && topic.size() >= 12 &&
+			topic.compare(topic.size() - 12, 12, "/time_status") == 0;
+		for (const auto& bridge : effective_config_.shared_topics) {
+			if (!imports(bridge))
+				continue;
+			if (matches_import(topic, bridge, effective_config_) &&
+				std::find(types.begin(), types.end(), bridge.message_type) != types.end()) {
+				matching_import = true;
+				break;
+			}
+		}
+		if (!matching_import && !time_status)
+			continue;
+		{
+			std::lock_guard<std::mutex> lock(transport_status_mutex_);
             if (observed_topics_.contains(topic)) continue;
-        }
-        try {
+		}
+		try {
             rclcpp::SubscriptionBase::SharedPtr subscription;
             if (time_status) {
                 subscription = create_subscription<mrs_uav_bluetooth::msg::BlePeerTimeStatus>(
@@ -340,31 +360,33 @@ void UserOverlayNode::refresh_import_observers() {
                     });
             }
             TopicObservation observation;
-            observation.type = types.front();
-            observation.subscription = subscription;
-            observation.started_at = std::chrono::steady_clock::now();
-            std::lock_guard<std::mutex> lock(transport_status_mutex_);
+			observation.peer = true;
+			observation.type = types.front();
+			observation.subscription = subscription;
+			observation.started_at = std::chrono::steady_clock::now();
+			std::lock_guard<std::mutex> lock(transport_status_mutex_);
             observed_topics_.emplace(topic, std::move(observation));
         } catch (const std::exception& error) {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
                 "Could not observe peer topic %s: %s", topic.c_str(), error.what());
         }
-    }
+	}
 
-    // Random-address peers can create new ROS paths over a long scan. Drop a
-    // silent observer only after its publisher has left the ROS graph.
-    const auto now = std::chrono::steady_clock::now();
-    std::vector<std::string> expired_topics;
+	// Random-address peers can create new ROS paths over a long scan. Drop a
+	// silent observer only after its publisher has left the ROS graph.
+	const auto now = std::chrono::steady_clock::now();
+	std::vector<std::string> expired_topics;
     {
         std::lock_guard<std::mutex> lock(transport_status_mutex_);
         for (const auto& [topic, observation] : observed_topics_) {
-            if (topic.find("/peers/") == std::string::npos) continue;
-            const auto last = observation.last_at ==
-                std::chrono::steady_clock::time_point{} ?
-                observation.started_at : observation.last_at;
-            if (now - last > 60s) expired_topics.push_back(topic);
-        }
-    }
+			if (!observation.peer)
+				continue;
+			const auto last = observation.last_at == std::chrono::steady_clock::time_point{} ? observation.started_at
+																							 : observation.last_at;
+			if (now - last > 60s)
+				expired_topics.push_back(topic);
+		}
+	}
     for (const auto& topic : expired_topics) {
         try {
             if (count_publishers(topic) != 0) continue;
@@ -638,18 +660,13 @@ void UserOverlayNode::print_transport_status() {
     bool warming_import = false;
     for (const auto& bridge : effective_config_.shared_topics) {
         if (!imports(bridge)) continue;
-        const auto segment = bridge.transport == "mesh" ? "/mesh/peers/" : "/le/peers/";
-        const auto suffix = "/" + bridge.import_topic_suffix;
         for (const auto& [topic, observation] : topics) {
-            if (topic.find(segment) == std::string::npos ||
-                topic.size() < suffix.size() ||
-                topic.compare(topic.size() - suffix.size(), suffix.size(), suffix) != 0)
-                continue;
-            observed_import = true;
-            const auto age = age_seconds(observation.last_at, now);
-            const auto fresh_limit = bridge.rate_hz > 0.0 ?
-                std::max(3.0, 3.0 / bridge.rate_hz) : 3.0;
-            if (age >= 0.0 && age < fresh_limit) ++active_imports;
+			if (!matches_import(topic, bridge, effective_config_))
+				continue;
+			observed_import = true;
+			const auto age = age_seconds(observation.last_at, now);
+			const auto fresh_limit = bridge.rate_hz > 0.0 ? std::max(3.0, 3.0 / bridge.rate_hz) : 3.0;
+			if (age >= 0.0 && age < fresh_limit) ++active_imports;
             if (bridge.rate_hz > 0.0)
                 lowest_ratio = std::min(lowest_ratio,
                     measured_hz(observation) / bridge.rate_hz);
@@ -915,23 +932,20 @@ void UserOverlayNode::print_transport_status() {
             report << " publishers=" << count_publishers(source) << '\n';
         }
         if (imports(bridge)) {
-            const auto segment = bridge.transport == "mesh" ? "/mesh/peers/" : "/le/peers/";
-            const auto prefix = util::normalize_ros_topic(
-                effective_config_.node_topics_prefix) + segment;
-            const auto suffix = "/" + bridge.import_topic_suffix;
-            std::set<std::string> shown_topics;
-            for (const auto& [topic, observation] : topics) {
-                (void)observation;
-                if (topic.rfind(prefix, 0) != 0 ||
-                    topic.size() < suffix.size() ||
-                    topic.compare(topic.size() - suffix.size(), suffix.size(), suffix) != 0)
-                    continue;
-                shown_topics.insert(topic);
-                report << "      received " << topic << " ";
-                append_rate(topic, bridge.rate_hz);
-                report << '\n';
-            }
-            for (const auto& token : expected_peer_tokens) {
+			auto prefix = effective_config_.peers_prefix;
+			prefix = prefix.empty() ? "/" : util::normalize_ros_topic(prefix) + "/";
+			const auto suffix = "/" + bridge.import_topic_suffix;
+			std::set<std::string> shown_topics;
+			for (const auto& [topic, observation] : topics) {
+				(void)observation;
+				if (!matches_import(topic, bridge, effective_config_))
+					continue;
+				shown_topics.insert(topic);
+				report << "      received " << topic << " ";
+				append_rate(topic, bridge.rate_hz);
+				report << '\n';
+			}
+			for (const auto& token : expected_peer_tokens) {
                 const auto topic = prefix + token + suffix;
                 if (!shown_topics.insert(topic).second) continue;
                 report << "      received " << topic << " ";
@@ -948,12 +962,11 @@ void UserOverlayNode::print_transport_status() {
         bool time_found = false;
         for (const auto& [topic, observation] : topics) {
             (void)observation;
-            if (topic.find("/le/peers/") == std::string::npos ||
-                topic.size() < 12 ||
-                topic.compare(topic.size() - 12, 12, "/time_status") != 0)
-                continue;
-            time_found = true;
-            report << "    clock " << topic << " ";
+			if (observation.type != "mrs_uav_bluetooth/msg/BlePeerTimeStatus" || topic.size() < 12 ||
+				topic.compare(topic.size() - 12, 12, "/time_status") != 0)
+				continue;
+			time_found = true;
+			report << "    clock " << topic << " ";
             append_rate(topic, effective_config_.time_update_period > 0.0
                 ? 1.0 / effective_config_.time_update_period : 0.0);
             if (const auto found = peer_rtt.find(topic); found != peer_rtt.end())

@@ -250,16 +250,10 @@ std::pair<bool, std::string> rollback_netplan_change(const std::string& path,
 }
 
 /// \brief Derive the default Wi-Fi address from the numeric suffix of the local hostname.
+/// \param hostname UAV name supplied by the launch file.
 /// \return Deterministic Wi-Fi address derived from the local UAV number.
-std::string default_uav_static_address() {
-    // Derive the default Wi-Fi address from the numeric suffix of the local hostname.
-    char hostname_buf[256]{};
-    std::string hostname;
-    if (gethostname(hostname_buf, sizeof(hostname_buf) - 1) == 0) {
-        hostname = hostname_buf;
-    }
-
-    std::string lowered = hostname;
+std::string default_uav_static_address(const std::string& hostname) {
+	std::string lowered = hostname;
     std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
         // Normalize the hostname before deriving its deterministic static address.
         return static_cast<char>(std::tolower(ch));
@@ -288,11 +282,12 @@ std::string default_uav_static_address() {
 
 }  // namespace
 
-NetplanManager::NetplanManager(std::string netplan_config_file,
-                               std::vector<std::string> allowed_networks)
-    : netplan_config_file_(std::move(netplan_config_file)),
-      allowed_networks_(std::move(allowed_networks)) {
-    // Construction records policy; apply() performs the host-network change.
+NetplanManager::NetplanManager(
+	std::string hostname, std::string netplan_config_file, std::vector<std::string> allowed_networks)
+	: hostname_(std::move(hostname)),
+	  netplan_config_file_(std::move(netplan_config_file)),
+	  allowed_networks_(std::move(allowed_networks)) {
+	// Construction records policy; apply() performs the host-network change.
 }
 
 bool NetplanManager::busy() {
@@ -385,8 +380,8 @@ std::pair<bool, std::string> NetplanManager::write_netplan(
         iface_cfg["dhcp4"] = false;
         iface_cfg["dhcp6"] = false;
         iface_cfg["addresses"] = YAML::Node(YAML::NodeType::Sequence);
-        iface_cfg["addresses"].push_back(default_uav_static_address());
-    }
+		iface_cfg["addresses"].push_back(default_uav_static_address(hostname_));
+	}
     YAML::Node aps(YAML::NodeType::Map);
     YAML::Node ap_cfg(YAML::NodeType::Map);
 

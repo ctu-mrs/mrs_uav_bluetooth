@@ -79,10 +79,13 @@ struct SharedTopicConfig {
 
 /// Top-level node configuration model parsed from YAML.
 struct NodeConfig {
-    std::string node_topics_prefix = "/{hostname}/bluetooth";
-    double scan_publish_period{2.0};
-    double time_update_period{1.0};
-    double wifi_refresh_period{2.0};
+	/// Resolved parent path for imported peer topics and clock reports.
+	/// The configuration loader expands ~ to /<hostname>/bluetooth.
+	std::string peers_prefix{"~/peers"};
+
+	double scan_publish_period{2.0};
+	double time_update_period{1.0};
+	double wifi_refresh_period{2.0};
     double auto_connect_period{3.0};
     uint32_t discoverable_timeout{0};
     bool auto_pair{true};
@@ -179,9 +182,9 @@ struct NodeConfig {
     std::optional<uint32_t> advertise_min_interval;
     std::optional<uint32_t> advertise_max_interval;
     std::optional<int16_t> advertise_tx_power;
-    std::string advertise_extra_data_topic = "/{hostname}/bluetooth/le/advertisement";
-    std::string pairing_agent = "NoInputNoOutput";
-    bool enable_server{true};
+	std::string advertise_extra_data_topic = "~/le/advertisement";
+	std::string pairing_agent = "NoInputNoOutput";
+	bool enable_server{true};
     bool enable_scan{true};
     std::string scan_mode = "le";
 

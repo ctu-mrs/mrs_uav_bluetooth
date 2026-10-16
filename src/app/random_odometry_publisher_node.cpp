@@ -4,34 +4,16 @@
 
 #include "mrs_uav_bluetooth/app/random_odometry_publisher_node.hpp"
 
-#include "mrs_uav_bluetooth/util/hostname_utils.hpp"
 #include "mrs_uav_bluetooth/util/topic_utils.hpp"
 
 #include <cmath>
 #include <stdexcept>
-#include <string_view>
 
 namespace mrs_uav_bluetooth::app {
 
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr std::string_view kHostnameToken = "{hostname}";
-
-/// \brief Replace every hostname placeholder before creating ROS topics.
-/// \param value Configuration text in which placeholders are replaced.
-/// \param hostname UAV hostname used to identify the node.
-/// \return Input text with every hostname placeholder replaced.
-std::string expand_hostname(std::string value, const std::string& hostname) {
-    // Continue after each replacement so multiple placeholders are supported.
-    std::size_t position = 0;
-    while ((position = value.find(kHostnameToken, position)) != std::string::npos) {
-        value.replace(position, kHostnameToken.size(), hostname);
-        position += hostname.size();
-    }
-    return value;
-}
-
 /// \brief Reject nonfinite zero or negative random-publisher limits.
 /// \param value Configured numeric value to validate.
 /// \param name Configuration key reported when validation fails.
@@ -82,14 +64,11 @@ void RandomOdometryPublisherNode::configure_parameters() {
     declare_parameter<int64_t>("random_seed", random_seed_);
     declare_parameter<int>("qos_depth", qos_depth_);
 
-    // Resolve the token once so every publisher created by this process uses
-    // the same hostname even if the surrounding environment later changes.
-    const auto raw_hostname = util::system_hostname();
-    const auto hostname = util::sanitize_topic_suffix(
-        raw_hostname.empty() ? "mrs-uav" : raw_hostname);
-    odometry_topic_ = util::normalize_ros_topic(expand_hostname(
-        get_parameter("odometry_topic").as_string(), hostname));
-    frame_id_ = get_parameter("frame_id").as_string();
+	const auto hostname = declare_parameter<std::string>("hostname", "");
+	if (hostname.empty())
+		throw std::runtime_error("hostname must be provided by the launch file");
+	odometry_topic_ = util::resolve_topic_path(get_parameter("odometry_topic").as_string(), hostname);
+	frame_id_ = get_parameter("frame_id").as_string();
     child_frame_id_ = get_parameter("child_frame_id").as_string();
     rate_hz_ = get_parameter("rate_hz").as_double();
     position_xy_limit_ = get_parameter("position_xy_limit").as_double();

@@ -2,22 +2,20 @@
 /// \file src/app/service_node_status.cpp
 /// \brief Implements the service node status component of the ROS 2 application and operator-tool layer.
 
-#include "mrs_uav_bluetooth/app/service_node.hpp"
-
-#include "mrs_uav_bluetooth/gatt/bridge_naming.hpp"
-#include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
-#include "mrs_uav_bluetooth/util/device_utils.hpp"
-
-#include "mrs_uav_bluetooth/util/string_utils.hpp"
-
-#include "mrs_uav_bluetooth/util/hostname_utils.hpp"
-#include "mrs_uav_bluetooth/util/uuid_utils.hpp"
-
 #include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+
+#include "mrs_uav_bluetooth/app/service_node.hpp"
+#include "mrs_uav_bluetooth/gatt/bridge_naming.hpp"
+#include "mrs_uav_bluetooth/gatt/builtin_gatt.hpp"
+#include "mrs_uav_bluetooth/util/device_utils.hpp"
+#include "mrs_uav_bluetooth/util/hostname_utils.hpp"
+#include "mrs_uav_bluetooth/util/string_utils.hpp"
+#include "mrs_uav_bluetooth/util/topic_utils.hpp"
+#include "mrs_uav_bluetooth/util/uuid_utils.hpp"
 
 namespace {
 
@@ -537,9 +535,11 @@ std::string ServiceNode::build_detailed_status_report(
     lines.push_back("--- Service Node Status @ " + ts.str() + " ---");
     lines.push_back("  adapter:    " + adapter_path_);
     lines.push_back("  hostname:   " + hostname_);
-    lines.push_back("  prefix:     " + active_config_.node_topics_prefix);
-    lines.push_back("  config:     " + (overlay_config_ ? overlay_config_->active_source() : std::string{}));
-    if (cache_) {
+	lines.push_back("  prefix:     " + util::node_prefix(hostname_));
+	lines.push_back(
+		"  peers:      " + (active_config_.peers_prefix.empty() ? std::string("/") : active_config_.peers_prefix));
+	lines.push_back("  config:     " + (overlay_config_ ? overlay_config_->active_source() : std::string{}));
+	if (cache_) {
         if (const auto adapter = cache_->adapter(adapter_path_)) {
             lines.push_back("  alias:      " + (adapter->alias.empty() ? adapter->name : adapter->alias));
             lines.push_back("  powered:    " + std::string(bool_text(adapter->powered)));

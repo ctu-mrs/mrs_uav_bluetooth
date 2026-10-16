@@ -9,10 +9,6 @@
 
 namespace mrs_uav_bluetooth::util {
 
-/// Return the system hostname (gethostname).
-/// \return Local hostname without surrounding whitespace.
-std::string system_hostname();
-
 /// True when the hostname matches the given regex pattern (default: ^uav[0-9]{1,5}$).
 /// \param value Hostname to validate.
 /// \param pattern Regular expression that valid UAV hostnames must match completely.

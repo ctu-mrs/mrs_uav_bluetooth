@@ -693,7 +693,8 @@ void ServiceNode::configure_parameters() {
     const auto share_dir = ament_index_cpp::get_package_share_directory("mrs_uav_bluetooth");
     const auto default_config_path = share_dir + "/config/default.yaml";
 
-    declare_parameter<std::string>("default_config_path", default_config_path);
+	declare_parameter<std::string>("hostname", "");
+	declare_parameter<std::string>("default_config_path", default_config_path);
     declare_parameter<std::string>("overlay_keepalive_topic_suffix", "overlay_keepalive");
     declare_parameter<bool>("enable_server", true);
     declare_parameter<bool>("enable_wifi_service", true);
@@ -707,9 +708,11 @@ void ServiceNode::configure_parameters() {
 }
 
 void ServiceNode::build_runtime() {
-    hostname_ = util::system_hostname();
-    // Validate and select the radio mode before touching adapter properties.
-    active_config_ = config::load_effective_config(
+	hostname_ = get_parameter("hostname").as_string();
+	if (hostname_.empty())
+		throw std::runtime_error("hostname must be provided by the launch file");
+	// Validate and select the radio mode before touching adapter properties.
+	active_config_ = config::load_effective_config(
         get_parameter("default_config_path").as_string(), "", hostname_);
     service_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
     timer_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
@@ -799,9 +802,9 @@ void ServiceNode::build_runtime() {
         apply_config(cfg);
     });
 
-    netplan_ = std::make_unique<network::NetplanManager>(active_config_.wifi_netplan_config_path);
+	netplan_ = std::make_unique<network::NetplanManager>(hostname_, active_config_.wifi_netplan_config_path);
 
-    export_bridges_ = std::make_unique<bridge::ExportBridgeManager>(*this, get_logger());
+	export_bridges_ = std::make_unique<bridge::ExportBridgeManager>(*this, get_logger());
     export_bridges_->set_registry(&bridge_registry_);
     export_bridges_->set_state_mutex(&state_mutex_);
     import_bridges_ = std::make_unique<bridge::ImportBridgeManager>(*this, get_logger());
@@ -1661,16 +1664,10 @@ void ServiceNode::create_services() {
         handle_set_active_config(request, response);
     };
 
-    // Derive a stable API root from the machine hostname across overlay changes.
-    // All transport and configuration services share this canonical root while
-    // node_topics_prefix remains available for overlay data topics.
-    const auto hostname_token = util::sanitize_topic_suffix(
-        hostname_.empty() ? "mrs-uav" : hostname_);
-    const auto service_root = util::normalize_ros_topic(
-        "/" + hostname_token + "/bluetooth");
-    services_ = ros_->service_servers().register_all(
-        *this, handlers, service_root, service_callback_group_);
-    const auto qos = rclcpp::ServicesQoS();
+	// All Bluetooth topics and services share the fixed UAV namespace.
+	const auto service_root = util::node_prefix(hostname_);
+	services_ = ros_->service_servers().register_all(*this, handlers, service_root, service_callback_group_);
+	const auto qos = rclcpp::ServicesQoS();
     services_.push_back(create_service<mrs_uav_bluetooth::srv::MeshNetwork>(
         service_root + "/mesh/network",
         [this](const std::shared_ptr<mrs_uav_bluetooth::srv::MeshNetwork::Request> request,
@@ -1744,7 +1741,6 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
         pairing_agent_->set_auto_pair(cfg.auto_pair);
         pairing_agent_->set_auto_trust(cfg.auto_trust);
     }
-    ros_->status_publisher().configure_topics(cfg.node_topics_prefix);
     ros_->status_publisher().set_advertisement_user_data_type(
         bluez::kDefaultAdvertisementExtraDataType);
     publish_scan_snapshot();
@@ -1864,13 +1860,12 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
     // registry. Their subscriptions are ready before scanning/advertising is
     // resumed, preserving the first frame received by a hot overlay.
     if (transport_bridges_) {
-        transport_bridges_->configure(
-            cfg.shared_topics, cfg.node_topics_prefix, cfg.peer_whitelist);
-        if (client_ && cfg.advertise_mode == "broadcast") {
-            // BlueZ survives this ROS process and may retain the last packet
-            // for several random-address Device1 objects. Seed the new bridge
-            // generation with those values before scanning begins.
-            for (const auto& device : client_->get_devices()) {
+		transport_bridges_->configure(cfg.shared_topics, cfg.peers_prefix, cfg.peer_whitelist);
+		if (client_ && cfg.advertise_mode == "broadcast") {
+			// BlueZ survives this ROS process and may retain the last packet
+			// for several random-address Device1 objects. Seed the new bridge
+			// generation with those values before scanning begins.
+			for (const auto& device : client_->get_devices()) {
                 const auto payload = advertisement_user_payload(
                     device, bluez::kDefaultAdvertisementExtraDataType);
                 if (payload.empty()) continue;
@@ -1879,10 +1874,10 @@ void ServiceNode::apply_config(const config::NodeConfig& cfg) {
                         device, cfg.auto_connect_pattern, cfg.peer_whitelist),
                     device.mac, payload);
             }
-        }
-    }
+		}
+	}
 
-    netplan_->set_config_file(cfg.wifi_netplan_config_path);
+	netplan_->set_config_file(cfg.wifi_netplan_config_path);
     netplan_->set_allowed_networks(cfg.allowed_wifi_networks);
     const bool defer_broadcast_scan = cfg.advertise_mode == "broadcast" &&
         cfg.enable_server;

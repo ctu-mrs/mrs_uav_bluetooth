@@ -1,11 +1,11 @@
 # Advertisement example: broadcasts position and orientation without connecting.
 # Copy this file, list all UAVs below, and deploy the same copy everywhere.
 # Start user_node with config_path:=<absolute path to the copy>.
-# Updates may be missed. Received data appears below /<this-uav>/bluetooth/le/peers.
+# Updates may be missed. Received data appears below /<this-uav>/bluetooth/peers.
 
 # -----------------------------------------------------------------------------
 # Advertisement settings
-node_topics_prefix: "/{hostname}/bluetooth"
+peers_prefix: "~/peers"
 
 # Keep these values together.
 advertise_mode: broadcast

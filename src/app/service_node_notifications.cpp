@@ -404,20 +404,20 @@ void ServiceNode::prune_missing_import_bridges(const std::string& mac,
 
 std::string ServiceNode::peer_status_topic(const std::string& mac, const std::string& peer_name) const {
     // Build the normalized per-peer status topic below the active namespace.
-    return util::normalize_ros_topic(active_config_.node_topics_prefix + "/le/peers/" +
-                                     peer_topic_token(peer_name, mac) + "/time_status");
+	return util::normalize_ros_topic(
+		active_config_.peers_prefix + "/" + peer_topic_token(peer_name, mac) + "/time_status");
 }
 
 std::string ServiceNode::peer_bridge_topic(const std::string& mac,
                                            const std::string& peer_name,
                                            const std::string& requested_topic_suffix) const {
     // Build the normalized topic used for one peer-specific imported bridge.
-    std::string topic = active_config_.node_topics_prefix + "/le/peers/" + peer_topic_token(peer_name, mac);
-    const auto suffix = trim_topic_segment(requested_topic_suffix);
-    if (!suffix.empty()) {
-        topic += "/" + suffix;
-    }
-    return util::normalize_ros_topic(topic);
+	std::string topic = active_config_.peers_prefix + "/" + peer_topic_token(peer_name, mac);
+	const auto suffix = trim_topic_segment(requested_topic_suffix);
+	if (!suffix.empty()) {
+		topic += "/" + suffix;
+	}
+	return util::normalize_ros_topic(topic);
 }
 
 void ServiceNode::publish_peer_time_status(peer::PeerTimeBridge& bridge) const {

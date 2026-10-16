@@ -290,16 +290,12 @@ struct TransportBridgeManager::Impl {
         try {
             auto& base_publisher = entry.publishers[token];
             if (!base_publisher) {
-                const auto transport_segment = entry.config.transport == "mesh"
-                    ? "mesh" : "le";
-                auto topic = util::normalize_ros_topic(
-                    node_topics_prefix + "/" + transport_segment + "/peers/" +
-                    token + "/" + entry.config.import_topic_suffix);
-                base_publisher = entry.runtime->create_publisher(node, topic, 10);
-                RCLCPP_INFO(logger,
-                            "Bridge channel %u publishes peer %s on %s",
-                            entry.config.channel_id, token.c_str(), topic.c_str());
-            }
+				auto topic =
+					util::normalize_ros_topic(peers_prefix + "/" + token + "/" + entry.config.import_topic_suffix);
+				base_publisher = entry.runtime->create_publisher(node, topic, 10);
+				RCLCPP_INFO(logger, "Bridge channel %u publishes peer %s on %s", entry.config.channel_id, token.c_str(),
+					topic.c_str());
+			}
             auto publisher =
                 std::dynamic_pointer_cast<rclcpp::GenericPublisher>(base_publisher);
             if (!publisher) return false;
@@ -341,10 +337,10 @@ struct TransportBridgeManager::Impl {
     std::recursive_mutex mutex;
     std::mutex dispatch_mutex;
     uint64_t next_generation{0};
-    std::string node_topics_prefix;
-    std::vector<std::string> peer_whitelist;
-    std::map<uint16_t, std::string> mesh_peer_by_address;
-    AdvertisementSender advertisement_sender;
+	std::string peers_prefix;
+	std::vector<std::string> peer_whitelist;
+	std::map<uint16_t, std::string> mesh_peer_by_address;
+	AdvertisementSender advertisement_sender;
     MeshSender mesh_sender;
     std::map<std::string, Entry> entries;
 };
@@ -369,18 +365,16 @@ void TransportBridgeManager::set_mesh_sender(MeshSender sender) {
     impl_->mesh_sender = std::move(sender);
 }
 
-void TransportBridgeManager::configure(
-    const std::vector<config::SharedTopicConfig>& topics,
-    const std::string& node_topics_prefix,
-    const std::vector<std::string>& peer_whitelist) {
-    // Replace the entire bridge generation while no outbound callback can run.
-    std::lock_guard<std::mutex> dispatch_lock(impl_->dispatch_mutex);
-    std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
+void TransportBridgeManager::configure(const std::vector<config::SharedTopicConfig>& topics,
+	const std::string& peers_prefix, const std::vector<std::string>& peer_whitelist) {
+	// Replace the entire bridge generation while no outbound callback can run.
+	std::lock_guard<std::mutex> dispatch_lock(impl_->dispatch_mutex);
+	std::lock_guard<std::recursive_mutex> lock(impl_->mutex);
     impl_->entries.clear();
-    impl_->node_topics_prefix = util::normalize_ros_topic(node_topics_prefix);
-    impl_->peer_whitelist.clear();
-    impl_->mesh_peer_by_address.clear();
-    for (const auto& peer : peer_whitelist) {
+	impl_->peers_prefix = peers_prefix;
+	impl_->peer_whitelist.clear();
+	impl_->mesh_peer_by_address.clear();
+	for (const auto& peer : peer_whitelist) {
         const auto normalized = util::lower_trim_copy(peer);
         impl_->peer_whitelist.push_back(normalized);
         // Automatic Mesh uses the numeric hostname suffix as its immutable
